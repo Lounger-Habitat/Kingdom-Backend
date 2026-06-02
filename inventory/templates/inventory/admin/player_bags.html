@@ -1,0 +1,113 @@
+{% extends "admin/base_site.html" %}
+{% load i18n %}
+
+{% block breadcrumbs %}
+<div class="breadcrumbs">
+    <a href="{% url 'admin:index' %}">首页</a>
+    &rsaquo; <a href="{% url 'inventory-admin-player-list' %}">背包管理</a>
+    &rsaquo; <a href="{% url 'inventory-admin-player-bags' player.pk %}">{{ player.username }}</a>
+    &rsaquo; 背包列表
+</div>
+{% endblock %}
+
+{% block content %}
+<div id="content-main">
+    {% if messages %}
+    <ul class="messagelist">
+        {% for message in messages %}
+        <li{% if message.tags %} class="{{ message.tags }}"{% endif %}>{{ message }}</li>
+        {% endfor %}
+    </ul>
+    {% endif %}
+
+    {% if missing_templates %}
+    <div class="module" style="margin-bottom: 10px; padding: 10px; background: #fffbe6; border-left: 4px solid #ffc107;">
+        <p style="margin: 0 0 8px;">
+            模板中有 <strong>{{ missing_templates|length }}</strong> 个背包尚未为该玩家创建：
+            {% for cid in missing_templates %}<code>{{ cid }}</code>{% if not forloop.last %}, {% endif %}{% endfor %}
+        </p>
+        <form method="post" style="margin: 0;">
+            {% csrf_token %}
+            <input type="hidden" name="action" value="init_from_template" />
+            <input type="submit" value="从模板初始化缺失背包" class="default" />
+        </form>
+    </div>
+    {% endif %}
+
+    <!-- 玩家背包 -->
+    <div class="module">
+        <h2>玩家背包</h2>
+        {% if player_bag %}
+        <table>
+            <thead>
+                <tr>
+                    <th scope="col">角色ID</th>
+                    <th scope="col">金币</th>
+                    <th scope="col">物品数量</th>
+                    <th scope="col">操作</th>
+                </tr>
+            </thead>
+            <tbody>
+                <tr class="row1">
+                    <th>
+                        <a href="{% url 'inventory-admin-bag-detail' player.pk player_bag.pk %}">
+                            {{ player_bag.character_id }}
+                        </a>
+                    </th>
+                    <td>{{ player_bag.money }}</td>
+                    <td>{{ player_bag.slot_count }}</td>
+                    <td>
+                        <a href="{% url 'inventory-admin-bag-detail' player.pk player_bag.pk %}" class="button">查看物品</a>
+                    </td>
+                </tr>
+            </tbody>
+        </table>
+        {% else %}
+        <p style="padding: 20px; text-align: center; color: #999;">
+            尚未找到玩家背包（character_id="{{ player.username }}"）。请先在游戏中推送背包数据或从模板初始化。
+        </p>
+        {% endif %}
+    </div>
+
+    <!-- NPC 背包 -->
+    {% if npc_bags %}
+    <div class="module">
+        <h2>NPC 背包</h2>
+        <table>
+            <thead>
+                <tr>
+                    <th scope="col">角色ID</th>
+                    <th scope="col">金币</th>
+                    <th scope="col">物品数量</th>
+                    <th scope="col">操作</th>
+                </tr>
+            </thead>
+            <tbody>
+                {% for bag in npc_bags %}
+                <tr class="{% cycle 'row1' 'row2' %}">
+                    <th>
+                        <a href="{% url 'inventory-admin-bag-detail' player.pk bag.pk %}">
+                            {{ bag.character_id }}
+                        </a>
+                    </th>
+                    <td>{{ bag.money }}</td>
+                    <td>{{ bag.slot_count }}</td>
+                    <td>
+                        <a href="{% url 'inventory-admin-bag-detail' player.pk bag.pk %}" class="button">查看物品</a>
+                    </td>
+                </tr>
+                {% endfor %}
+            </tbody>
+        </table>
+    </div>
+    {% endif %}
+
+    {% if not player_bag and not npc_bags %}
+    <div class="module">
+        <p style="text-align: center; padding: 20px; color: #999;">
+            该玩家暂无背包数据。请先在游戏中推送背包数据，或点击上方按钮从模板初始化。
+        </p>
+    </div>
+    {% endif %}
+</div>
+{% endblock %}

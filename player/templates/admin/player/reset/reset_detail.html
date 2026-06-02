@@ -1,0 +1,171 @@
+{% extends "admin/base_site.html" %}
+{% load i18n %}
+
+{% block breadcrumbs %}
+<div class="breadcrumbs">
+    <a href="{% url 'admin:index' %}">首页</a>
+    &rsaquo; <a href="{% url 'player-admin-reset-list' %}">玩家重置</a>
+    &rsaquo; {{ account.username }}
+</div>
+{% endblock %}
+
+{% block content %}
+<div id="content-main">
+    <h1 style="margin: 0 0 20px;">重置玩家：{{ account.username }}</h1>
+
+    {% if messages %}
+    <ul class="messagelist">
+        {% for message in messages %}
+        <li{% if message.tags %} class="{{ message.tags }}"{% endif %}>{{ message }}</li>
+        {% endfor %}
+    </ul>
+    {% endif %}
+
+    <div style="background: #2b2b2b; border: 1px solid #444; border-radius: 6px; padding: 20px; margin-bottom: 20px;">
+        <h2 style="margin: 0 0 12px; color: #eee; font-size: 16px;">玩家背包</h2>
+        <table style="width: 100%; border-collapse: collapse;">
+            <tr>
+                <td style="padding: 8px 12px; color: #aaa; width: 140px;">物品数</td>
+                <td style="padding: 8px 12px; color: #eee;">{{ player_item_count }}</td>
+                <td style="padding: 8px 12px; color: #aaa; width: 140px;">金币</td>
+                <td style="padding: 8px 12px; color: #eee;">{{ player_money }}</td>
+            </tr>
+            <tr>
+                <td style="padding: 8px 12px; color: #aaa;">已掌握菜谱</td>
+                <td style="padding: 8px 12px; color: #eee;">{{ recipe_count }}</td>
+                <td style="padding: 8px 12px; color: #aaa;">行动力</td>
+                <td style="padding: 8px 12px; color: #eee;">{{ player_state.action_points }}</td>
+            </tr>
+            <tr>
+                <td style="padding: 8px 12px; color: #aaa;">称号数</td>
+                <td style="padding: 8px 12px; color: #eee;">{{ title_count }}</td>
+                <td style="padding: 8px 12px; color: #aaa;">游戏天数</td>
+                <td style="padding: 8px 12px; color: #eee;">第 {{ player_state.total_game_days }} 天</td>
+            </tr>
+        </table>
+    </div>
+
+    <div style="background: #2b2b2b; border: 1px solid #444; border-radius: 6px; padding: 20px; margin-bottom: 20px;">
+        <h2 style="margin: 0 0 12px; color: #eee; font-size: 16px;">NPC 背包（共 {{ npc_stats|length }} 个）</h2>
+        {% if npc_stats %}
+        <table style="width: 100%; border-collapse: collapse;">
+            <thead>
+                <tr>
+                    <th style="padding: 8px 12px; color: #aaa; text-align: left; border-bottom: 1px solid #444;">角色 ID</th>
+                    <th style="padding: 8px 12px; color: #aaa; text-align: left; border-bottom: 1px solid #444;">物品数</th>
+                    <th style="padding: 8px 12px; color: #aaa; text-align: left; border-bottom: 1px solid #444;">金币</th>
+                </tr>
+            </thead>
+            <tbody>
+                {% for ns in npc_stats %}
+                <tr style="border-bottom: 1px solid #333;">
+                    <td style="padding: 8px 12px; color: #eee;">{{ ns.character_id }}</td>
+                    <td style="padding: 8px 12px; color: #eee;">{{ ns.item_count }}</td>
+                    <td style="padding: 8px 12px; color: #eee;">{{ ns.money }}</td>
+                </tr>
+                {% endfor %}
+                <tr style="border-top: 2px solid #555;">
+                    <td style="padding: 8px 12px; color: #aaa; font-weight: bold;">合计</td>
+                    <td style="padding: 8px 12px; color: #aaa; font-weight: bold;">{{ total_npc_item_count }}</td>
+                    <td style="padding: 8px 12px; color: #aaa; font-weight: bold;">{{ total_npc_money }}</td>
+                </tr>
+            </tbody>
+        </table>
+        {% else %}
+        <p style="color: #888; margin: 0;">暂无 NPC 背包数据</p>
+        {% endif %}
+    </div>
+
+    <form method="post" id="reset-form">
+        {% csrf_token %}
+        <input type="hidden" name="action" value="reset" />
+
+        <div style="background: #2b2b2b; border: 1px solid #444; border-radius: 6px; padding: 20px; margin-bottom: 20px;">
+            <h2 style="margin: 0 0 12px; color: #eee; font-size: 16px;">选择要重置的数据</h2>
+
+            <div style="margin-bottom: 12px;">
+                <label style="cursor: pointer; display: flex; align-items: center; gap: 8px; padding: 6px 0;">
+                    <input type="checkbox" id="select-all" onchange="toggleAll(this)" />
+                    <span style="color: #eee; font-weight: bold;">全选</span>
+                </label>
+            </div>
+
+            <hr style="border: none; border-top: 1px solid #444; margin: 8px 0;" />
+
+            <div style="display: grid; grid-template-columns: 1fr 1fr; gap: 4px 24px;">
+                <label style="cursor: pointer; display: flex; align-items: center; gap: 8px; padding: 6px 0;">
+                    <input type="checkbox" name="opt_inventory" class="reset-opt" />
+                    <span style="color: #eee;">背包物品</span>
+                    <span style="color: #888; font-size: 12px;">（清空后从模板恢复）</span>
+                </label>
+
+                <label style="cursor: pointer; display: flex; align-items: center; gap: 8px; padding: 6px 0;">
+                    <input type="checkbox" name="opt_money" class="reset-opt" />
+                    <span style="color: #eee;">金币</span>
+                    <span style="color: #888; font-size: 12px;">（含 NPC 背包，全部重置为模板值）</span>
+                </label>
+
+                <label style="cursor: pointer; display: flex; align-items: center; gap: 8px; padding: 6px 0;">
+                    <input type="checkbox" name="opt_recipes" class="reset-opt" />
+                    <span style="color: #eee;">已掌握菜谱</span>
+                    <span style="color: #888; font-size: 12px;">（恢复为默认菜谱）</span>
+                </label>
+
+                <label style="cursor: pointer; display: flex; align-items: center; gap: 8px; padding: 6px 0;">
+                    <input type="checkbox" name="opt_action_points" class="reset-opt" />
+                    <span style="color: #eee;">行动力</span>
+                    <span style="color: #888; font-size: 12px;">（重置为 100）</span>
+                </label>
+
+                <label style="cursor: pointer; display: flex; align-items: center; gap: 8px; padding: 6px 0;">
+                    <input type="checkbox" name="opt_titles" class="reset-opt" />
+                    <span style="color: #eee;">称号</span>
+                    <span style="color: #888; font-size: 12px;">（清除所有称号）</span>
+                </label>
+
+                <label style="cursor: pointer; display: flex; align-items: center; gap: 8px; padding: 6px 0;">
+                    <input type="checkbox" name="opt_game_day" class="reset-opt" />
+                    <span style="color: #eee;">游戏天数</span>
+                    <span style="color: #888; font-size: 12px;">（重置为第 1 天）</span>
+                </label>
+            </div>
+        </div>
+
+        <div style="display: flex; gap: 12px;">
+            <button type="submit" id="reset-btn"
+                    style="background: #ba2121; color: #fff; border: none; padding: 10px 24px; border-radius: 4px; cursor: pointer; font-size: 14px;">
+                重置选中数据
+            </button>
+            <a href="{% url 'player-admin-reset-list' %}"
+               style="background: #417690; color: #fff; padding: 10px 24px; border-radius: 4px; text-decoration: none; font-size: 14px;">
+                返回列表
+            </a>
+        </div>
+    </form>
+</div>
+
+<script>
+function toggleAll(el) {
+    document.querySelectorAll('.reset-opt').forEach(function(cb) {
+        cb.checked = el.checked;
+    });
+}
+
+document.getElementById('reset-form').addEventListener('submit', function(e) {
+    var checked = document.querySelectorAll('.reset-opt:checked');
+    if (checked.length === 0) {
+        e.preventDefault();
+        alert('请至少选择一项要重置的数据。');
+        return;
+    }
+    var names = [];
+    checked.forEach(function(cb) {
+        var label = cb.closest('label').querySelector('span').textContent;
+        names.push(label);
+    });
+    if (!confirm('确定要重置该玩家的以下数据吗？\n\n' + names.join('、') + '\n\n此操作不可撤销！')) {
+        e.preventDefault();
+    }
+});
+</script>
+{% endblock %}

@@ -1,0 +1,185 @@
+{% extends "admin/base_site.html" %}
+{% load i18n %}
+
+{% block breadcrumbs %}
+<div class="breadcrumbs">
+    <a href="{% url 'admin:index' %}">首页</a>
+    &rsaquo; <a href="{% url 'inventory-admin-player-list' %}">背包管理</a>
+    &rsaquo; <a href="{% url 'inventory-admin-player-bags' player.pk %}">{{ player.username }}</a>
+    &rsaquo; <a href="{% url 'inventory-admin-bag-detail' player.pk bag.pk %}">{{ bag.character_id }}</a>
+    &rsaquo; 背包详情
+</div>
+{% endblock %}
+
+{% block content %}
+<div id="content-main">
+    <!-- 背包信息 -->
+    <div class="module">
+        <h2>背包信息</h2>
+        <form method="post" style="padding: 10px;">
+            {% csrf_token %}
+            <input type="hidden" name="action" value="save_money" />
+            <p>
+                <strong>角色ID：</strong>{{ bag.character_id }}
+            </p>
+            <p>
+                <label for="money"><strong>金币：</strong></label>
+                <input type="number" id="money" name="money" value="{{ bag.money }}" style="width: 120px;" />
+                <input type="submit" value="保存金币" class="default" style="margin-left: 10px;" />
+            </p>
+        </form>
+    </div>
+
+    <!-- 物品列表 -->
+    <div class="module">
+        <h2>
+            物品列表
+            <span style="font-size: 12px; font-weight: normal; color: #999;">
+                （共 {{ slots|length }} 个格位）
+            </span>
+        </h2>
+
+        <form method="post" id="slots-form">
+            {% csrf_token %}
+            <input type="hidden" name="action" value="save_slots" />
+
+            <table id="slots-table">
+                <thead>
+                    <tr>
+                        <th scope="col" style="width: 60px;">格位</th>
+                        <th scope="col" style="width: 80px;">物品ID</th>
+                        <th scope="col">物品名称</th>
+                        <th scope="col" style="width: 80px;">数量</th>
+                        <th scope="col" style="width: 60px;">已评价</th>
+                        <th scope="col" style="width: 90px;">评价价格</th>
+                        <th scope="col" style="width: 70px;">评分</th>
+                        <th scope="col" style="width: 100px;">原料</th>
+                        <th scope="col" style="width: 120px;">背包名称</th>
+                        <th scope="col" style="width: 80px;">烹饪时长</th>
+                        <th scope="col" style="width: 80px;">品质</th>
+                        <th scope="col" style="width: 60px;">操作</th>
+                    </tr>
+                </thead>
+                <tbody>
+                    {% for slot in slots %}
+                    <tr class="{% cycle 'row1' 'row2' %}">
+                        <td>{{ slot.slot_index }}</td>
+                        <td>
+                            <input type="hidden" name="slot_id" value="{{ slot.pk }}" />
+                            <input type="number" name="slot_{{ slot.pk }}_item_id"
+                                   value="{{ slot.item_id }}" style="width: 70px;" />
+                        </td>
+                        <td>
+                            {% if slot.item_id != 0 %}
+                                {% if slot.item_name %}
+                                    <strong>{{ slot.item_name }}</strong>
+                                {% else %}
+                                    <span style="color: #999;">未知物品</span>
+                                {% endif %}
+                            {% else %}
+                                <span style="color: #ccc;">空</span>
+                            {% endif %}
+                        </td>
+                        <td>
+                            <input type="number" name="slot_{{ slot.pk }}_item_amount"
+                                   value="{{ slot.item_amount }}" style="width: 70px;" />
+                        </td>
+                        <td style="text-align: center;">
+                            <input type="checkbox" name="slot_{{ slot.pk }}_rated"
+                                   {% if slot.rated %}checked{% endif %} />
+                        </td>
+                        <td>
+                            <input type="number" name="slot_{{ slot.pk }}_rating_price"
+                                   value="{{ slot.rating_price }}" style="width: 80px;" />
+                        </td>
+                        <td>
+                            <input type="number" name="slot_{{ slot.pk }}_overall_score"
+                                   value="{{ slot.overall_score }}" style="width: 60px;" min="0" max="100" />
+                        </td>
+                        <td>
+                            <input type="text" name="slot_{{ slot.pk }}_ingredient"
+                                   value="{{ slot.ingredient }}" style="width: 90px;" />
+                        </td>
+                        <td>
+                            <input type="text" name="slot_{{ slot.pk }}_item_bag_name"
+                                   value="{{ slot.item_bag_name }}" style="width: 110px;" />
+                        </td>
+                        <td>
+                            <input type="number" name="slot_{{ slot.pk }}_cook_time"
+                                   value="{{ slot.cook_time }}" style="width: 70px;" min="0" />
+                        </td>
+                        <td>
+                            <select name="slot_{{ slot.pk }}_dish_quality" style="width: 70px;">
+                                <option value="1" {% if slot.dish_quality == 1 %}selected{% endif %}>1 略逊</option>
+                                <option value="2" {% if slot.dish_quality == 2 %}selected{% endif %}>2 一般</option>
+                                <option value="3" {% if slot.dish_quality == 3 %}selected{% endif %}>3 正常</option>
+                                <option value="4" {% if slot.dish_quality == 4 %}selected{% endif %}>4 优秀</option>
+                                <option value="5" {% if slot.dish_quality == 5 %}selected{% endif %}>5 极品</option>
+                                <option value="6" {% if slot.dish_quality == 6 %}selected{% endif %}>6 绝品</option>
+                            </select>
+                        </td>
+                        <td>
+                            <button type="button" data-slot-id="{{ slot.pk }}"
+                                    class="delete-slot-btn"
+                                    style="color: #ba2121; background: none; border: none; cursor: pointer; text-decoration: underline;">
+                                删除
+                            </button>
+                        </td>
+                    </tr>
+                    {% empty %}
+                    <tr><td colspan="12" style="text-align: center; padding: 20px;">背包为空</td></tr>
+                    {% endfor %}
+                </tbody>
+            </table>
+
+            {% if slots %}
+            <div class="submit-row" style="padding: 10px;">
+                <input type="submit" value="保存所有修改" class="default" />
+            </div>
+            {% endif %}
+        </form>
+
+        <!-- 添加格位 -->
+        <form method="post" style="padding: 0 10px 10px;">
+            {% csrf_token %}
+            <input type="hidden" name="action" value="add_slot" />
+            <input type="submit" value="+ 添加空格位" />
+        </form>
+    </div>
+</div>
+
+<style>
+#slots-table input[type="number"],
+#slots-table input[type="text"] {
+    padding: 2px 4px;
+    border: 1px solid #ccc;
+    border-radius: 2px;
+}
+#slots-table input[type="number"]:focus,
+#slots-table input[type="text"]:focus {
+    border-color: #79aec8;
+    outline: none;
+}
+#slots-table th, #slots-table td {
+    padding: 6px 8px;
+}
+</style>
+
+<script>
+document.querySelectorAll('.delete-slot-btn').forEach(function(btn) {
+    btn.addEventListener('click', function(e) {
+        e.preventDefault();
+        if (!confirm('确定删除此格位？')) return;
+        var form = this.closest('form');
+        var slotId = this.getAttribute('data-slot-id');
+        var input = document.createElement('input');
+        input.type = 'hidden';
+        input.name = 'slot_id';
+        input.value = slotId;
+        form.appendChild(input);
+        form.querySelector('input[name="action"]').value = 'delete_slot';
+        form.submit();
+    });
+});
+</script>
+{% endblock %}

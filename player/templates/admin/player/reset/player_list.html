@@ -1,0 +1,66 @@
+{% extends "admin/base_site.html" %}
+{% load i18n %}
+
+{% block breadcrumbs %}
+<div class="breadcrumbs">
+    <a href="{% url 'admin:index' %}">首页</a>
+    &rsaquo; <a href="{% url 'player-admin-reset-list' %}">玩家重置</a>
+    &rsaquo; 玩家列表
+</div>
+{% endblock %}
+
+{% block content %}
+<div id="content-main">
+    <div class="module filtered" id="changelist">
+        <div id="toolbar">
+            <form id="changelist-search" method="get">
+                <input type="text" size="40" name="q" value="{{ search }}" placeholder="搜索用户名..." />
+                <input type="submit" value="搜索" />
+                {% if search %}
+                <a href="{% url 'player-admin-reset-list' %}" style="margin-left: 10px;">清除</a>
+                {% endif %}
+            </form>
+        </div>
+
+        <table id="result_list">
+            <thead>
+                <tr>
+                    <th scope="col">用户名</th>
+                    <th scope="col">背包物品数</th>
+                    <th scope="col">金币</th>
+                    <th scope="col">已掌握菜谱</th>
+                    <th scope="col">行动力</th>
+                    <th scope="col">称号数</th>
+                    <th scope="col">操作</th>
+                </tr>
+            </thead>
+            <tbody>
+                {% for p in player_list %}
+                <tr class="{% cycle 'row1' 'row2' %}">
+                    <th>{{ p.account.username }}</th>
+                    <td>{{ p.item_count }}</td>
+                    <td>{{ p.money }}</td>
+                    <td>{{ p.recipe_count }}</td>
+                    <td>{{ p.action_points }}</td>
+                    <td>{{ p.title_count }}</td>
+                    <td>
+                        <a href="{% url 'player-admin-reset-detail' p.account.pk %}"
+                           style="background: #ba2121; color: #fff; padding: 4px 12px; border-radius: 4px; text-decoration: none; font-size: 13px;">
+                            重置
+                        </a>
+                    </td>
+                </tr>
+                {% empty %}
+                <tr><td colspan="7" style="text-align: center; padding: 20px;">暂无玩家数据</td></tr>
+                {% endfor %}
+            </tbody>
+        </table>
+    </div>
+</div>
+
+<style>
+#changelist-search { margin: 10px 0; padding: 10px; }
+#changelist-search input[type="text"] { padding: 4px 8px; }
+#changelist-search input[type="submit"] { padding: 4px 12px; }
+</style>
+{% endblock %}

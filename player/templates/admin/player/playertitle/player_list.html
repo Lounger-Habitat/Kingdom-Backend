@@ -1,0 +1,40 @@
+{% extends "admin/base_site.html" %}
+{% load i18n %}
+
+{% block content %}
+<h1 style="margin: 0 0 16px; color: #eee;">选择玩家查看称号</h1>
+
+<div style="padding: 0;">
+  <table style="width: 100%; border-collapse: collapse; border: 1px solid #444; border-radius: 4px; overflow: hidden;">
+    <thead>
+      <tr style="background: #264b5d; color: #fff;">
+        <th style="padding: 10px 12px; text-align: left;">玩家 ID</th>
+        <th style="padding: 10px 12px; text-align: left;">玩家名称</th>
+        <th style="padding: 10px 12px; text-align: center;">称号数量</th>
+        <th style="padding: 10px 12px; text-align: center;">当前激活</th>
+        <th style="padding: 10px 12px; text-align: center;">操作</th>
+      </tr>
+    </thead>
+    <tbody>
+      {% for p in players %}
+      <tr style="background: {% cycle '#2b2b2b' '#242424' %}; border-bottom: 1px solid #444;">
+        <td style="padding: 8px 12px; color: #eee;">{{ p.player_id }}</td>
+        <td style="padding: 8px 12px; color: #eee;">{{ p.username }}</td>
+        <td style="padding: 8px 12px; text-align: center; color: #eee;">{{ p.title_count }}</td>
+        <td style="padding: 8px 12px; text-align: center; color: #7fdc8e;">{{ p.active_title|default:"-" }}</td>
+        <td style="padding: 8px 12px; text-align: center;">
+          <a href="?player__id__exact={{ p.id }}"
+             style="background: #417690; color: #fff; padding: 4px 12px; border-radius: 4px; text-decoration: none; font-size: 13px;">
+            查看称号
+          </a>
+        </td>
+      </tr>
+      {% empty %}
+      <tr>
+        <td colspan="5" style="padding: 20px; text-align: center; color: #888;">暂无玩家拥有称号</td>
+      </tr>
+      {% endfor %}
+    </tbody>
+  </table>
+</div>
+{% endblock %}

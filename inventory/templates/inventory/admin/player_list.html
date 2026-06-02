@@ -1,0 +1,59 @@
+{% extends "admin/base_site.html" %}
+{% load i18n %}
+
+{% block breadcrumbs %}
+<div class="breadcrumbs">
+    <a href="{% url 'admin:index' %}">首页</a>
+    &rsaquo; <a href="{% url 'inventory-admin-player-list' %}">背包管理</a>
+    &rsaquo; 玩家列表
+</div>
+{% endblock %}
+
+{% block content %}
+<div id="content-main">
+    <div class="module filtered" id="changelist">
+        <div id="toolbar">
+            <form id="changelist-search" method="get">
+                <input type="text" size="40" name="q" value="{{ search }}" placeholder="搜索用户名..." />
+                <input type="submit" value="搜索" />
+                {% if search %}
+                <a href="{% url 'inventory-admin-player-list' %}" style="margin-left: 10px;">清除</a>
+                {% endif %}
+            </form>
+        </div>
+
+        <table id="result_list">
+            <thead>
+                <tr>
+                    <th scope="col">用户名</th>
+                    <th scope="col">游客</th>
+                    <th scope="col">注册时间</th>
+                    <th scope="col">背包数量</th>
+                </tr>
+            </thead>
+            <tbody>
+                {% for player in players %}
+                <tr class="{% cycle 'row1' 'row2' %}">
+                    <th>
+                        <a href="{% url 'inventory-admin-player-bags' player.pk %}">
+                            {{ player.username }}
+                        </a>
+                    </th>
+                    <td>{% if player.is_guest %}是{% else %}否{% endif %}</td>
+                    <td>{{ player.created_at|date:"Y-m-d H:i" }}</td>
+                    <td>{{ player.bag_count }}</td>
+                </tr>
+                {% empty %}
+                <tr><td colspan="4" style="text-align: center; padding: 20px;">暂无玩家数据</td></tr>
+                {% endfor %}
+            </tbody>
+        </table>
+    </div>
+</div>
+
+<style>
+#changelist-search { margin: 10px 0; padding: 10px; }
+#changelist-search input[type="text"] { padding: 4px 8px; }
+#changelist-search input[type="submit"] { padding: 4px 12px; }
+</style>
+{% endblock %}

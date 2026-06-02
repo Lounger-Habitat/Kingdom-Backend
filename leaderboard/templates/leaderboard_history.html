@@ -1,0 +1,260 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>排行榜历史</title>
+<style>
+  * { margin: 0; padding: 0; box-sizing: border-box; }
+  body { font-family: -apple-system, "Microsoft YaHei", sans-serif; background: #f5f6fa; color: #2d3436; min-height: 100vh; }
+  .container { max-width: 720px; margin: 0 auto; padding: 24px 16px; }
+  h1 { font-size: 22px; margin-bottom: 20px; text-align: center; color: #2d3436; }
+
+  /* Breadcrumb */
+  .breadcrumb { font-size: 13px; color: #636e72; margin-bottom: 16px; }
+  .breadcrumb a { color: #0984e3; text-decoration: none; cursor: pointer; }
+  .breadcrumb a:hover { text-decoration: underline; }
+  .breadcrumb span { margin: 0 6px; }
+
+  /* Cards */
+  .card-list { display: flex; flex-direction: column; gap: 12px; }
+  .card { background: #fff; border-radius: 10px; padding: 18px 20px; cursor: pointer; box-shadow: 0 1px 4px rgba(0,0,0,0.06); transition: box-shadow 0.15s, transform 0.15s; display: flex; justify-content: space-between; align-items: center; }
+  .card:hover { box-shadow: 0 4px 12px rgba(0,0,0,0.12); transform: translateY(-1px); }
+  .card-title { font-size: 16px; font-weight: 600; }
+  .card-sub { font-size: 13px; color: #636e72; margin-top: 2px; }
+  .card-arrow { font-size: 18px; color: #b2bec3; }
+
+  /* Board type colors */
+  .board-wealth { border-left: 4px solid #fdcb6e; }
+  .board-output { border-left: 4px solid #00b894; }
+  .board-fresh  { border-left: 4px solid #74b9ff; }
+
+  /* Table */
+  .rank-table { width: 100%; border-collapse: collapse; background: #fff; border-radius: 10px; overflow: hidden; box-shadow: 0 1px 4px rgba(0,0,0,0.06); }
+  .rank-table th { background: #dfe6e9; font-size: 13px; font-weight: 600; padding: 10px 14px; text-align: left; }
+  .rank-table td { font-size: 14px; padding: 10px 14px; border-bottom: 1px solid #f0f0f0; }
+  .rank-table tr:last-child td { border-bottom: none; }
+  .rank-table tr:hover td { background: #f8f9fa; }
+  .rank-1 { color: #d63031; font-weight: 700; }
+  .rank-2 { color: #e17055; font-weight: 600; }
+  .rank-3 { color: #fdcb6e; font-weight: 600; }
+  .score { font-variant-numeric: tabular-nums; }
+  .title-tag { font-size: 12px; color: #6c5ce7; background: #f0edff; padding: 2px 8px; border-radius: 4px; margin-left: 6px; }
+  .ai-tag { font-size: 12px; color: #636e72; background: #eee; padding: 2px 6px; border-radius: 4px; margin-left: 6px; }
+  .dish-name { font-size: 13px; color: #6c5ce7; }
+
+  /* Empty state */
+  .empty { text-align: center; padding: 48px 16px; color: #b2bec3; font-size: 15px; }
+
+  /* Loading */
+  .loading { text-align: center; padding: 48px 16px; color: #636e72; font-size: 14px; }
+
+  /* Hidden */
+  .hidden { display: none; }
+
+  /* Score format helper */
+  .score-wealth::after { content: " 金"; color: #636e72; font-size: 12px; }
+  .score-output::after { content: " 道"; color: #636e72; font-size: 12px; }
+  .score-freshness::after { content: " 分"; color: #636e72; font-size: 12px; }
+</style>
+</head>
+<body>
+<div class="container">
+  <h1>排行榜历史</h1>
+
+  <div id="breadcrumb" class="breadcrumb hidden"></div>
+
+  <!-- Level 1: Days -->
+  <div id="view-days">
+    <div id="days-list" class="card-list"></div>
+    <div id="days-loading" class="loading">加载中...</div>
+    <div id="days-empty" class="empty hidden">暂无排行榜数据</div>
+  </div>
+
+  <!-- Level 2: Board types -->
+  <div id="view-boards" class="hidden">
+    <div id="boards-list" class="card-list"></div>
+  </div>
+
+  <!-- Level 3: Ranking table -->
+  <div id="view-rankings" class="hidden">
+    <div id="rankings-loading" class="loading hidden">加载中...</div>
+    <table id="rankings-table" class="rank-table hidden">
+      <thead>
+        <tr>
+          <th style="width:60px">排名</th>
+          <th>玩家</th>
+          <th style="width:120px; text-align:right">分数</th>
+        </tr>
+      </thead>
+      <tbody id="rankings-body"></tbody>
+    </table>
+    <div id="rankings-empty" class="empty hidden">该日暂无此榜单数据</div>
+  </div>
+</div>
+
+<script>
+const API = {
+  days: "/api/leaderboard/history/days",
+  detail: (board) => `/api/leaderboard/history/${board}`,
+};
+
+const BOARDS = [
+  { key: "wealth",    name: "富豪榜", sub: "交易净利润", cls: "board-wealth" },
+  { key: "output",    name: "产量榜", sub: "有效菜品数", cls: "board-output" },
+  { key: "freshness", name: "极鲜榜", sub: "单品最高品鉴值", cls: "board-fresh" },
+];
+
+let currentDay = null;
+let currentBoard = null;
+
+// ─── Init ───
+document.addEventListener("DOMContentLoaded", loadDays);
+
+async function loadDays() {
+  try {
+    const resp = await fetch(API.days);
+    const json = await resp.json();
+    const days = json.data?.days || [];
+
+    document.getElementById("days-loading").classList.add("hidden");
+
+    if (days.length === 0) {
+      document.getElementById("days-empty").classList.remove("hidden");
+      return;
+    }
+
+    const list = document.getElementById("days-list");
+    list.innerHTML = days.map(d => `
+      <div class="card" onclick="selectDay(${d})">
+        <div>
+          <div class="card-title">第 ${d} 天</div>
+          <div class="card-sub">点击查看各榜单排名</div>
+        </div>
+        <div class="card-arrow">&#8250;</div>
+      </div>
+    `).join("");
+  } catch (e) {
+    document.getElementById("days-loading").textContent = "加载失败，请刷新重试";
+  }
+}
+
+// ─── Select Day ───
+function selectDay(day) {
+  currentDay = day;
+  document.getElementById("view-days").classList.add("hidden");
+  document.getElementById("view-boards").classList.remove("hidden");
+  document.getElementById("view-rankings").classList.add("hidden");
+
+  updateBreadcrumb([{ label: `第 ${day} 天`, action: "backToDays()" }]);
+
+  const list = document.getElementById("boards-list");
+  list.innerHTML = BOARDS.map(b => `
+    <div class="card ${b.cls}" onclick="selectBoard('${b.key}')">
+      <div>
+        <div class="card-title">${b.name}</div>
+        <div class="card-sub">${b.sub}</div>
+      </div>
+      <div class="card-arrow">&#8250;</div>
+    </div>
+  `).join("");
+}
+
+// ─── Select Board ───
+async function selectBoard(boardKey) {
+  currentBoard = boardKey;
+  const boardInfo = BOARDS.find(b => b.key === boardKey);
+
+  document.getElementById("view-boards").classList.add("hidden");
+  document.getElementById("view-rankings").classList.remove("hidden");
+
+  updateBreadcrumb([
+    { label: `第 ${currentDay} 天`, action: "backToDays()" },
+    { label: boardInfo.name, action: "backToBoards()" },
+  ]);
+
+  const table = document.getElementById("rankings-table");
+  const loading = document.getElementById("rankings-loading");
+  const empty = document.getElementById("rankings-empty");
+  const body = document.getElementById("rankings-body");
+
+  table.classList.add("hidden");
+  empty.classList.add("hidden");
+  loading.classList.remove("hidden");
+  body.innerHTML = "";
+
+  try {
+    const resp = await fetch(API.detail(boardKey) + `?day=${currentDay}`);
+    const json = await resp.json();
+    const entries = json.data?.entries || [];
+
+    loading.classList.add("hidden");
+
+    if (entries.length === 0) {
+      empty.classList.remove("hidden");
+      return;
+    }
+
+    const scoreClass = `score-${boardKey === "freshness" ? "freshness" : boardKey}`;
+
+    const isFresh = boardKey === "freshness";
+    const headerRow = document.querySelector("#rankings-table thead tr");
+    headerRow.innerHTML = `<th style="width:60px">排名</th><th>玩家</th>${isFresh ? "<th>菜品</th>" : ""}<th style="width:120px; text-align:right">分数</th>`;
+
+    body.innerHTML = entries.map(e => {
+      const rankClass = e.rank <= 3 ? `rank-${e.rank}` : "";
+      const titleTag = e.title ? `<span class="title-tag">${e.title}</span>` : "";
+      const aiTag = e.isAI ? `<span class="ai-tag">AI</span>` : "";
+      const dishCol = isFresh ? `<td>${e.dishName || "-"}</td>` : "";
+      return `<tr>
+        <td class="${rankClass}">#${e.rank}</td>
+        <td>${e.displayName}${titleTag}${aiTag}</td>
+        ${dishCol}
+        <td class="score ${scoreClass}" style="text-align:right">${formatScore(e.score, boardKey)}</td>
+      </tr>`;
+    }).join("");
+
+    table.classList.remove("hidden");
+  } catch (e) {
+    loading.classList.add("hidden");
+    empty.textContent = "加载失败";
+    empty.classList.remove("hidden");
+  }
+}
+
+// ─── Navigation ───
+function backToDays() {
+  currentDay = null;
+  currentBoard = null;
+  document.getElementById("view-days").classList.remove("hidden");
+  document.getElementById("view-boards").classList.add("hidden");
+  document.getElementById("view-rankings").classList.add("hidden");
+  document.getElementById("breadcrumb").classList.add("hidden");
+}
+
+function backToBoards() {
+  currentBoard = null;
+  document.getElementById("view-boards").classList.remove("hidden");
+  document.getElementById("view-rankings").classList.add("hidden");
+  updateBreadcrumb([{ label: `第 ${currentDay} 天`, action: "backToDays()" }]);
+}
+
+function updateBreadcrumb(items) {
+  const el = document.getElementById("breadcrumb");
+  el.classList.remove("hidden");
+  let html = `<a onclick="backToDays()">全部天数</a>`;
+  items.forEach(item => {
+    html += `<span>/</span><a onclick="${item.action}">${item.label}</a>`;
+  });
+  el.innerHTML = html;
+}
+
+// ─── Helpers ───
+function formatScore(score, boardKey) {
+  if (boardKey === "wealth") return Math.round(score).toLocaleString();
+  if (boardKey === "output") return Math.round(score);
+  return score.toFixed(1);
+}
+</script>
+</body>
+</html>
