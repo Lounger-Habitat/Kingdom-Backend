@@ -30,8 +30,9 @@ INSTALLED_APPS = [
     "recipes",
     "inventory",
     "player",
-    "leaderboard",
+    "leaderboard.apps.LeaderboardConfig",
     "game_time",
+    "cooking",
 ]
 
 MIDDLEWARE = [

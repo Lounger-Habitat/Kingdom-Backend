@@ -8,6 +8,7 @@ urlpatterns = [
     path("api/leaderboard/history/<str:board_type>", views.history_detail, name="leaderboard-history-detail"),
     # 排行榜 API
     path("api/leaderboard/summary", views.leaderboard_summary, name="leaderboard-summary"),
+    path("api/leaderboard/season-info", views.season_info, name="leaderboard-season-info"),
     path("api/leaderboard/<str:board_type>/me", views.leaderboard_my_rank, name="leaderboard-my-rank"),
     path("api/leaderboard/<str:board_type>", views.leaderboard_detail, name="leaderboard-detail"),
     # 奖励 API

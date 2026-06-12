@@ -29,6 +29,7 @@ class InventorySlot(models.Model):
     item_bag_name = models.CharField(max_length=100, default="", blank=True)
     cook_time = models.IntegerField(default=0, help_text="烹饪时长（秒）")
     dish_quality = models.IntegerField(default=3, help_text="品质：1略逊 2一般 3正常 4优秀 5极品 6绝品")
+    hide_in_shop = models.BooleanField(default=False, help_text="是否在商店面板中隐藏此物品")
 
     class Meta:
         ordering = ["slot_index"]
@@ -59,6 +60,7 @@ class BagTemplateSlot(models.Model):
     ingredient = models.CharField(max_length=200, default="", blank=True)
     cook_time = models.IntegerField(default=0, help_text="烹饪时长（秒）")
     dish_quality = models.IntegerField(default=3, help_text="品质：1略逊 2一般 3正常 4优秀 5极品 6绝品")
+    hide_in_shop = models.BooleanField(default=False, help_text="是否在商店面板中隐藏此物品")
 
     class Meta:
         ordering = ["slot_index"]

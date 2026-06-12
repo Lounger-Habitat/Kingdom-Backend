@@ -1,0 +1,182 @@
+{% extends "admin/base_site.html" %}
+{% load i18n %}
+
+{% block breadcrumbs %}
+<div class="breadcrumbs">
+    <a href="{% url 'admin:index' %}">首页</a>
+    &rsaquo; 赛季轮转测试
+</div>
+{% endblock %}
+
+{% block content %}
+<div id="content-main">
+    <h1 style="margin: 0 0 20px; color: #4fc3f7;">赛季轮转测试</h1>
+
+    {% if messages %}
+    <ul class="messagelist">
+        {% for message in messages %}
+        <li{% if message.tags %} class="{{ message.tags }}"{% endif %}>{{ message }}</li>
+        {% endfor %}
+    </ul>
+    {% endif %}
+
+    {# ───── 赛季状态表 ───── #}
+    <div style="background: #2b2b2b; border: 1px solid #444; border-radius: 6px; padding: 20px; margin-bottom: 20px;">
+        <h2 style="margin: 0 0 12px; color: #eee; font-size: 16px;">赛季列表</h2>
+        {% if season_rows %}
+        <table style="width: 100%; border-collapse: collapse;">
+            <thead>
+                <tr style="border-bottom: 1px solid #555;">
+                    <th style="padding: 8px 12px; color: #aaa; text-align: left;">赛季 ID</th>
+                    <th style="padding: 8px 12px; color: #aaa; text-align: center;">序号</th>
+                    <th style="padding: 8px 12px; color: #aaa; text-align: center;">状态</th>
+                    <th style="padding: 8px 12px; color: #aaa; text-align: center;">已结算</th>
+                    <th style="padding: 8px 12px; color: #aaa; text-align: right;">玩家数</th>
+                    <th style="padding: 8px 12px; color: #aaa; text-align: right;">结束时间</th>
+                </tr>
+            </thead>
+            <tbody>
+                {% for s in season_rows %}
+                <tr style="border-bottom: 1px solid #333;">
+                    <td style="padding: 8px 12px; color: #eee;">{{ s.season_id }}</td>
+                    <td style="padding: 8px 12px; color: #eee; text-align: center;">{{ s.sequence }}</td>
+                    <td style="padding: 8px 12px; text-align: center;">
+                        {% if s.status == "active" %}
+                            <span style="color: #4caf50; font-weight: bold;">active</span>
+                        {% elif s.status == "ended" %}
+                            <span style="color: #ff9800; font-weight: bold;">ended</span>
+                        {% else %}
+                            <span style="color: #9e9e9e;">{{ s.status }}</span>
+                        {% endif %}
+                    </td>
+                    <td style="padding: 8px 12px; text-align: center;">
+                        {% if s.settled %}
+                            <span style="color: #4caf50;">&#10003;</span>
+                        {% else %}
+                            <span style="color: #666;">&#10007;</span>
+                        {% endif %}
+                    </td>
+                    <td style="padding: 8px 12px; color: #eee; text-align: right;">{{ s.player_count }}</td>
+                    <td style="padding: 8px 12px; color: #aaa; text-align: right; font-size: 12px;">{{ s.end_time }}</td>
+                </tr>
+                {% endfor %}
+            </tbody>
+        </table>
+        {% else %}
+        <p style="color: #aaa;">暂无赛季数据。</p>
+        {% endif %}
+    </div>
+
+    {# ───── 玩家分布 ───── #}
+    <div style="background: #2b2b2b; border: 1px solid #444; border-radius: 6px; padding: 20px; margin-bottom: 20px;">
+        <h2 style="margin: 0 0 12px; color: #eee; font-size: 16px;">玩家赛季分布（共 {{ player_count }} 名玩家）</h2>
+        {% if distribution %}
+        <table style="border-collapse: collapse;">
+            <thead>
+                <tr>
+                    <th style="padding: 6px 16px; color: #aaa; text-align: left;">赛季 ID</th>
+                    <th style="padding: 6px 16px; color: #aaa; text-align: right;">玩家数</th>
+                </tr>
+            </thead>
+            <tbody>
+                {% for d in distribution %}
+                <tr>
+                    <td style="padding: 6px 16px; color: #eee;">{{ d.current_season_id|default:"(空)" }}</td>
+                    <td style="padding: 6px 16px; color: #eee; text-align: right;">{{ d.cnt }}</td>
+                </tr>
+                {% endfor %}
+            </tbody>
+        </table>
+        {% else %}
+        <p style="color: #aaa;">暂无玩家数据。</p>
+        {% endif %}
+    </div>
+
+    {# ───── 操作区域 ───── #}
+    <div style="background: #1a2a3b; border: 1px solid #4fc3f7; border-radius: 6px; padding: 20px; margin-bottom: 20px;">
+        <h2 style="margin: 0 0 16px; color: #4fc3f7; font-size: 16px;">赛季轮转操作（按顺序执行）</h2>
+
+        <div style="display: flex; flex-direction: column; gap: 16px;">
+            {# Step 1 #}
+            <div style="background: #2b2b2b; border: 1px solid #444; border-radius: 4px; padding: 16px;">
+                <div style="display: flex; justify-content: space-between; align-items: center;">
+                    <div>
+                        <strong style="color: #ff9800;">步骤 1：使当前赛季到期</strong>
+                        <p style="color: #aaa; margin: 4px 0 0; font-size: 13px;">
+                            将活跃赛季的 end_time 设为过去时间，模拟赛季到期。
+                            {% if active_season %}
+                            <br/>当前活跃赛季：<span style="color: #4caf50;">{{ active_season.season_id }}</span>
+                            {% endif %}
+                        </p>
+                    </div>
+                    <form method="post" style="margin: 0;">
+                        {% csrf_token %}
+                        <input type="hidden" name="action" value="force_expire" />
+                        <button type="submit" id="btn-expire"
+                                style="background: #e65100; color: #fff; border: none; padding: 8px 20px; border-radius: 4px; cursor: pointer; font-size: 14px; white-space: nowrap;"
+                                onclick="return confirm('确认将当前赛季 end_time 设为过去？')">
+                            使赛季到期
+                        </button>
+                    </form>
+                </div>
+            </div>
+
+            {# Step 2 #}
+            <div style="background: #2b2b2b; border: 1px solid #444; border-radius: 4px; padding: 16px;">
+                <div style="display: flex; justify-content: space-between; align-items: center;">
+                    <div>
+                        <strong style="color: #4fc3f7;">步骤 2：触发轮转（等效 00:05 调度器）</strong>
+                        <p style="color: #aaa; margin: 4px 0 0; font-size: 13px;">
+                            创建新赛季，旧赛季标记为 ended（不结算、不重置玩家）。
+                            {% if ended_seasons %}
+                            <br/><span style="color: #ff9800;">已存在 ended 状态的赛季，请先执行步骤 3。</span>
+                            {% endif %}
+                        </p>
+                    </div>
+                    <form method="post" style="margin: 0;">
+                        {% csrf_token %}
+                        <input type="hidden" name="action" value="rotate" />
+                        <button type="submit" id="btn-rotate"
+                                style="background: #1565c0; color: #fff; border: none; padding: 8px 20px; border-radius: 4px; cursor: pointer; font-size: 14px; white-space: nowrap;"
+                                onclick="return confirm('确认触发赛季轮转？将创建新赛季并标记旧赛季为 ended。')">
+                            触发轮转
+                        </button>
+                    </form>
+                </div>
+            </div>
+
+            {# Step 3 #}
+            <div style="background: #2b2b2b; border: 1px solid #444; border-radius: 4px; padding: 16px;">
+                <div style="display: flex; justify-content: space-between; align-items: center;">
+                    <div>
+                        <strong style="color: #f44336;">步骤 3：触发结算（等效 04:00 调度器）</strong>
+                        <p style="color: #aaa; margin: 4px 0 0; font-size: 13px;">
+                            结算所有 ended 但未结算的赛季（快照排名 + 生成奖励），并强制迁移遗留玩家到新赛季。
+                        </p>
+                    </div>
+                    <form method="post" style="margin: 0;">
+                        {% csrf_token %}
+                        <input type="hidden" name="action" value="settle" />
+                        <button type="submit" id="btn-settle"
+                                style="background: #b71c1c; color: #fff; border: none; padding: 8px 20px; border-radius: 4px; cursor: pointer; font-size: 14px; white-space: nowrap;"
+                                onclick="return confirm('确认触发赛季结算？将结算旧赛季并强制迁移遗留玩家。')">
+                            触发结算
+                        </button>
+                    </form>
+                </div>
+            </div>
+        </div>
+    </div>
+
+    {# ───── 操作说明 ───── #}
+    <div style="background: #2b2b2b; border: 1px solid #444; border-radius: 6px; padding: 20px;">
+        <h2 style="margin: 0 0 12px; color: #eee; font-size: 16px;">操作说明</h2>
+        <ol style="color: #aaa; margin: 0; padding-left: 20px; line-height: 2;">
+            <li><strong style="color: #ff9800;">使赛季到期</strong>：将当前活跃赛季的 end_time 设为过去，模拟自然到期。此步不改变赛季状态。</li>
+            <li><strong style="color: #4fc3f7;">触发轮转</strong>：等效于凌晨 00:05 的定时任务。创建新赛季（active），旧赛季标记为 ended。此时客户端会收到 <code style="background: #333; padding: 2px 6px; border-radius: 3px;">seasonNotice: "new_season_available"</code>，弹出可选弹窗。</li>
+            <li><strong style="color: #f44336;">触发结算</strong>：等效于凌晨 04:00 的定时任务。结算旧赛季（快照排名 + 生成奖励），并将仍停留在旧赛季的玩家强制迁移到新赛季。旧赛季标记为 settled。</li>
+        </ol>
+        <p style="color: #aaa; margin: 12px 0 0;">建议按 1 → 2 → 3 顺序执行。每步操作后页面会自动刷新，可观察赛季状态和玩家分布的变化。</p>
+    </div>
+</div>
+{% endblock %}

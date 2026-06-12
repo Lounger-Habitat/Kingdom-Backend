@@ -1,10 +1,328 @@
 {% extends "admin/change_list.html" %}
+{% load i18n %}
+
+{% block extrastyle %}
+{{ block.super }}
+<style>
+  /* ── 赛季导航整体 ── */
+  .season-nav { margin-bottom: 16px; display: flex; align-items: center; gap: 8px; flex-wrap: wrap; }
+  .season-nav a { color: #417690; text-decoration: none; font-size: 13px; }
+  .season-nav a:hover { color: #205064; text-decoration: underline; }
+  .season-nav .sep { color: #ccc; }
+  .season-nav .current { font-weight: 600; color: #333; font-size: 13px; }
+
+  /* ── 第一层：赛季列表表格 ── */
+  .season-table { width: 100%; border-collapse: collapse; background: #fff; border-radius: 4px; overflow: hidden; box-shadow: 0 1px 3px rgba(0,0,0,.08); }
+  .season-table thead th { background: #417690; color: #fff; padding: 10px 14px; text-align: left; font-size: 13px; font-weight: 600; border-bottom: 2px solid #355d72; }
+  .season-table tbody td { padding: 10px 14px; border-bottom: 1px solid #eee; font-size: 13px; vertical-align: middle; color: #333; }
+  #changelist .season-table tbody tr:hover td { background: #e8f0fe; color: #333; }
+  .season-table tbody tr:last-child td { border-bottom: none; }
+  .badge { display: inline-block; padding: 2px 10px; border-radius: 10px; font-size: 12px; font-weight: 600; }
+  .badge-active { background: #e6f9f0; color: #00a86b; }
+  .badge-settled { background: #eee; color: #666; }
+  .btn { display: inline-block; padding: 5px 14px; border-radius: 4px; font-size: 12px; font-weight: 600; text-decoration: none; border: none; cursor: pointer; transition: background .15s; }
+  .btn-primary { background: #417690; color: #fff; }
+  .btn-primary:hover { background: #205064; color: #fff; }
+
+  /* ── 第二层：天数列表表格 ── */
+  .day-table { width: 100%; border-collapse: collapse; background: #fff; border-radius: 4px; overflow: hidden; box-shadow: 0 1px 3px rgba(0,0,0,.08); }
+  .day-table thead th { background: #79aec8; color: #fff; padding: 10px 14px; text-align: left; font-size: 13px; font-weight: 600; }
+  .day-table tbody td { padding: 10px 14px; border-bottom: 1px solid #eee; font-size: 13px; color: #333; }
+  #changelist .day-table tbody tr:hover td { background: #e8f0fe; color: #333; }
+  .day-table tbody tr:last-child td { border-bottom: none; }
+
+  /* ── 第三层：榜单分组 ── */
+  .board-group { margin-bottom: 28px; background: #fff; border-radius: 6px; box-shadow: 0 1px 4px rgba(0,0,0,.1); overflow: hidden; }
+  .board-group-header { padding: 12px 18px; display: flex; align-items: center; justify-content: space-between; }
+  .board-group-header h3 { margin: 0; font-size: 15px; font-weight: 700; color: #fff; display: flex; align-items: center; gap: 8px; }
+  .board-group-header .count { font-weight: 400; font-size: 12px; opacity: .85; }
+  .board-group-header .score-unit { font-size: 12px; font-weight: 400; opacity: .8; }
+  .board-group table { width: 100%; border-collapse: collapse; }
+  .board-group table thead th { padding: 9px 14px; text-align: left; font-size: 12px; font-weight: 600; color: #555; background: #f5f5f5; border-bottom: 2px solid #ddd; }
+  .board-group table tbody td { padding: 9px 14px; font-size: 13px; border-bottom: 1px solid #f0f0f0; color: #333; }
+  #changelist .board-group table tbody tr:hover td { background: #e8f0fe; color: #333; }
+  #changelist .board-group table tbody tr:hover td .cell-id code { background: #d5e3f1; color: #333; }
+  #changelist .board-group table tbody tr:hover td .cell-title { color: #7b1fa2; }
+  #changelist .board-group table tbody tr:hover td .cell-dish { color: #1b5e20; }
+  #changelist .board-group table tbody tr:hover td .tag-ai { background: #ffe0b2; color: #bf360c; }
+  .board-group table tbody tr:last-child td { border-bottom: none; }
+  .rank-num { display: inline-block; width: 28px; height: 28px; line-height: 28px; text-align: center; border-radius: 50%; font-weight: 700; font-size: 13px; }
+  .rank-1 { background: #ffd700; color: #333; }
+  .rank-2 { background: #c0c0c0; color: #333; }
+  .rank-3 { background: #cd7f32; color: #fff; }
+  .rank-n { color: #666; }
+  .cell-score { text-align: right; font-weight: 600; font-variant-numeric: tabular-nums; color: #333; }
+  .cell-id code { font-size: 11px; background: #f5f5f5; padding: 2px 6px; border-radius: 3px; color: #555; }
+  .tag-ai { display: inline-block; background: #fff3e0; color: #e65100; padding: 1px 8px; border-radius: 8px; font-size: 11px; font-weight: 600; }
+  .cell-title { color: #9c27b0; font-size: 12px; }
+  .cell-dish { color: #2e7d32; font-size: 12px; }
+  .empty-msg { text-align: center; padding: 40px; color: #999; font-size: 14px; }
+  .heading-16 { margin: 10px 0 16px; font-size: 16px; color: #333; }
+  .text-muted { color: #999; font-weight: 400; }
+  .text-sub { color: #666; font-size: 12px; }
+
+  /* ── 背景色 per board type ── */
+  .bg-wealth { background: linear-gradient(135deg, #f39c12, #e67e22); }
+  .bg-output { background: linear-gradient(135deg, #27ae60, #2ecc71); }
+  .bg-freshness { background: linear-gradient(135deg, #2980b9, #3498db); }
+  .bg-total_wealth { background: linear-gradient(135deg, #d35400, #e67e22); }
+  .bg-total_output { background: linear-gradient(135deg, #16a085, #1abc9c); }
+  .bg-total_freshness { background: linear-gradient(135deg, #8e44ad, #9b59b6); }
+
+  /* ── 深色模式 ── */
+  @media (prefers-color-scheme: dark) {
+    /* 导航 */
+    .season-nav a { color: #79aec8; }
+    .season-nav a:hover { color: #a5d0e6; }
+    .season-nav .sep { color: #555; }
+    .season-nav .current { color: #ddd; }
+
+    /* 赛季表格 */
+    .season-table { background: #2a2a2a; box-shadow: 0 1px 3px rgba(0,0,0,.3); }
+    .season-table thead th { background: #2d4f63; color: #ddd; border-bottom-color: #1e3a4d; }
+    .season-table tbody td { border-bottom-color: #3a3a3a; color: #ddd; }
+    #changelist .season-table tbody tr:hover td { background: #1e3a4d; color: #eee; }
+    .badge-active { background: #0d3d26; color: #4ade80; }
+    .badge-settled { background: #3a3a3a; color: #aaa; }
+    .btn-primary { background: #2d4f63; }
+    .btn-primary:hover { background: #1e3a4d; }
+
+    /* 天数表格 */
+    .day-table { background: #2a2a2a; box-shadow: 0 1px 3px rgba(0,0,0,.3); }
+    .day-table thead th { background: #3a6a82; color: #ddd; }
+    .day-table tbody td { border-bottom-color: #3a3a3a; color: #ddd; }
+    #changelist .day-table tbody tr:hover td { background: #1e3a4d; color: #eee; }
+
+    /* 榜单分组 */
+    .board-group { background: #2a2a2a; box-shadow: 0 1px 4px rgba(0,0,0,.3); }
+    .board-group table thead th { color: #bbb; background: #333; border-bottom-color: #444; }
+    .board-group table tbody td { border-bottom-color: #3a3a3a; color: #ddd; }
+    #changelist .board-group table tbody tr:hover td { background: #1e3a4d; color: #eee; }
+    #changelist .board-group table tbody tr:hover td .cell-id code { background: #1e3a4d; color: #a5d0e6; }
+    #changelist .board-group table tbody tr:hover td .cell-title { color: #ce93d8; }
+    #changelist .board-group table tbody tr:hover td .cell-dish { color: #81c784; }
+    #changelist .board-group table tbody tr:hover td .tag-ai { background: #4e342e; color: #ffab91; }
+    .rank-1 { color: #1a1a1a; }
+    .rank-2 { color: #1a1a1a; }
+    .rank-n { color: #aaa; }
+    .cell-score { color: #ddd; }
+    .cell-id code { background: #333; color: #aaa; }
+    .tag-ai { background: #3e2723; color: #ffab91; }
+    .cell-title { color: #ce93d8; }
+    .cell-dish { color: #81c784; }
+    .empty-msg { color: #777; }
+  }
+
+  /* ── Django admin 手动切换深色模式 (.dark 类) ── */
+  .dark .season-nav a { color: #79aec8; }
+  .dark .season-nav a:hover { color: #a5d0e6; }
+  .dark .season-nav .sep { color: #555; }
+  .dark .season-nav .current { color: #ddd; }
+
+  .dark .season-table { background: #2a2a2a; box-shadow: 0 1px 3px rgba(0,0,0,.3); }
+  .dark .season-table thead th { background: #2d4f63; color: #ddd; border-bottom-color: #1e3a4d; }
+  .dark .season-table tbody td { border-bottom-color: #3a3a3a; color: #ddd; }
+  .dark #changelist .season-table tbody tr:hover td { background: #1e3a4d; color: #eee; }
+  .dark .badge-active { background: #0d3d26; color: #4ade80; }
+  .dark .badge-settled { background: #3a3a3a; color: #aaa; }
+  .dark .btn-primary { background: #2d4f63; }
+  .dark .btn-primary:hover { background: #1e3a4d; }
+
+  .dark .day-table { background: #2a2a2a; box-shadow: 0 1px 3px rgba(0,0,0,.3); }
+  .dark .day-table thead th { background: #3a6a82; color: #ddd; }
+  .dark .day-table tbody td { border-bottom-color: #3a3a3a; color: #ddd; }
+  .dark #changelist .day-table tbody tr:hover td { background: #1e3a4d; color: #eee; }
+
+  .dark .board-group { background: #2a2a2a; box-shadow: 0 1px 4px rgba(0,0,0,.3); }
+  .dark .board-group table thead th { color: #bbb; background: #333; border-bottom-color: #444; }
+  .dark .board-group table tbody td { border-bottom-color: #3a3a3a; color: #ddd; }
+  .dark #changelist .board-group table tbody tr:hover td { background: #1e3a4d; color: #eee; }
+  .dark #changelist .board-group table tbody tr:hover td .cell-id code { background: #1e3a4d; color: #a5d0e6; }
+  .dark #changelist .board-group table tbody tr:hover td .cell-title { color: #ce93d8; }
+  .dark #changelist .board-group table tbody tr:hover td .cell-dish { color: #81c784; }
+  .dark #changelist .board-group table tbody tr:hover td .tag-ai { background: #4e342e; color: #ffab91; }
+  .dark .rank-1 { color: #1a1a1a; }
+  .dark .rank-2 { color: #1a1a1a; }
+  .dark .rank-n { color: #aaa; }
+  .dark .cell-score { color: #ddd; }
+  .dark .cell-id code { background: #333; color: #aaa; }
+  .dark .tag-ai { background: #3e2723; color: #ffab91; }
+  .dark .cell-title { color: #ce93d8; }
+  .dark .cell-dish { color: #81c784; }
+  .dark .empty-msg { color: #777; }
+  .dark .heading-16 { color: #ddd; }
+  .dark .text-muted { color: #888; }
+  .dark .text-sub { color: #aaa; }
+</style>
+{% endblock %}
+
 {% block object-tools-items %}
   <li>
     <a href="/leaderboard/history/" target="_blank"
-       style="background:#0984e3;color:#fff;padding:6px 14px;border-radius:4px;font-weight:600;text-decoration:none;">
+       style="background:#417690;color:#fff;padding:6px 14px;border-radius:4px;font-weight:600;text-decoration:none;">
       排行榜历史浏览
     </a>
   </li>
-  {{ block.super }}
+  {% if not season_list %}
+    {{ block.super }}
+  {% endif %}
+{% endblock %}
+
+{% block result_list %}
+{% if season_list %}
+  {# ════════ 第一层：赛季列表 ════════ #}
+  <h2 class="heading-16">赛季列表</h2>
+  {% if season_list %}
+  <table class="season-table">
+    <thead>
+      <tr>
+        <th>赛季 ID</th>
+        <th>序号</th>
+        <th>状态</th>
+        <th>时长</th>
+        <th>条目数</th>
+        <th>天数</th>
+        <th>操作</th>
+      </tr>
+    </thead>
+    <tbody>
+      {% for s in season_list %}
+      <tr>
+        <td><strong>{{ s.season_id }}</strong></td>
+        <td>#{{ s.sequence|default:"-" }}</td>
+        <td>
+          {% if s.status == "active" %}
+            <span class="badge badge-active">进行中</span>
+          {% elif s.status == "settled" %}
+            <span class="badge badge-settled">已结算</span>
+          {% else %}
+            {{ s.status }}
+          {% endif %}
+        </td>
+        <td>{{ s.duration_days }} 天</td>
+        <td>{{ s.entry_count }}</td>
+        <td>{{ s.day_count }}</td>
+        <td><a href="?season_id={{ s.season_id }}" class="btn btn-primary">查看天数 →</a></td>
+      </tr>
+      {% endfor %}
+    </tbody>
+  </table>
+  {% else %}
+  <p class="empty-msg">暂无赛季数据。玩家开始游戏后，赛季数据将自动出现。</p>
+  {% endif %}
+
+{% elif day_list %}
+  {# ════════ 第二层：游戏天数列表 ════════ #}
+  <div class="season-nav">
+    <a href="?">← 赛季列表</a>
+  </div>
+  <h2 class="heading-16" style="margin-top:0;">
+    {{ season_id }}　<span class="text-muted">游戏天数</span>
+  </h2>
+  <table class="day-table">
+    <thead>
+      <tr>
+        <th>天数</th>
+        <th>条目数</th>
+        <th>包含榜单</th>
+        <th>操作</th>
+      </tr>
+    </thead>
+    <tbody>
+      {% for d in day_list %}
+      <tr>
+        <td style="font-weight:600;">
+          {% if d.game_day %}
+            第 {{ d.game_day }} 天
+          {% else %}
+            <span class="text-muted" style="font-style:italic;">赛季结算</span>
+          {% endif %}
+        </td>
+        <td>{{ d.entry_count }}</td>
+        <td class="text-sub">{{ d.board_types }}</td>
+        <td>
+          {% if d.game_day %}
+          <a href="?season_id={{ season_id }}&game_day={{ d.game_day }}" class="btn btn-primary">查看榜单 →</a>
+          {% else %}
+          <a href="?season_id={{ season_id }}&game_day=__season__" class="btn btn-primary" style="background:#7b61ff;">查看赛季榜单 →</a>
+          {% endif %}
+        </td>
+      </tr>
+      {% endfor %}
+    </tbody>
+  </table>
+
+{% else %}
+  {# ════════ 第三层：按榜单分组显示 ════════ #}
+  <div class="season-nav">
+    <a href="?">赛季列表</a>
+    <span class="sep">›</span>
+    <a href="?season_id={{ season_id }}">{{ season_id }}</a>
+    <span class="sep">›</span>
+    <span class="current">{{ day_label }}</span>
+  </div>
+
+  {% if board_groups %}
+    {% for group in board_groups %}
+    <div class="board-group">
+      <div class="board-group-header bg-{{ group.board_type }}">
+        <h3>
+          {{ group.board_label }}
+          <span class="count">{{ group.entries|length }} 人</span>
+        </h3>
+        <span class="score-unit">
+          {% if "wealth" in group.board_type %}单位：金{% elif "output" in group.board_type %}单位：道{% elif "freshness" in group.board_type %}单位：分{% endif %}
+        </span>
+      </div>
+      <table>
+        <thead>
+          <tr>
+            <th style="width:50px;text-align:center;">排名</th>
+            <th>玩家</th>
+            <th style="width:100px;text-align:right;">分数</th>
+            <th style="width:50px;text-align:center;">AI</th>
+            <th style="width:100px;">称号</th>
+            <th style="width:120px;">菜品</th>
+          </tr>
+        </thead>
+        <tbody>
+          {% for entry in group.entries %}
+          <tr>
+            <td style="text-align:center;">
+              {% if entry.rank == 1 %}
+                <span class="rank-num rank-1">1</span>
+              {% elif entry.rank == 2 %}
+                <span class="rank-num rank-2">2</span>
+              {% elif entry.rank == 3 %}
+                <span class="rank-num rank-3">3</span>
+              {% else %}
+                <span class="rank-num rank-n">{{ entry.rank }}</span>
+              {% endif %}
+            </td>
+            <td>
+              <strong>{{ entry.display_name }}</strong>
+              <div class="cell-id"><code>{{ entry.character_id|truncatechars:12 }}</code></div>
+            </td>
+            <td class="cell-score">
+              {% if "wealth" in group.board_type %}{{ entry.score|floatformat:"0" }}
+              {% elif "output" in group.board_type %}{{ entry.score|floatformat:"0" }}
+              {% elif "freshness" in group.board_type %}{{ entry.score|floatformat:"1" }}
+              {% else %}{{ entry.score }}{% endif %}
+            </td>
+            <td style="text-align:center;">{% if entry.is_ai %}<span class="tag-ai">AI</span>{% endif %}</td>
+            <td class="cell-title">{{ entry.title }}</td>
+            <td class="cell-dish">{{ entry.dish_name }}</td>
+          </tr>
+          {% endfor %}
+        </tbody>
+      </table>
+    </div>
+    {% endfor %}
+  {% else %}
+    <div class="empty-msg">
+      <p>该天暂无榜单数据。</p>
+      <p style="font-size:12px;color:#bbb;">玩家完成交易、烹饪或品鉴后，数据将自动出现。</p>
+    </div>
+  {% endif %}
+{% endif %}
 {% endblock %}

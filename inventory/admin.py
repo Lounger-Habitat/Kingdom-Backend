@@ -31,7 +31,7 @@ class InventoryBagManagerAdmin(admin.ModelAdmin):
 class InventorySlotInline(admin.TabularInline):
     model = InventorySlot
     extra = 0
-    fields = ["slot_index", "item_id", "item_amount", "rated", "rating_price", "overall_score", "ingredient", "item_bag_name", "cook_time", "dish_quality"]
+    fields = ["slot_index", "item_id", "item_amount", "rated", "rating_price", "overall_score", "ingredient", "item_bag_name", "cook_time", "dish_quality", "hide_in_shop"]
     ordering = ["slot_index"]
 
 
@@ -55,7 +55,7 @@ class InventoryBagAdmin(admin.ModelAdmin):
 class BagTemplateSlotInline(admin.TabularInline):
     model = BagTemplateSlot
     extra = 0
-    fields = ["slot_index", "item", "item_amount", "rated", "rating_price", "overall_score", "ingredient", "cook_time", "dish_quality"]
+    fields = ["slot_index", "item", "item_amount", "rated", "rating_price", "overall_score", "ingredient", "cook_time", "dish_quality", "hide_in_shop"]
     ordering = ["slot_index"]
     autocomplete_fields = ["item"]
 

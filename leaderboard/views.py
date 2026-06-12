@@ -13,12 +13,9 @@ from player.models import PlayerState
 
 
 def get_current_season_id():
-    """Generate a season_id based on current week."""
-    from datetime import datetime
-    now = datetime.now()
-    week = now.isocalendar()[1]
-    year = now.year
-    return f"week_{year}_{week}"
+    """Return the current active season_id from the Season table."""
+    from .season_service import get_active_season
+    return get_active_season().season_id
 
 
 def get_current_game_day(player_id):
@@ -38,13 +35,24 @@ def _get_player_game_day(player_id):
         return None
 
 
+def _get_player_season_id(player_id):
+    """Return the player's current_season_id, falling back to active season."""
+    try:
+        state = PlayerState.objects.get(player_id=player_id)
+        if state.current_season_id:
+            return state.current_season_id
+    except PlayerState.DoesNotExist:
+        pass
+    return get_current_season_id()
+
+
 @api_view(["GET"])
 def leaderboard_detail(request, board_type):
-    if board_type not in [BoardType.WEALTH, BoardType.OUTPUT, BoardType.FRESHNESS]:
+    if board_type not in BoardType.values:
         return Response({"success": False, "message": "invalid board type"}, status=400)
 
     player_id = get_player_id(request)
-    season_id = get_current_season_id()
+    season_id = _get_player_season_id(player_id)
     current_game_day = get_current_game_day(player_id)
 
     day_param = request.query_params.get("day")
@@ -56,7 +64,7 @@ def leaderboard_detail(request, board_type):
     else:
         game_day = current_game_day
 
-    entries, my_rank = calculate_rankings_realtime(board_type, player_id, game_day=game_day)
+    entries, my_rank = calculate_rankings_realtime(board_type, player_id, game_day=game_day, season_id=season_id)
     entries = entries[:50]
 
     return Response({
@@ -74,10 +82,11 @@ def leaderboard_detail(request, board_type):
 
 @api_view(["GET"])
 def leaderboard_my_rank(request, board_type):
-    if board_type not in [BoardType.WEALTH, BoardType.OUTPUT, BoardType.FRESHNESS]:
+    if board_type not in BoardType.values:
         return Response({"success": False, "message": "invalid board type"}, status=400)
 
     player_id = get_player_id(request)
+    season_id = _get_player_season_id(player_id)
     current_game_day = get_current_game_day(player_id)
 
     day_param = request.query_params.get("day")
@@ -89,7 +98,7 @@ def leaderboard_my_rank(request, board_type):
     else:
         game_day = current_game_day
 
-    _, my_rank = calculate_rankings_realtime(board_type, player_id, game_day=game_day)
+    _, my_rank = calculate_rankings_realtime(board_type, player_id, game_day=game_day, season_id=season_id)
 
     return Response({
         "success": True,
@@ -100,7 +109,7 @@ def leaderboard_my_rank(request, board_type):
 @api_view(["GET"])
 def leaderboard_summary(request):
     player_id = get_player_id(request)
-    season_id = get_current_season_id()
+    season_id = _get_player_season_id(player_id)
     current_game_day = get_current_game_day(player_id)
 
     day_param = request.query_params.get("day")
@@ -113,8 +122,8 @@ def leaderboard_summary(request):
         game_day = current_game_day
 
     summaries = []
-    for board_type in [BoardType.WEALTH, BoardType.OUTPUT, BoardType.FRESHNESS]:
-        entries, my_rank = calculate_rankings_realtime(board_type, player_id, game_day=game_day)
+    for board_type in BoardType.values:
+        entries, my_rank = calculate_rankings_realtime(board_type, player_id, game_day=game_day, season_id=season_id)
         top_entry = entries[0] if entries else None
 
         summaries.append({
@@ -187,6 +196,7 @@ def report_heartbeat(request):
     player_id = get_player_id(request)
     timestamp = request.data.get("timestamp", int(time.time()))
     game_day = _get_player_game_day(player_id)
+    season_id = _get_player_season_id(player_id)
 
     ReportEvent.objects.create(
         player_id=player_id,
@@ -194,6 +204,7 @@ def report_heartbeat(request):
         payload={"timestamp": timestamp},
         timestamp=timestamp,
         game_day=game_day,
+        season_id=season_id,
     )
 
     return Response({"success": True, "message": "ok"})
@@ -206,6 +217,7 @@ def report_event(request):
     payload = request.data.get("payload", {})
     timestamp = request.data.get("timestamp", int(time.time()))
     game_day = _get_player_game_day(player_id)
+    season_id = _get_player_season_id(player_id)
 
     if isinstance(payload, str):
         try:
@@ -219,6 +231,7 @@ def report_event(request):
         payload=payload,
         timestamp=timestamp,
         game_day=game_day,
+        season_id=season_id,
     )
 
     return Response({"success": True, "message": "event recorded"})
@@ -229,6 +242,7 @@ def report_batch(request):
     player_id = get_player_id(request)
     events = request.data.get("events", [])
     game_day = _get_player_game_day(player_id)
+    season_id = _get_player_season_id(player_id)
 
     failed_indices = []
     for i, ev in enumerate(events):
@@ -249,6 +263,7 @@ def report_batch(request):
                 payload=payload,
                 timestamp=timestamp,
                 game_day=game_day,
+                season_id=season_id,
             )
         except Exception:
             failed_indices.append(i)
@@ -263,6 +278,40 @@ def report_batch(request):
     return Response({"success": True, "message": f"processed {len(events)} events"})
 
 
+@api_view(["GET"])
+def season_info(request):
+    """Return current season details for the requesting player."""
+    from .season_service import get_active_season
+
+    player_id = get_player_id(request)
+    season = get_active_season()
+    now = int(time.time())
+
+    player_game_day = 1
+    player_season_id = season.season_id
+    try:
+        player = PlayerState.objects.get(player_id=player_id)
+        player_game_day = player.total_game_days
+        if player.current_season_id:
+            player_season_id = player.current_season_id
+    except PlayerState.DoesNotExist:
+        pass
+
+    return Response({
+        "success": True,
+        "data": {
+            "seasonId": season.season_id,
+            "playerSeasonId": player_season_id,
+            "sequence": season.sequence,
+            "startTime": season.start_time,
+            "endTime": season.end_time,
+            "durationDays": season.duration_days,
+            "remainingSeconds": max(0, season.end_time - now),
+            "gameDay": player_game_day,
+        },
+    })
+
+
 # ───── 排行榜历史浏览 ─────
 
 def leaderboard_history_page(request):
@@ -274,8 +323,13 @@ def leaderboard_history_page(request):
 @permission_classes([AllowAny])
 def history_days(request):
     """Return a list of game days that have leaderboard data (snapshots + current day)."""
+    qs = LeaderboardEntry.objects.all()
+    season_param = request.query_params.get("season")
+    if season_param:
+        qs = qs.filter(season_id=season_param)
+
     days = set(
-        d for d in LeaderboardEntry.objects.values_list("game_day", flat=True).distinct()
+        d for d in qs.values_list("game_day", flat=True).distinct()
         if d is not None
     )
     # Include the current game day even if no snapshot exists yet
@@ -295,7 +349,7 @@ def history_detail(request, board_type):
 
     Uses real-time calculation from ReportEvent for all days to ensure up-to-date data.
     """
-    if board_type not in [BoardType.WEALTH, BoardType.OUTPUT, BoardType.FRESHNESS]:
+    if board_type not in BoardType.values:
         return Response({"success": False, "message": "invalid board type"}, status=400)
 
     day_param = request.query_params.get("day")
@@ -307,7 +361,8 @@ def history_detail(request, board_type):
     except (ValueError, TypeError):
         return Response({"success": False, "message": "invalid day"}, status=400)
 
-    entries, _ = calculate_rankings_realtime(board_type, game_day=game_day)
+    season_param = request.query_params.get("season")
+    entries, _ = calculate_rankings_realtime(board_type, game_day=game_day, season_id=season_param)
 
     data = [
         {

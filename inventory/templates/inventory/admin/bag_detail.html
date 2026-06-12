@@ -57,6 +57,7 @@
                         <th scope="col" style="width: 120px;">背包名称</th>
                         <th scope="col" style="width: 80px;">烹饪时长</th>
                         <th scope="col" style="width: 80px;">品质</th>
+                        <th scope="col" style="width: 80px;">商店隐藏</th>
                         <th scope="col" style="width: 60px;">操作</th>
                     </tr>
                 </thead>
@@ -118,6 +119,10 @@
                                 <option value="6" {% if slot.dish_quality == 6 %}selected{% endif %}>6 绝品</option>
                             </select>
                         </td>
+                        <td style="text-align: center;">
+                            <input type="checkbox" name="slot_{{ slot.pk }}_hide_in_shop"
+                                   {% if slot.hide_in_shop %}checked{% endif %} />
+                        </td>
                         <td>
                             <button type="button" data-slot-id="{{ slot.pk }}"
                                     class="delete-slot-btn"
@@ -127,7 +132,7 @@
                         </td>
                     </tr>
                     {% empty %}
-                    <tr><td colspan="12" style="text-align: center; padding: 20px;">背包为空</td></tr>
+                    <tr><td colspan="13" style="text-align: center; padding: 20px;">背包为空</td></tr>
                     {% endfor %}
                 </tbody>
             </table>

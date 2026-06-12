@@ -1,15 +1,17 @@
 """Business logic for leaderboard ranking, daily/weekly settlement."""
 import json
 import time
-from django.db.models import Sum, Max, Count
+from collections import defaultdict
+from django.db.models import Sum, Max, Count, F
 from .models import (
-    LeaderboardEntry, RewardConfig, PendingReward, ReportEvent, BoardType, SettlementType,
+    LeaderboardEntry, RewardConfig, PendingReward, ReportEvent, BoardType, SettlementType, SeasonConfig,
 )
 from player.models import PlayerState, PlayerTitle
 from account.models import GameAccount
+from inventory.models import InventoryBag
 
 
-def calculate_rankings_realtime(board_type, player_id=None, game_day=None):
+def calculate_rankings_realtime(board_type, player_id=None, game_day=None, season_id=None):
     """Real-time ranking calculation from ReportEvent, without writing to DB.
 
     Returns (entries_list, my_rank_dict):
@@ -18,6 +20,8 @@ def calculate_rankings_realtime(board_type, player_id=None, game_day=None):
     """
     if board_type == BoardType.WEALTH:
         qs = ReportEvent.objects.filter(event_type="trade_completed")
+        if season_id:
+            qs = qs.filter(season_id=season_id)
         if game_day is not None:
             qs = qs.filter(game_day=game_day)
         events = qs.values("player_id", "payload")
@@ -35,18 +39,22 @@ def calculate_rankings_realtime(board_type, player_id=None, game_day=None):
 
     elif board_type == BoardType.OUTPUT:
         qs = ReportEvent.objects.filter(event_type="cook_completed")
+        if season_id:
+            qs = qs.filter(season_id=season_id)
         if game_day is not None:
             qs = qs.filter(game_day=game_day)
         counts = qs.values("player_id").annotate(count=Count("id"))
         scores = {c["player_id"]: c["count"] for c in counts}
 
     elif board_type == BoardType.FRESHNESS:
+        top_n = SeasonConfig.get_instance().freshness_top_n
         qs = ReportEvent.objects.filter(event_type="judge_confirmed")
+        if season_id:
+            qs = qs.filter(season_id=season_id)
         if game_day is not None:
             qs = qs.filter(game_day=game_day)
         events = qs.values("player_id", "payload")
-        scores = {}
-        dish_names = {}
+        player_dishes = defaultdict(list)
         for ev in events:
             try:
                 payload = ev.get("payload", {})
@@ -54,18 +62,71 @@ def calculate_rankings_realtime(board_type, player_id=None, game_day=None):
                     payload = json.loads(payload)
                 pid = ev["player_id"]
                 score = payload.get("judge_score", 0)
-                if score > scores.get(pid, 0):
-                    scores[pid] = score
-                    dish_names[pid] = payload.get("dish_name", "")
+                dish = payload.get("dish_name", "")
+                dishes = player_dishes[pid]
+                if len(dishes) < top_n:
+                    dishes.append((score, dish))
+                    dishes.sort(reverse=True)
+                elif score > dishes[-1][0]:
+                    dishes[-1] = (score, dish)
+                    dishes.sort(reverse=True)
+            except (json.JSONDecodeError, TypeError):
+                continue
+
+    elif board_type == BoardType.TOTAL_WEALTH:
+        scores = {}
+        for bag in InventoryBag.objects.filter(
+            player__isnull=False, character_id=F("player__username")
+        ).values("player_id", "money"):
+            pid = str(bag["player_id"])
+            scores[pid] = scores.get(pid, 0) + bag["money"]
+
+    elif board_type == BoardType.TOTAL_OUTPUT:
+        qs = ReportEvent.objects.filter(event_type="cook_completed")
+        if season_id:
+            qs = qs.filter(season_id=season_id)
+        counts = qs.values("player_id").annotate(count=Count("id"))
+        scores = {c["player_id"]: c["count"] for c in counts}
+
+    elif board_type == BoardType.TOTAL_FRESHNESS:
+        top_n = SeasonConfig.get_instance().freshness_top_n
+        qs = ReportEvent.objects.filter(event_type="judge_confirmed")
+        if season_id:
+            qs = qs.filter(season_id=season_id)
+        events = qs.values("player_id", "payload")
+        player_dishes = defaultdict(list)
+        for ev in events:
+            try:
+                payload = ev.get("payload", {})
+                if isinstance(payload, str):
+                    payload = json.loads(payload)
+                pid = ev["player_id"]
+                score = payload.get("judge_score", 0)
+                dish = payload.get("dish_name", "")
+                dishes = player_dishes[pid]
+                if len(dishes) < top_n:
+                    dishes.append((score, dish))
+                    dishes.sort(reverse=True)
+                elif score > dishes[-1][0]:
+                    dishes[-1] = (score, dish)
+                    dishes.sort(reverse=True)
             except (json.JSONDecodeError, TypeError):
                 continue
     else:
         return [], None
 
-    ranked = sorted(scores.items(), key=lambda x: x[1], reverse=True)
+    is_freshness = board_type in (BoardType.FRESHNESS, BoardType.TOTAL_FRESHNESS)
+    if is_freshness:
+        all_items = []
+        for pid, dishes in player_dishes.items():
+            for score, dish in dishes:
+                all_items.append((pid, score, dish))
+        ranked = sorted(all_items, key=lambda x: x[1], reverse=True)
+    else:
+        ranked = sorted(scores.items(), key=lambda x: x[1], reverse=True)
 
     # Batch fetch player names and titles to avoid N+1
-    player_ids = [pid for pid, _ in ranked]
+    player_ids = list({pid for pid, *_ in ranked})
     usernames = {}
     for acc in GameAccount.objects.filter(id__in=player_ids):
         usernames[str(acc.id)] = acc.username
@@ -76,7 +137,12 @@ def calculate_rankings_realtime(board_type, player_id=None, game_day=None):
 
     entries = []
     my_rank = None
-    for rank, (pid, score) in enumerate(ranked, start=1):
+    for rank, item in enumerate(ranked, start=1):
+        if is_freshness:
+            pid, score, dish_name = item
+        else:
+            pid, score = item
+            dish_name = ""
         entry = {
             "rank": rank,
             "characterId": pid,
@@ -85,7 +151,7 @@ def calculate_rankings_realtime(board_type, player_id=None, game_day=None):
             "score": score,
             "title": active_titles.get(pid, ""),
             "avatarId": f"avatar_{pid}",
-            "dishName": dish_names.get(pid, "") if board_type == BoardType.FRESHNESS else "",
+            "dishName": dish_name,
         }
         entries.append(entry)
         if pid == player_id:
@@ -96,14 +162,14 @@ def calculate_rankings_realtime(board_type, player_id=None, game_day=None):
 
 def calculate_rankings(board_type, season_id="default", game_day=None):
     """Calculate rankings for a given board type based on ReportEvents."""
-    # Clear existing entries for this board type + day (all seasons) to avoid duplicates
-    qs = LeaderboardEntry.objects.filter(board_type=board_type)
+    # Clear existing entries for this board type + day + season to avoid duplicates
+    qs = LeaderboardEntry.objects.filter(board_type=board_type, season_id=season_id)
     if game_day is not None:
         qs = qs.filter(game_day=game_day)
     qs.delete()
 
     if board_type == BoardType.WEALTH:
-        qs = ReportEvent.objects.filter(event_type="trade_completed")
+        qs = ReportEvent.objects.filter(event_type="trade_completed", season_id=season_id)
         if game_day is not None:
             qs = qs.filter(game_day=game_day)
         events = qs.values("player_id", "payload")
@@ -120,19 +186,19 @@ def calculate_rankings(board_type, season_id="default", game_day=None):
                 continue
 
     elif board_type == BoardType.OUTPUT:
-        qs = ReportEvent.objects.filter(event_type="cook_completed")
+        qs = ReportEvent.objects.filter(event_type="cook_completed", season_id=season_id)
         if game_day is not None:
             qs = qs.filter(game_day=game_day)
         counts = qs.values("player_id").annotate(count=Count("id"))
         scores = {c["player_id"]: c["count"] for c in counts}
 
     elif board_type == BoardType.FRESHNESS:
-        qs = ReportEvent.objects.filter(event_type="judge_confirmed")
+        top_n = SeasonConfig.get_instance().freshness_top_n
+        qs = ReportEvent.objects.filter(event_type="judge_confirmed", season_id=season_id)
         if game_day is not None:
             qs = qs.filter(game_day=game_day)
         events = qs.values("player_id", "payload")
-        scores = {}
-        dish_names = {}
+        player_dishes = defaultdict(list)
         for ev in events:
             try:
                 payload = ev.get("payload", {})
@@ -140,25 +206,83 @@ def calculate_rankings(board_type, season_id="default", game_day=None):
                     payload = json.loads(payload)
                 pid = ev["player_id"]
                 score = payload.get("judge_score", 0)
-                if score > scores.get(pid, 0):
-                    scores[pid] = score
-                    dish_names[pid] = payload.get("dish_name", "")
+                dish = payload.get("dish_name", "")
+                dishes = player_dishes[pid]
+                if len(dishes) < top_n:
+                    dishes.append((score, dish))
+                    dishes.sort(reverse=True)
+                elif score > dishes[-1][0]:
+                    dishes[-1] = (score, dish)
+                    dishes.sort(reverse=True)
+            except (json.JSONDecodeError, TypeError):
+                continue
+
+    elif board_type == BoardType.TOTAL_WEALTH:
+        scores = {}
+        for bag in InventoryBag.objects.filter(
+            player__isnull=False, character_id=F("player__username")
+        ).values("player_id", "money"):
+            pid = str(bag["player_id"])
+            scores[pid] = scores.get(pid, 0) + bag["money"]
+
+    elif board_type == BoardType.TOTAL_OUTPUT:
+        qs = ReportEvent.objects.filter(event_type="cook_completed")
+        if season_id:
+            qs = qs.filter(season_id=season_id)
+        counts = qs.values("player_id").annotate(count=Count("id"))
+        scores = {c["player_id"]: c["count"] for c in counts}
+
+    elif board_type == BoardType.TOTAL_FRESHNESS:
+        top_n = SeasonConfig.get_instance().freshness_top_n
+        qs = ReportEvent.objects.filter(event_type="judge_confirmed")
+        if season_id:
+            qs = qs.filter(season_id=season_id)
+        events = qs.values("player_id", "payload")
+        player_dishes = defaultdict(list)
+        for ev in events:
+            try:
+                payload = ev.get("payload", {})
+                if isinstance(payload, str):
+                    payload = json.loads(payload)
+                pid = ev["player_id"]
+                score = payload.get("judge_score", 0)
+                dish = payload.get("dish_name", "")
+                dishes = player_dishes[pid]
+                if len(dishes) < top_n:
+                    dishes.append((score, dish))
+                    dishes.sort(reverse=True)
+                elif score > dishes[-1][0]:
+                    dishes[-1] = (score, dish)
+                    dishes.sort(reverse=True)
             except (json.JSONDecodeError, TypeError):
                 continue
     else:
         return
 
-    # Sort by score descending
-    ranked = sorted(scores.items(), key=lambda x: x[1], reverse=True)
+    # Build ranked list: freshness boards use (pid, score, dish_name) tuples
+    is_freshness = board_type in (BoardType.FRESHNESS, BoardType.TOTAL_FRESHNESS)
+    if is_freshness:
+        all_items = []
+        for pid, dishes in player_dishes.items():
+            for score, dish in dishes:
+                all_items.append((pid, score, dish))
+        ranked = sorted(all_items, key=lambda x: x[1], reverse=True)
+    else:
+        ranked = sorted(scores.items(), key=lambda x: x[1], reverse=True)
 
     # Batch fetch usernames
-    player_ids = [pid for pid, _ in ranked]
+    player_ids = list({pid for pid, *_ in ranked})
     usernames = {}
     for acc in GameAccount.objects.filter(id__in=player_ids):
         usernames[str(acc.id)] = acc.username
 
     entries = []
-    for rank, (player_id, score) in enumerate(ranked, start=1):
+    for rank, item in enumerate(ranked, start=1):
+        if is_freshness:
+            player_id, score, dish_name = item
+        else:
+            player_id, score = item
+            dish_name = ""
         display_name = usernames.get(player_id, player_id)
 
         # Get active title
@@ -180,7 +304,7 @@ def calculate_rankings(board_type, season_id="default", game_day=None):
             rank=rank,
             title=title,
             avatar_id=f"avatar_{player_id}",
-            dish_name=dish_names.get(player_id, "") if board_type == BoardType.FRESHNESS else "",
+            dish_name=dish_name,
             game_day=game_day,
         ))
 
@@ -196,7 +320,7 @@ def settle_leaderboard_for_day(total_game_days, season_id="default"):
     now_ts = int(time.time())
     expire_ts = now_ts + 86400 * 7  # Rewards expire in 7 days
 
-    for board_type in [BoardType.WEALTH, BoardType.OUTPUT, BoardType.FRESHNESS]:
+    for board_type in BoardType.values:
         # Calculate current rankings for this specific day
         calculate_rankings(board_type, season_id, game_day=total_game_days)
 
@@ -213,7 +337,7 @@ def settle_leaderboard_for_day(total_game_days, season_id="default"):
         )
 
         for entry in entries:
-            reward_id = f"daily_{board_type}_day{total_game_days}_{entry.character_id}"
+            reward_id = f"daily_{board_type}_{season_id}_day{total_game_days}_{entry.character_id}"
 
             # Skip if already exists (idempotent)
             if PendingReward.objects.filter(reward_id=reward_id).exists():
@@ -254,9 +378,10 @@ def reset_player_action_points(player_id):
 
 
 def daily_settlement(total_game_days, season_id="default"):
-    """Run daily settlement: calculate rankings, generate rewards, reset ALL players' AP."""
+    """Run daily settlement: calculate rankings, generate rewards, reset players' AP for current season."""
     settle_leaderboard_for_day(total_game_days, season_id)
-    PlayerState.objects.all().update(action_points=100)
+    # Only reset AP for players in the current season
+    PlayerState.objects.filter(current_season_id=season_id).update(action_points=100)
 
 
 def weekly_settlement(season_id, total_game_days):
@@ -264,7 +389,7 @@ def weekly_settlement(season_id, total_game_days):
     now_ts = int(time.time())
     expire_ts = now_ts + 86400 * 14  # Rewards expire in 14 days
 
-    for board_type in [BoardType.WEALTH, BoardType.OUTPUT, BoardType.FRESHNESS]:
+    for board_type in BoardType.values:
         configs = RewardConfig.objects.filter(
             board_type=board_type,
             settlement_type=SettlementType.WEEKLY,

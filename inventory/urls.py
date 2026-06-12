@@ -19,4 +19,5 @@ urlpatterns = [
     path("api/inventory/<str:character_id>/transfer", views.inventory_transfer, name="inventory-transfer"),
     path("api/inventory/<str:character_id>/trade-with", views.inventory_trade_with, name="inventory-trade-with"),
     path("api/inventory/<str:character_id>/money", views.inventory_money, name="inventory-money"),
+    path("api/inventory/<str:character_id>/compact", views.inventory_compact, name="inventory-compact"),
 ]

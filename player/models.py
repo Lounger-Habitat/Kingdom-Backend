@@ -17,6 +17,8 @@ class PlayerState(models.Model):
     total_game_days = models.IntegerField(default=1)
     # 是否已用首次客户端上报作为基准；避免首报被算成跨数月的 delta。
     time_initialized = models.BooleanField(default=False)
+    # 当前玩家所在的赛季 ID（空表示尚未迁移，等效于当前活跃赛季）
+    current_season_id = models.CharField(max_length=50, default="", blank=True)
 
     class Meta:
         ordering = ["player_id"]

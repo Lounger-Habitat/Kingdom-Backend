@@ -161,6 +161,7 @@ def _init_missing_npc_bags(player):
                 item_bag_name=slot.item.item_name if slot.item else "",
                 cook_time=slot.cook_time,
                 dish_quality=slot.dish_quality,
+                hide_in_shop=slot.hide_in_shop,
             )
         created += 1
     return created
@@ -185,6 +186,7 @@ def _save_slots(request, bag):
             slot.item_bag_name = request.POST.get(f"{prefix}_item_bag_name", "")
             slot.cook_time = int(request.POST.get(f"{prefix}_cook_time", 0))
             slot.dish_quality = int(request.POST.get(f"{prefix}_dish_quality", 3))
+            slot.hide_in_shop = request.POST.get(f"{prefix}_hide_in_shop") == "on"
             slot.save()
         except (ValueError, TypeError):
             continue

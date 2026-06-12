@@ -40,6 +40,7 @@ def init_player_bags(player):
                     item_bag_name=slot.item.item_name if slot.item else "",
                     cook_time=slot.cook_time,
                     dish_quality=slot.dish_quality,
+                    hide_in_shop=slot.hide_in_shop,
                 )
             created += 1
 

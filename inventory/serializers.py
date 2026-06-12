@@ -12,10 +12,11 @@ class InventorySlotSerializer(serializers.ModelSerializer):
     itemBagName = serializers.CharField(source="item_bag_name")
     cookTime = serializers.IntegerField(source="cook_time")
     dishQuality = serializers.IntegerField(source="dish_quality")
+    hideInShop = serializers.BooleanField(source="hide_in_shop")
 
     class Meta:
         model = InventorySlot
-        fields = ["instanceID", "itemID", "itemAmount", "rated", "ratingPrice", "overallScore", "ingredient", "itemBagName", "cookTime", "dishQuality"]
+        fields = ["instanceID", "itemID", "itemAmount", "rated", "ratingPrice", "overallScore", "ingredient", "itemBagName", "cookTime", "dishQuality", "hideInShop"]
 
 
 def serialize_bag(bag):

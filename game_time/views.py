@@ -6,8 +6,14 @@ from rest_framework.response import Response
 
 from config.auth import get_player_id
 from player.models import PlayerState
-from leaderboard.services import settle_leaderboard_for_day, reset_player_action_points
-from leaderboard.views import get_current_season_id
+from leaderboard.services import settle_leaderboard_for_day
+from leaderboard.season_service import (
+    check_and_rotate_season,
+    get_active_season,
+    get_season_notice,
+    transition_player_to_season,
+    build_season_time_response,
+)
 from .models import GameTimeState
 
 
@@ -34,6 +40,14 @@ def check_day_advance(request):
     player_id = get_player_id(request)
     player, _ = PlayerState.objects.get_or_create(player_id=player_id)
 
+    # Season check (creates initial season if needed)
+    current_season = check_and_rotate_season()
+
+    # Ensure player has current_season_id set
+    if not player.current_season_id:
+        player.current_season_id = current_season.season_id
+        player.save(update_fields=["current_season_id"])
+
     game_time_state = GameTimeState.get_instance()
     max_days = game_time_state.max_game_days
 
@@ -43,7 +57,21 @@ def check_day_advance(request):
             "message": f"当前已达到最大天数（第{max_days}天），无法继续推进",
         })
 
-    return Response({"success": True, "message": "ok"})
+    data = {
+        "seasonId": current_season.season_id,
+        "seasonEndTime": current_season.end_time,
+    }
+
+    # Season notice
+    notice = get_season_notice(player)
+    if notice:
+        data["seasonNotice"] = notice
+
+    return Response({
+        "success": True,
+        "message": "ok",
+        "data": data,
+    })
 
 
 @api_view(["POST"])
@@ -59,6 +87,9 @@ def day_advanced(request):
     """
     player_id = get_player_id(request)
 
+    # Season check: may trigger rotation and reset all players
+    current_season = check_and_rotate_season()
+
     new_year = int(request.data.get("game_year", 2026))
     new_month = int(request.data.get("game_month", 3))
     new_day = int(request.data.get("game_day", 8))
@@ -70,6 +101,11 @@ def day_advanced(request):
 
     player, _ = PlayerState.objects.get_or_create(player_id=player_id)
 
+    # Ensure player has current_season_id set
+    if not player.current_season_id:
+        player.current_season_id = current_season.season_id
+        player.save(update_fields=["current_season_id"])
+
     # 全服最大天数限制（仅阻止实际天数推进，不影响时间同步）
     game_time_state = GameTimeState.get_instance()
     max_days = game_time_state.max_game_days
@@ -79,14 +115,57 @@ def day_advanced(request):
     # - 客户端推进到 3-9 上报 → delta=1，进入第 2 天。
     old_date = _safe_date(player.game_year, player.game_month, player.game_day)
     raw_delta = (new_date - old_date).days
+
+    # 新鲜度检查：拒绝比已存储状态更旧的请求（异步请求乱序时，分钟广播可能在天推进之后到达）
     if raw_delta < 0:
-        logger.warning(
-            "[day_advanced] player=%s 日历回退 old=%s new=%s，按 0 处理",
+        logger.info(
+            "[day_advanced] player=%s 丢弃过期请求 old=%s new=%s",
             player_id, old_date, new_date,
         )
-        day_delta = 0
-    else:
-        day_delta = raw_delta
+        return Response({
+            "success": True,
+            "message": "stale, ignored",
+            "data": {
+                "game_year": player.game_year,
+                "game_month": player.game_month,
+                "game_day": player.game_day,
+                "game_hour": player.game_hour,
+                "game_minute": player.game_minute,
+                "season": player.season,
+                "total_game_days": player.total_game_days,
+                "day_delta": 0,
+                "action_points": player.action_points,
+                "max_game_days": max_days,
+            },
+        })
+
+    day_delta = raw_delta
+
+    # 同日时间回退检查：如后端已有 00:00（天推进后），旧请求的 23:59 不应覆盖
+    if day_delta == 0:
+        old_total_minutes = player.game_hour * 60 + player.game_minute
+        new_total_minutes = new_hour * 60 + new_minute
+        if new_total_minutes < old_total_minutes:
+            logger.info(
+                "[day_advanced] player=%s 丢弃同日过期时间 %02d:%02d < %02d:%02d",
+                player_id, new_hour, new_minute, player.game_hour, player.game_minute,
+            )
+            return Response({
+                "success": True,
+                "message": "stale time, ignored",
+                "data": {
+                    "game_year": player.game_year,
+                    "game_month": player.game_month,
+                    "game_day": player.game_day,
+                    "game_hour": player.game_hour,
+                    "game_minute": player.game_minute,
+                    "season": player.season,
+                    "total_game_days": player.total_game_days,
+                    "day_delta": 0,
+                    "action_points": player.action_points,
+                    "max_game_days": max_days,
+                },
+            })
 
     # 全服最大天数限制：有实际天数推进且已达上限时拒绝，返回当前状态供客户端回退
     if day_delta > 0 and max_days > 0 and player.total_game_days >= max_days:
@@ -108,9 +187,9 @@ def day_advanced(request):
     # 先用旧天数结算，确保当天所有事件都被包含在快照中
     if day_delta > 0:
         old_game_days = player.total_game_days
-        season_id = get_current_season_id()
+        season_id = current_season.season_id
         settle_leaderboard_for_day(old_game_days, season_id)
-        reset_player_action_points(player_id)
+        player.action_points = 100
 
     # 再更新天数
     player.total_game_days += day_delta
@@ -129,19 +208,89 @@ def day_advanced(request):
     if day_delta > 0:
         player.refresh_from_db()
 
+    data = {
+        "game_year": player.game_year,
+        "game_month": player.game_month,
+        "game_day": player.game_day,
+        "game_hour": player.game_hour,
+        "game_minute": player.game_minute,
+        "season": player.season,
+        "total_game_days": player.total_game_days,
+        "day_delta": day_delta,
+        "action_points": player.action_points,
+        "max_game_days": max_days,
+        "seasonId": current_season.season_id,
+        "seasonEndTime": current_season.end_time,
+        "seasonSequence": current_season.sequence,
+    }
+
+    # Season notice (check on every minute broadcast)
+    notice = get_season_notice(player)
+    if notice:
+        data["seasonNotice"] = notice
+
     return Response({
         "success": True,
         "message": "day advanced",
-        "data": {
-            "game_year": player.game_year,
-            "game_month": player.game_month,
-            "game_day": player.game_day,
-            "game_hour": player.game_hour,
-            "game_minute": player.game_minute,
-            "season": player.season,
-            "total_game_days": player.total_game_days,
-            "day_delta": day_delta,
-            "action_points": player.action_points,
-            "max_game_days": max_days,
-        },
+        "data": data,
+    })
+
+
+@api_view(["GET"])
+def game_init(request):
+    """登录后一次性返回玩家时间状态 + 赛季元数据，避免多次请求。"""
+    player_id = get_player_id(request)
+    player, _ = PlayerState.objects.get_or_create(player_id=player_id)
+
+    current_season = check_and_rotate_season()
+
+    # Ensure player has current_season_id set
+    if not player.current_season_id:
+        player.current_season_id = current_season.season_id
+        player.save(update_fields=["current_season_id"])
+
+    game_time_state = GameTimeState.get_instance()
+
+    # Check season notice
+    notice = get_season_notice(player)
+
+    data = {
+        "game_year": player.game_year,
+        "game_month": player.game_month,
+        "game_day": player.game_day,
+        "game_hour": player.game_hour,
+        "game_minute": player.game_minute,
+        "season": player.season,
+        "total_game_days": player.total_game_days,
+        "time_initialized": player.time_initialized,
+        "action_points": player.action_points,
+        "action_points_max": player.action_points_max,
+        "max_game_days": game_time_state.max_game_days,
+        "seasonId": current_season.season_id,
+        "seasonSequence": current_season.sequence,
+        "seasonEndTime": current_season.end_time,
+    }
+
+    if notice:
+        data["seasonNotice"] = notice
+
+    return Response({
+        "code": 0,
+        "data": data,
+    })
+
+
+@api_view(["POST"])
+def season_refresh(request):
+    """Player confirms season transition. Transitions the player to the current active season."""
+    player_id = get_player_id(request)
+    player, _ = PlayerState.objects.get_or_create(player_id=player_id)
+
+    new_season = transition_player_to_season(player)
+    player.refresh_from_db()
+
+    return Response({
+        "success": True,
+        "message": "season refreshed",
+        "data": build_season_time_response(player, new_season),
     })

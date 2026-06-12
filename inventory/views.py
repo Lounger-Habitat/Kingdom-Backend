@@ -48,6 +48,7 @@ def clear_slot_if_empty(slot):
         slot.item_bag_name = ""
         slot.cook_time = 0
         slot.dish_quality = 3
+        slot.hide_in_shop = False
         slot.save()
 
 
@@ -142,6 +143,7 @@ def inventory_rate(request, character_id):
         new_slot.item_bag_name = slot.item_bag_name
         new_slot.cook_time = slot.cook_time
         new_slot.dish_quality = slot.dish_quality
+        new_slot.hide_in_shop = slot.hide_in_shop
         new_slot.save()
     else:
         # Update in place
@@ -192,7 +194,7 @@ def inventory_swap(request, character_id):
     to_slot, _ = bag.slots.get_or_create(slot_index=to_index, defaults={"item_id": 0, "item_amount": 0})
 
     # Swap all fields
-    fields = ["item_id", "item_amount", "rated", "rating_price", "ingredient", "item_bag_name", "cook_time", "dish_quality"]
+    fields = ["item_id", "item_amount", "rated", "rating_price", "ingredient", "item_bag_name", "cook_time", "dish_quality", "hide_in_shop"]
     from_vals = {f: getattr(from_slot, f) for f in fields}
     to_vals = {f: getattr(to_slot, f) for f in fields}
 
@@ -297,6 +299,7 @@ def inventory_transfer(request, character_id):
         empty.item_bag_name = source_slot.item_bag_name
         empty.cook_time = source_slot.cook_time
         empty.dish_quality = source_slot.dish_quality
+        empty.hide_in_shop = source_slot.hide_in_shop
         empty.save()
 
     source_slot.item_amount -= amount
@@ -310,10 +313,10 @@ def inventory_transfer(request, character_id):
 def inventory_trade_with(request, character_id):
     bag = get_or_create_bag(request.user, character_id)
     other_id = request.data.get("otherCharacterId")
-    give_items = request.data.get("giveItem", [])
-    give_money = request.data.get("giveMoney", 0)
-    get_items = request.data.get("getItem", [])
-    get_money = request.data.get("getMoney", 0)
+    give_items = request.data.get("giveItem") or []
+    give_money = request.data.get("giveMoney") or 0
+    get_items = request.data.get("getItem") or []
+    get_money = request.data.get("getMoney") or 0
 
     if not other_id:
         return Response(error_response("otherCharacterId required"), status=400)
@@ -379,6 +382,7 @@ def inventory_trade_with(request, character_id):
                 empty.item_bag_name = source_slot.item_bag_name
                 empty.cook_time = source_slot.cook_time
                 empty.dish_quality = source_slot.dish_quality
+                empty.hide_in_shop = True
                 empty.save()
 
         source_slot.item_amount -= amt
@@ -403,6 +407,7 @@ def inventory_trade_with(request, character_id):
             empty.item_bag_name = source_slot.item_bag_name
             empty.cook_time = source_slot.cook_time
             empty.dish_quality = source_slot.dish_quality
+            empty.hide_in_shop = source_slot.hide_in_shop
             empty.save()
         source_slot.item_amount -= amt
         source_slot.save()
@@ -412,6 +417,38 @@ def inventory_trade_with(request, character_id):
     other_bag.save()
 
     return Response(dual_bag_response(bag, other_bag))
+
+
+@extend_schema(responses={200: InventoryResponseSerializer})
+@api_view(["POST"])
+def inventory_compact(request, character_id):
+    """整理背包：删除空槽位，有物品的槽位重新从 0 开始连续编号。"""
+    bag = get_or_create_bag(request.user, character_id)
+
+    with transaction.atomic():
+        # 收集所有有物品的槽位，按原 slot_index 排序保持相对顺序
+        filled_slots = list(bag.slots.filter(item_amount__gt=0).order_by("slot_index"))
+        # 删除所有槽位
+        bag.slots.all().delete()
+        # 用新编号重建
+        for new_index, old_slot in enumerate(filled_slots):
+            InventorySlot.objects.create(
+                bag=bag,
+                slot_index=new_index,
+                instance_id=old_slot.instance_id,
+                item_id=old_slot.item_id,
+                item_amount=old_slot.item_amount,
+                rated=old_slot.rated,
+                rating_price=old_slot.rating_price,
+                overall_score=old_slot.overall_score,
+                ingredient=old_slot.ingredient,
+                item_bag_name=old_slot.item_bag_name,
+                cook_time=old_slot.cook_time,
+                dish_quality=old_slot.dish_quality,
+                hide_in_shop=old_slot.hide_in_shop,
+            )
+
+    return Response(success_response(bag))
 
 
 @extend_schema(responses={200: InventoryResponseSerializer, 400: ErrorResponseSerializer})
@@ -479,6 +516,7 @@ def inventory_bulk_push(request):
                         ingredient=item.get("ingredient", ""),
                         cook_time=item.get("cookTime", 0),
                         dish_quality=item.get("dishQuality", 3),
+                        hide_in_shop=item.get("hideInShop", False),
                     )
                 results.append({"characterId": character_id, "success": True, "message": "模板同步成功"})
             else:
@@ -510,6 +548,7 @@ def inventory_bulk_push(request):
                         item_bag_name=item.get("itemBagName", ""),
                         cook_time=item.get("cookTime", 0),
                         dish_quality=item.get("dishQuality", 3),
+                        hide_in_shop=item.get("hideInShop", False),
                     )
                 results.append({"characterId": character_id, "success": True, "message": "同步成功"})
 
