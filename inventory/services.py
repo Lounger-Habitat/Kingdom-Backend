@@ -17,6 +17,7 @@ def init_player_bags(player):
         return 0
 
     created = 0
+    player_own_bag_money = 0
     with transaction.atomic():
         for tmpl in templates:
             # character_id="player" 的模板改为玩家用户名，作为玩家自己的背包
@@ -26,6 +27,8 @@ def init_player_bags(player):
                 character_id=cid,
                 money=tmpl.money,
             )
+            if tmpl.character_id == "player":
+                player_own_bag_money = tmpl.money
             for slot in tmpl.slots.select_related("item").all():
                 InventorySlot.objects.create(
                     bag=bag,
@@ -43,5 +46,13 @@ def init_player_bags(player):
                     hide_in_shop=slot.hide_in_shop,
                 )
             created += 1
+
+    # 设置富豪榜日榜第一天基准金币
+    if created > 0 and player_own_bag_money > 0:
+        from player.models import PlayerState
+        ps, _ = PlayerState.objects.get_or_create(player_id=player.username)
+        ps.day_start_money = player_own_bag_money
+        ps.day_start_money_game_day = 1
+        ps.save(update_fields=["day_start_money", "day_start_money_game_day"])
 
     return created

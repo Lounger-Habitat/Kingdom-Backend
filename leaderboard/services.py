@@ -19,22 +19,36 @@ def calculate_rankings_realtime(board_type, player_id=None, game_day=None, seaso
       - my_rank_dict: dict with rank, score for the given player_id, or None
     """
     if board_type == BoardType.WEALTH:
-        qs = ReportEvent.objects.filter(event_type="trade_completed")
-        if season_id:
-            qs = qs.filter(season_id=season_id)
+        # 富豪榜：当前金币 - 当天开始时金币，负数不上榜
+
+        # 补初始化：快照未设置的玩家，用 BagTemplate 初始金币作为基准
         if game_day is not None:
-            qs = qs.filter(game_day=game_day)
-        events = qs.values("player_id", "payload")
-        scores = {}
-        for ev in events:
+            from inventory.models import BagTemplate
             try:
-                payload = ev.get("payload", {})
-                if isinstance(payload, str):
-                    payload = json.loads(payload)
-                if payload.get("trade_type") == "sell":
-                    pid = ev["player_id"]
-                    scores[pid] = scores.get(pid, 0) + payload.get("total_price", 0)
-            except (json.JSONDecodeError, TypeError):
+                player_tmpl = BagTemplate.objects.get(character_id="player")
+                initial_money = player_tmpl.money
+            except BagTemplate.DoesNotExist:
+                initial_money = 0
+
+            uninitialized = PlayerState.objects.filter(day_start_money_game_day=0, total_game_days=game_day)
+            for ps in uninitialized:
+                ps.day_start_money = initial_money
+                ps.day_start_money_game_day = game_day
+                ps.save(update_fields=["day_start_money", "day_start_money_game_day"])
+
+        ps_qs = PlayerState.objects.filter(day_start_money_game_day=game_day) if game_day is not None else PlayerState.objects.exclude(day_start_money_game_day=0)
+        scores = {}
+        for ps in ps_qs:
+            try:
+                account = GameAccount.objects.get(id=ps.player_id)
+                bag = InventoryBag.objects.get(
+                    player_id=ps.player_id,
+                    character_id=account.username,
+                )
+                delta = bag.money - ps.day_start_money
+                if delta > 0:
+                    scores[ps.player_id] = delta
+            except (GameAccount.DoesNotExist, InventoryBag.DoesNotExist):
                 continue
 
     elif board_type == BoardType.OUTPUT:
@@ -169,20 +183,20 @@ def calculate_rankings(board_type, season_id="default", game_day=None):
     qs.delete()
 
     if board_type == BoardType.WEALTH:
-        qs = ReportEvent.objects.filter(event_type="trade_completed", season_id=season_id)
-        if game_day is not None:
-            qs = qs.filter(game_day=game_day)
-        events = qs.values("player_id", "payload")
+        # 富豪榜：当前金币 - 当天开始时金币，负数不上榜
+        ps_qs = PlayerState.objects.filter(day_start_money_game_day=game_day) if game_day is not None else PlayerState.objects.exclude(day_start_money_game_day=0)
         scores = {}
-        for ev in events:
+        for ps in ps_qs:
             try:
-                payload = ev.get("payload", {})
-                if isinstance(payload, str):
-                    payload = json.loads(payload)
-                if payload.get("trade_type") == "sell":
-                    pid = ev["player_id"]
-                    scores[pid] = scores.get(pid, 0) + payload.get("total_price", 0)
-            except (json.JSONDecodeError, TypeError):
+                account = GameAccount.objects.get(id=ps.player_id)
+                bag = InventoryBag.objects.get(
+                    player_id=ps.player_id,
+                    character_id=account.username,
+                )
+                delta = bag.money - ps.day_start_money
+                if delta > 0:
+                    scores[ps.player_id] = delta
+            except (GameAccount.DoesNotExist, InventoryBag.DoesNotExist):
                 continue
 
     elif board_type == BoardType.OUTPUT:

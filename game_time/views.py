@@ -6,6 +6,7 @@ from rest_framework.response import Response
 
 from config.auth import get_player_id
 from player.models import PlayerState
+from inventory.models import InventoryBag
 from leaderboard.services import settle_leaderboard_for_day
 from leaderboard.season_service import (
     check_and_rotate_season,
@@ -190,6 +191,17 @@ def day_advanced(request):
         season_id = current_season.season_id
         settle_leaderboard_for_day(old_game_days, season_id)
         player.action_points = 100
+
+        # 保存新一天的金币快照（用于富豪榜日榜）
+        try:
+            bag = InventoryBag.objects.get(
+                player__username=player.player_id,
+                character_id=player.player_id,
+            )
+            player.day_start_money = bag.money
+        except InventoryBag.DoesNotExist:
+            player.day_start_money = 0
+        player.day_start_money_game_day = player.total_game_days + day_delta
 
     # 再更新天数
     player.total_game_days += day_delta

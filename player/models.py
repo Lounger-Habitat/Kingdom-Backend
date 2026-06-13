@@ -19,6 +19,9 @@ class PlayerState(models.Model):
     time_initialized = models.BooleanField(default=False)
     # 当前玩家所在的赛季 ID（空表示尚未迁移，等效于当前活跃赛季）
     current_season_id = models.CharField(max_length=50, default="", blank=True)
+    # 日初金币快照（用于富豪榜日榜计算：当前金币 - day_start_money）
+    day_start_money = models.IntegerField(default=0)
+    day_start_money_game_day = models.IntegerField(default=0, help_text="快照对应的 total_game_days")
 
     class Meta:
         ordering = ["player_id"]
