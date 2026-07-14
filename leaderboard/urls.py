@@ -14,6 +14,7 @@ urlpatterns = [
     # 奖励 API
     path("api/reward/pending", views.reward_pending, name="reward-pending"),
     path("api/reward/claim", views.reward_claim, name="reward-claim"),
+    path("api/reward/tips", views.reward_tips, name="reward-tips"),
     # 数据上报 API
     path("api/report/heartbeat", views.report_heartbeat, name="report-heartbeat"),
     path("api/report/event", views.report_event, name="report-event"),

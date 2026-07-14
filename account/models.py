@@ -7,6 +7,7 @@ class GameAccount(models.Model):
     username = models.CharField(max_length=30, unique=True)
     password = models.CharField(max_length=128)
     is_guest = models.BooleanField(default=False)
+    is_ai = models.BooleanField(default=False)
     created_at = models.DateTimeField(auto_now_add=True)
 
     # Django admin 需要的字段（不会用到，但避免框架报错）

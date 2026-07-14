@@ -2,8 +2,8 @@ from rest_framework.decorators import api_view
 from rest_framework.response import Response
 from config.auth import get_player_id
 from recipes.models import Recipe as CatalogRecipe, RecipeIngredient
-from game_time.models import GameTimeState
-from .models import PlayerState, PlayerRecipe, PlayerTitle, DefaultRecipe
+from season.models import SeasonConfig
+from .models import PlayerState, PlayerRecipe, PlayerTitle, DefaultRecipe, ActionPointCostConfig
 
 
 def get_or_create_player(player_id):
@@ -15,7 +15,7 @@ def get_or_create_player(player_id):
 def player_state(request):
     player_id = get_player_id(request)
     player = get_or_create_player(player_id)
-    max_game_days = GameTimeState.get_instance().max_game_days
+    max_game_days = SeasonConfig.get_instance().max_game_days
     return Response({
         "code": 0,
         "data": {
@@ -39,7 +39,11 @@ def player_cost_action(request):
     player_id = get_player_id(request)
     player = get_or_create_player(player_id)
     cost_type = request.data.get("cost_type", "")
-    cost_amount = request.data.get("cost_amount", 0)
+
+    # 从配置表读取消耗量，忽略客户端传值
+    cost_amount = ActionPointCostConfig.get_cost(cost_type)
+    if cost_amount < 0:
+        cost_amount = 0
 
     if player.action_points < cost_amount:
         return Response({

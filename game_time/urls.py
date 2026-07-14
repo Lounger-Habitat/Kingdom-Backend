@@ -6,4 +6,5 @@ urlpatterns = [
     path("game/time/day-advanced", views.day_advanced, name="day-advanced"),
     path("game/time/check-day-advance", views.check_day_advance, name="check-day-advance"),
     path("game/time/season-refresh", views.season_refresh, name="season-refresh"),
+    path("game/time/sync", views.time_sync, name="time-sync"),
 ]

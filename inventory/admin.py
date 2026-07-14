@@ -1,6 +1,11 @@
 from django.contrib import admin
 from django.shortcuts import redirect
-from .models import InventoryBag, InventorySlot, BagTemplate, BagTemplateSlot
+from .models import (
+    InventoryBag, InventorySlot, BagTemplate, BagTemplateSlot,
+    CollectionPoint, CollectionPointLevel, CollectionPointLevelItem,
+    CollectionPointUpgradeItemCost, PlayerCollectionPoint, PlayerCollectionOverride,
+    AiConfig,
+)
 
 
 class InventoryBagProxy(InventoryBag):
@@ -76,3 +81,91 @@ class BagTemplateAdmin(admin.ModelAdmin):
 
 
 # BagTemplateSlot 通过 BagTemplate 的 inline 管理，不单独显示
+
+
+# ──────────────────────────────────────────────────────────────
+#  采集点等级系统 Admin
+# ──────────────────────────────────────────────────────────────
+
+class CollectionPointLevelInline(admin.TabularInline):
+    model = CollectionPointLevel
+    extra = 0
+    fields = ["level", "description", "upgrade_cost_money"]
+    show_change_link = True
+
+
+@admin.register(CollectionPoint)
+class CollectionPointAdmin(admin.ModelAdmin):
+    list_display = ["name", "collect_type", "item_type", "action_cost", "collect_count", "default_level"]
+    list_filter = ["item_type"]
+    search_fields = ["name", "collect_type"]
+    inlines = [CollectionPointLevelInline]
+
+
+class CollectionPointLevelItemInline(admin.TabularInline):
+    model = CollectionPointLevelItem
+    extra = 0
+    fields = ["item", "collect_weight", "collect_min_amount", "collect_max_amount"]
+    autocomplete_fields = ["item"]
+
+
+class CollectionPointUpgradeItemCostInline(admin.TabularInline):
+    model = CollectionPointUpgradeItemCost
+    extra = 0
+    fields = ["item", "amount"]
+    autocomplete_fields = ["item"]
+
+
+@admin.register(CollectionPointLevel)
+class CollectionPointLevelAdmin(admin.ModelAdmin):
+    list_display = ["collection_point", "level", "description", "item_count", "upgrade_cost_money"]
+    list_filter = ["collection_point"]
+    inlines = [CollectionPointLevelItemInline, CollectionPointUpgradeItemCostInline]
+
+    def item_count(self, obj):
+        return obj.items.count()
+
+    item_count.short_description = "物品数"
+
+
+class PlayerCollectionOverrideInline(admin.TabularInline):
+    model = PlayerCollectionOverride
+    extra = 0
+    fields = ["item", "override_weight", "override_min_amount", "override_max_amount", "is_excluded"]
+    autocomplete_fields = ["item"]
+
+
+@admin.register(PlayerCollectionPoint)
+class PlayerCollectionPointAdmin(admin.ModelAdmin):
+    list_display = ["player", "collection_point", "current_level"]
+    list_filter = ["collection_point", "current_level"]
+    search_fields = ["player__username"]
+    inlines = [PlayerCollectionOverrideInline]
+
+
+@admin.register(PlayerCollectionOverride)
+class PlayerCollectionOverrideAdmin(admin.ModelAdmin):
+    list_display = ["player_name", "collection_point_name", "item", "override_weight", "override_min_amount", "override_max_amount", "is_excluded"]
+    list_filter = ["player_collection_point__collection_point", "is_excluded"]
+    search_fields = ["player_collection_point__player__username", "item__item_name"]
+    autocomplete_fields = ["item"]
+
+    def player_name(self, obj):
+        return obj.player_collection_point.player.username
+    player_name.short_description = "玩家"
+
+    def collection_point_name(self, obj):
+        return obj.player_collection_point.collection_point.name
+    collection_point_name.short_description = "采集点"
+
+
+@admin.register(AiConfig)
+class AiConfigAdmin(admin.ModelAdmin):
+    list_display = ["model_name", "updated_at"]
+
+    def has_add_permission(self, request):
+        # 只允许添加一条配置
+        return not AiConfig.objects.exists()
+
+    def has_delete_permission(self, request, obj=None):
+        return False

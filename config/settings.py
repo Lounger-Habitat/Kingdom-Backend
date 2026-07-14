@@ -1,8 +1,10 @@
 import os
 from datetime import timedelta
 from pathlib import Path
+from dotenv import load_dotenv
 
 BASE_DIR = Path(__file__).resolve().parent.parent
+load_dotenv(BASE_DIR / ".env")
 
 SECRET_KEY = os.environ.get(
     "DJANGO_SECRET_KEY", "django-insecure-kingdom-dev-key-change-in-production"
@@ -30,9 +32,12 @@ INSTALLED_APPS = [
     "recipes",
     "inventory",
     "player",
+    "season.apps.SeasonConfig",
     "leaderboard.apps.LeaderboardConfig",
     "game_time",
     "cooking",
+    "restaurant",
+    "marketplace",
 ]
 
 MIDDLEWARE = [
@@ -140,3 +145,8 @@ SPECTACULAR_SETTINGS = {
     "VERSION": "1.0.0",
     "SERVE_INCLUDE_SCHEMA": False,
 }
+
+# AI 点评服务
+AI_SERVICE_URL = os.environ.get("AI_SERVICE_URL", "")
+AI_API_KEY = os.environ.get("AI_API_KEY", "")
+AI_REQUEST_TIMEOUT = int(os.environ.get("AI_REQUEST_TIMEOUT", "30"))

@@ -10,9 +10,13 @@ urlpatterns = [
     # API
     path("api/inventory/bulk-push", views.inventory_bulk_push, name="inventory-bulk-push"),
     path("api/inventory/<str:character_id>/collect", views.inventory_collect, name="inventory-collect"),
+    path("api/inventory/<str:character_id>/collect-upgrade", views.inventory_collect_upgrade, name="inventory-collect-upgrade"),
+    path("api/inventory/<str:character_id>/collect-upgrade-info", views.inventory_collect_upgrade_info, name="inventory-collect-upgrade-info"),
     path("api/inventory/<str:character_id>", views.inventory_detail, name="inventory-detail"),
     path("api/inventory/<str:character_id>/add", views.inventory_add, name="inventory-add"),
+    path("api/inventory/<str:character_id>/use", views.inventory_use, name="inventory-use"),
     path("api/inventory/<str:character_id>/rate", views.inventory_rate, name="inventory-rate"),
+    path("api/inventory/<str:character_id>/judge", views.inventory_judge, name="inventory-judge"),
     path("api/inventory/<str:character_id>/remove", views.inventory_remove, name="inventory-remove"),
     path("api/inventory/<str:character_id>/swap", views.inventory_swap, name="inventory-swap"),
     path("api/inventory/<str:character_id>/trade", views.inventory_trade, name="inventory-trade"),

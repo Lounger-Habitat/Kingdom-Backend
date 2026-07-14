@@ -1,0 +1,122 @@
+{% extends "admin/base_site.html" %}
+{% load i18n %}
+
+{% block breadcrumbs %}
+<div class="breadcrumbs">
+    <a href="{% url 'admin:index' %}">首页</a>
+    &rsaquo; <a href="{% url 'admin:marketplace_marketlisting_changelist' %}">市场挂单</a>
+    &rsaquo; 代购 #{{ listing.id }}
+</div>
+{% endblock %}
+
+{% block content %}
+<div id="content-main">
+    <h1 style="margin: 0 0 20px;">代购挂单 #{{ listing.id }}</h1>
+
+    {% if messages %}
+    <ul class="messagelist">
+        {% for message in messages %}
+        <li{% if message.tags %} class="{{ message.tags }}"{% endif %}>{{ message }}</li>
+        {% endfor %}
+    </ul>
+    {% endif %}
+
+    <div style="background: #2b2b2b; border: 1px solid #444; border-radius: 6px; padding: 20px; margin-bottom: 20px;">
+        <h2 style="margin: 0 0 12px; color: #eee; font-size: 16px;">挂单信息</h2>
+        <table style="width: 100%; border-collapse: collapse;">
+            <tr>
+                <td style="padding: 8px 12px; color: #aaa; width: 120px;">物品</td>
+                <td style="padding: 8px 12px; color: #eee;">[{{ listing.item_id }}] {{ listing.item_name_snapshot }}</td>
+                <td style="padding: 8px 12px; color: #aaa; width: 120px;">类型</td>
+                <td style="padding: 8px 12px; color: #eee;">{{ listing.get_source_type_display }}</td>
+            </tr>
+            <tr>
+                <td style="padding: 8px 12px; color: #aaa;">单价</td>
+                <td style="padding: 8px 12px; color: #eee;">{{ listing.price }} 金币</td>
+                <td style="padding: 8px 12px; color: #aaa;">卖家</td>
+                <td style="padding: 8px 12px; color: #eee;">{% if listing.seller %}{{ listing.seller.username }}{% else %}系统{% endif %}</td>
+            </tr>
+            <tr>
+                <td style="padding: 8px 12px; color: #aaa;">剩余数量</td>
+                <td style="padding: 8px 12px; color: #eee;">{{ listing.remaining_amount }}</td>
+                <td style="padding: 8px 12px; color: #aaa;">状态</td>
+                <td style="padding: 8px 12px; color: #eee;">{{ listing.get_status_display }}</td>
+            </tr>
+        </table>
+    </div>
+
+    <form method="post" id="buy-form">
+        {% csrf_token %}
+
+        <div style="background: #2b2b2b; border: 1px solid #444; border-radius: 6px; padding: 20px; margin-bottom: 20px;">
+            <h2 style="margin: 0 0 12px; color: #eee; font-size: 16px;">购买设置</h2>
+
+            <div style="margin-bottom: 16px;">
+                <label for="buyer_id" style="display: block; color: #eee; margin-bottom: 6px; font-weight: bold;">买家账号</label>
+                <select name="buyer_id" id="buyer_id" required style="width: 400px; padding: 6px 10px; background: #1e1e1e; color: #eee; border: 1px solid #555; border-radius: 4px;">
+                    <option value="">-- 选择买家 --</option>
+                    {% for account in accounts %}
+                    <option value="{{ account.id }}" {% if selected_buyer == account.id|stringformat:"d" %}selected{% endif %}>
+                        {{ account.username }} (金币: {{ account.money }})
+                    </option>
+                    {% endfor %}
+                </select>
+            </div>
+
+            <div style="margin-bottom: 16px;">
+                <label for="amount" style="display: block; color: #eee; margin-bottom: 6px; font-weight: bold;">购买数量</label>
+                <input type="number" name="amount" id="amount" value="{{ listing.remaining_amount }}" min="1" max="{{ listing.remaining_amount }}"
+                       style="width: 200px; padding: 6px 10px; background: #1e1e1e; color: #eee; border: 1px solid #555; border-radius: 4px;" />
+                <span style="color: #888; margin-left: 8px;">单价 {{ listing.price }} 金币</span>
+            </div>
+
+            <div style="margin-bottom: 16px; padding: 12px; background: #1e1e1e; border-radius: 4px;">
+                <span style="color: #aaa;">预计总价：</span>
+                <span id="total-price" style="color: #4caf50; font-size: 18px; font-weight: bold;">{{ listing.price }}</span>
+                <span style="color: #aaa;"> 金币</span>
+            </div>
+        </div>
+
+        <div style="display: flex; gap: 12px;">
+            <button type="submit" id="buy-btn"
+                    style="background: #417690; color: #fff; border: none; padding: 10px 24px; border-radius: 4px; cursor: pointer; font-size: 14px;">
+                确认购买
+            </button>
+            <a href="{% url 'admin:marketplace_marketlisting_changelist' %}"
+               style="background: #555; color: #fff; padding: 10px 24px; border-radius: 4px; text-decoration: none; font-size: 14px;">
+                返回列表
+            </a>
+        </div>
+    </form>
+</div>
+
+<script>
+var unitPrice = {{ listing.price }};
+var amountInput = document.getElementById('amount');
+var totalSpan = document.getElementById('total-price');
+
+function updateTotal() {
+    var qty = parseInt(amountInput.value) || 0;
+    totalSpan.textContent = (unitPrice * qty).toLocaleString();
+}
+amountInput.addEventListener('input', updateTotal);
+
+document.getElementById('buy-form').addEventListener('submit', function(e) {
+    var buyer = document.getElementById('buyer_id').value;
+    var qty = parseInt(amountInput.value);
+    if (!buyer) {
+        e.preventDefault();
+        alert('请选择买家账号');
+        return;
+    }
+    if (!qty || qty <= 0) {
+        e.preventDefault();
+        alert('请输入有效的购买数量');
+        return;
+    }
+    if (!confirm('确认使用选中账号购买 ' + qty + ' 个物品？\n总价：' + (unitPrice * qty) + ' 金币')) {
+        e.preventDefault();
+    }
+});
+</script>
+{% endblock %}

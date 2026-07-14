@@ -7,12 +7,12 @@ import uuid
 from django.db import transaction
 from django.utils import timezone
 
-from .models import Season, SeasonConfig, LeaderboardEntry, PendingReward, ReportEvent, BoardType, SettlementType, RewardConfig
+from .models import LeaderboardEntry, PendingReward, ReportEvent, BoardType, SettlementType, RewardConfig
+from season.models import Season, SeasonConfig
 from player.models import PlayerState, PlayerRecipe, PlayerTitle, DefaultRecipe
 from account.models import GameAccount
-from inventory.models import InventoryBag, InventorySlot, BagTemplate
+from inventory.models import InventoryBag, InventorySlot, BagTemplate, PlayerCollectionPoint, PlayerCollectionOverride
 from cooking.models import PityCounter
-from game_time.models import GameTimeState
 import json
 
 logger = logging.getLogger(__name__)
@@ -63,9 +63,8 @@ def get_active_season():
         season = Season.objects.create(
             season_id="season_1",
             sequence=1,
-            duration_days=config.default_duration_days,
             start_time=now,
-            end_time=aligned_season_end_time(now, config.default_duration_days),
+            end_time=aligned_season_end_time(now, config.duration_days),
             status="active",
         )
         logger.info("[season] Created initial season: %s", season.season_id)
@@ -153,7 +152,6 @@ def is_player_season_reset(player):
 
 def build_season_time_response(player, season):
     """Build the time snapshot response dict for day_advanced."""
-    game_time_state = GameTimeState.get_instance()
     return {
         "game_year": player.game_year,
         "game_month": player.game_month,
@@ -164,7 +162,7 @@ def build_season_time_response(player, season):
         "total_game_days": player.total_game_days,
         "day_delta": 0,
         "action_points": player.action_points,
-        "max_game_days": game_time_state.max_game_days,
+        "max_game_days": SeasonConfig.get_instance().max_game_days,
         "seasonId": season.season_id,
         "seasonEndTime": season.end_time,
         "seasonSequence": season.sequence,
@@ -196,9 +194,8 @@ def rotate_season():
     new_season = Season.objects.create(
         season_id=f"season_{new_seq}",
         sequence=new_seq,
-        duration_days=config.default_duration_days,
         start_time=current.end_time,
-        end_time=aligned_season_end_time(current.end_time, config.default_duration_days),
+        end_time=aligned_season_end_time(current.end_time, config.duration_days),
         status="active",
     )
 
@@ -260,6 +257,10 @@ def transition_player_to_season(player_state):
         player_state.time_initialized = False
         player_state.action_points = 100
         player_state.current_season_id = active_season.season_id
+        # 重置富豪榜快照，避免旧赛季残留数据影响新赛季
+        player_state.day_start_money = 0
+        player_state.day_start_money_game_day = 0
+        player_state.total_wealth_snapshot = 0
         player_state.save()
 
         # 2. Reset inventory & money from templates
@@ -280,6 +281,27 @@ def transition_player_to_season(player_state):
         try:
             PityCounter.objects.filter(player_id=player_state.player_id).update(count_4=0, count_5=0, count_6=0)
         except Exception:
+            pass
+
+        # 6. Reset collection point levels and overrides
+        try:
+            account = GameAccount.objects.get(pk=int(player_state.player_id))
+            PlayerCollectionOverride.objects.filter(
+                player_collection_point__player=account
+            ).delete()
+            PlayerCollectionPoint.objects.filter(player=account).delete()
+        except (GameAccount.DoesNotExist, ValueError):
+            pass
+
+        # 7. Reset restaurant state
+        try:
+            from restaurant.models import PlayerRestaurantState, MenuItem, CustomerTransaction, DailyBusinessLog
+            account = GameAccount.objects.get(pk=int(player_state.player_id))
+            PlayerRestaurantState.objects.filter(player=account).delete()
+            MenuItem.objects.filter(player=account).delete()
+            CustomerTransaction.objects.filter(player=account).delete()
+            DailyBusinessLog.objects.filter(player=account).delete()
+        except (GameAccount.DoesNotExist, ValueError):
             pass
 
     logger.info("[transition] Player %s transitioned to %s", player_state.player_id, active_season.season_id)
@@ -335,6 +357,9 @@ def _reset_player_inventory(account):
         if not bag:
             continue
         for slot in tmpl.slots.select_related("item").all():
+            remaining_uses = None
+            if slot.item and slot.item.item_type == "Usable":
+                remaining_uses = slot.item.max_use_count
             InventorySlot.objects.create(
                 bag=bag,
                 slot_index=slot.slot_index,
@@ -345,9 +370,11 @@ def _reset_player_inventory(account):
                 rating_price=slot.rating_price,
                 overall_score=slot.overall_score,
                 ingredient=slot.ingredient,
-                item_bag_name=slot.item.item_name if slot.item else "",
+                item_bag_name=f"{slot.item.item_name}_{slot.slot_index}" if slot.item else "",
                 cook_time=slot.cook_time,
                 dish_quality=slot.dish_quality,
+                hide_in_shop=slot.hide_in_shop,
+                remaining_uses=remaining_uses,
             )
 
 
@@ -358,6 +385,7 @@ def _reset_player_money(account):
     for bag in bags:
         cid = "player" if bag.character_id == account.username else bag.character_id
         bag.money = templates.get(cid, 0)
+        bag._money_change_source = "season_reset"
         bag.save(update_fields=["money"])
 
 
@@ -395,15 +423,15 @@ def full_reset_to_season_1():
         Season.objects.create(
             season_id="season_1",
             sequence=1,
-            duration_days=config.default_duration_days,
             start_time=now,
-            end_time=aligned_season_end_time(now, config.default_duration_days),
+            end_time=aligned_season_end_time(now, config.duration_days),
             status="active",
         )
         stats["new_season"] = "season_1"
 
         # ── 3. 重置所有 PlayerState ──
         stats["players_reset"] = PlayerState.objects.all().update(
+            current_season_id="season_1",
             total_game_days=1,
             game_year=INITIAL_GAME_YEAR,
             game_month=INITIAL_GAME_MONTH,
@@ -413,6 +441,9 @@ def full_reset_to_season_1():
             season=INITIAL_SEASON,
             time_initialized=False,
             action_points=100,
+            day_start_money=0,
+            day_start_money_game_day=0,
+            total_wealth_snapshot=0,
         )
 
         # ── 4. 重置所有玩家背包 & 金钱 ──
@@ -435,10 +466,14 @@ def full_reset_to_season_1():
                 if not tmpl:
                     continue
                 bag.money = tmpl.money
+                bag._money_change_source = "full_season_reset"
                 bag.save(update_fields=["money"])
                 stats["inventory_bags_reset"] += 1
 
                 for slot in tmpl.slots.select_related("item").all():
+                    remaining_uses = None
+                    if slot.item and slot.item.item_type == "Usable":
+                        remaining_uses = slot.item.max_use_count
                     InventorySlot.objects.create(
                         bag=bag,
                         slot_index=slot.slot_index,
@@ -449,9 +484,11 @@ def full_reset_to_season_1():
                         rating_price=slot.rating_price,
                         overall_score=slot.overall_score,
                         ingredient=slot.ingredient,
-                        item_bag_name=slot.item.item_name if slot.item else "",
+                        item_bag_name=f"{slot.item.item_name}_{slot.slot_index}" if slot.item else "",
                         cook_time=slot.cook_time,
                         dish_quality=slot.dish_quality,
+                        hide_in_shop=slot.hide_in_shop,
+                        remaining_uses=remaining_uses,
                     )
                     stats["inventory_slots_created"] += 1
 
@@ -476,16 +513,22 @@ def full_reset_to_season_1():
         # ── 7. 重置所有烹饪保底计数器 ──
         stats["pity_counters_reset"] = PityCounter.objects.all().update(count_4=0, count_5=0, count_6=0)
 
-        # ── 8. 重置全局游戏时间 ──
-        game_time = GameTimeState.get_instance()
-        game_time.game_day = 1
-        game_time.game_year = INITIAL_GAME_YEAR
-        game_time.game_month = INITIAL_GAME_MONTH
-        game_time.game_hour = INITIAL_GAME_HOUR
-        game_time.game_minute = INITIAL_GAME_MINUTE
-        game_time.season = INITIAL_SEASON
-        game_time.save()
-        stats["game_time_reset"] = True
+        # ── 8. 重置采集点等级和覆盖 ──
+        stats["collection_overrides_deleted"] = PlayerCollectionOverride.objects.all().delete()[0]
+        stats["collection_points_reset"] = PlayerCollectionPoint.objects.all().delete()[0]
+
+        # ── 9. 清除餐厅数据 ──
+        try:
+            from restaurant.models import PlayerRestaurantState, MenuItem, CustomerTransaction, DailyBusinessLog
+            stats["restaurant_states_deleted"] = PlayerRestaurantState.objects.all().delete()[0]
+            stats["menu_items_deleted"] = MenuItem.objects.all().delete()[0]
+            stats["customer_transactions_deleted"] = CustomerTransaction.objects.all().delete()[0]
+            stats["business_logs_deleted"] = DailyBusinessLog.objects.all().delete()[0]
+        except Exception:
+            stats["restaurant_states_deleted"] = 0
+            stats["menu_items_deleted"] = 0
+            stats["customer_transactions_deleted"] = 0
+            stats["business_logs_deleted"] = 0
 
     logger.info("[full_reset] All data reset to season_1: %s", stats)
     return stats

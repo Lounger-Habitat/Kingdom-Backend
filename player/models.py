@@ -13,7 +13,7 @@ class PlayerState(models.Model):
     game_hour = models.IntegerField(default=7)
     game_minute = models.IntegerField(default=0)
     season = models.IntegerField(default=0)
-    # 累计游戏天数（"第 N 天"），由后端按日历日差累加得到，作为权威值。
+    # 累计游戏天数（"第 N 天"），每次玩家点击下一日+1，赛季轮换时重置为1。
     total_game_days = models.IntegerField(default=1)
     # 是否已用首次客户端上报作为基准；避免首报被算成跨数月的 delta。
     time_initialized = models.BooleanField(default=False)
@@ -22,6 +22,8 @@ class PlayerState(models.Model):
     # 日初金币快照（用于富豪榜日榜计算：当前金币 - day_start_money）
     day_start_money = models.IntegerField(default=0)
     day_start_money_game_day = models.IntegerField(default=0, help_text="快照对应的 total_game_days")
+    # 总榜金币快照（用于富豪榜总榜计算：snapshot + 当天增量）
+    total_wealth_snapshot = models.IntegerField(default=0, help_text="截至上一个游戏日结束时的累计金币")
 
     class Meta:
         ordering = ["player_id"]
@@ -65,6 +67,29 @@ class PlayerTitle(models.Model):
 
     def __str__(self):
         return f"{self.player.player_id} - {self.title_name}"
+
+
+class ActionPointCostConfig(models.Model):
+    """行动力消耗配置，可在 Django Admin 中修改。"""
+    cost_type = models.CharField(max_length=50, unique=True, help_text="消耗类型标识，如 collect / talk / cook / trade / judge")
+    cost_amount = models.IntegerField(default=0, help_text="每次消耗的行动力数值")
+    description = models.CharField(max_length=100, blank=True, default="", help_text="备注说明")
+
+    class Meta:
+        ordering = ["cost_type"]
+        verbose_name = "行动力消耗配置"
+        verbose_name_plural = "行动力消耗配置"
+
+    def __str__(self):
+        return f"{self.cost_type} = {self.cost_amount}"
+
+    @classmethod
+    def get_cost(cls, cost_type: str) -> int:
+        """根据类型获取消耗量，未配置的类型返回 0。"""
+        try:
+            return cls.objects.get(cost_type=cost_type).cost_amount
+        except cls.DoesNotExist:
+            return 0
 
 
 class PlayerResetProxy(GameAccount):

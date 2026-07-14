@@ -1,0 +1,484 @@
+{
+  "items": [
+    {
+      "itemID": 3001,
+      "itemName": "西红柿炒鸡蛋菜谱",
+      "itemType": "Usable",
+      "itemDescription": "使用后学会制作西红柿炒鸡蛋",
+      "canPickedup": true,
+      "canDropped": true,
+      "canCarried": true,
+      "itemPrice": 300,
+      "sellPercentage": 0.5,
+      "useEffectType": "unlock_recipe",
+      "useEffectData": {
+        "recipeName": "西红柿炒鸡蛋"
+      },
+      "maxUseCount": 1
+    },
+    {
+      "itemID": 3002,
+      "itemName": "辣子鸡丁菜谱",
+      "itemType": "Usable",
+      "itemDescription": "使用后学会制作辣子鸡丁",
+      "canPickedup": true,
+      "canDropped": true,
+      "canCarried": true,
+      "itemPrice": 300,
+      "sellPercentage": 0.5,
+      "useEffectType": "unlock_recipe",
+      "useEffectData": {
+        "recipeName": "辣子鸡丁"
+      },
+      "maxUseCount": 1
+    },
+    {
+      "itemID": 3003,
+      "itemName": "红烧肉菜谱",
+      "itemType": "Usable",
+      "itemDescription": "使用后学会制作红烧肉",
+      "canPickedup": true,
+      "canDropped": true,
+      "canCarried": true,
+      "itemPrice": 300,
+      "sellPercentage": 0.5,
+      "useEffectType": "unlock_recipe",
+      "useEffectData": {
+        "recipeName": "红烧肉"
+      },
+      "maxUseCount": 1
+    },
+    {
+      "itemID": 3004,
+      "itemName": "蔬菜沙拉菜谱",
+      "itemType": "Usable",
+      "itemDescription": "使用后学会制作蔬菜沙拉",
+      "canPickedup": true,
+      "canDropped": true,
+      "canCarried": true,
+      "itemPrice": 500,
+      "sellPercentage": 0.5,
+      "useEffectType": "unlock_recipe",
+      "useEffectData": {
+        "recipeName": "蔬菜沙拉"
+      },
+      "maxUseCount": 1
+    },
+    {
+      "itemID": 3005,
+      "itemName": "地三鲜菜谱",
+      "itemType": "Usable",
+      "itemDescription": "使用后学会制作地三鲜",
+      "canPickedup": true,
+      "canDropped": true,
+      "canCarried": true,
+      "itemPrice": 500,
+      "sellPercentage": 0.5,
+      "useEffectType": "unlock_recipe",
+      "useEffectData": {
+        "recipeName": "地三鲜"
+      },
+      "maxUseCount": 1
+    },
+    {
+      "itemID": 3006,
+      "itemName": "红烧排骨菜谱",
+      "itemType": "Usable",
+      "itemDescription": "使用后学会制作红烧排骨",
+      "canPickedup": true,
+      "canDropped": true,
+      "canCarried": true,
+      "itemPrice": 500,
+      "sellPercentage": 0.5,
+      "useEffectType": "unlock_recipe",
+      "useEffectData": {
+        "recipeName": "红烧排骨"
+      },
+      "maxUseCount": 1
+    },
+    {
+      "itemID": 3007,
+      "itemName": "鱼香肉丝菜谱",
+      "itemType": "Usable",
+      "itemDescription": "使用后学会制作鱼香肉丝",
+      "canPickedup": true,
+      "canDropped": true,
+      "canCarried": true,
+      "itemPrice": 500,
+      "sellPercentage": 0.5,
+      "useEffectType": "unlock_recipe",
+      "useEffectData": {
+        "recipeName": "鱼香肉丝"
+      },
+      "maxUseCount": 1
+    },
+    {
+      "itemID": 3008,
+      "itemName": "菠萝咕噜肉菜谱",
+      "itemType": "Usable",
+      "itemDescription": "使用后学会制作菠萝咕噜肉",
+      "canPickedup": true,
+      "canDropped": true,
+      "canCarried": true,
+      "itemPrice": 800,
+      "sellPercentage": 0.5,
+      "useEffectType": "unlock_recipe",
+      "useEffectData": {
+        "recipeName": "菠萝咕噜肉"
+      },
+      "maxUseCount": 1
+    },
+    {
+      "itemID": 3009,
+      "itemName": "农家小炒肉菜谱",
+      "itemType": "Usable",
+      "itemDescription": "使用后学会制作农家小炒肉",
+      "canPickedup": true,
+      "canDropped": true,
+      "canCarried": true,
+      "itemPrice": 800,
+      "sellPercentage": 0.5,
+      "useEffectType": "unlock_recipe",
+      "useEffectData": {
+        "recipeName": "农家小炒肉"
+      },
+      "maxUseCount": 1
+    },
+    {
+      "itemID": 3010,
+      "itemName": "海岛炒饭菜谱",
+      "itemType": "Usable",
+      "itemDescription": "使用后学会制作海岛炒饭",
+      "canPickedup": true,
+      "canDropped": true,
+      "canCarried": true,
+      "itemPrice": 500,
+      "sellPercentage": 0.5,
+      "useEffectType": "unlock_recipe",
+      "useEffectData": {
+        "recipeName": "海岛炒饭"
+      },
+      "maxUseCount": 1
+    },
+    {
+      "itemID": 3011,
+      "itemName": "凉拌海带丝菜谱",
+      "itemType": "Usable",
+      "itemDescription": "使用后学会制作凉拌海带丝",
+      "canPickedup": true,
+      "canDropped": true,
+      "canCarried": true,
+      "itemPrice": 500,
+      "sellPercentage": 0.5,
+      "useEffectType": "unlock_recipe",
+      "useEffectData": {
+        "recipeName": "凉拌海带丝"
+      },
+      "maxUseCount": 1
+    },
+    {
+      "itemID": 3012,
+      "itemName": "奶酪焗玉米菜谱",
+      "itemType": "Usable",
+      "itemDescription": "使用后学会制作奶酪焗玉米",
+      "canPickedup": true,
+      "canDropped": true,
+      "canCarried": true,
+      "itemPrice": 300,
+      "sellPercentage": 0.5,
+      "useEffectType": "unlock_recipe",
+      "useEffectData": {
+        "recipeName": "奶酪焗玉米"
+      },
+      "maxUseCount": 1
+    },
+    {
+      "itemID": 3013,
+      "itemName": "蒜蓉西兰花菜谱",
+      "itemType": "Usable",
+      "itemDescription": "使用后学会制作蒜蓉西兰花",
+      "canPickedup": true,
+      "canDropped": true,
+      "canCarried": true,
+      "itemPrice": 300,
+      "sellPercentage": 0.5,
+      "useEffectType": "unlock_recipe",
+      "useEffectData": {
+        "recipeName": "蒜蓉西兰花"
+      },
+      "maxUseCount": 1
+    },
+    {
+      "itemID": 3014,
+      "itemName": "洋葱炒火腿菜谱",
+      "itemType": "Usable",
+      "itemDescription": "使用后学会制作洋葱炒火腿",
+      "canPickedup": true,
+      "canDropped": true,
+      "canCarried": true,
+      "itemPrice": 500,
+      "sellPercentage": 0.5,
+      "useEffectType": "unlock_recipe",
+      "useEffectData": {
+        "recipeName": "洋葱炒火腿"
+      },
+      "maxUseCount": 1
+    },
+    {
+      "itemID": 3015,
+      "itemName": "蘑菇焖鸡菜谱",
+      "itemType": "Usable",
+      "itemDescription": "使用后学会制作蘑菇焖鸡",
+      "canPickedup": true,
+      "canDropped": true,
+      "canCarried": true,
+      "itemPrice": 500,
+      "sellPercentage": 0.5,
+      "useEffectType": "unlock_recipe",
+      "useEffectData": {
+        "recipeName": "蘑菇焖鸡"
+      },
+      "maxUseCount": 1
+    },
+    {
+      "itemID": 3016,
+      "itemName": "糖醋里脊菜谱",
+      "itemType": "Usable",
+      "itemDescription": "使用后学会制作糖醋里脊",
+      "canPickedup": true,
+      "canDropped": true,
+      "canCarried": true,
+      "itemPrice": 800,
+      "sellPercentage": 0.5,
+      "useEffectType": "unlock_recipe",
+      "useEffectData": {
+        "recipeName": "糖醋里脊"
+      },
+      "maxUseCount": 1
+    },
+    {
+      "itemID": 3017,
+      "itemName": "酸辣土豆丝菜谱",
+      "itemType": "Usable",
+      "itemDescription": "使用后学会制作酸辣土豆丝",
+      "canPickedup": true,
+      "canDropped": true,
+      "canCarried": true,
+      "itemPrice": 800,
+      "sellPercentage": 0.5,
+      "useEffectType": "unlock_recipe",
+      "useEffectData": {
+        "recipeName": "酸辣土豆丝"
+      },
+      "maxUseCount": 1
+    },
+    {
+      "itemID": 3018,
+      "itemName": "麻婆豆腐菜谱",
+      "itemType": "Usable",
+      "itemDescription": "使用后学会制作麻婆豆腐",
+      "canPickedup": true,
+      "canDropped": true,
+      "canCarried": true,
+      "itemPrice": 500,
+      "sellPercentage": 0.5,
+      "useEffectType": "unlock_recipe",
+      "useEffectData": {
+        "recipeName": "麻婆豆腐"
+      },
+      "maxUseCount": 1
+    },
+    {
+      "itemID": 3019,
+      "itemName": "土豆烧牛肉菜谱",
+      "itemType": "Usable",
+      "itemDescription": "使用后学会制作土豆烧牛肉",
+      "canPickedup": true,
+      "canDropped": true,
+      "canCarried": true,
+      "itemPrice": 800,
+      "sellPercentage": 0.5,
+      "useEffectType": "unlock_recipe",
+      "useEffectData": {
+        "recipeName": "土豆烧牛肉"
+      },
+      "maxUseCount": 1
+    },
+    {
+      "itemID": 3020,
+      "itemName": "葱爆牛肉菜谱",
+      "itemType": "Usable",
+      "itemDescription": "使用后学会制作葱爆牛肉",
+      "canPickedup": true,
+      "canDropped": true,
+      "canCarried": true,
+      "itemPrice": 800,
+      "sellPercentage": 0.5,
+      "useEffectType": "unlock_recipe",
+      "useEffectData": {
+        "recipeName": "葱爆牛肉"
+      },
+      "maxUseCount": 1
+    },
+    {
+      "itemID": 3021,
+      "itemName": "西红柿炖牛腩菜谱",
+      "itemType": "Usable",
+      "itemDescription": "使用后学会制作西红柿炖牛腩",
+      "canPickedup": true,
+      "canDropped": true,
+      "canCarried": true,
+      "itemPrice": 800,
+      "sellPercentage": 0.5,
+      "useEffectType": "unlock_recipe",
+      "useEffectData": {
+        "recipeName": "西红柿炖牛腩"
+      },
+      "maxUseCount": 1
+    },
+    {
+      "itemID": 3022,
+      "itemName": "青萝卜炖牛肉菜谱",
+      "itemType": "Usable",
+      "itemDescription": "使用后学会制作青萝卜炖牛肉",
+      "canPickedup": true,
+      "canDropped": true,
+      "canCarried": true,
+      "itemPrice": 500,
+      "sellPercentage": 0.5,
+      "useEffectType": "unlock_recipe",
+      "useEffectData": {
+        "recipeName": "青萝卜炖牛肉"
+      },
+      "maxUseCount": 1
+    },
+    {
+      "itemID": 3023,
+      "itemName": "红烧牛肉菜谱",
+      "itemType": "Usable",
+      "itemDescription": "使用后学会制作红烧牛肉",
+      "canPickedup": true,
+      "canDropped": true,
+      "canCarried": true,
+      "itemPrice": 800,
+      "sellPercentage": 0.5,
+      "useEffectType": "unlock_recipe",
+      "useEffectData": {
+        "recipeName": "红烧牛肉"
+      },
+      "maxUseCount": 1
+    },
+    {
+      "itemID": 3024,
+      "itemName": "蒜香牛肉菜谱",
+      "itemType": "Usable",
+      "itemDescription": "使用后学会制作蒜香牛肉",
+      "canPickedup": true,
+      "canDropped": true,
+      "canCarried": true,
+      "itemPrice": 800,
+      "sellPercentage": 0.5,
+      "useEffectType": "unlock_recipe",
+      "useEffectData": {
+        "recipeName": "蒜香牛肉"
+      },
+      "maxUseCount": 1
+    },
+    {
+      "itemID": 3025,
+      "itemName": "辣椒炒牛肉菜谱",
+      "itemType": "Usable",
+      "itemDescription": "使用后学会制作辣椒炒牛肉",
+      "canPickedup": true,
+      "canDropped": true,
+      "canCarried": true,
+      "itemPrice": 800,
+      "sellPercentage": 0.5,
+      "useEffectType": "unlock_recipe",
+      "useEffectData": {
+        "recipeName": "辣椒炒牛肉"
+      },
+      "maxUseCount": 1
+    },
+    {
+      "itemID": 3026,
+      "itemName": "洋葱炒牛肉菜谱",
+      "itemType": "Usable",
+      "itemDescription": "使用后学会制作洋葱炒牛肉",
+      "canPickedup": true,
+      "canDropped": true,
+      "canCarried": true,
+      "itemPrice": 500,
+      "sellPercentage": 0.5,
+      "useEffectType": "unlock_recipe",
+      "useEffectData": {
+        "recipeName": "洋葱炒牛肉"
+      },
+      "maxUseCount": 1
+    },
+    {
+      "itemID": 3027,
+      "itemName": "胡萝卜炖牛肉菜谱",
+      "itemType": "Usable",
+      "itemDescription": "使用后学会制作胡萝卜炖牛肉",
+      "canPickedup": true,
+      "canDropped": true,
+      "canCarried": true,
+      "itemPrice": 500,
+      "sellPercentage": 0.5,
+      "useEffectType": "unlock_recipe",
+      "useEffectData": {
+        "recipeName": "胡萝卜炖牛肉"
+      },
+      "maxUseCount": 1
+    },
+    {
+      "itemID": 3028,
+      "itemName": "牛肉炒鸡蛋菜谱",
+      "itemType": "Usable",
+      "itemDescription": "使用后学会制作牛肉炒鸡蛋",
+      "canPickedup": true,
+      "canDropped": true,
+      "canCarried": true,
+      "itemPrice": 500,
+      "sellPercentage": 0.5,
+      "useEffectType": "unlock_recipe",
+      "useEffectData": {
+        "recipeName": "牛肉炒鸡蛋"
+      },
+      "maxUseCount": 1
+    },
+    {
+      "itemID": 3029,
+      "itemName": "海带牛肉汤菜谱",
+      "itemType": "Usable",
+      "itemDescription": "使用后学会制作海带牛肉汤",
+      "canPickedup": true,
+      "canDropped": true,
+      "canCarried": true,
+      "itemPrice": 800,
+      "sellPercentage": 0.5,
+      "useEffectType": "unlock_recipe",
+      "useEffectData": {
+        "recipeName": "海带牛肉汤"
+      },
+      "maxUseCount": 1
+    },
+    {
+      "itemID": 3030,
+      "itemName": "水煮牛肉菜谱",
+      "itemType": "Usable",
+      "itemDescription": "使用后学会制作水煮牛肉",
+      "canPickedup": true,
+      "canDropped": true,
+      "canCarried": true,
+      "itemPrice": 1200,
+      "sellPercentage": 0.5,
+      "useEffectType": "unlock_recipe",
+      "useEffectData": {
+        "recipeName": "水煮牛肉"
+      },
+      "maxUseCount": 1
+    }
+  ]
+}

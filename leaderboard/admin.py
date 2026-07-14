@@ -1,12 +1,14 @@
+import copy
 from django.contrib import admin
 from django.db.models import Count
-from django.http import HttpResponseRedirect
+from django.http import HttpResponseRedirect, QueryDict
 from django.shortcuts import redirect
 from django.urls import path
 from django.utils.html import format_html
 from import_export import resources
 from import_export.admin import ImportExportModelAdmin
-from .models import RewardConfig, LeaderboardEntry, ReportEvent, PendingReward, Season, SeasonConfig, SeasonResetProxy, SeasonTestProxy
+from .models import RewardConfig, LeaderboardEntry, ReportEvent, PendingReward
+from season.models import Season
 
 
 class RewardConfigResource(resources.ModelResource):
@@ -88,7 +90,13 @@ class LeaderboardEntryAdmin(admin.ModelAdmin):
             extra_context["game_day"] = game_day
             extra_context["day_label"] = day_label
             extra_context["board_groups"] = board_groups
-            return super().changelist_view(request, extra_context=extra_context)
+            # 移除自定义参数，避免 ChangeList 处理时报错
+            cleaned = copy.copy(request)
+            cleaned.GET = QueryDict(request.GET.urlencode())
+            for k in ("season_id", "game_day"):
+                cleaned.GET = cleaned.GET.copy()
+                cleaned.GET.pop(k, None)
+            return super().changelist_view(cleaned, extra_context=extra_context)
 
         # 第二层：只有赛季，显示该赛季的游戏天数列表
         if season_id:
@@ -160,66 +168,3 @@ class PendingRewardAdmin(admin.ModelAdmin):
     list_filter = ["board_type", "settlement_type", "claimed"]
     search_fields = ["player_id", "reward_id"]
     readonly_fields = ["player_id", "reward_id", "board_type", "settlement_type", "rank", "rewards", "expire_time"]
-
-
-@admin.register(Season)
-class SeasonAdmin(admin.ModelAdmin):
-    list_display = ["season_id", "sequence", "duration_days", "status", "settled", "start_time_display", "end_time_display"]
-    list_filter = ["status", "settled"]
-    readonly_fields = ["season_id", "sequence", "start_time", "start_time_display", "end_time", "end_time_display", "settled"]
-
-    @staticmethod
-    def _fmt_epoch(ts):
-        if not ts:
-            return "-"
-        import datetime
-        from django.utils import timezone
-        dt = datetime.datetime.fromtimestamp(int(ts), tz=timezone.get_current_timezone())
-        return dt.strftime("%Y-%m-%d %H:%M:%S")
-
-    @admin.display(description="开始时间", ordering="start_time")
-    def start_time_display(self, obj):
-        return self._fmt_epoch(obj.start_time)
-
-    @admin.display(description="结束时间", ordering="end_time")
-    def end_time_display(self, obj):
-        return self._fmt_epoch(obj.end_time)
-
-
-@admin.register(SeasonConfig)
-class SeasonConfigAdmin(admin.ModelAdmin):
-    list_display = ["default_duration_days", "auto_rotate", "freshness_top_n"]
-
-
-@admin.register(SeasonResetProxy)
-class SeasonResetAdmin(admin.ModelAdmin):
-    """代理模型 Admin，点击后跳转到赛季重置确认页。"""
-
-    def has_add_permission(self, request):
-        return False
-
-    def has_change_permission(self, request, obj=None):
-        return False
-
-    def has_delete_permission(self, request, obj=None):
-        return False
-
-    def changelist_view(self, request, extra_context=None):
-        return redirect("leaderboard-season-reset-confirm")
-
-
-@admin.register(SeasonTestProxy)
-class SeasonTestAdmin(admin.ModelAdmin):
-    """代理模型 Admin，点击后跳转到赛季轮转测试面板。"""
-
-    def has_add_permission(self, request):
-        return False
-
-    def has_change_permission(self, request, obj=None):
-        return False
-
-    def has_delete_permission(self, request, obj=None):
-        return False
-
-    def changelist_view(self, request, extra_context=None):
-        return redirect("leaderboard-season-test")

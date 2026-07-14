@@ -8,8 +8,8 @@ class RegisterSerializer(serializers.Serializer):
     password = serializers.CharField(min_length=6, max_length=50)
 
     def validate_username(self, value):
-        if not re.match(r"^[a-zA-Z0-9_]+$", value):
-            raise serializers.ValidationError("用户名只能包含字母、数字和下划线")
+        if not re.match(r"^[\w一-鿿]+$", value):
+            raise serializers.ValidationError("用户名只能包含字母、数字、下划线和中文")
         if GameAccount.objects.filter(username=value).exists():
             raise serializers.ValidationError("用户名已存在")
         return value
@@ -25,8 +25,8 @@ class ConvertGuestSerializer(serializers.Serializer):
     new_password = serializers.CharField(min_length=6, max_length=50)
 
     def validate_new_username(self, value):
-        if not re.match(r"^[a-zA-Z0-9_]+$", value):
-            raise serializers.ValidationError("用户名只能包含字母、数字和下划线")
+        if not re.match(r"^[\w一-鿿]+$", value):
+            raise serializers.ValidationError("用户名只能包含字母、数字、下划线和中文")
         if GameAccount.objects.filter(username=value).exists():
             raise serializers.ValidationError("用户名已存在")
         return value

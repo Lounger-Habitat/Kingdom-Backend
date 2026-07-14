@@ -1,7 +1,7 @@
 """Backfill season_id on existing ReportEvent rows and current_season_id on PlayerState."""
 from django.core.management.base import BaseCommand
 from leaderboard.models import ReportEvent
-from leaderboard.season_service import get_active_season
+from season.season_service import get_active_season
 from player.models import PlayerState
 
 

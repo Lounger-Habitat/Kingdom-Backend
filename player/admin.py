@@ -3,7 +3,7 @@ from django.db.models import Count
 from django.shortcuts import render, redirect
 from django.urls import path
 from account.models import GameAccount
-from .models import PlayerState, PlayerRecipe, PlayerTitle, DefaultRecipe, PlayerResetProxy
+from .models import PlayerState, PlayerRecipe, PlayerTitle, DefaultRecipe, PlayerResetProxy, ActionPointCostConfig
 
 
 class PlayerRecipeInline(admin.TabularInline):
@@ -24,6 +24,7 @@ class PlayerTitleInline(admin.TabularInline):
 class PlayerStateAdmin(admin.ModelAdmin):
     list_display = [
         "player_id",
+        "player_name",
         "recipe_count",
         "action_points",
         "action_points_max",
@@ -36,6 +37,13 @@ class PlayerStateAdmin(admin.ModelAdmin):
     list_filter = ["season", "game_year", "current_season_id"]
     search_fields = ["player_id"]
     inlines = [PlayerRecipeInline, PlayerTitleInline]
+
+    @admin.display(description="玩家名称")
+    def player_name(self, obj):
+        if obj.player_id.isdigit():
+            account = GameAccount.objects.filter(id=int(obj.player_id)).first()
+            return account.username if account else obj.player_id
+        return obj.player_id
 
     @admin.display(description="菜谱数")
     def recipe_count(self, obj):
@@ -138,6 +146,13 @@ class PlayerTitleAdmin(admin.ModelAdmin):
             })
         context = {**self.admin_site.each_context(request), "players": player_list, "title": "选择玩家查看称号"}
         return render(request, "admin/player/playertitle/player_list.html", context)
+
+
+@admin.register(ActionPointCostConfig)
+class ActionPointCostConfigAdmin(admin.ModelAdmin):
+    list_display = ["cost_type", "cost_amount", "description"]
+    search_fields = ["cost_type"]
+    list_editable = ["cost_amount"]
 
 
 @admin.register(DefaultRecipe)

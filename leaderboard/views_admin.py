@@ -6,8 +6,9 @@ from django.db.models import Count
 from django.shortcuts import render, redirect
 from django.urls import reverse
 
-from .models import Season, LeaderboardEntry, ReportEvent, PendingReward
-from .season_service import full_reset_to_season_1, rotate_season, settle_and_transition_old_season
+from season.models import Season
+from leaderboard.models import LeaderboardEntry, ReportEvent, PendingReward
+from season.season_service import full_reset_to_season_1, rotate_season, settle_and_transition_old_season
 from player.models import PlayerState
 from cooking.models import PityCounter
 
@@ -30,6 +31,8 @@ def season_reset_confirm(request):
                     f"食谱重建: {stats.get('recipes_created', 0)}",
                     f"称号清除: {stats.get('titles_deleted', 0)}",
                     f"保底计数器重置: {stats.get('pity_counters_reset', 0)}",
+                    f"采集点覆盖清除: {stats.get('collection_overrides_deleted', 0)}",
+                    f"采集点等级重置: {stats.get('collection_points_reset', 0)}",
                 ]
                 messages.success(request, "全量重置完成！" + "；".join(parts))
             except Exception as e:
@@ -75,6 +78,16 @@ def season_test_panel(request):
                     messages.info(request, f"当前赛季 {new_season.season_id} 未到期，无需轮转。")
             except Exception as e:
                 messages.error(request, f"轮转失败: {e}")
+
+        elif action == "extend":
+            days = int(request.POST.get("days", 7))
+            season = Season.objects.filter(status="active").order_by("-sequence").first()
+            if season:
+                season.end_time += days * 86400
+                season.save(update_fields=["end_time"])
+                messages.success(request, f"已将 {season.season_id} 结束时间延长 {days} 天。")
+            else:
+                messages.error(request, "没有活跃的赛季。")
 
         elif action == "settle":
             try:

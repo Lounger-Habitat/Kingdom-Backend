@@ -13,8 +13,11 @@ class ItemSerializer(serializers.ModelSerializer):
     canCarried = serializers.BooleanField(source="can_carried")
     itemPrice = serializers.IntegerField(source="item_price")
     sellPercentage = serializers.FloatField(source="sell_percentage")
-    iconUrl = serializers.URLField(source="icon_url", allow_null=True, required=False)
+    iconUrl = serializers.SerializerMethodField()
     iconImage = serializers.SerializerMethodField()
+    useEffectType = serializers.CharField(source="use_effect_type")
+    useEffectData = serializers.JSONField(source="use_effect_data")
+    maxUseCount = serializers.IntegerField(source="max_use_count")
     isDeleted = serializers.BooleanField(source="is_deleted")
 
     class Meta:
@@ -22,8 +25,20 @@ class ItemSerializer(serializers.ModelSerializer):
         fields = [
             "itemID", "itemName", "itemType", "itemDescription",
             "itemUseRadius", "canPickedup", "canDropped", "canCarried",
-            "itemPrice", "sellPercentage", "iconUrl", "iconImage", "isDeleted",
+            "itemPrice", "sellPercentage", "iconUrl", "iconImage",
+            "useEffectType", "useEffectData", "maxUseCount", "isDeleted",
         ]
+
+    def get_iconUrl(self, obj):
+        # 优先用 icon_url，没有则兜底到 icon_image
+        if obj.icon_url:
+            return obj.icon_url
+        if obj.icon_image:
+            request = self.context.get("request")
+            if request:
+                return request.build_absolute_uri(obj.icon_image.url)
+            return obj.icon_image.url
+        return None
 
     def get_iconImage(self, obj):
         if obj.icon_image:

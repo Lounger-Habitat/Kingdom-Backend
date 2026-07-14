@@ -18,6 +18,7 @@ class ItemType(models.TextChoices):
     VEGETABLE = "蔬菜", "蔬菜"
     FRUIT = "水果", "水果"
     SEASONING = "调料类", "调料类"
+    USABLE = "Usable", "可使用"
 
 
 class Item(models.Model):
@@ -37,6 +38,9 @@ class Item(models.Model):
     collect_weight = models.IntegerField(default=100, help_text="采集权重，越大越容易被抽到")
     collect_min_amount = models.IntegerField(default=1, help_text="采集时最少获得数量")
     collect_max_amount = models.IntegerField(default=2, help_text="采集时最多获得数量")
+    use_effect_type = models.CharField(max_length=50, blank=True, default="", help_text="使用效果类型，如 unlock_recipe")
+    use_effect_data = models.JSONField(default=dict, blank=True, help_text="使用效果数据，如 {\"recipeName\": \"红烧肉\"}")
+    max_use_count = models.IntegerField(default=1, help_text="最大使用次数，-1 表示无限次")
     is_deleted = models.BooleanField(default=False)
     updated_at = models.DateTimeField(auto_now=True)
     created_at = models.DateTimeField(auto_now_add=True)
@@ -45,7 +49,7 @@ class Item(models.Model):
         ordering = ["item_id"]
 
     def save(self, *args, **kwargs):
-        if not self.pk and self.item_type == ItemType.FOOD:
+        if not self.pk and self.item_type in (ItemType.FOOD, ItemType.USABLE):
             self.collectable = False
         super().save(*args, **kwargs)
 

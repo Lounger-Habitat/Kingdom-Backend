@@ -1,8 +1,9 @@
+import json
 import uuid
 from django.contrib import messages
 from django.contrib.admin.views.decorators import staff_member_required
 from django.shortcuts import render, get_object_or_404, redirect
-from django.db.models import Count
+from django.db.models import Count, Max
 from account.models import GameAccount
 from items.models import Item
 from .models import InventoryBag, InventorySlot, BagTemplate, BagTemplateSlot
@@ -117,10 +118,15 @@ def bag_detail(request, player_id, bag_id):
     for slot in slots:
         slot.item_name = name_map.get(slot.item_id, "")
 
+    items = list(
+        Item.objects.filter(is_deleted=False).order_by("item_id").values("item_id", "item_name")
+    )
+
     return render(request, "inventory/admin/bag_detail.html", {
         "player": player,
         "bag": bag,
         "slots": slots,
+        "items_json": json.dumps(items, ensure_ascii=False),
         "title": f"背包管理 - {player.username} / {bag.character_id}",
         "opts": InventoryBag._meta,
     })
@@ -148,6 +154,9 @@ def _init_missing_npc_bags(player):
             money=tmpl.money,
         )
         for slot in tmpl.slots.select_related("item").all():
+            remaining_uses = None
+            if slot.item and slot.item.item_type == "Usable":
+                remaining_uses = slot.item.max_use_count
             InventorySlot.objects.create(
                 bag=bag,
                 slot_index=slot.slot_index,
@@ -158,10 +167,11 @@ def _init_missing_npc_bags(player):
                 rating_price=slot.rating_price,
                 overall_score=slot.overall_score,
                 ingredient=slot.ingredient,
-                item_bag_name=slot.item.item_name if slot.item else "",
+                item_bag_name=f"{slot.item.item_name}_{slot.slot_index}" if slot.item else "",
                 cook_time=slot.cook_time,
                 dish_quality=slot.dish_quality,
                 hide_in_shop=slot.hide_in_shop,
+                remaining_uses=remaining_uses,
             )
         created += 1
     return created
@@ -181,20 +191,23 @@ def _save_slots(request, bag):
             slot.item_amount = int(request.POST.get(f"{prefix}_item_amount", 0))
             slot.rated = request.POST.get(f"{prefix}_rated") == "on"
             slot.rating_price = int(request.POST.get(f"{prefix}_rating_price", -1))
-            slot.overall_score = int(request.POST.get(f"{prefix}_overall_score", 0))
+            slot.overall_score = float(request.POST.get(f"{prefix}_overall_score", 0))
             slot.ingredient = request.POST.get(f"{prefix}_ingredient", "")
             slot.item_bag_name = request.POST.get(f"{prefix}_item_bag_name", "")
             slot.cook_time = int(request.POST.get(f"{prefix}_cook_time", 0))
             slot.dish_quality = int(request.POST.get(f"{prefix}_dish_quality", 3))
             slot.hide_in_shop = request.POST.get(f"{prefix}_hide_in_shop") == "on"
+            remaining_uses_raw = request.POST.get(f"{prefix}_remaining_uses", "").strip()
+            slot.remaining_uses = int(remaining_uses_raw) if remaining_uses_raw != "" else None
             slot.save()
         except (ValueError, TypeError):
             continue
 
 
 def _add_slot(request, bag):
-    max_index = bag.slots.count()
-    InventorySlot.objects.create(bag=bag, slot_index=max_index)
+    result = bag.slots.aggregate(max_idx=Max("slot_index"))
+    next_index = (result["max_idx"] or -1) + 1
+    InventorySlot.objects.create(bag=bag, slot_index=next_index)
 
 
 def _delete_slot(request, bag):

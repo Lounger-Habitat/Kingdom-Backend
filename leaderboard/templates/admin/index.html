@@ -1,0 +1,32 @@
+{% extends "admin/index.html" %}
+{% load i18n static %}
+
+{% block sidebar %}
+{{ block.super }}
+<div id="quick-actions-module" class="module" style="margin-top: 20px;">
+    <h2>快捷操作</h2>
+    <ul class="actionlist" style="list-style: none; padding: 0; margin: 0;">
+        <li style="padding: 8px 10px; border-bottom: 1px solid #eee;">
+            <a href="{% url 'leaderboard-season-test' %}" style="color: #417690; text-decoration: none; font-weight: bold;">
+                赛季轮转测试
+            </a>
+            <br>
+            <span class="mini quiet">延长赛季、轮转、结算等操作</span>
+        </li>
+        <li style="padding: 8px 10px; border-bottom: 1px solid #eee;">
+            <a href="{% url 'leaderboard-season-reset-confirm' %}" style="color: #417690; text-decoration: none; font-weight: bold;">
+                赛季重置
+            </a>
+            <br>
+            <span class="mini quiet">全量重置回第一赛季</span>
+        </li>
+        <li style="padding: 8px 10px; border-bottom: 1px solid #eee;">
+            <a href="{% url 'player-admin-reset-list' %}" style="color: #417690; text-decoration: none; font-weight: bold;">
+                玩家重置
+            </a>
+            <br>
+            <span class="mini quiet">重置单个玩家数据</span>
+        </li>
+    </ul>
+</div>
+{% endblock %}

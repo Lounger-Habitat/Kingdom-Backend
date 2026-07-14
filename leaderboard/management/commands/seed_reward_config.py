@@ -23,7 +23,7 @@ class Command(BaseCommand):
              "rank_min": 2, "rank_max": 3, "reward_type": "actionPoint", "reward_data": {"amount": 10}},
             # 极鲜榜 - 每日结算
             {"board_type": BoardType.FRESHNESS, "settlement_type": SettlementType.DAILY,
-             "rank_min": 1, "rank_max": 1, "reward_type": "actionPoint", "reward_data": {"amount": 20}},
+             "rank_min": 1, "rank_max": 1, "reward_type": "randomRecipe", "reward_data": {}},
             {"board_type": BoardType.FRESHNESS, "settlement_type": SettlementType.DAILY,
              "rank_min": 1, "rank_max": 1, "reward_type": "title", "reward_data": {"titleId": "daily_fresh_1", "titleName": "极鲜之王"}},
             {"board_type": BoardType.FRESHNESS, "settlement_type": SettlementType.DAILY,

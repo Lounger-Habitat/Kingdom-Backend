@@ -8,7 +8,12 @@ from .serializers import ItemSerializer
 
 
 def _items_response(items, request=None, status_code=200):
-    timestamp = int(time.time() * 1000)
+    from django.db.models import Max
+    max_updated = items.aggregate(Max("updated_at"))["updated_at__max"]
+    if max_updated is not None:
+        timestamp = int(max_updated.timestamp() * 1000)
+    else:
+        timestamp = int(time.time() * 1000)
     serialized = ItemSerializer(items, many=True, context={"request": request}).data
     return Response({
         "code": status_code,
@@ -55,6 +60,9 @@ def item_upload(request):
         "itemPrice": "item_price",
         "sellPercentage": "sell_percentage",
         "iconUrl": "icon_url",
+        "useEffectType": "use_effect_type",
+        "useEffectData": "use_effect_data",
+        "maxUseCount": "max_use_count",
         "isDeleted": "is_deleted",
     }
 

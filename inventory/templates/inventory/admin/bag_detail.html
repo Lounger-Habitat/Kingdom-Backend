@@ -47,7 +47,7 @@
                 <thead>
                     <tr>
                         <th scope="col" style="width: 60px;">格位</th>
-                        <th scope="col" style="width: 80px;">物品ID</th>
+                        <th scope="col" style="width: 170px;">物品</th>
                         <th scope="col">物品名称</th>
                         <th scope="col" style="width: 80px;">数量</th>
                         <th scope="col" style="width: 60px;">已评价</th>
@@ -58,6 +58,7 @@
                         <th scope="col" style="width: 80px;">烹饪时长</th>
                         <th scope="col" style="width: 80px;">品质</th>
                         <th scope="col" style="width: 80px;">商店隐藏</th>
+                        <th scope="col" style="width: 80px;">剩余次数</th>
                         <th scope="col" style="width: 60px;">操作</th>
                     </tr>
                 </thead>
@@ -67,8 +68,15 @@
                         <td>{{ slot.slot_index }}</td>
                         <td>
                             <input type="hidden" name="slot_id" value="{{ slot.pk }}" />
-                            <input type="number" name="slot_{{ slot.pk }}_item_id"
-                                   value="{{ slot.item_id }}" style="width: 70px;" />
+                            <input type="hidden" name="slot_{{ slot.pk }}_item_id" class="item-id-hidden"
+                                   value="{{ slot.item_id }}" />
+                            <div class="combo" data-slot="{{ slot.pk }}">
+                                <input type="text" class="combo-input"
+                                       value="{% if slot.item_id != 0 %}[{{ slot.item_id }}] {{ slot.item_name }}{% endif %}"
+                                       placeholder="输入搜索物品..."
+                                       autocomplete="off" />
+                                <div class="combo-dropdown"></div>
+                            </div>
                         </td>
                         <td>
                             {% if slot.item_id != 0 %}
@@ -95,7 +103,7 @@
                         </td>
                         <td>
                             <input type="number" name="slot_{{ slot.pk }}_overall_score"
-                                   value="{{ slot.overall_score }}" style="width: 60px;" min="0" max="100" />
+                                   value="{{ slot.overall_score }}" style="width: 60px;" min="0" max="100" step="0.1" />
                         </td>
                         <td>
                             <input type="text" name="slot_{{ slot.pk }}_ingredient"
@@ -124,6 +132,12 @@
                                    {% if slot.hide_in_shop %}checked{% endif %} />
                         </td>
                         <td>
+                            <input type="number" name="slot_{{ slot.pk }}_remaining_uses"
+                                   value="{{ slot.remaining_uses|default_if_none:'' }}"
+                                   placeholder="N/A"
+                                   style="width: 70px;" />
+                        </td>
+                        <td>
                             <button type="button" data-slot-id="{{ slot.pk }}"
                                     class="delete-slot-btn"
                                     style="color: #ba2121; background: none; border: none; cursor: pointer; text-decoration: underline;">
@@ -132,7 +146,7 @@
                         </td>
                     </tr>
                     {% empty %}
-                    <tr><td colspan="13" style="text-align: center; padding: 20px;">背包为空</td></tr>
+                    <tr><td colspan="14" style="text-align: center; padding: 20px;">背包为空</td></tr>
                     {% endfor %}
                 </tbody>
             </table>
@@ -168,6 +182,71 @@
 #slots-table th, #slots-table td {
     padding: 6px 8px;
 }
+
+/* combobox */
+.combo { position: relative; width: 170px; }
+.combo-input {
+    width: 100%;
+    padding: 3px 6px;
+    border: 1px solid #ccc;
+    border-radius: 2px;
+    font-size: 13px;
+    box-sizing: border-box;
+    background: #fff;
+    color: #333;
+}
+.combo-input:focus { border-color: #79aec8; outline: none; }
+.combo-dropdown {
+    display: none;
+    position: absolute;
+    z-index: 9999;
+    left: 0; top: 100%;
+    width: 260px;
+    max-height: 300px;
+    overflow-y: auto;
+    background: #fff;
+    color: #333;
+    border: 1px solid #79aec8;
+    border-top: none;
+    box-shadow: 0 4px 12px rgba(0,0,0,.15);
+}
+.combo-dropdown.open { display: block; }
+.combo-item {
+    padding: 5px 8px;
+    cursor: pointer;
+    font-size: 13px;
+    white-space: nowrap;
+    color: #333;
+}
+.combo-item:hover, .combo-item.active {
+    background: #79aec8;
+    color: #fff;
+}
+.combo-item-id { color: #888; font-size: 12px; margin-right: 4px; }
+.combo-item:hover .combo-item-id, .combo-item.active .combo-item-id { color: #dde; }
+
+/* dark mode */
+@media (prefers-color-scheme: dark) {
+    .combo-input {
+        background: #1a1a1a;
+        color: #e0e0e0;
+        border-color: #555;
+    }
+    .combo-input:focus { border-color: #79aec8; }
+    .combo-dropdown {
+        background: #2a2a2a;
+        color: #e0e0e0;
+        border-color: #555;
+        box-shadow: 0 4px 12px rgba(0,0,0,.5);
+    }
+    .combo-item { color: #e0e0e0; }
+    .combo-item-id { color: #888; }
+    .combo-item:hover, .combo-item.active {
+        background: #3a6e8a;
+        color: #fff;
+    }
+    .combo-item:hover .combo-item-id, .combo-item.active .combo-item-id { color: #bcd; }
+}
 </style>
 
 <script>
@@ -186,5 +265,119 @@ document.querySelectorAll('.delete-slot-btn').forEach(function(btn) {
         form.submit();
     });
 });
+
+// 可搜索下拉框 (combobox)
+(function() {
+    // 全局物品列表 [{id, name}]
+    var rawItems = {{ items_json|safe }};
+    var ALL_ITEMS = [{id: 0, name: '-- 空 --'}].concat(rawItems.map(function(it) {
+        return {id: it.item_id, name: it.item_name};
+    }));
+
+    function renderItems(list, dropdown, hiddenInput) {
+        dropdown.innerHTML = '';
+        list.forEach(function(item) {
+            var div = document.createElement('div');
+            div.className = 'combo-item' + (String(item.id) === hiddenInput.value ? ' active' : '');
+            div.innerHTML = '<span class="combo-item-id">[' + item.id + ']</span> ' + item.name;
+            div.dataset.id = item.id;
+            div.dataset.name = item.name;
+            dropdown.appendChild(div);
+        });
+    }
+
+    document.querySelectorAll('.combo').forEach(function(combo) {
+        var input = combo.querySelector('.combo-input');
+        var dropdown = combo.querySelector('.combo-dropdown');
+        var hiddenInput = combo.previousElementSibling; // the hidden item_id input
+        var activeIndex = -1;
+
+        function openDropdown(keyword) {
+            var kw = (keyword || '').trim().toLowerCase();
+            var filtered = ALL_ITEMS;
+            if (kw) {
+                filtered = ALL_ITEMS.filter(function(it) {
+                    return it.id === 0 ||
+                           String(it.id).indexOf(kw) !== -1 ||
+                           it.name.toLowerCase().indexOf(kw) !== -1;
+                });
+            }
+            if (filtered.length === 0) {
+                dropdown.innerHTML = '<div class="combo-item" style="color:#999;cursor:default;">无匹配物品</div>';
+            } else {
+                renderItems(filtered, dropdown, hiddenInput);
+            }
+            activeIndex = -1;
+            dropdown.classList.add('open');
+        }
+
+        function closeDropdown() {
+            dropdown.classList.remove('open');
+            activeIndex = -1;
+        }
+
+        function selectItem(id, name) {
+            hiddenInput.value = id;
+            input.value = id === 0 ? '' : '[' + id + '] ' + name;
+            closeDropdown();
+        }
+
+        // 聚焦时打开
+        input.addEventListener('focus', function() {
+            openDropdown(input.value);
+        });
+
+        // 输入时过滤
+        input.addEventListener('input', function() {
+            openDropdown(input.value);
+        });
+
+        // 点击选项
+        dropdown.addEventListener('mousedown', function(e) {
+            var item = e.target.closest('.combo-item');
+            if (item && item.dataset.id !== undefined) {
+                selectItem(parseInt(item.dataset.id), item.dataset.name);
+                e.preventDefault();
+            }
+        });
+
+        // 键盘导航
+        input.addEventListener('keydown', function(e) {
+            var items = dropdown.querySelectorAll('.combo-item[data-id]');
+            if (!dropdown.classList.contains('open') || items.length === 0) return;
+
+            if (e.key === 'ArrowDown') {
+                e.preventDefault();
+                activeIndex = Math.min(activeIndex + 1, items.length - 1);
+                updateActive(items);
+            } else if (e.key === 'ArrowUp') {
+                e.preventDefault();
+                activeIndex = Math.max(activeIndex - 1, 0);
+                updateActive(items);
+            } else if (e.key === 'Enter') {
+                e.preventDefault();
+                if (activeIndex >= 0 && activeIndex < items.length) {
+                    selectItem(parseInt(items[activeIndex].dataset.id), items[activeIndex].dataset.name);
+                }
+            } else if (e.key === 'Escape') {
+                closeDropdown();
+            }
+        });
+
+        function updateActive(items) {
+            items.forEach(function(el, i) {
+                el.classList.toggle('active', i === activeIndex);
+            });
+            if (activeIndex >= 0 && items[activeIndex]) {
+                items[activeIndex].scrollIntoView({block: 'nearest'});
+            }
+        }
+
+        // 失焦关闭
+        input.addEventListener('blur', function() {
+            setTimeout(closeDropdown, 150);
+        });
+    });
+})();
 </script>
 {% endblock %}

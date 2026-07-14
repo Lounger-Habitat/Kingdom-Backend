@@ -84,7 +84,7 @@ def _reset_inventory(account):
                 rating_price=slot.rating_price,
                 overall_score=slot.overall_score,
                 ingredient=slot.ingredient,
-                item_bag_name=slot.item.item_name if slot.item else "",
+                item_bag_name=f"{slot.item.item_name}_{slot.slot_index}" if slot.item else "",
                 cook_time=slot.cook_time,
                 dish_quality=slot.dish_quality,
             )
@@ -104,6 +104,7 @@ def _reset_money(account):
         cid = "player" if bag.character_id == account.username else bag.character_id
         tmpl_money = templates.get(cid, 0)
         bag.money = tmpl_money
+        bag._money_change_source = "player_reset"
         bag.save(update_fields=["money"])
         if cid == "player":
             reset_money = tmpl_money

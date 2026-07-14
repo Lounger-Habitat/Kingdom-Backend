@@ -1,6 +1,6 @@
 """Management command: full reset all data back to season_1."""
 from django.core.management.base import BaseCommand
-from leaderboard.season_service import full_reset_to_season_1
+from season.season_service import full_reset_to_season_1
 
 
 class Command(BaseCommand):
