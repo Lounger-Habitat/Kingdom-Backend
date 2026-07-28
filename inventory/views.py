@@ -1,4 +1,4 @@
-import uuid
+﻿import uuid
 import random
 from django.db import transaction
 from django.db.models import Max
@@ -9,11 +9,12 @@ from .models import (
     InventoryBag, InventorySlot, BagTemplate, BagTemplateSlot,
     CollectionPoint, CollectionPointLevel, CollectionPointLevelItem,
     CollectionPointUpgradeItemCost, PlayerCollectionPoint, PlayerCollectionOverride,
-    AiConfig,
+    AiConfig, NpcGlobalInventory, NpcGlobalInventorySlot,
 )
 from .serializers import (
     success_response, dual_bag_response, error_response, serialize_bag,
     InventoryResponseSerializer, DualBagResponseSerializer, ErrorResponseSerializer,
+    serialize_npc_global_bag,
 )
 from items.models import Item, ItemType
 
@@ -1232,7 +1233,6 @@ def _report_judge_confirmed(player_id, item_id, item_name, overall_score, commen
         season_id=season_id,
     )
 
-    refresh_leaderboard(BoardType.FRESHNESS, season_id, game_day)
     refresh_leaderboard(BoardType.TOTAL_FRESHNESS, season_id)
 
 
@@ -1610,3 +1610,241 @@ def inventory_judge_by_agent(request, character_id):
             "bagData": serialize_bag(bag),
         }
     })
+
+
+# ─────────────── NPC 全局库存 API ───────────────
+
+
+@api_view(["GET"])
+def npc_global_inventory_detail(request, character_id):
+    """获取NPC全局库存。Env Server启动时调用加载库存。"""
+    try:
+        bag = NpcGlobalInventory.objects.get(character_id=character_id)
+    except NpcGlobalInventory.DoesNotExist:
+        # 从BagTemplate初始化
+        bag = _init_npc_global_from_template(character_id)
+        if bag is None:
+            return Response(error_response(f"NPC {character_id} 无模板数据"))
+    return Response({
+        "success": True,
+        "message": "获取成功",
+        "data": serialize_npc_global_bag(bag),
+    })
+
+
+@api_view(["PUT"])
+@transaction.atomic
+def npc_global_inventory_update(request, character_id):
+    """更新NPC全局库存（Env Server交易后写回）。
+
+    请求体: {"money": 100, "items": [{"slotIndex": 0, "itemId": 1, "itemAmount": 5, ...}, ...]}
+    """
+    bag, _ = NpcGlobalInventory.objects.get_or_create(character_id=character_id)
+    money = request.data.get("money")
+    if money is not None:
+        bag.money = money
+        bag.save()
+
+    items = request.data.get("items")
+    if items is not None:
+        # 清除旧slots，全量写入
+        bag.slots.all().delete()
+        for item_data in items:
+            NpcGlobalInventorySlot.objects.create(
+                bag=bag,
+                slot_index=item_data.get("slotIndex", 0),
+                item_id=item_data.get("itemId", 0),
+                item_amount=item_data.get("itemAmount", 0),
+                rated=item_data.get("rated", False),
+                rating_price=item_data.get("ratingPrice", -1),
+                overall_score=item_data.get("overallScore", 0),
+                ingredient=item_data.get("ingredient", ""),
+                item_bag_name=item_data.get("itemBagName", ""),
+                cook_time=item_data.get("cookTime", 0),
+                dish_quality=item_data.get("dishQuality", 3),
+                hide_in_shop=item_data.get("hideInShop", False),
+                remaining_uses=item_data.get("remainingUses"),
+                review_comment=item_data.get("reviewComment", ""),
+            )
+
+    return Response({
+        "success": True,
+        "message": "更新成功",
+        "data": serialize_npc_global_bag(bag),
+    })
+
+
+@api_view(["POST"])
+@transaction.atomic
+def npc_global_inventory_trade(request, character_id):
+    """NPC全局库存交易：玩家从NPC购买物品。
+
+    请求体: {"itemId": 1, "amount": 1, "playerPay": 100}
+    响应: {"success": true, "data": {"npcBag": {...}, "tradeMessage": "..."}}
+    """
+    try:
+        bag = NpcGlobalInventory.objects.select_for_update().get(character_id=character_id)
+    except NpcGlobalInventory.DoesNotExist:
+        return Response(error_response(f"NPC {character_id} 库存不存在"))
+
+    item_id = request.data.get("itemId")
+    amount = request.data.get("amount", 1)
+    player_pay = request.data.get("playerPay", 0)
+
+    if not item_id:
+        return Response(error_response("缺少itemId"))
+
+    slot = bag.slots.filter(item_id=item_id, item_amount__gt=0).first()
+    if not slot:
+        return Response(error_response("NPC没有该物品"))
+    if slot.item_amount < amount:
+        return Response(error_response("NPC库存不足"))
+
+    # 扣NPC库存
+    slot.item_amount -= amount
+    slot.save()
+    if slot.item_amount <= 0:
+        slot.delete()
+
+    # 加金币
+    bag.money += player_pay
+    bag.save()
+
+    return Response({
+        "success": True,
+        "data": {
+            "npcBag": serialize_npc_global_bag(bag),
+            "tradeMessage": f"交易成功，获得 {amount} 个物品",
+        }
+    })
+
+
+@api_view(["POST"])
+@transaction.atomic
+def npc_global_inventory_sell(request, character_id):
+    """玩家向NPC出售物品到全局库存。
+
+    请求体: {"itemId": 1, "amount": 1, "itemData": {...}, "npcPay": 50}
+    """
+    try:
+        bag = NpcGlobalInventory.objects.select_for_update().get(character_id=character_id)
+    except NpcGlobalInventory.DoesNotExist:
+        return Response(error_response(f"NPC {character_id} 库存不存在"))
+
+    item_id = request.data.get("itemId")
+    amount = request.data.get("amount", 1)
+    item_data = request.data.get("itemData", {})
+    npc_pay = request.data.get("npcPay", 0)
+
+    if not item_id:
+        return Response(error_response("缺少itemId"))
+
+    # 查找已有slot或创建新slot
+    slot = bag.slots.filter(item_id=item_id, item_amount__gt=0).first()
+    if slot:
+        slot.item_amount += amount
+        slot.save()
+    else:
+        max_idx = bag.slots.aggregate(Max("slot_index"))["slot_index__max"]
+        next_idx = (max_idx + 1) if max_idx is not None else 0
+        NpcGlobalInventorySlot.objects.create(
+            bag=bag,
+            slot_index=next_idx,
+            item_id=item_id,
+            item_amount=amount,
+            item_bag_name=item_data.get("itemBagName", ""),
+            ingredient=item_data.get("ingredient", ""),
+            dish_quality=item_data.get("dishQuality", 3),
+        )
+
+    # 扣金币
+    bag.money = max(0, bag.money - npc_pay)
+    bag.save()
+
+    return Response({
+        "success": True,
+        "data": {
+            "npcBag": serialize_npc_global_bag(bag),
+            "tradeMessage": f"出售成功，获得 {npc_pay} 金币",
+        }
+    })
+
+
+@api_view(["POST"])
+@transaction.atomic
+def npc_global_inventory_restock(request):
+    """批量补充NPC库存到模板数量（凌晨4点重置时调用）。
+
+    请求体: {"characterIds": ["zhplb", "hmzs"]} 或 {} 表示全部
+    """
+    character_ids = request.data.get("characterIds", [])
+    templates = BagTemplate.objects.prefetch_related("slots__item").all()
+    if character_ids:
+        templates = templates.filter(character_id__in=character_ids)
+    templates = templates.exclude(character_id="player")
+
+    restocked = 0
+    for tmpl in templates:
+        bag, _ = NpcGlobalInventory.objects.select_for_update().get_or_create(
+            character_id=tmpl.character_id
+        )
+        for tmpl_slot in tmpl.slots.select_related("item").all():
+            if not tmpl_slot.item:
+                continue
+            existing = bag.slots.filter(item_id=tmpl_slot.item_id, item_amount__gt=0).first()
+            if existing:
+                deficit = tmpl_slot.item_amount - existing.item_amount
+                if deficit > 0:
+                    existing.item_amount = tmpl_slot.item_amount
+                    existing.save()
+            else:
+                max_idx = bag.slots.aggregate(Max("slot_index"))["slot_index__max"]
+                next_idx = (max_idx + 1) if max_idx is not None else 0
+                NpcGlobalInventorySlot.objects.create(
+                    bag=bag,
+                    slot_index=next_idx,
+                    item_id=tmpl_slot.item_id,
+                    item_amount=tmpl_slot.item_amount,
+                    rated=tmpl_slot.rated,
+                    rating_price=tmpl_slot.rating_price,
+                    overall_score=tmpl_slot.overall_score,
+                    ingredient=tmpl_slot.ingredient,
+                    item_bag_name=f"{tmpl_slot.item.item_name}_{next_idx}",
+                    cook_time=tmpl_slot.cook_time,
+                    dish_quality=tmpl_slot.dish_quality,
+                    hide_in_shop=tmpl_slot.hide_in_shop,
+                )
+        restocked += 1
+
+    return Response({"success": True, "restocked": restocked})
+
+
+def _init_npc_global_from_template(character_id):
+    """从BagTemplate初始化NPC全局库存。"""
+    tmpl = BagTemplate.objects.prefetch_related("slots__item").filter(character_id=character_id).first()
+    if not tmpl:
+        return None
+
+    bag = NpcGlobalInventory.objects.create(character_id=character_id, money=tmpl.money)
+    for tmpl_slot in tmpl.slots.select_related("item").all():
+        if not tmpl_slot.item:
+            continue
+        remaining_uses = None
+        if tmpl_slot.item.item_type == "Usable":
+            remaining_uses = tmpl_slot.item.max_use_count
+        NpcGlobalInventorySlot.objects.create(
+            bag=bag,
+            slot_index=tmpl_slot.slot_index,
+            item_id=tmpl_slot.item_id,
+            item_amount=tmpl_slot.item_amount,
+            rated=tmpl_slot.rated,
+            rating_price=tmpl_slot.rating_price,
+            overall_score=tmpl_slot.overall_score,
+            ingredient=tmpl_slot.ingredient,
+            item_bag_name=f"{tmpl_slot.item.item_name}_{tmpl_slot.slot_index}",
+            cook_time=tmpl_slot.cook_time,
+            dish_quality=tmpl_slot.dish_quality,
+            hide_in_shop=tmpl_slot.hide_in_shop,
+            remaining_uses=remaining_uses,
+        )
+    return bag

@@ -25,4 +25,11 @@ urlpatterns = [
     path("api/inventory/<str:character_id>/trade-with", views.inventory_trade_with, name="inventory-trade-with"),
     path("api/inventory/<str:character_id>/money", views.inventory_money, name="inventory-money"),
     path("api/inventory/<str:character_id>/compact", views.inventory_compact, name="inventory-compact"),
+
+    # NPC 全局库存 API
+    path("api/npc-inventory/restock", views.npc_global_inventory_restock, name="npc-global-inventory-restock"),
+    path("api/npc-inventory/<str:character_id>", views.npc_global_inventory_detail, name="npc-global-inventory-detail"),
+    path("api/npc-inventory/<str:character_id>/update", views.npc_global_inventory_update, name="npc-global-inventory-update"),
+    path("api/npc-inventory/<str:character_id>/trade", views.npc_global_inventory_trade, name="npc-global-inventory-trade"),
+    path("api/npc-inventory/<str:character_id>/sell", views.npc_global_inventory_sell, name="npc-global-inventory-sell"),
 ]

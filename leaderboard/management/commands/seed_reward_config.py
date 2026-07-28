@@ -7,26 +7,26 @@ class Command(BaseCommand):
 
     def handle(self, *args, **options):
         configs = [
-            # 富豪榜 - 每日结算
-            {"board_type": BoardType.WEALTH, "settlement_type": SettlementType.DAILY,
+            # 总富豪榜 - 每日结算
+            {"board_type": BoardType.TOTAL_WEALTH, "settlement_type": SettlementType.DAILY,
              "rank_min": 1, "rank_max": 1, "reward_type": "actionPoint", "reward_data": {"amount": 20}},
-            {"board_type": BoardType.WEALTH, "settlement_type": SettlementType.DAILY,
+            {"board_type": BoardType.TOTAL_WEALTH, "settlement_type": SettlementType.DAILY,
              "rank_min": 1, "rank_max": 1, "reward_type": "title", "reward_data": {"titleId": "daily_wealth_1", "titleName": "日进斗金"}},
-            {"board_type": BoardType.WEALTH, "settlement_type": SettlementType.DAILY,
+            {"board_type": BoardType.TOTAL_WEALTH, "settlement_type": SettlementType.DAILY,
              "rank_min": 2, "rank_max": 3, "reward_type": "actionPoint", "reward_data": {"amount": 10}},
-            # 产量榜 - 每日结算
-            {"board_type": BoardType.OUTPUT, "settlement_type": SettlementType.DAILY,
+            # 总产量榜 - 每日结算
+            {"board_type": BoardType.TOTAL_OUTPUT, "settlement_type": SettlementType.DAILY,
              "rank_min": 1, "rank_max": 1, "reward_type": "actionPoint", "reward_data": {"amount": 20}},
-            {"board_type": BoardType.OUTPUT, "settlement_type": SettlementType.DAILY,
+            {"board_type": BoardType.TOTAL_OUTPUT, "settlement_type": SettlementType.DAILY,
              "rank_min": 1, "rank_max": 1, "reward_type": "title", "reward_data": {"titleId": "daily_output_1", "titleName": "产量之星"}},
-            {"board_type": BoardType.OUTPUT, "settlement_type": SettlementType.DAILY,
+            {"board_type": BoardType.TOTAL_OUTPUT, "settlement_type": SettlementType.DAILY,
              "rank_min": 2, "rank_max": 3, "reward_type": "actionPoint", "reward_data": {"amount": 10}},
-            # 极鲜榜 - 每日结算
-            {"board_type": BoardType.FRESHNESS, "settlement_type": SettlementType.DAILY,
+            # 总极鲜榜 - 每日结算
+            {"board_type": BoardType.TOTAL_FRESHNESS, "settlement_type": SettlementType.DAILY,
              "rank_min": 1, "rank_max": 1, "reward_type": "randomRecipe", "reward_data": {}},
-            {"board_type": BoardType.FRESHNESS, "settlement_type": SettlementType.DAILY,
+            {"board_type": BoardType.TOTAL_FRESHNESS, "settlement_type": SettlementType.DAILY,
              "rank_min": 1, "rank_max": 1, "reward_type": "title", "reward_data": {"titleId": "daily_fresh_1", "titleName": "极鲜之王"}},
-            {"board_type": BoardType.FRESHNESS, "settlement_type": SettlementType.DAILY,
+            {"board_type": BoardType.TOTAL_FRESHNESS, "settlement_type": SettlementType.DAILY,
              "rank_min": 2, "rank_max": 3, "reward_type": "actionPoint", "reward_data": {"amount": 10}},
         ]
 

@@ -317,10 +317,8 @@ def report_event(request):
 
     # 实时刷新对应的 LeaderboardEntry
     if event_type == "cook_completed":
-        refresh_leaderboard(BoardType.OUTPUT, season_id, game_day)
         refresh_leaderboard(BoardType.TOTAL_OUTPUT, season_id)
     elif event_type == "judge_confirmed":
-        refresh_leaderboard(BoardType.FRESHNESS, season_id, game_day)
         refresh_leaderboard(BoardType.TOTAL_FRESHNESS, season_id)
 
     return Response({"success": True, "message": "event recorded"})
@@ -361,10 +359,8 @@ def report_batch(request):
 
     # 批量上报完成后，统一刷新一次对应的 LeaderboardEntry
     if "cook_completed" in event_types_seen:
-        refresh_leaderboard(BoardType.OUTPUT, season_id, game_day)
         refresh_leaderboard(BoardType.TOTAL_OUTPUT, season_id)
     if "judge_confirmed" in event_types_seen:
-        refresh_leaderboard(BoardType.FRESHNESS, season_id, game_day)
         refresh_leaderboard(BoardType.TOTAL_FRESHNESS, season_id)
 
     if failed_indices:

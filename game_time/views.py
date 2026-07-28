@@ -307,3 +307,130 @@ def season_refresh(request):
         "message": "season refreshed",
         "data": build_season_time_response(player, new_season),
     })
+
+
+# ─────────────── 全局游戏时间 API（Env Server专用） ───────────────
+
+from .models import GlobalGameTimeState
+
+
+@api_view(["GET"])
+def global_time_get(request):
+    """获取全服统一游戏时间。Env Server启动时调用。"""
+    state = GlobalGameTimeState.get_instance()
+    return Response({
+        "success": True,
+        "data": {
+            "game_year": state.game_year,
+            "game_month": state.game_month,
+            "game_day": state.game_day,
+            "game_hour": state.game_hour,
+            "game_minute": state.game_minute,
+            "season": state.season,
+            "total_game_days": state.total_game_days,
+            "current_season_id": state.current_season_id,
+        }
+    })
+
+
+@api_view(["PUT"])
+def global_time_update(request):
+    """更新全服统一游戏时间。Env Server推进时间后调用。
+
+    请求体: {"game_year": 2026, "game_month": 3, "game_day": 9, "game_hour": 8, "game_minute": 30, "season": 0, "total_game_days": 2, "current_season_id": "s1"}
+    """
+    state = GlobalGameTimeState.get_instance()
+
+    for field in ["game_year", "game_month", "game_day", "game_hour", "game_minute", "season", "total_game_days", "current_season_id"]:
+        val = request.data.get(field)
+        if val is not None:
+            setattr(state, field, val)
+
+    state.save()
+
+    return Response({
+        "success": True,
+        "data": {
+            "game_year": state.game_year,
+            "game_month": state.game_month,
+            "game_day": state.game_day,
+            "game_hour": state.game_hour,
+            "game_minute": state.game_minute,
+            "season": state.season,
+            "total_game_days": state.total_game_days,
+            "current_season_id": state.current_season_id,
+        }
+    })
+
+
+@api_view(["POST"])
+def global_time_day_advanced(request):
+    """全局日推进（Env Server专用）。推进天数、结算排行榜、补充NPC库存。
+
+    请求体: {"game_year": 2026, "game_month": 3, "game_day": 9, "game_hour": 7, "game_minute": 0, "season": 0}
+    """
+    from inventory.services import restock_npc_bags_global
+    from leaderboard.services import refresh_leaderboard
+
+    state = GlobalGameTimeState.get_instance()
+    current_season = check_and_rotate_season()
+
+    new_year = int(request.data.get("game_year", state.game_year))
+    new_month = int(request.data.get("game_month", state.game_month))
+    new_day = int(request.data.get("game_day", state.game_day))
+    new_hour = int(request.data.get("game_hour", state.game_hour))
+    new_minute = int(request.data.get("game_minute", state.game_minute))
+    season = int(request.data.get("season", state.season))
+
+    new_date = _safe_date(new_year, new_month, new_day)
+    old_date = _safe_date(state.game_year, state.game_month, state.game_day)
+    raw_delta = (new_date - old_date).days
+
+    state.game_year = new_date.year
+    state.game_month = new_date.month
+    state.game_day = new_date.day
+    state.game_hour = new_hour
+    state.game_minute = new_minute
+    state.season = season
+
+    day_delta = 1 if raw_delta > 0 else 0
+    state.total_game_days += day_delta
+    if state.total_game_days < 1:
+        state.total_game_days = 1
+    state.current_season_id = current_season.season_id
+    state.save()
+
+    max_days = SeasonConfig.get_instance().max_game_days
+
+    if day_delta > 0:
+        # 补充全局NPC库存
+        try:
+            restock_npc_bags_global()
+        except Exception:
+            logger.warning("restock_npc_bags_global failed", exc_info=True)
+
+        # 刷新排行榜
+        try:
+            refresh_leaderboard(season_id=current_season.season_id, game_day=state.total_game_days)
+        except Exception:
+            logger.warning("refresh_leaderboard failed", exc_info=True)
+
+    data = {
+        "game_year": state.game_year,
+        "game_month": state.game_month,
+        "game_day": state.game_day,
+        "game_hour": state.game_hour,
+        "game_minute": state.game_minute,
+        "season": state.season,
+        "total_game_days": state.total_game_days,
+        "day_delta": day_delta,
+        "max_game_days": max_days,
+        "seasonId": current_season.season_id,
+        "seasonEndTime": current_season.end_time,
+    }
+
+    return Response({
+        "success": True,
+        "message": "day advanced",
+        "data": data,
+    })

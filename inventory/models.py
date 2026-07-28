@@ -89,7 +89,6 @@ class InventoryBag(models.Model):
 
                 from leaderboard.services import refresh_leaderboard
                 from leaderboard.models import BoardType
-                refresh_leaderboard(BoardType.WEALTH, season_id, game_day)
                 refresh_leaderboard(BoardType.TOTAL_WEALTH, season_id)
             except Exception:
                 pass
@@ -284,3 +283,39 @@ class PlayerCollectionOverride(models.Model):
     def __str__(self):
         status = "排除" if self.is_excluded else "覆盖"
         return f"{self.player_collection_point} - {self.item.item_name} ({status})"
+
+
+class NpcGlobalInventory(models.Model):
+    """NPC全局库存（全服共享，不按玩家隔离）。"""
+    character_id = models.CharField(max_length=100, unique=True, help_text="NPC角色ID，如 zhplb、hmzs")
+    money = models.IntegerField(default=0)
+    updated_at = models.DateTimeField(auto_now=True)
+
+    def __str__(self):
+        return f"全局库存: {self.character_id} (money={self.money})"
+
+
+class NpcGlobalInventorySlot(models.Model):
+    """NPC全局库存的物品格位。"""
+    bag = models.ForeignKey(NpcGlobalInventory, on_delete=models.CASCADE, related_name="slots")
+    slot_index = models.IntegerField()
+    instance_id = models.UUIDField(default=uuid.uuid4, editable=False)
+    item_id = models.IntegerField(default=0)
+    item_amount = models.IntegerField(default=0)
+    rated = models.BooleanField(default=False)
+    rating_price = models.IntegerField(default=-1)
+    overall_score = models.FloatField(default=0)
+    ingredient = models.CharField(max_length=200, default="", blank=True)
+    item_bag_name = models.CharField(max_length=100, default="", blank=True)
+    cook_time = models.IntegerField(default=0)
+    dish_quality = models.IntegerField(default=3)
+    hide_in_shop = models.BooleanField(default=False)
+    remaining_uses = models.IntegerField(null=True, blank=True)
+    review_comment = models.TextField(default="", blank=True)
+
+    class Meta:
+        ordering = ["slot_index"]
+        unique_together = [("bag", "slot_index")]
+
+    def __str__(self):
+        return f"全局{self.bag.character_id}[{self.slot_index}] item={self.item_id} x{self.item_amount}"

@@ -20,127 +20,7 @@ def calculate_rankings_realtime(board_type, player_id=None, game_day=None, seaso
       - entries_list: list of dicts with rank, characterId, displayName, isAI, score, title, avatarId
       - my_rank_dict: dict with rank, score for the given player_id, or None
     """
-    if board_type == BoardType.WEALTH:
-        # 富豪榜日榜：使用 day_settlement 事件计算当日财富变化
-        scores = {}
-
-        if game_day is not None and game_day > 1:
-            prev_day = game_day - 1
-            prev_settlements = ReportEvent.objects.filter(
-                event_type="day_settlement", game_day=prev_day
-            )
-            prev_balance = {}
-            for ev in prev_settlements:
-                payload = ev.payload if isinstance(ev.payload, dict) else {}
-                prev_balance[ev.player_id] = payload.get("balance", 0)
-
-            curr_settlements = ReportEvent.objects.filter(
-                event_type="day_settlement", game_day=game_day
-            )
-            curr_balance = {}
-            for ev in curr_settlements:
-                payload = ev.payload if isinstance(ev.payload, dict) else {}
-                curr_balance[ev.player_id] = payload.get("balance", 0)
-
-            if curr_balance:
-                # 历史日：优先用两天结算数据差值；缺失前一天数据时回退到 day_start_money
-                for pid, curr in curr_balance.items():
-                    if pid in prev_balance:
-                        scores[pid] = curr - prev_balance[pid]
-                    else:
-                        try:
-                            ps = PlayerState.objects.get(player_id=pid)
-                            if ps.day_start_money_game_day == game_day:
-                                scores[pid] = curr - ps.day_start_money
-                        except PlayerState.DoesNotExist:
-                            pass
-                # 有 prev_balance 但无 curr_balance 的玩家：用当前背包计算
-                for pid, prev in prev_balance.items():
-                    if pid not in scores:
-                        try:
-                            account = GameAccount.objects.get(id=pid)
-                            bag = InventoryBag.objects.get(player_id=pid, character_id=account.username)
-                            scores[pid] = bag.money - prev
-                        except (GameAccount.DoesNotExist, InventoryBag.DoesNotExist):
-                            continue
-            elif prev_balance:
-                # 当日（尚未结算）：用当前背包金额 - 上一日结算快照
-                for pid, prev in prev_balance.items():
-                    try:
-                        account = GameAccount.objects.get(id=pid)
-                        bag = InventoryBag.objects.get(player_id=pid, character_id=account.username)
-                        scores[pid] = bag.money - prev
-                    except (GameAccount.DoesNotExist, InventoryBag.DoesNotExist):
-                        continue
-            else:
-                # 无任何结算数据：回退到 day_start_money
-                for ps in PlayerState.objects.filter(day_start_money_game_day=game_day):
-                    try:
-                        account = GameAccount.objects.get(id=ps.player_id)
-                        bag = InventoryBag.objects.get(player_id=ps.player_id, character_id=account.username)
-                        scores[ps.player_id] = bag.money - ps.day_start_money
-                    except (GameAccount.DoesNotExist, InventoryBag.DoesNotExist):
-                        continue
-
-        elif game_day == 1:
-            from inventory.models import BagTemplate
-            try:
-                player_tmpl = BagTemplate.objects.get(character_id="player")
-                initial_money = player_tmpl.money
-            except BagTemplate.DoesNotExist:
-                initial_money = 0
-
-            settlements = ReportEvent.objects.filter(event_type="day_settlement", game_day=1)
-            settlement_balance = {}
-            for ev in settlements:
-                payload = ev.payload if isinstance(ev.payload, dict) else {}
-                settlement_balance[ev.player_id] = payload.get("balance", 0)
-
-            # 用 BagTemplate 作为所有玩家的基准，再用 settlement 数据覆盖
-            for bag in InventoryBag.objects.filter(player__isnull=False, character_id=F("player__username")).values("player_id", "money"):
-                pid = str(bag["player_id"])
-                if pid in settlement_balance:
-                    scores[pid] = settlement_balance[pid] - initial_money
-                else:
-                    scores[pid] = bag["money"] - initial_money
-
-    elif board_type == BoardType.OUTPUT:
-        qs = ReportEvent.objects.filter(event_type="cook_completed")
-        if season_id:
-            qs = qs.filter(season_id=season_id)
-        if game_day is not None:
-            qs = qs.filter(game_day=game_day)
-        counts = qs.values("player_id").annotate(count=Count("id"))
-        scores = {c["player_id"]: c["count"] for c in counts}
-
-    elif board_type == BoardType.FRESHNESS:
-        top_n = SeasonConfig.get_instance().freshness_top_n
-        qs = ReportEvent.objects.filter(event_type="judge_confirmed")
-        if season_id:
-            qs = qs.filter(season_id=season_id)
-        if game_day is not None:
-            qs = qs.filter(game_day=game_day)
-        events = qs.values("player_id", "payload")
-        player_dishes = defaultdict(list)
-        for ev in events:
-            try:
-                payload = ev.get("payload", {})
-                if isinstance(payload, str):
-                    payload = json.loads(payload)
-                pid = ev["player_id"]
-                score = payload.get("judge_score", 0)
-                dish = payload.get("dish_name", "")
-                dishes = player_dishes[pid]
-                if len(dishes) < top_n:
-                    dishes.append((score, dish))
-                    dishes.sort(reverse=True)
-                elif score > dishes[-1][0]:
-                    dishes[-1] = (score, dish)
-                    dishes.sort(reverse=True)
-            except (json.JSONDecodeError, TypeError):
-                continue
-
-    elif board_type == BoardType.TOTAL_WEALTH:
+    if board_type == BoardType.TOTAL_WEALTH:
         scores = {}
         for bag in InventoryBag.objects.filter(
             player__isnull=False, character_id=F("player__username")
@@ -182,7 +62,7 @@ def calculate_rankings_realtime(board_type, player_id=None, game_day=None, seaso
     else:
         return [], None
 
-    is_freshness = board_type in (BoardType.FRESHNESS, BoardType.TOTAL_FRESHNESS)
+    is_freshness = board_type == BoardType.TOTAL_FRESHNESS
     if is_freshness:
         all_items = []
         for pid, dishes in player_dishes.items():
@@ -232,123 +112,7 @@ def calculate_rankings_realtime(board_type, player_id=None, game_day=None, seaso
 def calculate_rankings(board_type, season_id="default", game_day=None):
     """Calculate rankings for a given board type based on ReportEvents."""
 
-    if board_type == BoardType.WEALTH:
-        # 富豪榜日榜：使用 day_settlement 事件计算当日财富变化
-        scores = {}
-
-        if game_day is not None and game_day > 1:
-            prev_day = game_day - 1
-            prev_settlements = ReportEvent.objects.filter(
-                event_type="day_settlement", game_day=prev_day
-            )
-            prev_balance = {}
-            for ev in prev_settlements:
-                payload = ev.payload if isinstance(ev.payload, dict) else {}
-                prev_balance[ev.player_id] = payload.get("balance", 0)
-
-            curr_settlements = ReportEvent.objects.filter(
-                event_type="day_settlement", game_day=game_day
-            )
-            curr_balance = {}
-            for ev in curr_settlements:
-                payload = ev.payload if isinstance(ev.payload, dict) else {}
-                curr_balance[ev.player_id] = payload.get("balance", 0)
-
-            if curr_balance:
-                # 历史日：优先用两天结算数据差值；缺失前一天数据时回退到 day_start_money
-                for pid, curr in curr_balance.items():
-                    if pid in prev_balance:
-                        scores[pid] = curr - prev_balance[pid]
-                    else:
-                        try:
-                            ps = PlayerState.objects.get(player_id=pid)
-                            if ps.day_start_money_game_day == game_day:
-                                scores[pid] = curr - ps.day_start_money
-                        except PlayerState.DoesNotExist:
-                            pass
-                # 有 prev_balance 但无 curr_balance 的玩家：用当前背包计算
-                for pid, prev in prev_balance.items():
-                    if pid not in scores:
-                        try:
-                            account = GameAccount.objects.get(id=pid)
-                            bag = InventoryBag.objects.get(player_id=pid, character_id=account.username)
-                            scores[pid] = bag.money - prev
-                        except (GameAccount.DoesNotExist, InventoryBag.DoesNotExist):
-                            continue
-            elif prev_balance:
-                # 当日（尚未结算）：用当前背包金额 - 上一日结算快照
-                for pid, prev in prev_balance.items():
-                    try:
-                        account = GameAccount.objects.get(id=pid)
-                        bag = InventoryBag.objects.get(player_id=pid, character_id=account.username)
-                        scores[pid] = bag.money - prev
-                    except (GameAccount.DoesNotExist, InventoryBag.DoesNotExist):
-                        continue
-            else:
-                # 无任何结算数据：回退到 day_start_money
-                for ps in PlayerState.objects.filter(day_start_money_game_day=game_day):
-                    try:
-                        account = GameAccount.objects.get(id=ps.player_id)
-                        bag = InventoryBag.objects.get(player_id=ps.player_id, character_id=account.username)
-                        scores[ps.player_id] = bag.money - ps.day_start_money
-                    except (GameAccount.DoesNotExist, InventoryBag.DoesNotExist):
-                        continue
-
-        elif game_day == 1:
-            from inventory.models import BagTemplate
-            try:
-                player_tmpl = BagTemplate.objects.get(character_id="player")
-                initial_money = player_tmpl.money
-            except BagTemplate.DoesNotExist:
-                initial_money = 0
-
-            settlements = ReportEvent.objects.filter(event_type="day_settlement", game_day=1)
-            settlement_balance = {}
-            for ev in settlements:
-                payload = ev.payload if isinstance(ev.payload, dict) else {}
-                settlement_balance[ev.player_id] = payload.get("balance", 0)
-
-            # 用 BagTemplate 作为所有玩家的基准，再用 settlement 数据覆盖
-            for bag in InventoryBag.objects.filter(player__isnull=False, character_id=F("player__username")).values("player_id", "money"):
-                pid = str(bag["player_id"])
-                if pid in settlement_balance:
-                    scores[pid] = settlement_balance[pid] - initial_money
-                else:
-                    scores[pid] = bag["money"] - initial_money
-
-    elif board_type == BoardType.OUTPUT:
-        qs = ReportEvent.objects.filter(event_type="cook_completed", season_id=season_id)
-        if game_day is not None:
-            qs = qs.filter(game_day=game_day)
-        counts = qs.values("player_id").annotate(count=Count("id"))
-        scores = {c["player_id"]: c["count"] for c in counts}
-
-    elif board_type == BoardType.FRESHNESS:
-        top_n = SeasonConfig.get_instance().freshness_top_n
-        qs = ReportEvent.objects.filter(event_type="judge_confirmed", season_id=season_id)
-        if game_day is not None:
-            qs = qs.filter(game_day=game_day)
-        events = qs.values("player_id", "payload")
-        player_dishes = defaultdict(list)
-        for ev in events:
-            try:
-                payload = ev.get("payload", {})
-                if isinstance(payload, str):
-                    payload = json.loads(payload)
-                pid = ev["player_id"]
-                score = payload.get("judge_score", 0)
-                dish = payload.get("dish_name", "")
-                dishes = player_dishes[pid]
-                if len(dishes) < top_n:
-                    dishes.append((score, dish))
-                    dishes.sort(reverse=True)
-                elif score > dishes[-1][0]:
-                    dishes[-1] = (score, dish)
-                    dishes.sort(reverse=True)
-            except (json.JSONDecodeError, TypeError):
-                continue
-
-    elif board_type == BoardType.TOTAL_WEALTH:
+    if board_type == BoardType.TOTAL_WEALTH:
         scores = {}
         bag_qs = InventoryBag.objects.filter(
             player__isnull=False, character_id=F("player__username")
@@ -395,11 +159,6 @@ def calculate_rankings(board_type, season_id="default", game_day=None):
     else:
         return
 
-    # For WEALTH, only delete old entries if we have new data (valid snapshots).
-    # This preserves historical entries when snapshots are lost after day advance.
-    if board_type == BoardType.WEALTH and game_day is not None and not scores:
-        return
-
     # Clear existing entries for this board type + season to avoid duplicates
     is_total = board_type.startswith("total_")
     entry_game_day = None if is_total else game_day
@@ -414,7 +173,7 @@ def calculate_rankings(board_type, season_id="default", game_day=None):
     qs.delete()
 
     # Build ranked list: freshness boards use (pid, score, dish_name) tuples
-    is_freshness = board_type in (BoardType.FRESHNESS, BoardType.TOTAL_FRESHNESS)
+    is_freshness = board_type == BoardType.TOTAL_FRESHNESS
     if is_freshness:
         all_items = []
         for pid, dishes in player_dishes.items():

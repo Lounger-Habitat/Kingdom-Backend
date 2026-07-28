@@ -2,9 +2,6 @@ from django.db import models
 
 
 class BoardType(models.TextChoices):
-    WEALTH = "wealth", "富豪榜"
-    OUTPUT = "output", "产量榜"
-    FRESHNESS = "freshness", "极鲜榜"
     TOTAL_WEALTH = "total_wealth", "总富豪榜"
     TOTAL_OUTPUT = "total_output", "总产量榜"
     TOTAL_FRESHNESS = "total_freshness", "总极鲜榜"

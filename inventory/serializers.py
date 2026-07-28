@@ -89,3 +89,11 @@ class DualBagResponseSerializer(serializers.Serializer):
 class ErrorResponseSerializer(serializers.Serializer):
     success = serializers.BooleanField()
     message = serializers.CharField()
+
+
+def serialize_npc_global_bag(bag):
+    """Serialize an NpcGlobalInventory with all its slots."""
+    from .models import NpcGlobalInventorySlot
+    slots = bag.slots.all().order_by("slot_index")
+    items = InventorySlotSerializer(slots, many=True).data
+    return {"money": bag.money, "items": items}

@@ -144,3 +144,51 @@ def restock_npc_bags(player):
                             hide_in_shop=tmpl_slot.hide_in_shop,
                             remaining_uses=remaining_uses,
                         )
+
+
+def restock_npc_bags_global():
+    """全服统一补充NPC全局库存到模板数量（凌晨4点重置时调用）。"""
+    from .models import NpcGlobalInventory, NpcGlobalInventorySlot, BagTemplate
+
+    templates = {
+        t.character_id: t
+        for t in BagTemplate.objects.prefetch_related("slots__item").all()
+        if t.character_id != "player"
+    }
+    if not templates:
+        return
+
+    for character_id, tmpl in templates.items():
+        bag, _ = NpcGlobalInventory.objects.get_or_create(character_id=character_id)
+        for tmpl_slot in tmpl.slots.select_related("item").all():
+            if not tmpl_slot.item:
+                continue
+            existing = bag.slots.filter(item_id=tmpl_slot.item_id, item_amount__gt=0).first()
+            if existing:
+                deficit = tmpl_slot.item_amount - existing.item_amount
+                if deficit > 0:
+                    existing.item_amount = tmpl_slot.item_amount
+                    existing.hide_in_shop = tmpl_slot.hide_in_shop
+                    existing.save()
+            else:
+                from django.db.models import Max
+                max_idx = bag.slots.aggregate(Max("slot_index"))["slot_index__max"]
+                next_idx = (max_idx + 1) if max_idx is not None else 0
+                remaining_uses = None
+                if tmpl_slot.item.item_type == "Usable":
+                    remaining_uses = tmpl_slot.item.max_use_count
+                NpcGlobalInventorySlot.objects.create(
+                    bag=bag,
+                    slot_index=next_idx,
+                    item_id=tmpl_slot.item_id,
+                    item_amount=tmpl_slot.item_amount,
+                    rated=tmpl_slot.rated,
+                    rating_price=tmpl_slot.rating_price,
+                    overall_score=tmpl_slot.overall_score,
+                    ingredient=tmpl_slot.ingredient,
+                    item_bag_name=f"{tmpl_slot.item.item_name}_{next_idx}",
+                    cook_time=tmpl_slot.cook_time,
+                    dish_quality=tmpl_slot.dish_quality,
+                    hide_in_shop=tmpl_slot.hide_in_shop,
+                    remaining_uses=remaining_uses,
+                )

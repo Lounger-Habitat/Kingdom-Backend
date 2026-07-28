@@ -19,19 +19,13 @@ class Command(BaseCommand):
                 deleted_events += 1
 
         # 2. 删除极鲜榜中 score=100 的 LeaderboardEntry
-        deleted_entries_fresh = LeaderboardEntry.objects.filter(
-            board_type=BoardType.FRESHNESS, score=100
-        ).delete()[0]
-
         deleted_entries_total = LeaderboardEntry.objects.filter(
             board_type=BoardType.TOTAL_FRESHNESS, score=100
         ).delete()[0]
 
         self.stdout.write(f"删除 ReportEvent: {deleted_events} 条")
-        self.stdout.write(f"删除 FRESHNESS LeaderboardEntry: {deleted_entries_fresh} 条")
         self.stdout.write(f"删除 TOTAL_FRESHNESS LeaderboardEntry: {deleted_entries_total} 条")
 
         # 3. 刷新极鲜榜
-        refresh_leaderboard(BoardType.FRESHNESS)
         refresh_leaderboard(BoardType.TOTAL_FRESHNESS)
         self.stdout.write(self.style.SUCCESS("极鲜榜已刷新完成"))

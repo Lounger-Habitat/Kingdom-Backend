@@ -7,26 +7,26 @@ class Command(BaseCommand):
 
     def handle(self, *args, **options):
         configs = [
-            # 富豪榜 - 赛季结算
-            {"board_type": BoardType.WEALTH, "settlement_type": SettlementType.SEASON,
+            # 总富豪榜 - 赛季结算
+            {"board_type": BoardType.TOTAL_WEALTH, "settlement_type": SettlementType.SEASON,
              "rank_min": 1, "rank_max": 1, "reward_type": "actionPoint", "reward_data": {"amount": 50}},
-            {"board_type": BoardType.WEALTH, "settlement_type": SettlementType.SEASON,
+            {"board_type": BoardType.TOTAL_WEALTH, "settlement_type": SettlementType.SEASON,
              "rank_min": 1, "rank_max": 1, "reward_type": "title", "reward_data": {"titleId": "season_wealth_1", "titleName": "赛季首富"}},
-            {"board_type": BoardType.WEALTH, "settlement_type": SettlementType.SEASON,
+            {"board_type": BoardType.TOTAL_WEALTH, "settlement_type": SettlementType.SEASON,
              "rank_min": 2, "rank_max": 3, "reward_type": "actionPoint", "reward_data": {"amount": 30}},
-            # 产量榜 - 赛季结算
-            {"board_type": BoardType.OUTPUT, "settlement_type": SettlementType.SEASON,
+            # 总产量榜 - 赛季结算
+            {"board_type": BoardType.TOTAL_OUTPUT, "settlement_type": SettlementType.SEASON,
              "rank_min": 1, "rank_max": 1, "reward_type": "actionPoint", "reward_data": {"amount": 50}},
-            {"board_type": BoardType.OUTPUT, "settlement_type": SettlementType.SEASON,
+            {"board_type": BoardType.TOTAL_OUTPUT, "settlement_type": SettlementType.SEASON,
              "rank_min": 1, "rank_max": 1, "reward_type": "title", "reward_data": {"titleId": "season_output_1", "titleName": "赛季产量王"}},
-            {"board_type": BoardType.OUTPUT, "settlement_type": SettlementType.SEASON,
+            {"board_type": BoardType.TOTAL_OUTPUT, "settlement_type": SettlementType.SEASON,
              "rank_min": 2, "rank_max": 3, "reward_type": "actionPoint", "reward_data": {"amount": 30}},
-            # 极鲜榜 - 赛季结算
-            {"board_type": BoardType.FRESHNESS, "settlement_type": SettlementType.SEASON,
+            # 总极鲜榜 - 赛季结算
+            {"board_type": BoardType.TOTAL_FRESHNESS, "settlement_type": SettlementType.SEASON,
              "rank_min": 1, "rank_max": 1, "reward_type": "actionPoint", "reward_data": {"amount": 50}},
-            {"board_type": BoardType.FRESHNESS, "settlement_type": SettlementType.SEASON,
+            {"board_type": BoardType.TOTAL_FRESHNESS, "settlement_type": SettlementType.SEASON,
              "rank_min": 1, "rank_max": 1, "reward_type": "title", "reward_data": {"titleId": "season_fresh_1", "titleName": "赛季极鲜王"}},
-            {"board_type": BoardType.FRESHNESS, "settlement_type": SettlementType.SEASON,
+            {"board_type": BoardType.TOTAL_FRESHNESS, "settlement_type": SettlementType.SEASON,
              "rank_min": 2, "rank_max": 3, "reward_type": "actionPoint", "reward_data": {"amount": 30}},
         ]
 
