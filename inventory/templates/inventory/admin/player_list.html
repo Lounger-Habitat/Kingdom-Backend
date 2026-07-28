@@ -12,6 +12,13 @@
 {% block content %}
 <div id="content-main">
     <div class="module filtered" id="changelist">
+        <div style="margin: 10px 0; padding: 10px;">
+            <form method="post" style="display: inline;">
+                {% csrf_token %}
+                <input type="hidden" name="action" value="init_all_missing" />
+                <input type="submit" value="为所有玩家初始化缺失背包" style="padding: 6px 16px; background: #417690; color: #fff; border: none; cursor: pointer;" />
+            </form>
+        </div>
         <div id="toolbar">
             <form id="changelist-search" method="get">
                 <input type="text" size="40" name="q" value="{{ search }}" placeholder="搜索用户名..." />

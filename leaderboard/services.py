@@ -404,7 +404,10 @@ def calculate_rankings(board_type, season_id="default", game_day=None):
     is_total = board_type.startswith("total_")
     entry_game_day = None if is_total else game_day
     qs = LeaderboardEntry.objects.filter(board_type=board_type, season_id=season_id)
-    if entry_game_day is not None:
+    if is_total:
+        # 总榜：删除所有匹配的记录，无论 game_day 是否为 null
+        pass  # 不添加 game_day 过滤条件
+    elif entry_game_day is not None:
         qs = qs.filter(game_day=entry_game_day)
     else:
         qs = qs.filter(game_day__isnull=True)

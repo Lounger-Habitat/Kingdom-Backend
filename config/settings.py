@@ -38,6 +38,7 @@ INSTALLED_APPS = [
     "cooking",
     "restaurant",
     "marketplace",
+    "autobuy.apps.AutobuyConfig",
 ]
 
 MIDDLEWARE = [
@@ -88,6 +89,9 @@ else:
         "default": {
             "ENGINE": "django.db.backends.sqlite3",
             "NAME": BASE_DIR / "db.sqlite3",
+            "OPTIONS": {
+                "timeout": 30,  # 秒，等待锁释放
+            },
         }
     }
 
@@ -150,3 +154,28 @@ SPECTACULAR_SETTINGS = {
 AI_SERVICE_URL = os.environ.get("AI_SERVICE_URL", "")
 AI_API_KEY = os.environ.get("AI_API_KEY", "")
 AI_REQUEST_TIMEOUT = int(os.environ.get("AI_REQUEST_TIMEOUT", "30"))
+
+# Logging: suppress noisy runserver access logs for /game/time/sync
+import logging
+
+
+class _SuppressTimeSyncFilter(logging.Filter):
+    def filter(self, record):
+        return "/game/time/sync" not in record.getMessage()
+
+
+LOGGING = {
+    "version": 1,
+    "filters": {
+        "suppress_time_sync": {
+            "()": _SuppressTimeSyncFilter,
+        },
+    },
+    "loggers": {
+        "django.server": {
+            "level": "INFO",
+            "filters": ["suppress_time_sync"],
+            "propagate": True,
+        },
+    },
+}

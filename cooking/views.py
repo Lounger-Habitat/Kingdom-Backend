@@ -81,8 +81,6 @@ def pity_check(request):
     counter = PityCounter.get_or_create_for(request.user)
 
     with transaction.atomic():
-        # 锁定计数器行，防止并发问题
-        counter = PityCounter.objects.select_for_update().get(pk=counter.pk)
 
         # 各计数器 +1
         counter.count_4 += 1
@@ -192,7 +190,7 @@ def cook(request):
         ingredients.append({"itemId": int(item_id), "count": int(count)})
 
     with transaction.atomic():
-        bag = InventoryBag.objects.select_for_update().filter(
+        bag = InventoryBag.objects.filter(
             player=request.user, character_id=character_id
         ).first()
         if not bag:
@@ -203,7 +201,7 @@ def cook(request):
         for ing in ingredients:
             remaining = ing["count"]
             slots_for_item = list(
-                bag.slots.select_for_update().filter(item_id=ing["itemId"], item_amount__gt=0).order_by("slot_index")
+                bag.slots.filter(item_id=ing["itemId"], item_amount__gt=0).order_by("slot_index")
             )
             total_available = sum(s.item_amount for s in slots_for_item)
             if total_available < remaining:
@@ -435,7 +433,6 @@ def _apply_pity(user, recipe_id, quality, cook_time, default_cook_time):
     """
     config = PityConfig.get_config()
     counter = PityCounter.get_or_create_for(user)
-    counter = PityCounter.objects.select_for_update().get(pk=counter.pk)
 
     counter.count_4 += 1
     counter.count_5 += 1

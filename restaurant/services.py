@@ -254,7 +254,7 @@ class RestaurantService:
                     rating_price=menu_item.rating_price,
                     overall_score=menu_item.overall_score,
                     ingredient=menu_item.ingredient,
-                    item_bag_name=menu_item.item_bag_name or f"{menu_item.item_id}_{new_index}",
+                    item_bag_name=f"{menu_item.item_id}_{new_index}",
                     cook_time=menu_item.cook_time,
                     dish_quality=menu_item.dish_quality,
                 )
@@ -504,7 +504,9 @@ class RestaurantService:
                     slots = bag.slots.filter(item_id=item_id, item_amount__gt=0)
                     qualified = [s for s in slots if s.overall_score >= min_score]
                     if not qualified:
-                        return False, f"菜品{item_id}评分不足（需要>={min_score}）"
+                        item = Item.objects.filter(item_id=item_id).first()
+                        item_name = item.item_name if item else str(item_id)
+                        return False, f"菜品{item_name}评分不足（需要>={min_score}）"
                     # 扣评分最低的达标份，保留高分菜品
                     best_slot = min(qualified, key=lambda s: s.overall_score)
                     if best_slot.item_amount <= 1:
@@ -581,10 +583,14 @@ class RestaurantService:
                     min_score = req["minScore"]
                     slots = bag.slots.filter(item_id=item_id, item_amount__gt=0)
                     if not slots.exists():
-                        return False, f"背包中没有菜品{item_id}"
+                        item = Item.objects.filter(item_id=item_id).first()
+                        item_name = item.item_name if item else str(item_id)
+                        return False, f"背包中没有菜品{item_name}"
                     best_score = max(s.overall_score for s in slots)
                     if best_score < min_score:
-                        return False, f"菜品{item_id}评分不足（需要>={min_score}，当前{best_score}）"
+                        item = Item.objects.filter(item_id=item_id).first()
+                        item_name = item.item_name if item else str(item_id)
+                        return False, f"菜品{item_name}评分不足（需要>={min_score}，当前{best_score}）"
             except InventoryBag.DoesNotExist:
                 return False, "背包不存在"
 

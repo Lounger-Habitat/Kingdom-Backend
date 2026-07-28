@@ -3,7 +3,7 @@ import random
 from django.db import transaction
 from django.db.models import Max
 from drf_spectacular.utils import extend_schema
-from rest_framework.decorators import api_view
+from rest_framework.decorators import api_view, authentication_classes, permission_classes
 from rest_framework.response import Response
 from .models import (
     InventoryBag, InventorySlot, BagTemplate, BagTemplateSlot,
@@ -1202,6 +1202,40 @@ import httpx
 from django.conf import settings
 
 
+def _report_judge_confirmed(player_id, item_id, item_name, overall_score, comment):
+    """上报 judge_confirmed 事件并刷新极鲜榜排行榜。"""
+    from leaderboard.models import ReportEvent
+    from leaderboard.services import refresh_leaderboard, BoardType
+    from player.models import PlayerState
+
+    game_day = None
+    season_id = None
+    try:
+        state = PlayerState.objects.get(player_id=player_id)
+        game_day = state.total_game_days
+        season_id = state.current_season_id
+    except PlayerState.DoesNotExist:
+        pass
+
+    payload = {
+        "dish_id": item_id,
+        "dish_name": item_name or "",
+        "judge_score": overall_score,
+        "judge_comment": comment or "",
+    }
+
+    ReportEvent.objects.create(
+        player_id=str(player_id),
+        event_type="judge_confirmed",
+        payload=payload,
+        game_day=game_day,
+        season_id=season_id,
+    )
+
+    refresh_leaderboard(BoardType.FRESHNESS, season_id, game_day)
+    refresh_leaderboard(BoardType.TOTAL_FRESHNESS, season_id)
+
+
 def _calc_quality_price(base_price, dish_quality):
     """根据品质计算售价（与Unity端QualityPriceHelper逻辑一致）。"""
     coeffs = {1: 0.3, 2: 0.7, 3: 1.0, 4: 1.5, 5: 2.0, 6: 3.0}
@@ -1428,6 +1462,138 @@ def inventory_judge(request, character_id):
         # 扣除行动力
         player.action_points -= judge_cost
         player.save()
+
+    # 上报 judge_confirmed 事件（刷新极鲜榜）
+    _report_judge_confirmed(player_user.pk, slot.item_id, item_detail.item_name, overall_score, comment)
+
+    return Response({
+        "success": True,
+        "message": "点评成功",
+        "data": {
+            "instanceId": str(instance_id),
+            "comment": comment,
+            "ratingPrice": rating_price,
+            "overallScore": overall_score,
+            "scores": scores,
+            "customerFeedback": customer_feedback,
+            "actionPoints": player.action_points,
+            "actionPointsMax": player.action_points_max,
+            "bagData": serialize_bag(bag),
+        }
+    })
+
+
+@api_view(["POST"])
+@authentication_classes([])
+@permission_classes([])
+def inventory_judge_by_agent(request, character_id):
+    """Agent点评接口：接收Agent生成的评语和评分，后端计算总分和点评价值并保存。无需JWT认证。"""
+    from player.models import PlayerState
+    from recipes.models import Recipe
+
+    instance_id = request.data.get("instanceId")
+    comment = request.data.get("comment", "")
+    scores = request.data.get("scores", {})
+    customer_feedback = request.data.get("customerFeedback", "")
+
+    # 参数校验
+    if not instance_id:
+        return Response(error_response("缺少 instanceId"), status=400)
+    if not comment:
+        return Response(error_response("缺少 comment"), status=400)
+    required_scores = ["color", "aroma", "taste", "presentation"]
+    for key in required_scores:
+        if key not in scores:
+            return Response(error_response(f"缺少 scores.{key}"), status=400)
+
+    # 分数范围校验（1-10）
+    for key in required_scores:
+        val = scores[key]
+        if not isinstance(val, (int, float)) or val < 1 or val > 10:
+            return Response(error_response(f"scores.{key} 必须在 1-10 之间"), status=400)
+
+    # 通过 instanceId 查找物品所在背包，从而确定玩家
+    slot_obj = InventorySlot.objects.filter(instance_id=instance_id, item_amount__gt=0).first()
+    if not slot_obj:
+        return Response(error_response("物品未找到"), status=400)
+    bag = slot_obj.bag
+    player_user = bag.player
+    if not player_user:
+        return Response(error_response("无法确定物品所属玩家"), status=400)
+
+    slot = find_slot_by_instance(bag, instance_id)
+    if not slot:
+        return Response(error_response("物品未找到"), status=400)
+
+    # 获取物品详情
+    try:
+        item_detail = Item.objects.get(item_id=slot.item_id)
+    except Item.DoesNotExist:
+        return Response(error_response("物品详情不存在"), status=400)
+
+    # 验证是否食物
+    if item_detail.item_type != ItemType.FOOD:
+        return Response(error_response(f"{item_detail.item_name}不是食物，无法进行评价"), status=400)
+
+    # 验证是否已点评
+    if slot.rated:
+        return Response(error_response(f"{item_detail.item_name}都已经评价过了，选择其他菜品吧！"), status=400)
+
+    # 行动力检查
+    player, _ = PlayerState.objects.get_or_create(player_id=player_user.pk)
+    judge_cost = 2
+    if player.action_points < judge_cost:
+        return Response(error_response("行动力不足，无法点评"), status=400)
+
+    # 获取菜谱信息
+    recipe = Recipe.objects.filter(item_id=slot.item_id).first()
+
+    # 计算品质价格
+    base_price = round(item_detail.item_price * item_detail.sell_percentage)
+    quality_price = _calc_quality_price(base_price, slot.dish_quality)
+
+    # 由后端计算点评价值
+    rating_price = _calc_rating_price(quality_price, slot.dish_quality)
+
+    # 计算总分
+    difficulty = recipe.difficulty if recipe else 2
+    overall_score = _calc_overall_score(scores, difficulty)
+
+    # 保存结果
+    slot = find_slot_by_instance(bag, instance_id)
+    if not slot:
+        return Response(error_response("物品未找到（可能已被整理操作移除）"), status=400)
+
+    with transaction.atomic():
+        if slot.item_amount > 1:
+            InventorySlot.objects.filter(pk=slot.pk).update(item_amount=slot.item_amount - 1)
+            new_slot = find_empty_slot(bag)
+            new_slot.item_id = slot.item_id
+            new_slot.item_amount = 1
+            new_slot.rated = True
+            new_slot.rating_price = rating_price
+            new_slot.overall_score = overall_score
+            new_slot.ingredient = slot.ingredient
+            new_slot.item_bag_name = slot.item_bag_name
+            new_slot.cook_time = slot.cook_time
+            new_slot.dish_quality = slot.dish_quality
+            new_slot.hide_in_shop = slot.hide_in_shop
+            new_slot.review_comment = comment
+            new_slot.save()
+        else:
+            InventorySlot.objects.filter(pk=slot.pk).update(
+                rated=True,
+                rating_price=rating_price,
+                overall_score=overall_score,
+                review_comment=comment,
+            )
+
+        # 扣除行动力
+        player.action_points -= judge_cost
+        player.save()
+
+    # 上报 judge_confirmed 事件（刷新极鲜榜）
+    _report_judge_confirmed(player_user.pk, slot.item_id, item_detail.item_name, overall_score, comment)
 
     return Response({
         "success": True,

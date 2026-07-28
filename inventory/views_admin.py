@@ -13,6 +13,21 @@ from .services import init_player_bags
 @staff_member_required
 def player_list(request):
     """第一层：玩家列表，显示所有 GameAccount 及其背包数量。"""
+    if request.method == "POST" and request.POST.get("action") == "init_all_missing":
+        players = GameAccount.objects.all()
+        total_created = 0
+        updated_players = 0
+        for player in players:
+            created = _init_missing_npc_bags(player)
+            if created > 0:
+                total_created += created
+                updated_players += 1
+        if total_created > 0:
+            messages.success(request, f"已为 {updated_players} 个玩家补充 {total_created} 个缺失背包。")
+        else:
+            messages.info(request, "所有玩家的背包均已完整，无需补充。")
+        return redirect("inventory-admin-player-list")
+
     qs = GameAccount.objects.annotate(bag_count=Count("inventorybag"))
     search = request.GET.get("q", "").strip()
     if search:

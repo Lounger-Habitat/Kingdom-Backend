@@ -17,6 +17,7 @@ urlpatterns = [
     path("api/inventory/<str:character_id>/use", views.inventory_use, name="inventory-use"),
     path("api/inventory/<str:character_id>/rate", views.inventory_rate, name="inventory-rate"),
     path("api/inventory/<str:character_id>/judge", views.inventory_judge, name="inventory-judge"),
+    path("api/inventory/<str:character_id>/judge-by-agent", views.inventory_judge_by_agent, name="inventory-judge-by-agent"),
     path("api/inventory/<str:character_id>/remove", views.inventory_remove, name="inventory-remove"),
     path("api/inventory/<str:character_id>/swap", views.inventory_swap, name="inventory-swap"),
     path("api/inventory/<str:character_id>/trade", views.inventory_trade, name="inventory-trade"),
