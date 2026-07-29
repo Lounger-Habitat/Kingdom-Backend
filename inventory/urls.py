@@ -26,6 +26,9 @@ urlpatterns = [
     path("api/inventory/<str:character_id>/money", views.inventory_money, name="inventory-money"),
     path("api/inventory/<str:character_id>/compact", views.inventory_compact, name="inventory-compact"),
 
+    # Env Server 内部动作 API（service token only）
+    path("api/env/actions/npc-trade", views.env_npc_trade, name="env-npc-trade"),
+
     # NPC 全局库存 API
     path("api/npc-inventory/restock", views.npc_global_inventory_restock, name="npc-global-inventory-restock"),
     path("api/npc-inventory/<str:character_id>", views.npc_global_inventory_detail, name="npc-global-inventory-detail"),

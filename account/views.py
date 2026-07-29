@@ -2,13 +2,14 @@ import uuid
 import secrets
 
 from rest_framework import status
-from rest_framework.decorators import api_view, permission_classes
+from rest_framework.decorators import api_view, authentication_classes, permission_classes
 from rest_framework.permissions import AllowAny, IsAuthenticated
 from rest_framework.response import Response
 from rest_framework_simplejwt.tokens import RefreshToken
 
 from .models import GameAccount
 from .serializers import RegisterSerializer, LoginSerializer, ConvertGuestSerializer
+from .env_auth import EnvServerJWTAuthentication, validate_player_access_token
 from inventory.services import init_player_bags
 from player.models import PlayerState
 
@@ -146,3 +147,30 @@ def auth_refresh(request):
             {"code": 401, "message": "refresh token 无效或已过期"},
             status=status.HTTP_401_UNAUTHORIZED,
         )
+
+
+@api_view(["POST"])
+@authentication_classes([EnvServerJWTAuthentication])
+@permission_classes([IsAuthenticated])
+def env_verify_player(request):
+    """Verify a player's access token for a Direct WS session.
+
+    The Env Server is authenticated by the Authorization header.  The player
+    token is validated by SimpleJWT here, so Unity never treats a decoded JWT
+    payload as a trusted identity.
+    """
+    try:
+        account = validate_player_access_token(request.data.get("playerAccessToken"))
+    except Exception:
+        return Response(
+            {"success": False, "message": "玩家 token 无效或已过期"},
+            status=status.HTTP_401_UNAUTHORIZED,
+        )
+
+    return Response({
+        "success": True,
+        "data": {
+            "playerId": str(account.id),
+            "playerName": account.username,
+        },
+    })

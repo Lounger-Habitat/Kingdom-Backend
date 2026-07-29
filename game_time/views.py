@@ -2,7 +2,9 @@ import datetime
 import logging
 import time
 
-from rest_framework.decorators import api_view
+from django.db import transaction
+from rest_framework.decorators import api_view, authentication_classes, permission_classes
+from rest_framework.permissions import IsAuthenticated
 from rest_framework.response import Response
 
 from config.auth import get_player_id
@@ -19,6 +21,7 @@ from season.season_service import (
     build_season_time_response,
 )
 from season.models import SeasonConfig
+from account.env_auth import EnvServerJWTAuthentication
 
 
 logger = logging.getLogger(__name__)
@@ -315,6 +318,8 @@ from .models import GlobalGameTimeState
 
 
 @api_view(["GET"])
+@authentication_classes([EnvServerJWTAuthentication])
+@permission_classes([IsAuthenticated])
 def global_time_get(request):
     """获取全服统一游戏时间。Env Server启动时调用。"""
     state = GlobalGameTimeState.get_instance()
@@ -329,11 +334,14 @@ def global_time_get(request):
             "season": state.season,
             "total_game_days": state.total_game_days,
             "current_season_id": state.current_season_id,
+            "max_game_days": SeasonConfig.get_instance().max_game_days,
         }
     })
 
 
 @api_view(["PUT"])
+@authentication_classes([EnvServerJWTAuthentication])
+@permission_classes([IsAuthenticated])
 def global_time_update(request):
     """更新全服统一游戏时间。Env Server推进时间后调用。
 
@@ -364,6 +372,9 @@ def global_time_update(request):
 
 
 @api_view(["POST"])
+@authentication_classes([EnvServerJWTAuthentication])
+@permission_classes([IsAuthenticated])
+@transaction.atomic
 def global_time_day_advanced(request):
     """全局日推进（Env Server专用）。推进天数、结算排行榜、补充NPC库存。
 
@@ -372,7 +383,10 @@ def global_time_day_advanced(request):
     from inventory.services import restock_npc_bags_global
     from leaderboard.services import refresh_leaderboard
 
-    state = GlobalGameTimeState.get_instance()
+    # Lock the singleton row so two Env Server processes cannot both settle the
+    # same game day or restock the same shared inventory.
+    GlobalGameTimeState.get_instance()
+    state = GlobalGameTimeState.objects.select_for_update().get(pk=1)
     current_season = check_and_rotate_season()
 
     new_year = int(request.data.get("game_year", state.game_year))
@@ -385,6 +399,28 @@ def global_time_day_advanced(request):
     new_date = _safe_date(new_year, new_month, new_day)
     old_date = _safe_date(state.game_year, state.game_month, state.game_day)
     raw_delta = (new_date - old_date).days
+
+    max_days = SeasonConfig.get_instance().max_game_days
+    if raw_delta < 0:
+        return Response({
+            "success": True,
+            "message": "stale time, ignored",
+            "data": {
+                "game_year": state.game_year, "game_month": state.game_month, "game_day": state.game_day,
+                "game_hour": state.game_hour, "game_minute": state.game_minute, "season": state.season,
+                "total_game_days": state.total_game_days, "max_game_days": max_days,
+            },
+        })
+    if raw_delta > 0 and max_days > 0 and state.total_game_days >= max_days:
+        return Response({
+            "success": False,
+            "message": "已达到赛季最大天数",
+            "data": {
+                "game_year": state.game_year, "game_month": state.game_month, "game_day": state.game_day,
+                "game_hour": state.game_hour, "game_minute": state.game_minute, "season": state.season,
+                "total_game_days": state.total_game_days, "max_game_days": max_days,
+            },
+        })
 
     state.game_year = new_date.year
     state.game_month = new_date.month
@@ -399,8 +435,6 @@ def global_time_day_advanced(request):
         state.total_game_days = 1
     state.current_season_id = current_season.season_id
     state.save()
-
-    max_days = SeasonConfig.get_instance().max_game_days
 
     if day_delta > 0:
         # 补充全局NPC库存

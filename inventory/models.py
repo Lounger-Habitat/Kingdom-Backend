@@ -319,3 +319,18 @@ class NpcGlobalInventorySlot(models.Model):
 
     def __str__(self):
         return f"全局{self.bag.character_id}[{self.slot_index}] item={self.item_id} x{self.item_amount}"
+
+
+class EnvActionReceipt(models.Model):
+    """Idempotency record for an Env Server action that mutates shared state."""
+    player = models.ForeignKey(GameAccount, on_delete=models.CASCADE, related_name="env_action_receipts")
+    request_id = models.CharField(max_length=128)
+    action = models.CharField(max_length=64)
+    response_data = models.JSONField(default=dict)
+    created_at = models.DateTimeField(auto_now_add=True)
+
+    class Meta:
+        unique_together = [("player", "request_id")]
+
+    def __str__(self):
+        return f"{self.action} player={self.player_id} request={self.request_id}"

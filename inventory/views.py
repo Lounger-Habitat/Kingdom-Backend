@@ -4,12 +4,13 @@ from django.db import transaction
 from django.db.models import Max
 from drf_spectacular.utils import extend_schema
 from rest_framework.decorators import api_view, authentication_classes, permission_classes
+from rest_framework.permissions import IsAuthenticated
 from rest_framework.response import Response
 from .models import (
     InventoryBag, InventorySlot, BagTemplate, BagTemplateSlot,
     CollectionPoint, CollectionPointLevel, CollectionPointLevelItem,
     CollectionPointUpgradeItemCost, PlayerCollectionPoint, PlayerCollectionOverride,
-    AiConfig, NpcGlobalInventory, NpcGlobalInventorySlot,
+    AiConfig, NpcGlobalInventory, NpcGlobalInventorySlot, EnvActionReceipt,
 )
 from .serializers import (
     success_response, dual_bag_response, error_response, serialize_bag,
@@ -17,6 +18,8 @@ from .serializers import (
     serialize_npc_global_bag,
 )
 from items.models import Item, ItemType
+from account.env_auth import EnvServerJWTAuthentication
+from account.models import GameAccount
 
 
 def get_or_create_bag(player, character_id):
@@ -1485,7 +1488,7 @@ def inventory_judge(request, character_id):
 
 @api_view(["POST"])
 @authentication_classes([])
-@permission_classes([])
+@permission_classes([IsAuthenticated])
 def inventory_judge_by_agent(request, character_id):
     """Agent点评接口：接收Agent生成的评语和评分，后端计算总分和点评价值并保存。无需JWT认证。"""
     from player.models import PlayerState
@@ -1612,10 +1615,183 @@ def inventory_judge_by_agent(request, character_id):
     })
 
 
+# ─────────────── Env Server 原子动作 API ───────────────
+
+
+def _copy_npc_slot_to_player(npc_slot, player_bag, amount):
+    """Copy a purchased item while preserving the instance attributes Unity uses."""
+    target = find_empty_slot(player_bag)
+    target.item_id = npc_slot.item_id
+    target.item_amount = amount
+    target.rated = npc_slot.rated
+    target.rating_price = npc_slot.rating_price
+    target.overall_score = npc_slot.overall_score
+    target.ingredient = npc_slot.ingredient
+    target.item_bag_name = npc_slot.item_bag_name
+    target.cook_time = npc_slot.cook_time
+    target.dish_quality = npc_slot.dish_quality
+    target.hide_in_shop = False
+    target.remaining_uses = npc_slot.remaining_uses
+    target.review_comment = npc_slot.review_comment
+    target.save()
+
+
+def _copy_player_slot_to_npc(player_slot, npc_bag, amount):
+    """Store a sold player item in the shared NPC inventory."""
+    target = npc_bag.slots.select_for_update().filter(
+        item_id=player_slot.item_id,
+        item_amount__gt=0,
+        rated=player_slot.rated,
+        rating_price=player_slot.rating_price,
+        overall_score=player_slot.overall_score,
+        ingredient=player_slot.ingredient,
+        cook_time=player_slot.cook_time,
+        dish_quality=player_slot.dish_quality,
+        remaining_uses=player_slot.remaining_uses,
+        review_comment=player_slot.review_comment,
+    ).first()
+    if target:
+        target.item_amount += amount
+        target.save(update_fields=["item_amount"])
+        return
+
+    max_idx = npc_bag.slots.aggregate(Max("slot_index"))["slot_index__max"]
+    NpcGlobalInventorySlot.objects.create(
+        bag=npc_bag,
+        slot_index=(max_idx + 1) if max_idx is not None else 0,
+        item_id=player_slot.item_id,
+        item_amount=amount,
+        rated=player_slot.rated,
+        rating_price=player_slot.rating_price,
+        overall_score=player_slot.overall_score,
+        ingredient=player_slot.ingredient,
+        item_bag_name=player_slot.item_bag_name,
+        cook_time=player_slot.cook_time,
+        dish_quality=player_slot.dish_quality,
+        hide_in_shop=True,
+        remaining_uses=player_slot.remaining_uses,
+        review_comment=player_slot.review_comment,
+    )
+
+
+@api_view(["POST"])
+@authentication_classes([EnvServerJWTAuthentication])
+@permission_classes([IsAuthenticated])
+@transaction.atomic
+def env_npc_trade(request):
+    """Execute a player/NPC trade in one database transaction.
+
+    Only the Env Server may call this endpoint.  Prices are derived from the
+    item catalogue, rather than accepting playerPay/npcPay from the caller.
+    """
+    request_id = str(request.data.get("requestId") or "").strip()
+    player_id = str(request.data.get("playerId") or "").strip()
+    npc_id = str(request.data.get("npcId") or "").strip()
+    direction = str(request.data.get("direction") or "").lower()
+    item_id = request.data.get("itemId")
+    instance_id = request.data.get("instanceId")
+
+    try:
+        amount = int(request.data.get("amount", 0))
+    except (TypeError, ValueError):
+        amount = 0
+
+    if not request_id or not player_id or not npc_id or direction not in {"buy", "sell"}:
+        return Response(error_response("缺少或非法的 requestId、playerId、npcId 或 direction"), status=400)
+    if amount <= 0:
+        return Response(error_response("amount 必须大于0"), status=400)
+
+    try:
+        player = GameAccount.objects.get(id=player_id, is_active=True)
+    except GameAccount.DoesNotExist:
+        return Response(error_response("玩家不存在或已禁用"), status=404)
+
+    receipt, created = EnvActionReceipt.objects.select_for_update().get_or_create(
+        player=player,
+        request_id=request_id,
+        defaults={"action": "npc_trade", "response_data": {}},
+    )
+    if not created:
+        return Response(receipt.response_data)
+
+    try:
+        npc_bag = NpcGlobalInventory.objects.select_for_update().get(character_id=npc_id)
+    except NpcGlobalInventory.DoesNotExist:
+        return Response(error_response("NPC库存不存在"), status=404)
+
+    player_bag, _ = InventoryBag.objects.get_or_create(player=player, character_id="player")
+    player_bag = InventoryBag.objects.select_for_update().get(pk=player_bag.pk)
+
+    if direction == "buy":
+        if item_id is None:
+            return Response(error_response("购买缺少 itemId"), status=400)
+        npc_slot = npc_bag.slots.select_for_update().filter(item_id=item_id, item_amount__gt=0).first()
+        if not npc_slot or npc_slot.item_amount < amount:
+            return Response(error_response("NPC库存不足"), status=400)
+        item = Item.objects.filter(item_id=item_id).first()
+        if not item:
+            return Response(error_response("物品配置不存在"), status=400)
+        total_price = item.item_price * amount
+        if player_bag.money < total_price:
+            return Response(error_response("金币不足"), status=400)
+
+        _copy_npc_slot_to_player(npc_slot, player_bag, amount)
+        npc_slot.item_amount -= amount
+        if npc_slot.item_amount == 0:
+            npc_slot.delete()
+        else:
+            npc_slot.save(update_fields=["item_amount"])
+        player_bag.money -= total_price
+        player_bag._money_change_source = "env_npc_buy"
+        player_bag.save()
+        npc_bag.money += total_price
+        npc_bag.save(update_fields=["money"])
+        message = "购买成功"
+    else:
+        player_slot = (
+            player_bag.slots.select_for_update().filter(instance_id=instance_id, item_amount__gt=0).first()
+            if instance_id else player_bag.slots.select_for_update().filter(item_id=item_id, item_amount__gt=0).first()
+        )
+        if not player_slot or player_slot.item_amount < amount:
+            return Response(error_response("玩家背包物品不足"), status=400)
+        item = Item.objects.filter(item_id=player_slot.item_id).first()
+        if not item:
+            return Response(error_response("物品配置不存在"), status=400)
+        total_price = int(item.item_price * item.sell_percentage) * amount
+        if npc_bag.money < total_price:
+            return Response(error_response("NPC金币不足"), status=400)
+
+        _copy_player_slot_to_npc(player_slot, npc_bag, amount)
+        player_slot.item_amount -= amount
+        player_slot.save(update_fields=["item_amount"])
+        clear_slot_if_empty(player_slot)
+        player_bag.money += total_price
+        player_bag._money_change_source = "env_npc_sell"
+        player_bag.save()
+        npc_bag.money -= total_price
+        npc_bag.save(update_fields=["money"])
+        message = "出售成功"
+
+    response_data = {
+        "success": True,
+        "message": message,
+        "data": {
+            "requestId": request_id,
+            "playerInventory": serialize_bag(player_bag),
+            "npcInventory": serialize_npc_global_bag(npc_bag),
+        },
+    }
+    receipt.response_data = response_data
+    receipt.save(update_fields=["response_data"])
+    return Response(response_data)
+
+
 # ─────────────── NPC 全局库存 API ───────────────
 
 
 @api_view(["GET"])
+@authentication_classes([EnvServerJWTAuthentication])
+@permission_classes([IsAuthenticated])
 def npc_global_inventory_detail(request, character_id):
     """获取NPC全局库存。Env Server启动时调用加载库存。"""
     try:
@@ -1633,6 +1809,8 @@ def npc_global_inventory_detail(request, character_id):
 
 
 @api_view(["PUT"])
+@authentication_classes([EnvServerJWTAuthentication])
+@permission_classes([IsAuthenticated])
 @transaction.atomic
 def npc_global_inventory_update(request, character_id):
     """更新NPC全局库存（Env Server交易后写回）。
@@ -1675,6 +1853,8 @@ def npc_global_inventory_update(request, character_id):
 
 
 @api_view(["POST"])
+@authentication_classes([EnvServerJWTAuthentication])
+@permission_classes([IsAuthenticated])
 @transaction.atomic
 def npc_global_inventory_trade(request, character_id):
     """NPC全局库存交易：玩家从NPC购买物品。
@@ -1720,6 +1900,8 @@ def npc_global_inventory_trade(request, character_id):
 
 
 @api_view(["POST"])
+@authentication_classes([EnvServerJWTAuthentication])
+@permission_classes([IsAuthenticated])
 @transaction.atomic
 def npc_global_inventory_sell(request, character_id):
     """玩家向NPC出售物品到全局库存。
@@ -1771,6 +1953,8 @@ def npc_global_inventory_sell(request, character_id):
 
 
 @api_view(["POST"])
+@authentication_classes([EnvServerJWTAuthentication])
+@permission_classes([IsAuthenticated])
 @transaction.atomic
 def npc_global_inventory_restock(request):
     """批量补充NPC库存到模板数量（凌晨4点重置时调用）。

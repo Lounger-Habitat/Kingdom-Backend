@@ -5,6 +5,7 @@ from .models import (
     CollectionPoint, CollectionPointLevel, CollectionPointLevelItem,
     CollectionPointUpgradeItemCost, PlayerCollectionPoint, PlayerCollectionOverride,
     AiConfig,
+    NpcGlobalInventory, NpcGlobalInventorySlot,
 )
 
 
@@ -169,3 +170,29 @@ class AiConfigAdmin(admin.ModelAdmin):
 
     def has_delete_permission(self, request, obj=None):
         return False
+
+
+# ──────────────────────────────────────────────────────────────
+#  NPC 全局库存 Admin
+# ──────────────────────────────────────────────────────────────
+
+class NpcGlobalInventorySlotInline(admin.TabularInline):
+    model = NpcGlobalInventorySlot
+    extra = 0
+    fields = ["slot_index", "item_id", "item_amount", "rated", "rating_price", "overall_score", "ingredient", "item_bag_name", "cook_time", "dish_quality", "hide_in_shop"]
+    ordering = ["slot_index"]
+
+
+@admin.register(NpcGlobalInventory)
+class NpcGlobalInventoryAdmin(admin.ModelAdmin):
+    list_display = ["character_id", "money", "slot_count", "updated_at"]
+    search_fields = ["character_id"]
+    inlines = [NpcGlobalInventorySlotInline]
+
+    def slot_count(self, obj):
+        return obj.slots.count()
+
+    slot_count.short_description = "物品数"
+
+
+# NpcGlobalInventorySlot 通过 NpcGlobalInventory 的 inline 管理，不单独显示

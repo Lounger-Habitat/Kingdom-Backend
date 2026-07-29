@@ -1,4 +1,4 @@
-"""生成 Env Server 永不过期的 service token。
+"""生成 Env Server 专用的、可轮换的 service token。
 
 用法: python manage.py generate_service_token
 """
@@ -24,16 +24,18 @@ class Command(BaseCommand):
         else:
             self.stdout.write(f"服务账号已存在: env_server (id={account.id})")
 
-        # 生成 token，过期时间设为 10 年
+        # service token 必须带受限 scope；过期后由部署系统重新签发。
         token = AccessToken.for_user(account)
-        token.set_exp(lifetime=timedelta(days=3650))
+        token["scope"] = "env_server"
+        token["aud"] = "kingdom-env"
+        token.set_exp(lifetime=timedelta(days=1))
 
         token_str = str(token)
         self.stdout.write("")
         self.stdout.write(self.style.SUCCESS("=" * 60))
-        self.stdout.write(self.style.SUCCESS("Service Token (永不过期，10年有效):"))
+        self.stdout.write(self.style.SUCCESS("Service Token (Env Server scope，有效期24小时):"))
         self.stdout.write(self.style.SUCCESS("=" * 60))
         self.stdout.write(token_str)
         self.stdout.write(self.style.SUCCESS("=" * 60))
         self.stdout.write("")
-        self.stdout.write("将此 token 填入 Unity 的 EnvServerConfig.asset → serviceToken 字段")
+        self.stdout.write("通过服务器宿主机的 ENV_SERVER_TOKEN 注入，勿写入客户端构建物或 Resources 资源。")

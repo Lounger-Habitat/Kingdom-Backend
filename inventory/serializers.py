@@ -5,6 +5,7 @@ from items.models import Item
 
 
 class InventorySlotSerializer(serializers.ModelSerializer):
+    slotIndex = serializers.IntegerField(source="slot_index")
     instanceID = serializers.UUIDField(source="instance_id")
     itemID = serializers.IntegerField(source="item_id")
     itemAmount = serializers.IntegerField(source="item_amount")
@@ -19,7 +20,7 @@ class InventorySlotSerializer(serializers.ModelSerializer):
 
     class Meta:
         model = InventorySlot
-        fields = ["instanceID", "itemID", "itemAmount", "rated", "ratingPrice", "overallScore", "ingredient", "itemBagName", "cookTime", "dishQuality", "hideInShop", "remainingUses", "reviewComment"]
+        fields = ["slotIndex", "instanceID", "itemID", "itemAmount", "rated", "ratingPrice", "overallScore", "ingredient", "itemBagName", "cookTime", "dishQuality", "hideInShop", "remainingUses", "reviewComment"]
 
     def to_representation(self, instance):
         data = super().to_representation(instance)

@@ -7,4 +7,5 @@ urlpatterns = [
     path("api/auth/guest", views.auth_guest, name="auth-guest"),
     path("api/auth/convert", views.auth_convert, name="auth-convert"),
     path("api/auth/refresh", views.auth_refresh, name="auth-refresh"),
+    path("api/env/auth/verify-player", views.env_verify_player, name="env-verify-player"),
 ]
