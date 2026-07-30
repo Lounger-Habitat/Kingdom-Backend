@@ -5,7 +5,7 @@ from .models import (
     CollectionPoint, CollectionPointLevel, CollectionPointLevelItem,
     CollectionPointUpgradeItemCost, PlayerCollectionPoint, PlayerCollectionOverride,
     AiConfig,
-    NpcGlobalInventory, NpcGlobalInventorySlot,
+    NpcDefinition, NpcGlobalInventory, NpcGlobalInventorySlot,
 )
 
 
@@ -66,14 +66,27 @@ class BagTemplateSlotInline(admin.TabularInline):
     autocomplete_fields = ["item"]
 
 
+@admin.register(NpcDefinition)
+class NpcDefinitionAdmin(admin.ModelAdmin):
+    list_display = ["agent_id", "name"]
+    search_fields = ["agent_id", "name"]
+
+
 @admin.register(BagTemplate)
 class BagTemplateAdmin(admin.ModelAdmin):
-    list_display = ["character_id", "money", "slot_count"]
-    search_fields = ["character_id"]
+    list_display = ["display_name", "money", "slot_count"]
+    search_fields = ["npc__agent_id", "npc__name", "character_id"]
+    list_filter = ["npc"]
     inlines = [BagTemplateSlotInline]
 
     class Media:
         js = ("inventory/js/auto_slot_index.js",)
+
+    def display_name(self, obj):
+        if obj.npc:
+            return f"{obj.npc.name} ({obj.npc.agent_id})"
+        return obj.character_id
+    display_name.short_description = "模板归属"
 
     def slot_count(self, obj):
         return obj.slots.count()
@@ -185,9 +198,17 @@ class NpcGlobalInventorySlotInline(admin.TabularInline):
 
 @admin.register(NpcGlobalInventory)
 class NpcGlobalInventoryAdmin(admin.ModelAdmin):
-    list_display = ["character_id", "money", "slot_count", "updated_at"]
-    search_fields = ["character_id"]
+    list_display = ["npc_name", "npc_agent_id", "money", "slot_count", "updated_at"]
+    search_fields = ["npc__agent_id", "npc__name"]
     inlines = [NpcGlobalInventorySlotInline]
+
+    def npc_name(self, obj):
+        return obj.npc.name
+    npc_name.short_description = "NPC"
+
+    def npc_agent_id(self, obj):
+        return obj.npc.agent_id
+    npc_agent_id.short_description = "Agent ID"
 
     def slot_count(self, obj):
         return obj.slots.count()

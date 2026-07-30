@@ -11,7 +11,6 @@ from config.auth import get_player_id
 from account.models import GameAccount
 from player.models import PlayerState
 from inventory.models import InventoryBag
-from inventory.services import restock_npc_bags
 from leaderboard.services import settle_leaderboard_for_day, settle_milestone_for_player
 from season.season_service import (
     check_and_rotate_season,
@@ -178,7 +177,6 @@ def day_advanced(request):
         season_id = current_season.season_id
         settle_leaderboard_for_day(old_game_days, season_id, player_id=player_id)
         player.action_points = 100
-        restock_npc_bags(request.user)
 
         # 保存新一天的金币快照（用于富豪榜日榜）和总榜快照
         try:

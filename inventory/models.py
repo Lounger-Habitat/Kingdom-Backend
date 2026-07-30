@@ -122,12 +122,34 @@ class InventorySlot(models.Model):
         return f"{self.bag.character_id}[{self.slot_index}] item={self.item_id} x{self.item_amount}"
 
 
-class BagTemplate(models.Model):
-    """背包模板，用于新玩家初始化。"""
-    character_id = models.CharField(max_length=100, unique=True, help_text="对应角色ID，如 player、tjplb")
-    money = models.IntegerField(default=0, help_text="初始金币")
+class NpcDefinition(models.Model):
+    """NPC 定义，agent_id 为 Unity 通信主键。"""
+    agent_id = models.CharField(max_length=100, unique=True, db_index=True,
+                                help_text="Unity AgentController.agentID，如 10012")
+    name = models.CharField(max_length=100, help_text="展示名，如 jack")
+
+    class Meta:
+        verbose_name = "NPC 定义"
+        verbose_name_plural = "NPC 定义"
 
     def __str__(self):
+        return f"{self.name} ({self.agent_id})"
+
+
+class BagTemplate(models.Model):
+    """背包模板，用于新玩家初始化。"""
+    npc = models.ForeignKey(NpcDefinition, on_delete=models.CASCADE, null=True, blank=True,
+                            related_name="templates", help_text="绑定NPC，玩家模板留空")
+    character_id = models.CharField(max_length=100, default="player",
+                                    help_text="兼容字段：player=玩家模板，NPC模板由 npc FK 关联")
+    money = models.IntegerField(default=0, help_text="初始金币")
+
+    class Meta:
+        unique_together = [("npc",)]  # 每个NPC最多一个模板
+
+    def __str__(self):
+        if self.npc:
+            return f"NPC模板: {self.npc.name} (money={self.money})"
         return f"模板: {self.character_id} (money={self.money})"
 
 
@@ -287,12 +309,13 @@ class PlayerCollectionOverride(models.Model):
 
 class NpcGlobalInventory(models.Model):
     """NPC全局库存（全服共享，不按玩家隔离）。"""
-    character_id = models.CharField(max_length=100, unique=True, help_text="NPC角色ID，如 zhplb、hmzs")
+    npc = models.OneToOneField(NpcDefinition, on_delete=models.CASCADE,
+                               related_name="global_inventory", help_text="关联NPC")
     money = models.IntegerField(default=0)
     updated_at = models.DateTimeField(auto_now=True)
 
     def __str__(self):
-        return f"全局库存: {self.character_id} (money={self.money})"
+        return f"全局库存: {self.npc.name} (money={self.money})"
 
 
 class NpcGlobalInventorySlot(models.Model):
@@ -318,7 +341,7 @@ class NpcGlobalInventorySlot(models.Model):
         unique_together = [("bag", "slot_index")]
 
     def __str__(self):
-        return f"全局{self.bag.character_id}[{self.slot_index}] item={self.item_id} x{self.item_amount}"
+        return f"全局{self.bag.npc.name}[{self.slot_index}] item={self.item_id} x{self.item_amount}"
 
 
 class EnvActionReceipt(models.Model):

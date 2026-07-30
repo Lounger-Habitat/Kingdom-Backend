@@ -47,50 +47,27 @@ def player_bags(request, player_id):
     """第二层：指定玩家的所有背包列表。"""
     player = get_object_or_404(GameAccount, pk=player_id)
 
-    # 从模板初始化 NPC 背包（仅在玩家没有任何背包时生效）
+    # 仅初始化玩家主背包；NPC 库存是全服共享的 NpcGlobalInventory，
+    # 不允许在此页为某个玩家创建 NPC 私有背包。
     if request.method == "POST" and request.POST.get("action") == "init_from_template":
         created = init_player_bags(player)
         if created > 0:
-            messages.success(request, f"已从模板初始化 {created} 个背包。")
+            messages.success(request, "已从模板初始化玩家主背包。")
         else:
-            templates = BagTemplate.objects.all()
-            if not templates.exists():
-                messages.warning(request, "模板表为空，请先推送背包数据。")
-            else:
-                # 模板存在但玩家已有背包，尝试补充缺失的 NPC 背包
-                created = _init_missing_npc_bags(player)
-                if created > 0:
-                    messages.success(request, f"已补充 {created} 个缺失的 NPC 背包。")
-                else:
-                    messages.info(request, "所有 NPC 背包已存在，无需初始化。")
+            messages.info(request, "玩家主背包已存在，或 player 模板尚未配置。")
         return redirect("inventory-admin-player-bags", player_id=player_id)
 
-    bags = InventoryBag.objects.filter(player=player).annotate(
+    player_bag = InventoryBag.objects.filter(
+        player=player, character_id=player.username
+    ).annotate(
         slot_count=Count("slots")
-    ).order_by("character_id")
-
-    # 玩家自己的背包：character_id == 玩家用户名
-    player_bag = None
-    npc_bags = []
-    for bag in bags:
-        if bag.character_id == player.username:
-            player_bag = bag
-        else:
-            npc_bags.append(bag)
-
-    # 检查模板中是否有尚未为该玩家创建的 NPC 背包
-    existing_ids = {b.character_id for b in bags}
-    missing_templates = BagTemplate.objects.exclude(
-        character_id="player"
-    ).exclude(
-        character_id__in=existing_ids
-    ).values_list("character_id", flat=True)
+    ).first()
 
     return render(request, "inventory/admin/player_bags.html", {
         "player": player,
         "player_bag": player_bag,
-        "npc_bags": npc_bags,
-        "missing_templates": list(missing_templates),
+        "npc_bags": [],
+        "missing_templates": [],
         "title": f"背包管理 - {player.username} 的背包",
         "opts": InventoryBag._meta,
     })
@@ -100,7 +77,11 @@ def player_bags(request, player_id):
 def bag_detail(request, player_id, bag_id):
     """第三层：背包详情，显示和编辑物品列表。"""
     player = get_object_or_404(GameAccount, pk=player_id)
-    bag = get_object_or_404(InventoryBag, pk=bag_id, player=player)
+    # 玩家管理页只允许访问该玩家的主背包；旧 NPC 私有背包仅保留为历史数据，
+    # 不再允许通过此入口读取或编辑。
+    bag = get_object_or_404(
+        InventoryBag, pk=bag_id, player=player, character_id=player.username
+    )
 
     if request.method == "POST":
         action = request.POST.get("action")
@@ -151,6 +132,9 @@ def bag_detail(request, player_id, bag_id):
 
 def _init_missing_npc_bags(player):
     """为已有玩家补充缺失的背包（从 BagTemplate 复制）。"""
+    # 已废弃：不再为玩家创建 NPC 私有背包，旧数据仅作历史备份。
+    return 0
+
     existing_ids = set(
         InventoryBag.objects.filter(player=player).values_list("character_id", flat=True)
     )

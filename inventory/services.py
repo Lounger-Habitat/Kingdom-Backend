@@ -4,63 +4,54 @@ from .models import InventoryBag, InventorySlot, BagTemplate, BagTemplateSlot
 
 
 def init_player_bags(player):
-    """根据 BagTemplate 为新玩家初始化所有背包。
+    """从 ``player`` 模板初始化玩家自己的背包。
 
-    只在该玩家没有任何背包数据时执行，已存在则跳过。
-    返回创建的背包数量。
+    NPC 库存属于 ``NpcGlobalInventory``，绝不能在这里为每个玩家复制一份。
     """
-    if InventoryBag.objects.filter(player=player).exists():
+    if InventoryBag.objects.filter(player=player, character_id=player.username).exists():
         return 0
 
-    templates = BagTemplate.objects.prefetch_related("slots").all()
-    if not templates.exists():
+    template = BagTemplate.objects.prefetch_related("slots__item").filter(character_id="player").first()
+    if template is None:
         return 0
 
-    created = 0
-    player_own_bag_money = 0
     with transaction.atomic():
-        for tmpl in templates:
-            # character_id="player" 的模板改为玩家用户名，作为玩家自己的背包
-            cid = player.username if tmpl.character_id == "player" else tmpl.character_id
-            bag = InventoryBag.objects.create(
-                player=player,
-                character_id=cid,
-                money=tmpl.money,
+        bag = InventoryBag.objects.create(
+            player=player,
+            character_id=player.username,
+            money=template.money,
+        )
+        for slot in template.slots.all():
+            remaining_uses = None
+            if slot.item and slot.item.item_type == "Usable":
+                remaining_uses = slot.item.max_use_count
+            InventorySlot.objects.create(
+                bag=bag,
+                slot_index=slot.slot_index,
+                instance_id=uuid.uuid4(),
+                item_id=slot.item_id,
+                item_amount=slot.item_amount,
+                rated=slot.rated,
+                rating_price=slot.rating_price,
+                overall_score=slot.overall_score,
+                ingredient=slot.ingredient,
+                item_bag_name=f"{slot.item.item_name}_{slot.slot_index}" if slot.item else "",
+                cook_time=slot.cook_time,
+                dish_quality=slot.dish_quality,
+                hide_in_shop=slot.hide_in_shop,
+                remaining_uses=remaining_uses,
             )
-            if tmpl.character_id == "player":
-                player_own_bag_money = tmpl.money
-            for slot in tmpl.slots.select_related("item").all():
-                remaining_uses = None
-                if slot.item and slot.item.item_type == "Usable":
-                    remaining_uses = slot.item.max_use_count
-                InventorySlot.objects.create(
-                    bag=bag,
-                    slot_index=slot.slot_index,
-                    instance_id=uuid.uuid4(),
-                    item_id=slot.item_id,
-                    item_amount=slot.item_amount,
-                    rated=slot.rated,
-                    rating_price=slot.rating_price,
-                    overall_score=slot.overall_score,
-                    ingredient=slot.ingredient,
-                    item_bag_name=f"{slot.item.item_name}_{slot.slot_index}" if slot.item else "",
-                    cook_time=slot.cook_time,
-                    dish_quality=slot.dish_quality,
-                    hide_in_shop=slot.hide_in_shop,
-                    remaining_uses=remaining_uses,
-                )
-            created += 1
 
     # 设置富豪榜日榜第一天基准金币和总榜快照
-    if created > 0 and player_own_bag_money > 0:
+    if template.money > 0:
         from player.models import PlayerState
         ps, _ = PlayerState.objects.get_or_create(player_id=str(player.id))
-        ps.day_start_money = player_own_bag_money
+        ps.day_start_money = template.money
         ps.day_start_money_game_day = 1
-        ps.total_wealth_snapshot = player_own_bag_money
+        ps.total_wealth_snapshot = template.money
         ps.save(update_fields=["day_start_money", "day_start_money_game_day", "total_wealth_snapshot"])
 
-    return created
+    return 1
 
 
 def restock_npc_bags(player):
@@ -69,6 +60,10 @@ def restock_npc_bags(player):
     只补 BagTemplate 中定义的物品，玩家卖给NPC的物品不受影响。
     不重置金币。
     """
+    # 已废弃：NPC 库存改为 NpcGlobalInventory，旧的按玩家库存只保留作历史备份。
+    # 保留此入口以兼容外部旧调用，但禁止再读取或写入旧记录。
+    return
+
     templates = {
         t.character_id: t
         for t in BagTemplate.objects.prefetch_related("slots__item").all()
@@ -150,16 +145,18 @@ def restock_npc_bags_global():
     """全服统一补充NPC全局库存到模板数量（凌晨4点重置时调用）。"""
     from .models import NpcGlobalInventory, NpcGlobalInventorySlot, BagTemplate
 
-    templates = {
-        t.character_id: t
-        for t in BagTemplate.objects.prefetch_related("slots__item").all()
-        if t.character_id != "player"
-    }
-    if not templates:
+    # 获取所有绑定NPC的模板
+    templates = BagTemplate.objects.prefetch_related("slots__item").filter(npc__isnull=False)
+    if not templates.exists():
         return
 
-    for character_id, tmpl in templates.items():
-        bag, _ = NpcGlobalInventory.objects.get_or_create(character_id=character_id)
+    for tmpl in templates:
+        npc = tmpl.npc
+        # 仅首次创建时复制模板金币；后续每日补货不能重置交易后的 NPC 金币。
+        bag, _ = NpcGlobalInventory.objects.get_or_create(
+            npc=npc,
+            defaults={"money": tmpl.money},
+        )
         for tmpl_slot in tmpl.slots.select_related("item").all():
             if not tmpl_slot.item:
                 continue

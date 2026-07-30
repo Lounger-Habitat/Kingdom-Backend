@@ -6,11 +6,12 @@ from drf_spectacular.utils import extend_schema
 from rest_framework.decorators import api_view, authentication_classes, permission_classes
 from rest_framework.permissions import IsAuthenticated
 from rest_framework.response import Response
+from rest_framework.exceptions import ValidationError
 from .models import (
     InventoryBag, InventorySlot, BagTemplate, BagTemplateSlot,
     CollectionPoint, CollectionPointLevel, CollectionPointLevelItem,
     CollectionPointUpgradeItemCost, PlayerCollectionPoint, PlayerCollectionOverride,
-    AiConfig, NpcGlobalInventory, NpcGlobalInventorySlot, EnvActionReceipt,
+    AiConfig, NpcDefinition, NpcGlobalInventory, NpcGlobalInventorySlot, EnvActionReceipt,
 )
 from .serializers import (
     success_response, dual_bag_response, error_response, serialize_bag,
@@ -23,7 +24,13 @@ from account.models import GameAccount
 
 
 def get_or_create_bag(player, character_id):
-    bag, _ = InventoryBag.objects.get_or_create(player=player, character_id=character_id)
+    # "player" 只是 BagTemplate 的保留 ID；运行时玩家主背包始终按用户名存储。
+    # NPC 库存只能走 api/npc-inventory 或 env/actions/npc-trade，禁止创建私有副本。
+    if character_id not in {"player", player.username}:
+        raise ValidationError({
+            "characterId": "NPC 库存为全服共享数据，不能通过玩家背包接口访问"
+        })
+    bag, _ = InventoryBag.objects.get_or_create(player=player, character_id=player.username)
     return bag
 
 
@@ -790,42 +797,12 @@ def inventory_bulk_push(request):
                     )
                 results.append({"characterId": character_id, "success": True, "message": "模板同步成功"})
             else:
-                # ---- NPC 背包：写入当前玩家的 InventoryBag ----
-                bag = get_or_create_bag(player, character_id)
-                bag.money = bag_data.get("money", bag.money)
-                bag._money_change_source = "npc_sync"
-                bag.save()
-
-                bag.slots.all().delete()
-                for idx, item in enumerate(bag_data.get("items", [])):
-                    instance_id = item.get("instanceID")
-                    if instance_id:
-                        try:
-                            instance_id = uuid.UUID(instance_id)
-                        except (ValueError, AttributeError):
-                            instance_id = uuid.uuid4()
-                    else:
-                        instance_id = uuid.uuid4()
-
-                    # NPC背包中的物品默认不在商店显示（NPC商店只卖预设物品）
-                    hide = item.get("hideInShop", False) or True
-
-                    InventorySlot.objects.create(
-                        bag=bag,
-                        slot_index=idx,
-                        instance_id=instance_id,
-                        item_id=item.get("itemID", 0),
-                        item_amount=item.get("itemAmount", 0),
-                        rated=item.get("rated", False),
-                        rating_price=item.get("ratingPrice", -1),
-                        ingredient=item.get("ingredient", ""),
-                        item_bag_name=item.get("itemBagName", ""),
-                        cook_time=item.get("cookTime", 0),
-                        dish_quality=item.get("dishQuality", 3),
-                        hide_in_shop=hide,
-                        remaining_uses=item.get("remainingUses"),
-                    )
-                results.append({"characterId": character_id, "success": True, "message": "同步成功"})
+                # NPC 已改为 NpcGlobalInventory；拒绝旧协议，防止重新创建按玩家库存。
+                results.append({
+                    "characterId": character_id,
+                    "success": False,
+                    "message": "NPC库存为全服共享数据，不能通过 bulk-push 写入",
+                })
 
     return Response({"success": True, "message": "批量同步完成", "data": results})
 
@@ -1715,11 +1692,11 @@ def env_npc_trade(request):
         return Response(receipt.response_data)
 
     try:
-        npc_bag = NpcGlobalInventory.objects.select_for_update().get(character_id=npc_id)
+        npc_bag = NpcGlobalInventory.objects.select_for_update().get(npc__agent_id=npc_id)
     except NpcGlobalInventory.DoesNotExist:
         return Response(error_response("NPC库存不存在"), status=404)
 
-    player_bag, _ = InventoryBag.objects.get_or_create(player=player, character_id="player")
+    player_bag, _ = InventoryBag.objects.get_or_create(player=player, character_id=player.username)
     player_bag = InventoryBag.objects.select_for_update().get(pk=player_bag.pk)
 
     if direction == "buy":
@@ -1795,7 +1772,7 @@ def env_npc_trade(request):
 def npc_global_inventory_detail(request, character_id):
     """获取NPC全局库存。Env Server启动时调用加载库存。"""
     try:
-        bag = NpcGlobalInventory.objects.get(character_id=character_id)
+        bag = NpcGlobalInventory.objects.select_related("npc").get(npc__agent_id=character_id)
     except NpcGlobalInventory.DoesNotExist:
         # 从BagTemplate初始化
         bag = _init_npc_global_from_template(character_id)
@@ -1817,7 +1794,10 @@ def npc_global_inventory_update(request, character_id):
 
     请求体: {"money": 100, "items": [{"slotIndex": 0, "itemId": 1, "itemAmount": 5, ...}, ...]}
     """
-    bag, _ = NpcGlobalInventory.objects.get_or_create(character_id=character_id)
+    npc = NpcDefinition.objects.filter(agent_id=character_id).first()
+    if not npc:
+        return Response(error_response(f"NPC {character_id} 不存在"))
+    bag, _ = NpcGlobalInventory.objects.get_or_create(npc=npc)
     money = request.data.get("money")
     if money is not None:
         bag.money = money
@@ -1863,7 +1843,7 @@ def npc_global_inventory_trade(request, character_id):
     响应: {"success": true, "data": {"npcBag": {...}, "tradeMessage": "..."}}
     """
     try:
-        bag = NpcGlobalInventory.objects.select_for_update().get(character_id=character_id)
+        bag = NpcGlobalInventory.objects.select_for_update().get(npc__agent_id=character_id)
     except NpcGlobalInventory.DoesNotExist:
         return Response(error_response(f"NPC {character_id} 库存不存在"))
 
@@ -1909,7 +1889,7 @@ def npc_global_inventory_sell(request, character_id):
     请求体: {"itemId": 1, "amount": 1, "itemData": {...}, "npcPay": 50}
     """
     try:
-        bag = NpcGlobalInventory.objects.select_for_update().get(character_id=character_id)
+        bag = NpcGlobalInventory.objects.select_for_update().get(npc__agent_id=character_id)
     except NpcGlobalInventory.DoesNotExist:
         return Response(error_response(f"NPC {character_id} 库存不存在"))
 
@@ -2004,31 +1984,34 @@ def npc_global_inventory_restock(request):
 
 
 def _init_npc_global_from_template(character_id):
-    """从BagTemplate初始化NPC全局库存。"""
-    tmpl = BagTemplate.objects.prefetch_related("slots__item").filter(character_id=character_id).first()
-    if not tmpl:
+    """从BagTemplate初始化NPC全局库存。无模板时创建空库存。"""
+    npc = NpcDefinition.objects.filter(agent_id=character_id).first()
+    if not npc:
         return None
 
-    bag = NpcGlobalInventory.objects.create(character_id=character_id, money=tmpl.money)
-    for tmpl_slot in tmpl.slots.select_related("item").all():
-        if not tmpl_slot.item:
-            continue
-        remaining_uses = None
-        if tmpl_slot.item.item_type == "Usable":
-            remaining_uses = tmpl_slot.item.max_use_count
-        NpcGlobalInventorySlot.objects.create(
-            bag=bag,
-            slot_index=tmpl_slot.slot_index,
-            item_id=tmpl_slot.item_id,
-            item_amount=tmpl_slot.item_amount,
-            rated=tmpl_slot.rated,
-            rating_price=tmpl_slot.rating_price,
-            overall_score=tmpl_slot.overall_score,
-            ingredient=tmpl_slot.ingredient,
-            item_bag_name=f"{tmpl_slot.item.item_name}_{tmpl_slot.slot_index}",
-            cook_time=tmpl_slot.cook_time,
-            dish_quality=tmpl_slot.dish_quality,
-            hide_in_shop=tmpl_slot.hide_in_shop,
-            remaining_uses=remaining_uses,
-        )
+    tmpl = BagTemplate.objects.prefetch_related("slots__item").filter(npc=npc).first()
+
+    bag = NpcGlobalInventory.objects.create(npc=npc, money=tmpl.money if tmpl else 0)
+    if tmpl:
+        for tmpl_slot in tmpl.slots.select_related("item").all():
+            if not tmpl_slot.item:
+                continue
+            remaining_uses = None
+            if tmpl_slot.item.item_type == "Usable":
+                remaining_uses = tmpl_slot.item.max_use_count
+            NpcGlobalInventorySlot.objects.create(
+                bag=bag,
+                slot_index=tmpl_slot.slot_index,
+                item_id=tmpl_slot.item_id,
+                item_amount=tmpl_slot.item_amount,
+                rated=tmpl_slot.rated,
+                rating_price=tmpl_slot.rating_price,
+                overall_score=tmpl_slot.overall_score,
+                ingredient=tmpl_slot.ingredient,
+                item_bag_name=f"{tmpl_slot.item.item_name}_{tmpl_slot.slot_index}",
+                cook_time=tmpl_slot.cook_time,
+                dish_quality=tmpl_slot.dish_quality,
+                hide_in_shop=tmpl_slot.hide_in_shop,
+                remaining_uses=remaining_uses,
+            )
     return bag
