@@ -28,13 +28,9 @@ class PlayerStateAdmin(admin.ModelAdmin):
         "recipe_count",
         "action_points",
         "action_points_max",
-        "game_day",
-        "game_year",
-        "game_month",
-        "season",
         "current_season_id",
     ]
-    list_filter = ["season", "game_year", "current_season_id"]
+    list_filter = ["current_season_id"]
     search_fields = ["player_id"]
     inlines = [PlayerRecipeInline, PlayerTitleInline]
 

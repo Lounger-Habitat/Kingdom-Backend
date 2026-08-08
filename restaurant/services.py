@@ -1,16 +1,18 @@
 import random
 import json
+import logging
 import requests
 from django.db import transaction
 from django.conf import settings
 from account.models import GameAccount
 from inventory.models import InventoryBag, InventorySlot
 from items.models import Item
-from player.models import PlayerState
 from .models import (
     RestaurantConfig, RestaurantLevelConfig, PlayerRestaurantState,
-    MenuItem, CustomerTransaction, DailyBusinessLog
+    MenuItem, CustomerTransaction, DailyBusinessLog, RestaurantHourlySlot, RestaurantSaleEvent
 )
+
+logger = logging.getLogger(__name__)
 
 
 def _get_quality_coeff(dish_quality):
@@ -40,29 +42,8 @@ class RestaurantService:
         state = RestaurantService.get_or_create_state(player)
         config = RestaurantConfig.get_instance()
 
-        # 获取游戏日历和当前赛季，判断今日是否已营业
-        current_day = 0
-        current_season_id = ""
-        game_year = 0
-        game_month = 0
-        game_day_of_month = 0
-        try:
-            player_state = PlayerState.objects.get(player_id=str(player.id))
-            current_day = player_state.total_game_days
-            current_season_id = player_state.current_season_id or ""
-            game_year = player_state.game_year
-            game_month = player_state.game_month
-            game_day_of_month = player_state.game_day
-        except PlayerState.DoesNotExist:
-            pass
-
-        has_done_business_today = DailyBusinessLog.objects.filter(
-            player=player,
-            season_id=current_season_id,
-            game_year=game_year,
-            game_month=game_month,
-            game_day_of_month=game_day_of_month,
-        ).exists() and current_day > 0
+        from game_time.models import GlobalGameTimeState
+        current_time = GlobalGameTimeState.get_instance()
 
         # 获取菜单
         menu_items = MenuItem.objects.filter(player=player)
@@ -87,6 +68,7 @@ class RestaurantService:
                 "costMoney": next_level_config.cost_money,
                 "costItems": next_level_config.cost_items,
                 "rewardCustomerBonus": next_level_config.reward_customer_bonus,
+                "rewardMenuCapacityBonus": next_level_config.reward_menu_capacity_bonus,
                 "rewardMaterials": next_level_config.reward_materials,
                 "rewardSpeedBonusPct": next_level_config.reward_speed_bonus_pct,
                 "rewardPriceBonusPct": next_level_config.reward_price_bonus_pct,
@@ -97,6 +79,7 @@ class RestaurantService:
         # 计算当前等级的总加成
         level_configs = RestaurantLevelConfig.objects.filter(level__lte=state.current_level)
         total_customer_bonus = sum(lc.reward_customer_bonus for lc in level_configs)
+        total_menu_capacity_bonus = sum(lc.reward_menu_capacity_bonus for lc in level_configs)
         total_price_bonus = sum(lc.reward_price_bonus_pct for lc in level_configs)
         total_speed_bonus = sum(lc.reward_speed_bonus_pct for lc in level_configs)
 
@@ -112,19 +95,25 @@ class RestaurantService:
                 "totalGoldEarned": state.total_gold_earned,
                 "totalRatingsReceived": state.total_ratings_received,
                 "dishesSoldSet": state.dishes_sold_set,
-                "lastBusinessGameDay": state.last_business_game_day,
                 "seasonId": state.season_id,
-                "hasDoneBusinessToday": has_done_business_today,
-                "currentGameDay": current_day,
+                "isOpen": config.opening_hour <= current_time.game_hour < config.closing_hour,
             },
             "businessConfig": {
-                "businessHour": config.business_hour,
-                "businessMinute": config.business_minute,
-                "baseCustomerCount": config.base_customer_count,
-                "customersPerLevel": config.customers_per_level,
+                "openingHour": config.opening_hour,
+                "closingHour": config.closing_hour,
+                "baseHourlySales": config.base_hourly_sales,
+                "hourlySalesPerLevel": config.hourly_sales_per_level,
+                "baseMenuCapacity": config.base_menu_capacity,
+                "menuCapacityPerLevel": config.menu_capacity_per_level,
                 "totalCustomerBonus": total_customer_bonus,
                 "totalPriceBonusPct": total_price_bonus,
                 "totalSpeedBonusPct": total_speed_bonus,
+                "totalHourlySales": config.base_hourly_sales + max(0, state.current_level - 1) * config.hourly_sales_per_level + total_customer_bonus,
+                "totalMenuCapacity": (
+                    config.base_menu_capacity
+                    + max(0, state.current_level - 1) * config.menu_capacity_per_level
+                    + total_menu_capacity_bonus
+                ),
             },
             "menuItems": [
                 {
@@ -139,7 +128,6 @@ class RestaurantService:
                     "ingredient": item.ingredient,
                     "cookTime": item.cook_time,
                     "quantity": item.quantity,
-                    "exhibitedGameDay": item.exhibited_game_day,
                 }
                 for item in menu_items
             ],
@@ -153,12 +141,20 @@ class RestaurantService:
         item_id = data["item_id"]
         quantity = data["quantity"]
 
-        # 验证物品在背包中
-        try:
-            player_state = PlayerState.objects.get(player_id=str(player.id))
-        except PlayerState.DoesNotExist:
-            print(f"[exhibit_dish] PlayerState not found for player_id={player.id} (username={player.username})")
-            return False, "物品不存在于背包中"
+        # 菜品上架不依赖玩家本地日期；容量按餐厅当前等级的总份数计算。
+        restaurant_state = RestaurantService.get_or_create_state(player)
+        config = RestaurantConfig.get_instance()
+        capacity = (
+            config.base_menu_capacity
+            + max(0, restaurant_state.current_level - 1) * config.menu_capacity_per_level
+            + sum(
+                row.reward_menu_capacity_bonus
+                for row in RestaurantLevelConfig.objects.filter(level__lte=restaurant_state.current_level)
+            )
+        )
+        occupied = sum(MenuItem.objects.filter(player=player).values_list("quantity", flat=True))
+        if occupied + quantity > capacity:
+            return False, f"菜单总份数已达上限（{occupied}/{capacity}）"
 
         try:
             bag = InventoryBag.objects.get(
@@ -180,9 +176,6 @@ class RestaurantService:
         if slot.item_amount < quantity:
             return False, f"背包中物品数量不足（拥有{slot.item_amount}，需要{quantity}）"
 
-        # 获取累计游戏天数
-        game_day = player_state.total_game_days
-
         # 创建菜单项
         with transaction.atomic():
             menu_item = MenuItem.objects.create(
@@ -197,7 +190,6 @@ class RestaurantService:
                 ingredient=data.get("ingredient", ""),
                 cook_time=data.get("cook_time", 0),
                 quantity=quantity,
-                exhibited_game_day=game_day
             )
 
             # 扣减背包数量
@@ -265,202 +257,134 @@ class RestaurantService:
 
     @staticmethod
     def cleanup_expired_menu_items(player):
-        """清理过期的菜单菜品（昨日残留）。"""
-        try:
-            player_state = PlayerState.objects.get(player_id=str(player.id))
-            current_day = player_state.total_game_days
-        except PlayerState.DoesNotExist:
-            return 0
+        """菜品不再按游戏日过期，保留兼容调用。"""
+        return 0
 
-        expired_items = MenuItem.objects.filter(
-            player=player,
-            exhibited_game_day__lt=current_day
-        )
-        count = expired_items.count()
-        expired_items.delete()
-        return count
+    @staticmethod
+    def process_global_time(global_time):
+        """由全局时间同步触发：在 10:00（含）到 19:00（不含）随机自动售卖。"""
+        config = RestaurantConfig.get_instance()
+        if not config.opening_hour <= global_time.game_hour < config.closing_hour:
+            return []
+
+        updates = []
+        players = GameAccount.objects.filter(restaurant_state__isnull=False)
+        for player in players:
+            update = RestaurantService._process_player_hour(player, global_time, config)
+            if update:
+                updates.append(update)
+                logger.info(
+                    "[RestaurantAutoBusiness] player=%s time=%04d-%02d-%02d %02d:%02d sales=%s gold=%s ratings=%s",
+                    update["playerId"],
+                    update["gameYear"], update["gameMonth"], update["gameDay"],
+                    update["gameHour"], update["gameMinute"],
+                    update["salesCount"], update["goldEarned"], update["ratingsReceived"],
+                )
+        return updates
+
+    @staticmethod
+    def _process_player_hour(player, global_time, config):
+        state = RestaurantService.get_or_create_state(player)
+        level_bonus = sum(row.reward_customer_bonus for row in RestaurantLevelConfig.objects.filter(level__lte=state.current_level))
+        quota = config.base_hourly_sales + max(0, state.current_level - 1) * config.hourly_sales_per_level + level_bonus
+        sold_count = 0
+        gold_earned = 0
+        ratings_received = 0
+        sold_item_ids = []
+        with transaction.atomic():
+            slot, created = RestaurantHourlySlot.objects.select_for_update().get_or_create(
+                player=player, game_year=global_time.game_year, game_month=global_time.game_month,
+                game_day=global_time.game_day, game_hour=global_time.game_hour,
+                defaults={"quota": quota, "restaurant_level": state.current_level},
+            )
+            if created:
+                # 同一分钟允许多单；随机事件总数严格等于本小时额度上限。
+                RestaurantSaleEvent.objects.bulk_create([
+                    RestaurantSaleEvent(slot=slot, scheduled_minute=random.randint(0, 59)) for _ in range(quota)
+                ])
+            due_events = list(slot.sale_events.select_for_update().filter(processed=False, scheduled_minute__lte=global_time.game_minute).order_by("scheduled_minute", "id"))
+            for event in due_events:
+                if slot.sold_count >= slot.quota:
+                    event.processed, event.skipped = True, True
+                    event.save(update_fields=["processed", "skipped"])
+                    continue
+                menu = list(MenuItem.objects.select_for_update().filter(player=player, quantity__gt=0))
+                if not menu:
+                    event.processed, event.skipped = True, True
+                    event.save(update_fields=["processed", "skipped"])
+                    continue
+                item = random.choices(menu, weights=[m.quantity for m in menu], k=1)[0]
+                sold_item_id = item.item_id
+                daily_log, _ = DailyBusinessLog.objects.get_or_create(
+                    player=player,
+                    season_id=state.season_id,
+                    game_year=global_time.game_year,
+                    game_month=global_time.game_month,
+                    game_day_of_month=global_time.game_day,
+                    defaults={"game_day": global_time.game_day},
+                )
+                level_bonus = sum(row.reward_price_bonus_pct for row in RestaurantLevelConfig.objects.filter(level__lte=state.current_level))
+                base_price = item.rating_price if item.rated and item.rating_price > 0 else int((Item.objects.filter(item_id=item.item_id).first().item_price if Item.objects.filter(item_id=item.item_id).first() else 100) * _get_quality_coeff(item.dish_quality))
+                price = int(base_price * (100 + level_bonus) / 100)
+                dish_info = {
+                    "item_name": item.item_name,
+                    "dish_quality": item.dish_quality,
+                    "ingredient": item.ingredient,
+                    "price": price,
+                }
+                rating, comment = RestaurantService._request_llm_review(dish_info, config)
+                transaction_row = CustomerTransaction.objects.create(player=player, daily_log=daily_log,
+                    season_id=state.season_id, game_day=global_time.game_day,
+                    customer_name=random.choice(config.customer_name_pool or ["顾客"]), item_id=item.item_id,
+                    item_name=item.item_name, dish_quality=item.dish_quality, amount_paid=price, rating=rating, review_comment=comment)
+                item.quantity -= 1
+                if item.quantity:
+                    item.save(update_fields=["quantity"])
+                else:
+                    item.delete()
+                slot.sold_count += 1
+                slot.save(update_fields=["sold_count"])
+                event.processed, event.transaction = True, transaction_row
+                event.save(update_fields=["processed", "transaction"])
+                state.total_dishes_sold += 1
+                state.total_gold_earned += price
+                sold_count += 1
+                gold_earned += price
+                if rating >= 4:
+                    state.total_ratings_received += 1
+                    ratings_received += 1
+                if sold_item_id not in state.dishes_sold_set:
+                    state.dishes_sold_set.append(sold_item_id)
+                sold_item_ids.append(sold_item_id)
+                state.save(update_fields=["total_dishes_sold", "total_gold_earned", "total_ratings_received", "dishes_sold_set"])
+                daily_log.customer_count += 1
+                daily_log.total_earned += price
+                daily_log.save(update_fields=["customer_count", "total_earned"])
+                bag, _ = InventoryBag.objects.get_or_create(player=player, character_id=player.username, defaults={"money": 0})
+                bag.money += price
+                bag._money_change_source = "restaurant_hourly_sale"
+                bag.save(update_fields=["money"])
+
+        if sold_count <= 0:
+            return None
+
+        return {
+            "playerId": str(player.id),
+            "gameYear": global_time.game_year,
+            "gameMonth": global_time.game_month,
+            "gameDay": global_time.game_day,
+            "gameHour": global_time.game_hour,
+            "gameMinute": global_time.game_minute,
+            "salesCount": sold_count,
+            "goldEarned": gold_earned,
+            "ratingsReceived": ratings_received,
+            "soldItemIds": sold_item_ids,
+        }
 
     @staticmethod
     def process_daily_business(player):
-        """每日营业主流程。"""
-        config = RestaurantConfig.get_instance()
-        state = RestaurantService.get_or_create_state(player)
-
-        # 获取累计游戏天数
-        try:
-            player_state = PlayerState.objects.get(player_id=str(player.id))
-            current_day = player_state.total_game_days
-        except PlayerState.DoesNotExist:
-            return False, "玩家状态不存在"
-
-        # 检查是否已营业（以 DailyBusinessLog 为准，按赛季+日历日期过滤）
-        current_season_id = player_state.current_season_id or ""
-        if DailyBusinessLog.objects.filter(
-            player=player,
-            season_id=current_season_id,
-            game_year=player_state.game_year,
-            game_month=player_state.game_month,
-            game_day_of_month=player_state.game_day,
-        ).exists():
-            return False, "今日已营业"
-
-        # 计算顾客数
-        level_configs = RestaurantLevelConfig.objects.filter(level__lte=state.current_level)
-        total_customer_bonus = sum(lc.reward_customer_bonus for lc in level_configs)
-        customer_count = (
-            config.base_customer_count
-            + (state.current_level - 1) * config.customers_per_level
-            + total_customer_bonus
-        )
-
-        # 获取菜单
-        menu_items = list(MenuItem.objects.filter(player=player, quantity__gt=0))
-        if not menu_items:
-            return False, "菜单为空，无法接待顾客"
-
-        # 计算价格加成
-        total_price_bonus_pct = sum(lc.reward_price_bonus_pct for lc in level_configs)
-
-        # 获取顾客姓名池
-        name_pool = config.customer_name_pool or ["顾客"]
-
-        # ====== 阶段1：事务外完成所有 LLM 调用（避免 SQLite 锁） ======
-        customer_results = []  # [(customer_name, chosen_item, final_price, rating, comment), ...]
-        for _ in range(customer_count):
-            if not menu_items:
-                break
-
-            customer_name = random.choice(name_pool)
-
-            weights = [item.quantity for item in menu_items]
-            chosen_item = random.choices(menu_items, weights=weights, k=1)[0]
-
-            if chosen_item.rated and chosen_item.rating_price > 0:
-                base_price = chosen_item.rating_price
-            else:
-                item_obj = Item.objects.filter(item_id=chosen_item.item_id).first()
-                base_price = item_obj.item_price if item_obj else 100
-                base_price = int(base_price * _get_quality_coeff(chosen_item.dish_quality))
-
-            final_price = int(base_price * (100 + total_price_bonus_pct) / 100)
-
-            dish_info = {
-                "item_name": chosen_item.item_name,
-                "dish_quality": chosen_item.dish_quality,
-                "ingredient": chosen_item.ingredient,
-                "price": final_price,
-            }
-            rating, comment = RestaurantService._request_llm_review(dish_info, config)
-
-            customer_results.append((customer_name, chosen_item, final_price, rating, comment))
-
-            # 模拟扣减（只用于后续顾客选择计算，不实际修改数据库）
-            chosen_item.quantity -= 1
-            if chosen_item.quantity <= 0:
-                menu_items.remove(chosen_item)
-
-        # ====== 阶段2：事务内只做数据库操作 ======
-        # 重新加载菜单（阶段1 的 quantity 修改只是模拟，需重新查询）
-        menu_items_db = list(MenuItem.objects.filter(player=player, quantity__gt=0))
-        menu_map = {item.id: item for item in menu_items_db}
-
-        transactions_list = []
-        total_earned = 0
-
-        with transaction.atomic():
-            # 先创建营业日志（后续 transaction 通过 FK 关联）
-            daily_log, _ = DailyBusinessLog.objects.update_or_create(
-                player=player,
-                season_id=current_season_id,
-                game_year=player_state.game_year,
-                game_month=player_state.game_month,
-                game_day_of_month=player_state.game_day,
-                defaults={
-                    "game_day": current_day,
-                    "customer_count": 0,
-                    "total_earned": 0,
-                }
-            )
-
-            for customer_name, chosen_item, final_price, rating, comment in customer_results:
-                # 从数据库重新获取菜品（可能已被前一轮删除）
-                db_item = menu_map.get(chosen_item.id)
-                if db_item is None or db_item.quantity <= 0:
-                    continue
-
-                trans = CustomerTransaction.objects.create(
-                    player=player,
-                    daily_log=daily_log,
-                    season_id=state.season_id,
-                    game_day=current_day,
-                    customer_name=customer_name,
-                    item_id=db_item.item_id,
-                    item_name=db_item.item_name,
-                    dish_quality=db_item.dish_quality,
-                    amount_paid=final_price,
-                    rating=rating,
-                    review_comment=comment,
-                )
-                transactions_list.append(trans)
-                total_earned += final_price
-
-                db_item.quantity -= 1
-                if db_item.quantity <= 0:
-                    db_item.delete()
-                else:
-                    db_item.save()
-
-                state.total_dishes_sold += 1
-                state.total_gold_earned += final_price
-                if rating >= 3.8:
-                    state.total_ratings_received += 1
-                if db_item.item_id not in state.dishes_sold_set:
-                    state.dishes_sold_set = state.dishes_sold_set + [db_item.item_id]
-
-            # 销毁剩余菜品
-            remaining = MenuItem.objects.filter(player=player, quantity__gt=0)
-            destroyed_count = remaining.count()
-            remaining.delete()
-
-            # 更新营业记录
-            state.last_business_game_day = current_day
-            state.save()
-
-            # 更新营业日志的最终统计
-            daily_log.customer_count = len(transactions_list)
-            daily_log.total_earned = total_earned
-            daily_log.save()
-
-            # 增加玩家金币
-            try:
-                bag = InventoryBag.objects.get(player=player, character_id=player.username)
-                bag.money += total_earned
-                bag._money_change_source = "restaurant_income"
-                bag.save()
-            except InventoryBag.DoesNotExist:
-                pass
-
-        # 构建返回数据
-        result = {
-            "transactions": [
-                {
-                    "customerName": t.customer_name,
-                    "itemId": t.item_id,
-                    "itemName": t.item_name,
-                    "dishQuality": t.dish_quality,
-                    "amountPaid": t.amount_paid,
-                    "rating": t.rating,
-                    "reviewComment": t.review_comment,
-                }
-                for t in transactions_list
-            ],
-            "totalEarned": total_earned,
-            "destroyedDishes": destroyed_count,
-            "customerCount": len(transactions_list),
-            "money": bag.money,
-        }
-
-        return True, result
+        """兼容旧调用；餐厅营业已由全局时间按小时自动处理。"""
+        return False, "餐厅已改为按全局时间自动营业，请勿调用每日营业接口"
 
     @staticmethod
     def upgrade_restaurant(player):
@@ -630,7 +554,11 @@ class RestaurantService:
 
             # 调用 AI 服务
             endpoint = config.llm_review_endpoint or "menglong/chat"
-            url = f"http://localhost:8000/{endpoint}"
+            url = f"{settings.AI_SERVICE_URL}/{endpoint}"
+
+            headers = {}
+            if settings.AI_API_KEY:
+                headers["Authorization"] = f"Bearer {settings.AI_API_KEY}"
 
             response = requests.post(
                 url,
@@ -640,6 +568,7 @@ class RestaurantService:
                         {"role": "user", "content": user_message}
                     ]
                 },
+                headers=headers,
                 timeout=10
             )
 

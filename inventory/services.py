@@ -46,10 +46,7 @@ def init_player_bags(player):
     if template.money > 0:
         from player.models import PlayerState
         ps, _ = PlayerState.objects.get_or_create(player_id=str(player.id))
-        ps.day_start_money = template.money
-        ps.day_start_money_game_day = 1
-        ps.total_wealth_snapshot = template.money
-        ps.save(update_fields=["day_start_money", "day_start_money_game_day", "total_wealth_snapshot"])
+        # 榜单改为按真实时间窗口统计 ReportEvent，不再维护日初金币快照。
 
     return 1
 

@@ -4,4 +4,4 @@ from django.apps import AppConfig
 class MarketplaceConfig(AppConfig):
     default_auto_field = "django.db.models.BigAutoField"
     name = "marketplace"
-    verbose_name = "玩家市场"
+    verbose_name = "市场交易"

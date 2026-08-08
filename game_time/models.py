@@ -7,22 +7,21 @@ class GlobalGameTimeState(models.Model):
     与 per-player 的 PlayerState 不同，此模型存储全服共享的游戏时间。
     Env Server 启动时加载，推进后回写。
     """
-    game_year = models.IntegerField(default=2026)
-    game_month = models.IntegerField(default=3)
-    game_day = models.IntegerField(default=8, help_text="日历的日 (day-of-month)")
-    game_hour = models.IntegerField(default=7)
-    game_minute = models.IntegerField(default=0)
-    season = models.IntegerField(default=0)
-    total_game_days = models.IntegerField(default=1, help_text="累计游戏天数")
-    current_season_id = models.CharField(max_length=50, default="", blank=True)
-    updated_at = models.DateTimeField(auto_now=True)
+    game_year = models.IntegerField("游戏年", default=2026)
+    game_month = models.IntegerField("游戏月", default=3)
+    game_day = models.IntegerField("游戏日", default=8, help_text="日历日（每月中的第几日）")
+    game_hour = models.IntegerField("游戏小时", default=7)
+    game_minute = models.IntegerField("游戏分钟", default=0)
+    season = models.IntegerField("赛季序号", default=0)
+    current_season_id = models.CharField("当前赛季标识", max_length=50, default="", blank=True)
+    updated_at = models.DateTimeField("更新时间", auto_now=True)
 
     class Meta:
         verbose_name = "全局游戏时间"
         verbose_name_plural = "全局游戏时间"
 
     def __str__(self):
-        return f"全局时间: {self.game_year}-{self.game_month}-{self.game_day} 第{self.total_game_days}天"
+        return f"全局时间: {self.game_year}-{self.game_month}-{self.game_day}"
 
     @classmethod
     def get_instance(cls):

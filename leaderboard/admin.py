@@ -7,7 +7,7 @@ from django.urls import path
 from django.utils.html import format_html
 from import_export import resources
 from import_export.admin import ImportExportModelAdmin
-from .models import RewardConfig, LeaderboardEntry, ReportEvent, PendingReward
+from .models import RewardConfig, LeaderboardEntry, ReportEvent, PendingReward, LeaderboardPeriodConfig
 from season.models import Season
 
 
@@ -20,13 +20,33 @@ class RewardConfigResource(resources.ModelResource):
 @admin.register(RewardConfig)
 class RewardConfigAdmin(ImportExportModelAdmin):
     resource_class = RewardConfigResource
-    list_display = ["board_type", "settlement_type", "rank_min", "rank_max", "reward_type", "reward_data"]
+    list_display = ["period_config", "board_type", "settlement_type", "rank_min", "rank_max", "reward_type", "reward_data"]
     list_filter = ["board_type", "settlement_type", "reward_type"]
     search_fields = ["board_type"]
 
 
+@admin.register(LeaderboardPeriodConfig)
+class LeaderboardPeriodConfigAdmin(admin.ModelAdmin):
+    list_display = ["name", "interval_hours", "enabled", "reward_expire_hours"]
+    list_editable = ["enabled"]
+    ordering = ["interval_hours", "name"]
+
+
+class ReadOnlyRecordAdmin(admin.ModelAdmin):
+    """系统生成的运行记录只允许查看，避免后台误操作破坏结算数据。"""
+
+    def has_add_permission(self, request):
+        return False
+
+    def has_change_permission(self, request, obj=None):
+        return False
+
+    def has_delete_permission(self, request, obj=None):
+        return False
+
+
 @admin.register(LeaderboardEntry)
-class LeaderboardEntryAdmin(admin.ModelAdmin):
+class LeaderboardEntryAdmin(ReadOnlyRecordAdmin):
     list_display = ["season_id", "board_type", "game_day", "rank", "character_id", "display_name", "score", "is_ai"]
     list_filter = ["board_type", "is_ai"]
     search_fields = ["character_id", "display_name"]
@@ -152,7 +172,7 @@ class LeaderboardEntryAdmin(admin.ModelAdmin):
 
 
 @admin.register(ReportEvent)
-class ReportEventAdmin(admin.ModelAdmin):
+class ReportEventAdmin(ReadOnlyRecordAdmin):
     list_display = ["player_id", "event_type", "game_day", "season_id", "timestamp"]
     list_filter = ["event_type", "game_day", "season_id"]
     search_fields = ["player_id"]
@@ -163,7 +183,7 @@ class ReportEventAdmin(admin.ModelAdmin):
 
 
 @admin.register(PendingReward)
-class PendingRewardAdmin(admin.ModelAdmin):
+class PendingRewardAdmin(ReadOnlyRecordAdmin):
     list_display = ["player_id", "reward_id", "board_type", "settlement_type", "rank", "claimed", "expire_time"]
     list_filter = ["board_type", "settlement_type", "claimed"]
     search_fields = ["player_id", "reward_id"]

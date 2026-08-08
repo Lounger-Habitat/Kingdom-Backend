@@ -2,15 +2,103 @@
 import json
 import random
 import time
+from datetime import timedelta
 from collections import defaultdict
-from django.db.models import Sum, Max, Count, F
+from django.db.models import Count, F
+from django.utils import timezone
 from .models import (
-    LeaderboardEntry, RewardConfig, PendingReward, ReportEvent, BoardType, SettlementType,
+    LeaderboardEntry, RewardConfig, PendingReward, ReportEvent, BoardType, SettlementType, LeaderboardPeriodConfig,
 )
 from season.models import SeasonConfig
 from player.models import PlayerState, PlayerTitle
 from account.models import GameAccount
 from inventory.models import InventoryBag
+
+
+BEIJING_TZ = timezone.get_fixed_timezone(8 * 60)
+
+
+def get_period_bounds(period_config, now=None):
+    """返回包含 now 的北京时间自然整点周期 [start, end)。"""
+    now = timezone.localtime(now or timezone.now(), BEIJING_TZ)
+    midnight = now.replace(hour=0, minute=0, second=0, microsecond=0)
+    start = midnight + timedelta(hours=(now.hour // period_config.interval_hours) * period_config.interval_hours)
+    return start, start + timedelta(hours=period_config.interval_hours)
+
+
+def _period_key(period_config, start):
+    return f"{period_config.pk}:{start.strftime('%Y%m%d%H')}"
+
+
+def _period_scores(board_type, season_id, start, end):
+    events = ReportEvent.objects.filter(season_id=season_id, timestamp__gte=int(start.timestamp()), timestamp__lt=int(end.timestamp()))
+    if board_type == BoardType.TOTAL_WEALTH:
+        scores = defaultdict(float)
+        for event in events.filter(event_type="money_changed").only("player_id", "payload"):
+            payload = event.payload if isinstance(event.payload, dict) else {}
+            try:
+                scores[event.player_id] += float(payload.get("delta", 0) or 0)
+            except (TypeError, ValueError):
+                continue
+        return dict(scores)
+    if board_type == BoardType.TOTAL_OUTPUT:
+        return {row["player_id"]: row["score"] for row in events.filter(event_type="cook_completed").values("player_id").annotate(score=Count("id"))}
+    if board_type == BoardType.TOTAL_FRESHNESS:
+        result = {}
+        for row in events.filter(event_type="judge_confirmed").values("player_id", "payload"):
+            payload = row["payload"] if isinstance(row["payload"], dict) else {}
+            try:
+                score = float(payload.get("judge_score", 0) or 0)
+            except (TypeError, ValueError):
+                continue
+            result[row["player_id"]] = max(result.get(row["player_id"], 0), score)
+        return result
+    return {}
+
+
+def calculate_period_rankings(period_config, season_id, start, end):
+    """计算结束周期内的增量榜并写入不可变快照。"""
+    key = _period_key(period_config, start)
+    for board_type in BoardType.values:
+        scores = _period_scores(board_type, season_id, start, end)
+        LeaderboardEntry.objects.filter(board_type=board_type, season_id=season_id, period_key=key).delete()
+        accounts = {str(row.id): row for row in GameAccount.objects.filter(id__in=scores.keys())}
+        entries = []
+        for rank, (player_id, score) in enumerate(sorted(scores.items(), key=lambda row: row[1], reverse=True), 1):
+            account = accounts.get(str(player_id))
+            entries.append(LeaderboardEntry(board_type=board_type, season_id=season_id, character_id=player_id,
+                display_name=account.username if account else player_id, is_ai=account.is_ai if account else False,
+                score=score, rank=rank, avatar_id=f"avatar_{player_id}", period_key=key,
+                period_start=start, period_end=end))
+        LeaderboardEntry.objects.bulk_create(entries)
+    return key
+
+
+def settle_period(period_config, start, end, season_id):
+    key = calculate_period_rankings(period_config, season_id, start, end)
+    expire = int(time.time()) + period_config.reward_expire_hours * 3600
+    for board_type in BoardType.values:
+        configs = RewardConfig.objects.filter(board_type=board_type, period_config=period_config)
+        for entry in LeaderboardEntry.objects.filter(board_type=board_type, season_id=season_id, period_key=key, score__gt=0):
+            rewards = [{"type": config.reward_type, **(config.reward_data or {})} for config in configs if config.rank_min <= entry.rank <= config.rank_max]
+            if rewards:
+                PendingReward.objects.get_or_create(reward_id=f"period_{key}_{board_type}_{entry.character_id}", defaults={
+                    "player_id": entry.character_id, "board_type": board_type, "settlement_type": SettlementType.PERIODIC,
+                    "rank": entry.rank, "rewards": rewards, "expire_time": expire,
+                })
+
+
+def settle_due_periods(now=None):
+    """由每分钟调度调用；仅在北京时间周期边界结算刚结束的周期。"""
+    from season.season_service import get_active_season
+    now = timezone.localtime(now or timezone.now(), BEIJING_TZ)
+    # 调度器可能在整点后数秒执行；整分钟内重复进入由 reward_id 幂等保护。
+    if now.minute:
+        return
+    for config in LeaderboardPeriodConfig.objects.filter(enabled=True):
+        if now.hour % config.interval_hours == 0:
+            end = now.replace(second=0, microsecond=0)
+            settle_period(config, end - timedelta(hours=config.interval_hours), end, get_active_season().season_id)
 
 
 def calculate_rankings_realtime(board_type, player_id=None, game_day=None, season_id=None):
@@ -47,6 +135,8 @@ def calculate_rankings_realtime(board_type, player_id=None, game_day=None, seaso
                 payload = ev.get("payload", {})
                 if isinstance(payload, str):
                     payload = json.loads(payload)
+                if not isinstance(payload, dict):
+                    continue
                 pid = ev["player_id"]
                 score = payload.get("judge_score", 0)
                 dish = payload.get("dish_name", "")
@@ -57,7 +147,7 @@ def calculate_rankings_realtime(board_type, player_id=None, game_day=None, seaso
                 elif score > dishes[-1][0]:
                     dishes[-1] = (score, dish)
                     dishes.sort(reverse=True)
-            except (json.JSONDecodeError, TypeError):
+            except (json.JSONDecodeError, TypeError, AttributeError):
                 continue
     else:
         return [], None

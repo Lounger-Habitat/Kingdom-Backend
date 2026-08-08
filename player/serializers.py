@@ -8,14 +8,8 @@ class PlayerStateSerializer(serializers.ModelSerializer):
         fields = [
             "action_points",
             "action_points_max",
-            "game_day",
-            "game_year",
-            "game_month",
-            "game_hour",
-            "game_minute",
-            "season",
-            "total_game_days",
-            "time_initialized",
+            "action_points_recovered_at",
+            "current_season_id",
         ]
 
 

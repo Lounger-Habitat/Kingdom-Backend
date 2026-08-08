@@ -47,6 +47,8 @@ class Item(models.Model):
 
     class Meta:
         ordering = ["item_id"]
+        verbose_name = "道具"
+        verbose_name_plural = "道具"
 
     def save(self, *args, **kwargs):
         if not self.pk and self.item_type in (ItemType.FOOD, ItemType.USABLE):

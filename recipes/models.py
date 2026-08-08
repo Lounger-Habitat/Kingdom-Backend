@@ -21,6 +21,8 @@ class Recipe(models.Model):
 
     class Meta:
         ordering = ["item_id"]
+        verbose_name = "菜谱"
+        verbose_name_plural = "菜谱"
 
     def __str__(self):
         return f"{self.item_id} - {self.recipe_name}"

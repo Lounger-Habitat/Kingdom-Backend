@@ -12,6 +12,10 @@ from leaderboard.views_admin import season_reset_confirm, season_test_panel
 from marketplace.views import item_autocomplete
 from marketplace.admin import admin_buy_view
 
+admin.site.site_header = "王国游戏管理后台"
+admin.site.site_title = "王国游戏后台"
+admin.site.index_title = "运营管理"
+
 urlpatterns = [
     # 自定义 Admin 页面（必须在 admin.site.urls 之前，否则被 catch_all_view 拦截）
     path("", include("inventory.urls")),

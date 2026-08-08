@@ -21,7 +21,7 @@ def restaurant_state(request):
     except GameAccount.DoesNotExist:
         return Response({"success": False, "message": "玩家不存在"}, status=404)
 
-    # 清理过期菜品
+    # 保留兼容调用；菜单现在持续保留，不按游戏日清理。
     expired_count = RestaurantService.cleanup_expired_menu_items(player)
 
     # 获取状态数据
@@ -109,26 +109,8 @@ def menu_withdraw(request):
 
 @api_view(["POST"])
 def daily_business(request):
-    """触发每日营业。"""
-    player_id = get_player_id(request)
-    if not player_id:
-        return Response({"success": False, "message": "缺少玩家ID"}, status=400)
-
-    try:
-        player = GameAccount.objects.get(id=player_id)
-    except GameAccount.DoesNotExist:
-        return Response({"success": False, "message": "玩家不存在"}, status=404)
-
-    result, data = RestaurantService.process_daily_business(player)
-
-    if result:
-        return Response({
-            "success": True,
-            "message": f"营业完成，售出{data['customerCount']}道菜品，销毁{data['destroyedDishes']}道剩余菜品",
-            "data": data
-        })
-    else:
-        return Response({"success": False, "message": data}, status=400)
+    """兼容旧路由：餐厅现在由服务端全局时间自动营业。"""
+    return Response({"success": False, "message": "餐厅会在 10:00-19:00 按全局时间自动售卖"}, status=410)
 
 
 @api_view(["GET"])
@@ -181,7 +163,7 @@ def upgrade_restaurant(request):
 
 @api_view(["GET"])
 def business_history(request):
-    """查询营业历史记录。支持分页和按天查询。"""
+    """查询按游戏日汇总的自动售卖历史。支持分页和按天查询。"""
     player_id = get_player_id(request)
     if not player_id:
         return Response({"success": False, "message": "缺少玩家ID"}, status=400)
@@ -198,7 +180,7 @@ def business_history(request):
     if game_day is not None:
         qs = qs.filter(game_day=int(game_day))
 
-    qs = qs.order_by("-game_day")
+    qs = qs.order_by("-game_year", "-game_month", "-game_day_of_month")
 
     # 分页
     page = int(request.GET.get("page", 1))

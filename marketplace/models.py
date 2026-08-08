@@ -61,6 +61,8 @@ class MarketListing(models.Model):
 
     class Meta:
         ordering = ["-created_at"]
+        verbose_name = "市场挂单"
+        verbose_name_plural = "市场挂单"
         indexes = [
             models.Index(fields=["source_type", "status"]),
             models.Index(fields=["status", "item_id"]),
@@ -95,6 +97,8 @@ class MarketTransaction(models.Model):
 
     class Meta:
         ordering = ["-created_at"]
+        verbose_name = "市场成交记录"
+        verbose_name_plural = "市场成交记录"
         indexes = [
             models.Index(fields=["listing"]),
             models.Index(fields=["seller", "created_at"]),

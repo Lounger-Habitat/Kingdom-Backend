@@ -29,6 +29,8 @@ class AutobuyConfig(AppConfig):
             misfire_grace_time=60,
         )
         scheduler.start()
+        from config.scheduler_registry import register_scheduler
+        register_scheduler("自动购买", scheduler)
         logger.info("[scheduler] Auto-buy scheduled every 5 minutes (interval configurable in admin, requires restart)")
 
     @staticmethod

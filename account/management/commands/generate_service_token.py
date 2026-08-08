@@ -28,12 +28,12 @@ class Command(BaseCommand):
         token = AccessToken.for_user(account)
         token["scope"] = "env_server"
         token["aud"] = "kingdom-env"
-        token.set_exp(lifetime=timedelta(days=1))
+        token.set_exp(lifetime=timedelta(days=365))
 
         token_str = str(token)
         self.stdout.write("")
         self.stdout.write(self.style.SUCCESS("=" * 60))
-        self.stdout.write(self.style.SUCCESS("Service Token (Env Server scope，有效期24小时):"))
+        self.stdout.write(self.style.SUCCESS("Service Token (Env Server scope，有效期365天):"))
         self.stdout.write(self.style.SUCCESS("=" * 60))
         self.stdout.write(token_str)
         self.stdout.write(self.style.SUCCESS("=" * 60))

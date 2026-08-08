@@ -142,31 +142,17 @@ def settle_season(season):
 
 def is_player_season_reset(player):
     """Check if a player has been reset by a season rotation but the client hasn't synced yet."""
-    return (
-        player.total_game_days == 1
-        and player.game_year == INITIAL_GAME_YEAR
-        and player.game_month == INITIAL_GAME_MONTH
-        and player.game_day == INITIAL_GAME_DAY
-    )
+    return not player.current_season_id
 
 
 def build_season_time_response(player, season):
     """Build the time snapshot response dict for day_advanced."""
-    return {
-        "game_year": player.game_year,
-        "game_month": player.game_month,
-        "game_day": player.game_day,
-        "game_hour": player.game_hour,
-        "game_minute": player.game_minute,
-        "season": player.season,
-        "total_game_days": player.total_game_days,
-        "day_delta": 0,
-        "action_points": player.action_points,
-        "max_game_days": SeasonConfig.get_instance().max_game_days,
-        "seasonId": season.season_id,
-        "seasonEndTime": season.end_time,
-        "seasonSequence": season.sequence,
-    }
+    from game_time.models import GlobalGameTimeState
+    state = GlobalGameTimeState.get_instance()
+    return {"game_year": state.game_year, "game_month": state.game_month, "game_day": state.game_day,
+            "game_hour": state.game_hour, "game_minute": state.game_minute, "season": state.season,
+            "action_points": player.action_points, "seasonId": season.season_id,
+            "seasonEndTime": season.end_time, "seasonSequence": season.sequence}
 
 
 # ───── New two-phase season rotation ─────
@@ -246,21 +232,11 @@ def transition_player_to_season(player_state):
     logger.info("[transition] Player %s: %s -> %s", player_state.player_id, old_season_id, active_season.season_id)
 
     with transaction.atomic():
-        # 1. Reset PlayerState time fields
-        player_state.total_game_days = 1
-        player_state.game_year = INITIAL_GAME_YEAR
-        player_state.game_month = INITIAL_GAME_MONTH
-        player_state.game_day = INITIAL_GAME_DAY
-        player_state.game_hour = INITIAL_GAME_HOUR
-        player_state.game_minute = INITIAL_GAME_MINUTE
-        player_state.season = INITIAL_SEASON
-        player_state.time_initialized = False
-        player_state.action_points = 100
+        # 1. 玩家不保存日期；赛季切换只更新赛季和行动力。
+        from django.utils import timezone
+        player_state.action_points = 200
+        player_state.action_points_recovered_at = timezone.now()
         player_state.current_season_id = active_season.season_id
-        # 重置富豪榜快照，避免旧赛季残留数据影响新赛季
-        player_state.day_start_money = 0
-        player_state.day_start_money_game_day = 0
-        player_state.total_wealth_snapshot = 0
         player_state.save()
 
         # 2. Reset inventory & money from templates
@@ -430,20 +406,9 @@ def full_reset_to_season_1():
         stats["new_season"] = "season_1"
 
         # ── 3. 重置所有 PlayerState ──
+        from django.utils import timezone
         stats["players_reset"] = PlayerState.objects.all().update(
-            current_season_id="season_1",
-            total_game_days=1,
-            game_year=INITIAL_GAME_YEAR,
-            game_month=INITIAL_GAME_MONTH,
-            game_day=INITIAL_GAME_DAY,
-            game_hour=INITIAL_GAME_HOUR,
-            game_minute=INITIAL_GAME_MINUTE,
-            season=INITIAL_SEASON,
-            time_initialized=False,
-            action_points=100,
-            day_start_money=0,
-            day_start_money_game_day=0,
-            total_wealth_snapshot=0,
+            current_season_id="season_1", action_points=200, action_points_recovered_at=timezone.now(),
         )
 
         # ── 4. 重置所有玩家背包 & 金钱 ──

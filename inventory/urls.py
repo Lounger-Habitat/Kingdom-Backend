@@ -20,19 +20,15 @@ urlpatterns = [
     path("api/inventory/<str:character_id>/judge-by-agent", views.inventory_judge_by_agent, name="inventory-judge-by-agent"),
     path("api/inventory/<str:character_id>/remove", views.inventory_remove, name="inventory-remove"),
     path("api/inventory/<str:character_id>/swap", views.inventory_swap, name="inventory-swap"),
-    path("api/inventory/<str:character_id>/trade", views.inventory_trade, name="inventory-trade"),
     path("api/inventory/<str:character_id>/transfer", views.inventory_transfer, name="inventory-transfer"),
-    path("api/inventory/<str:character_id>/trade-with", views.inventory_trade_with, name="inventory-trade-with"),
     path("api/inventory/<str:character_id>/money", views.inventory_money, name="inventory-money"),
     path("api/inventory/<str:character_id>/compact", views.inventory_compact, name="inventory-compact"),
 
     # Env Server 内部动作 API（service token only）
-    path("api/env/actions/npc-trade", views.env_npc_trade, name="env-npc-trade"),
+    path("api/env/actions/character-trade", views.character_trade, name="character-trade"),
 
     # NPC 全局库存 API
     path("api/npc-inventory/restock", views.npc_global_inventory_restock, name="npc-global-inventory-restock"),
     path("api/npc-inventory/<str:character_id>", views.npc_global_inventory_detail, name="npc-global-inventory-detail"),
     path("api/npc-inventory/<str:character_id>/update", views.npc_global_inventory_update, name="npc-global-inventory-update"),
-    path("api/npc-inventory/<str:character_id>/trade", views.npc_global_inventory_trade, name="npc-global-inventory-trade"),
-    path("api/npc-inventory/<str:character_id>/sell", views.npc_global_inventory_sell, name="npc-global-inventory-sell"),
 ]

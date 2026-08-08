@@ -15,6 +15,8 @@ class GameAccount(models.Model):
 
     class Meta:
         ordering = ["-created_at"]
+        verbose_name = "游戏账号"
+        verbose_name_plural = "游戏账号"
 
     def __str__(self):
         tag = " [guest]" if self.is_guest else ""

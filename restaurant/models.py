@@ -4,10 +4,12 @@ from account.models import GameAccount
 
 class RestaurantConfig(models.Model):
     """餐厅全局配置（单例模式）。"""
-    business_hour = models.IntegerField("营业时间-小时", default=19, help_text="0-23")
-    business_minute = models.IntegerField("营业时间-分钟", default=0)
-    base_customer_count = models.IntegerField("基础顾客数", default=3, help_text="1级餐厅基础顾客数")
-    customers_per_level = models.IntegerField("每级增加顾客数", default=1)
+    opening_hour = models.IntegerField("营业开始小时", default=10)
+    closing_hour = models.IntegerField("营业结束小时", default=19, help_text="19:00 停止营业")
+    base_hourly_sales = models.IntegerField("每小时基础售卖数", default=3)
+    hourly_sales_per_level = models.IntegerField("每级每小时增加售卖数", default=1)
+    base_menu_capacity = models.IntegerField("基础菜单总份数上限", default=5)
+    menu_capacity_per_level = models.IntegerField("每级菜单总份数增加", default=1)
     llm_review_endpoint = models.CharField("AI点评端点", max_length=100, default="menglong/chat")
     customer_name_pool = models.JSONField("顾客姓名池", default=list, blank=True,
                                           help_text='["张三", "李四", ...]')
@@ -44,8 +46,10 @@ class RestaurantLevelConfig(models.Model):
     cost_money = models.IntegerField("升级金币消耗", default=0)
     cost_items = models.JSONField("升级物品消耗", default=list, blank=True,
                                   help_text='[{"itemId": 101, "amount": 5}]')
-    reward_customer_bonus = models.IntegerField("额外顾客数", default=0,
-                                                help_text="每次营业额外顾客数")
+    reward_customer_bonus = models.IntegerField("每小时额外售卖数", default=0,
+                                                help_text="每小时额外售卖数量（偶数等级增加）")
+    reward_menu_capacity_bonus = models.IntegerField("菜单容量增加", default=0,
+                                                     help_text="菜单总份数上限增加量（奇数等级增加）")
     reward_materials = models.JSONField("奖励材料", default=list, blank=True,
                                         help_text='[{"itemId": 101, "amount": 3}]')
     reward_recipes = models.JSONField("奖励菜谱", default=list, blank=True,
@@ -72,7 +76,6 @@ class PlayerRestaurantState(models.Model):
     total_ratings_received = models.IntegerField("累计好评数", default=0)
     dishes_sold_set = models.JSONField("已售卖菜品ID集合", default=list, blank=True,
                                        help_text="[101, 102, ...]")
-    last_business_game_day = models.IntegerField("上次营业游戏天数", default=0)
     season_id = models.CharField("所属赛季ID", max_length=50, default="", blank=True)
 
     class Meta:
@@ -84,7 +87,7 @@ class PlayerRestaurantState(models.Model):
 
 
 class MenuItem(models.Model):
-    """菜单菜品，当日有效，每日营业后未被消费的将被销毁。"""
+    """菜单菜品；上架后持续保留，营业时段由服务端按小时自动售卖。"""
     player = models.ForeignKey(GameAccount, on_delete=models.CASCADE,
                                related_name="menu_items", verbose_name="玩家")
     instance_id = models.CharField("实例ID", max_length=50, help_text="对应 InventorySlot 的 instance_id")
@@ -97,13 +100,11 @@ class MenuItem(models.Model):
     ingredient = models.CharField("原料信息", max_length=200, default="", blank=True)
     cook_time = models.IntegerField("烹饪时长", default=0)
     quantity = models.IntegerField("可售卖数量", default=1)
-    exhibited_game_day = models.IntegerField("上架时游戏天数", default=0,
-                                             help_text="用于判断是否过期")
 
     class Meta:
         verbose_name = "菜单菜品"
         verbose_name_plural = "菜单菜品"
-        ordering = ["-exhibited_game_day", "item_name"]
+        ordering = ["item_name", "id"]
 
     def __str__(self):
         return f"{self.player.username} - {self.item_name} x{self.quantity}"
@@ -157,3 +158,34 @@ class DailyBusinessLog(models.Model):
 
     def __str__(self):
         return f"{self.player.username} {self.season_id or 'S0'} {self.game_year}/{self.game_month}/{self.game_day_of_month} 售{self.total_earned}金币"
+
+
+class RestaurantHourlySlot(models.Model):
+    """某玩家在一个全局游戏小时内冻结的售卖额度。"""
+    player = models.ForeignKey(GameAccount, verbose_name="玩家", on_delete=models.CASCADE, related_name="restaurant_hourly_slots")
+    game_year = models.IntegerField("游戏年")
+    game_month = models.IntegerField("游戏月")
+    game_day = models.IntegerField("游戏日")
+    game_hour = models.IntegerField("游戏小时")
+    quota = models.PositiveIntegerField("本小时售卖额度", default=0)
+    sold_count = models.PositiveIntegerField("已售数量", default=0)
+    restaurant_level = models.PositiveIntegerField("额度冻结时餐厅等级", default=1)
+
+    class Meta:
+        unique_together = [("player", "game_year", "game_month", "game_day", "game_hour")]
+        verbose_name = "餐厅每小时售卖额度"
+        verbose_name_plural = "餐厅每小时售卖额度"
+
+
+class RestaurantSaleEvent(models.Model):
+    """在营业小时内随机安排的一次自动售卖。"""
+    slot = models.ForeignKey(RestaurantHourlySlot, verbose_name="小时售卖额度", on_delete=models.CASCADE, related_name="sale_events")
+    scheduled_minute = models.PositiveSmallIntegerField("计划售卖分钟")
+    processed = models.BooleanField("已处理", default=False)
+    skipped = models.BooleanField("已跳过", default=False)
+    transaction = models.OneToOneField(CustomerTransaction, verbose_name="成交记录", null=True, blank=True, on_delete=models.SET_NULL, related_name="sale_event")
+    created_at = models.DateTimeField("创建时间", auto_now_add=True)
+
+    class Meta:
+        verbose_name = "餐厅随机售卖事件"
+        verbose_name_plural = "餐厅随机售卖事件"

@@ -9,8 +9,8 @@ class RestaurantConfigSerializer(serializers.ModelSerializer):
     class Meta:
         model = RestaurantConfig
         fields = [
-            "business_hour", "business_minute",
-            "base_customer_count", "customers_per_level",
+            "opening_hour", "closing_hour", "base_hourly_sales", "hourly_sales_per_level",
+            "base_menu_capacity", "menu_capacity_per_level",
             "llm_review_endpoint", "customer_name_pool"
         ]
 
@@ -26,7 +26,7 @@ class PlayerRestaurantStateSerializer(serializers.ModelSerializer):
         model = PlayerRestaurantState
         fields = [
             "current_level", "total_dishes_sold", "total_gold_earned",
-            "total_ratings_received", "dishes_sold_set", "last_business_game_day",
+            "total_ratings_received", "dishes_sold_set",
             "season_id"
         ]
 
@@ -37,7 +37,7 @@ class MenuItemSerializer(serializers.ModelSerializer):
         fields = [
             "id", "instance_id", "item_id", "item_name", "dish_quality",
             "rated", "rating_price", "overall_score", "ingredient",
-            "cook_time", "quantity", "exhibited_game_day"
+            "cook_time", "quantity"
         ]
 
 

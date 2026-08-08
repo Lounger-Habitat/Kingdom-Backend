@@ -20,7 +20,9 @@ from .serializers import (
 )
 from items.models import Item, ItemType
 from account.env_auth import EnvServerJWTAuthentication
+from account.authentication import GameJWTAuthentication
 from account.models import GameAccount
+from config.auth import get_player_id
 
 
 def get_or_create_bag(player, character_id):
@@ -251,62 +253,6 @@ def inventory_swap(request, character_id):
 
 @extend_schema(responses={200: InventoryResponseSerializer, 400: ErrorResponseSerializer})
 @api_view(["POST"])
-def inventory_trade(request, character_id):
-    bag = get_or_create_bag(request.user, character_id)
-    instance_id = request.data.get("instanceId")
-    amount = request.data.get("amount", 1)
-    is_sell = request.data.get("isSell", False)
-
-    if not instance_id:
-        return Response(error_response("缺少 instanceId"), status=400)
-
-    slot = find_slot_by_instance(bag, instance_id)
-    if not slot:
-        return Response(error_response("物品未找到"), status=400)
-
-    # Get item price config
-    item_price = 0
-    sell_pct = 0.5
-    try:
-        item = Item.objects.get(item_id=slot.item_id)
-        item_price = item.item_price
-        sell_pct = item.sell_percentage
-    except Item.DoesNotExist:
-        pass
-
-    if is_sell:
-        # Sell: remove item, add money
-        if slot.item_amount < amount:
-            return Response(error_response("物品数量不足"), status=400)
-        earnings = int(item_price * sell_pct * amount)
-        slot.item_amount -= amount
-        slot.save()
-        clear_slot_if_empty(slot)
-        bag.money += earnings
-        bag._money_change_source = "npc_sell"
-        bag.save()
-    else:
-        # Buy: deduct money, add item
-        cost = item_price * amount
-        if bag.money < cost:
-            return Response(error_response("金币不足"), status=400)
-        bag.money -= cost
-        bag._money_change_source = "npc_buy"
-        bag.save()
-
-        existing = bag.slots.filter(item_id=slot.item_id, item_amount__gt=0).exclude(pk=slot.pk).first()
-        if existing:
-            existing.item_amount += amount
-            existing.save()
-        else:
-            slot.item_amount += amount
-            slot.save()
-
-    return Response(success_response(bag))
-
-
-@extend_schema(responses={200: DualBagResponseSerializer, 400: ErrorResponseSerializer})
-@api_view(["POST"])
 def inventory_transfer(request, character_id):
     bag = get_or_create_bag(request.user, character_id)
     instance_id = request.data.get("instanceId")
@@ -351,129 +297,6 @@ def inventory_transfer(request, character_id):
 
 
 @extend_schema(responses={200: DualBagResponseSerializer, 400: ErrorResponseSerializer})
-@api_view(["POST"])
-def inventory_trade_with(request, character_id):
-    bag = get_or_create_bag(request.user, character_id)
-    other_id = request.data.get("otherCharacterId")
-    give_items = request.data.get("giveItem") or []
-    give_money = request.data.get("giveMoney") or 0
-    get_items = request.data.get("getItem") or []
-    get_money = request.data.get("getMoney") or 0
-
-    if not other_id:
-        return Response(error_response("缺少 otherCharacterId"), status=400)
-
-    other_bag = get_or_create_bag(request.user, other_id)
-
-    # Validate money
-    if bag.money < give_money:
-        return Response(error_response("金币不足"), status=400)
-    if other_bag.money < get_money:
-        return Response(error_response("对方金币不足"), status=400)
-
-    # Validate give items
-    for gi in give_items:
-        item_id = gi.get("itemID")
-        inst_id = gi.get("instanceID")
-        amt = gi.get("amount", 1)
-        if inst_id:
-            slot = find_slot_by_instance(bag, inst_id)
-        else:
-            slot = bag.slots.filter(item_id=item_id, item_amount__gt=0).first()
-        if not slot or slot.item_amount < amt:
-            try:
-                item_name = Item.objects.get(item_id=item_id).item_name
-            except Item.DoesNotExist:
-                item_name = str(item_id)
-            return Response(error_response(f"物品 {item_name} 数量不足"), status=400)
-
-    # Validate get items
-    for gi in get_items:
-        item_id = gi.get("itemID")
-        amt = gi.get("amount", 1)
-        slot = other_bag.slots.filter(item_id=item_id, item_amount__gt=0).first()
-        if not slot or slot.item_amount < amt:
-            try:
-                item_name = Item.objects.get(item_id=item_id).item_name
-            except Item.DoesNotExist:
-                item_name = str(item_id)
-            return Response(error_response(f"对方物品 {item_name} 数量不足"), status=400)
-
-    # Execute transfers
-    bag.money -= give_money
-    other_bag.money += give_money
-    other_bag.money -= get_money
-    bag.money += get_money
-    bag._money_change_source = "trade_with"
-    other_bag._money_change_source = "trade_with"
-
-    for gi in give_items:
-        item_id = gi.get("itemID")
-        inst_id = gi.get("instanceID")
-        amt = gi.get("amount", 1)
-        if inst_id:
-            source_slot = find_slot_by_instance(bag, inst_id)
-        else:
-            source_slot = bag.slots.filter(item_id=item_id, item_amount__gt=0).first()
-
-        # 所有物品写入NPC背包，但标记为不在商店显示（NPC商店只卖预设物品）
-        target_slot = other_bag.slots.filter(item_id=item_id, item_amount__gt=0).first()
-        if target_slot:
-            target_slot.item_amount += amt
-            # 不改变已有槽位的 hide_in_shop，避免覆盖NPC预设物品的可见性
-            target_slot.save()
-        else:
-            empty = find_empty_slot(other_bag)
-            empty.item_id = source_slot.item_id
-            empty.item_amount = amt
-            empty.rated = source_slot.rated
-            empty.rating_price = source_slot.rating_price
-            empty.ingredient = source_slot.ingredient
-            empty.item_bag_name = source_slot.item_bag_name
-            empty.cook_time = source_slot.cook_time
-            empty.dish_quality = source_slot.dish_quality
-            empty.hide_in_shop = True
-            empty.remaining_uses = source_slot.remaining_uses
-            empty.review_comment = source_slot.review_comment
-            empty.save()
-
-        source_slot.item_amount -= amt
-        source_slot.save()
-        clear_slot_if_empty(source_slot)
-
-    for gi in get_items:
-        item_id = gi.get("itemID")
-        amt = gi.get("amount", 1)
-        source_slot = other_bag.slots.filter(item_id=item_id, item_amount__gt=0).first()
-        target_slot = bag.slots.filter(item_id=item_id, item_amount__gt=0).first()
-        if target_slot:
-            target_slot.item_amount += amt
-            target_slot.save()
-        else:
-            empty = find_empty_slot(bag)
-            empty.item_id = source_slot.item_id
-            empty.item_amount = amt
-            empty.rated = source_slot.rated
-            empty.rating_price = source_slot.rating_price
-            empty.ingredient = source_slot.ingredient
-            empty.item_bag_name = source_slot.item_bag_name
-            empty.cook_time = source_slot.cook_time
-            empty.dish_quality = source_slot.dish_quality
-            empty.hide_in_shop = source_slot.hide_in_shop
-            empty.remaining_uses = source_slot.remaining_uses
-            empty.review_comment = source_slot.review_comment
-            empty.save()
-        source_slot.item_amount -= amt
-        source_slot.save()
-        clear_slot_if_empty(source_slot)
-
-    bag.save()
-    other_bag.save()
-
-    return Response(dual_bag_response(bag, other_bag))
-
-
-@extend_schema(responses={200: InventoryResponseSerializer})
 @api_view(["POST"])
 def inventory_compact(request, character_id):
     """整理背包：删除空槽位，有物品的槽位重新从 0 开始连续编号。"""
@@ -886,6 +709,8 @@ def inventory_collect(request, character_id):
     # 校验行动力
     player_id = request.user.pk
     player, _ = PlayerState.objects.get_or_create(player_id=player_id)
+    from player.services import recover_action_points
+    recover_action_points(player)
     if player.action_points < collection_point.action_cost:
         return Response({
             "code": "INSUFFICIENT_ACTION_POINTS",
@@ -920,7 +745,9 @@ def inventory_collect(request, character_id):
     bag = get_or_create_bag(request.user, character_id)
     with transaction.atomic():
         player.action_points -= collection_point.action_cost
-        player.save()
+        from django.utils import timezone
+        player.action_points_recovered_at = timezone.now()
+        player.save(update_fields=["action_points", "action_points_recovered_at"])
 
         for ci in collected_items:
             existing = bag.slots.filter(item_id=ci["itemId"], item_amount__gt=0).first()
@@ -1187,16 +1014,8 @@ def _report_judge_confirmed(player_id, item_id, item_name, overall_score, commen
     """上报 judge_confirmed 事件并刷新极鲜榜排行榜。"""
     from leaderboard.models import ReportEvent
     from leaderboard.services import refresh_leaderboard, BoardType
-    from player.models import PlayerState
-
-    game_day = None
-    season_id = None
-    try:
-        state = PlayerState.objects.get(player_id=player_id)
-        game_day = state.total_game_days
-        season_id = state.current_season_id
-    except PlayerState.DoesNotExist:
-        pass
+    from season.season_service import get_active_season
+    season_id = get_active_season().season_id
 
     payload = {
         "dish_id": item_id,
@@ -1209,7 +1028,6 @@ def _report_judge_confirmed(player_id, item_id, item_name, overall_score, commen
         player_id=str(player_id),
         event_type="judge_confirmed",
         payload=payload,
-        game_day=game_day,
         season_id=season_id,
     )
 
@@ -1352,6 +1170,8 @@ def inventory_judge(request, character_id):
     # 行动力检查
     player_id = request.user.pk
     player, _ = PlayerState.objects.get_or_create(player_id=player_id)
+    from player.services import recover_action_points
+    recover_action_points(player)
     judge_cost = 2  # 默认点评消耗
     if player.action_points < judge_cost:
         return Response(error_response("行动力不足，无法点评"), status=400)
@@ -1441,7 +1261,9 @@ def inventory_judge(request, character_id):
 
         # 扣除行动力
         player.action_points -= judge_cost
-        player.save()
+        from django.utils import timezone
+        player.action_points_recovered_at = timezone.now()
+        player.save(update_fields=["action_points", "action_points_recovered_at"])
 
     # 上报 judge_confirmed 事件（刷新极鲜榜）
     _report_judge_confirmed(player_user.pk, slot.item_id, item_detail.item_name, overall_score, comment)
@@ -1464,10 +1286,10 @@ def inventory_judge(request, character_id):
 
 
 @api_view(["POST"])
-@authentication_classes([])
+@authentication_classes([GameJWTAuthentication])
 @permission_classes([IsAuthenticated])
 def inventory_judge_by_agent(request, character_id):
-    """Agent点评接口：接收Agent生成的评语和评分，后端计算总分和点评价值并保存。无需JWT认证。"""
+    """Agent点评接口：接收Agent生成的评语和评分，后端计算并保存最终结果。"""
     from player.models import PlayerState
     from recipes.models import Recipe
 
@@ -1500,6 +1322,8 @@ def inventory_judge_by_agent(request, character_id):
     player_user = bag.player
     if not player_user:
         return Response(error_response("无法确定物品所属玩家"), status=400)
+    if str(player_user.id) != str(get_player_id(request)):
+        return Response(error_response("点评物品不属于当前玩家"), status=403)
 
     slot = find_slot_by_instance(bag, instance_id)
     if not slot:
@@ -1521,6 +1345,8 @@ def inventory_judge_by_agent(request, character_id):
 
     # 行动力检查
     player, _ = PlayerState.objects.get_or_create(player_id=player_user.pk)
+    from player.services import recover_action_points
+    recover_action_points(player)
     judge_cost = 2
     if player.action_points < judge_cost:
         return Response(error_response("行动力不足，无法点评"), status=400)
@@ -1570,7 +1396,9 @@ def inventory_judge_by_agent(request, character_id):
 
         # 扣除行动力
         player.action_points -= judge_cost
-        player.save()
+        from django.utils import timezone
+        player.action_points_recovered_at = timezone.now()
+        player.save(update_fields=["action_points", "action_points_recovered_at"])
 
     # 上报 judge_confirmed 事件（刷新极鲜榜）
     _report_judge_confirmed(player_user.pk, slot.item_id, item_detail.item_name, overall_score, comment)
@@ -1595,171 +1423,395 @@ def inventory_judge_by_agent(request, character_id):
 # ─────────────── Env Server 原子动作 API ───────────────
 
 
-def _copy_npc_slot_to_player(npc_slot, player_bag, amount):
-    """Copy a purchased item while preserving the instance attributes Unity uses."""
-    target = find_empty_slot(player_bag)
-    target.item_id = npc_slot.item_id
+def _character_trade_owner(raw_owner, label):
+    """Normalize a generic trade participant into a player or NPC owner."""
+    if not isinstance(raw_owner, dict):
+        return None, f"缺少 {label} 交易对象"
+
+    owner_type = str(raw_owner.get("type") or "").strip().lower()
+    owner_id = str(
+        raw_owner.get("id")
+        or raw_owner.get("characterId")
+        or ""
+    ).strip()
+    if owner_type not in {"player", "npc"} or not owner_id:
+        return None, f"{label} 交易对象格式错误"
+
+    if owner_type == "player":
+        try:
+            player = GameAccount.objects.get(id=owner_id, is_active=True)
+        except (GameAccount.DoesNotExist, ValueError, TypeError):
+            player = GameAccount.objects.filter(
+                username=owner_id, is_active=True
+            ).first()
+        if player is None:
+            return None, f"玩家不存在或已禁用: {owner_id}"
+
+        bag, _ = InventoryBag.objects.get_or_create(
+            player=player, character_id=player.username
+        )
+        return {
+            "type": "player",
+            "id": str(player.id),
+            "account": player,
+            "bag": bag,
+        }, None
+
+    try:
+        npc_bag = NpcGlobalInventory.objects.get(npc__agent_id=owner_id)
+    except NpcGlobalInventory.DoesNotExist:
+        # Keep the generic endpoint usable after a fresh deployment or when
+        # GameInitializer has not loaded this NPC yet.  The initializer uses
+        # the NPC's BagTemplate and returns None for an unknown agent ID.
+        npc_bag = _init_npc_global_from_template(owner_id)
+        if npc_bag is None:
+            return None, f"NPC库存不存在: {owner_id}"
+
+    return {
+        "type": "npc",
+        "id": owner_id,
+        "account": None,
+        "bag": npc_bag,
+    }, None
+
+
+def _character_trade_items(raw_items, label):
+    """Parse the original giveItem/getItem shape for the generic endpoint."""
+    if raw_items is None:
+        return [], None
+    if not isinstance(raw_items, list):
+        return [], f"{label} 必须是数组"
+
+    parsed = []
+    for raw_item in raw_items:
+        if not isinstance(raw_item, dict):
+            return [], f"{label} 物品格式错误"
+
+        item_id = raw_item.get("itemID")
+        if item_id is None:
+            item_id = raw_item.get("itemId")
+        instance_id = raw_item.get("instanceID")
+        if instance_id is None:
+            instance_id = raw_item.get("instanceId")
+
+        try:
+            item_id = int(item_id)
+            amount = int(raw_item.get("amount", 0))
+        except (TypeError, ValueError):
+            return [], f"{label} 物品格式错误"
+
+        if item_id <= 0 or amount <= 0:
+            return [], f"{label} 物品格式错误"
+
+        parsed.append({
+            "item_id": item_id,
+            "instance_id": str(instance_id or "").strip() or None,
+            "amount": amount,
+        })
+    return parsed, None
+
+
+def _character_trade_find_slot(owner, item):
+    slots = owner["bag"].slots.select_for_update().filter(item_amount__gt=0)
+    instance_id = item["instance_id"]
+    if instance_id:
+        slot = slots.filter(instance_id=instance_id).first()
+        if slot is not None and slot.item_id != item["item_id"]:
+            return None, "物品实例与物品ID不匹配"
+    else:
+        slot = slots.filter(item_id=item["item_id"]).first()
+
+    if slot is None or slot.item_id != item["item_id"]:
+        return None, "物品数量不足"
+    return slot, None
+
+
+def _character_trade_copy_slot(source_slot, target_owner, amount):
+    """Copy one inventory slot to either a player bag or an NPC global bag."""
+    target_bag = target_owner["bag"]
+    target_is_npc = target_owner["type"] == "npc"
+    target_hide_in_shop = False
+    if target_is_npc:
+        # NPC 模板是商店商品白名单。玩家卖出的物品仍进入 NPC 全局库存，
+        # 但只有模板中配置为可见的物品才能出现在商店页面。
+        target_hide_in_shop = not BagTemplateSlot.objects.filter(
+            template__npc_id=target_bag.npc_id,
+            item_id=source_slot.item_id,
+            hide_in_shop=False,
+        ).exists()
+
+    existing = target_bag.slots.select_for_update().filter(
+        item_id=source_slot.item_id,
+        item_amount__gt=0,
+        rated=source_slot.rated,
+        rating_price=source_slot.rating_price,
+        overall_score=source_slot.overall_score,
+        ingredient=source_slot.ingredient,
+        cook_time=source_slot.cook_time,
+        dish_quality=source_slot.dish_quality,
+        remaining_uses=source_slot.remaining_uses,
+        review_comment=source_slot.review_comment,
+    ).order_by("hide_in_shop", "slot_index", "id").first()
+    if existing:
+        existing.item_amount += amount
+        # 同步模板白名单结果，同时修正历史上写错的可见性。
+        existing.hide_in_shop = target_hide_in_shop
+        existing.save(update_fields=["item_amount", "hide_in_shop"])
+        return
+
+    if target_is_npc:
+        target = target_bag.slots.filter(item_amount=0).first()
+        if target is None:
+            max_idx = target_bag.slots.aggregate(Max("slot_index"))["slot_index__max"]
+            target = NpcGlobalInventorySlot.objects.create(
+                bag=target_bag,
+                slot_index=(max_idx + 1) if max_idx is not None else 0,
+            )
+    else:
+        target = find_empty_slot(target_bag)
+
+    target.item_id = source_slot.item_id
     target.item_amount = amount
-    target.rated = npc_slot.rated
-    target.rating_price = npc_slot.rating_price
-    target.overall_score = npc_slot.overall_score
-    target.ingredient = npc_slot.ingredient
-    target.item_bag_name = npc_slot.item_bag_name
-    target.cook_time = npc_slot.cook_time
-    target.dish_quality = npc_slot.dish_quality
-    target.hide_in_shop = False
-    target.remaining_uses = npc_slot.remaining_uses
-    target.review_comment = npc_slot.review_comment
+    target.rated = source_slot.rated
+    target.rating_price = source_slot.rating_price
+    target.overall_score = source_slot.overall_score
+    target.ingredient = source_slot.ingredient
+    target.item_bag_name = source_slot.item_bag_name
+    target.cook_time = source_slot.cook_time
+    target.dish_quality = source_slot.dish_quality
+    target.hide_in_shop = target_hide_in_shop
+    target.remaining_uses = source_slot.remaining_uses
+    target.review_comment = source_slot.review_comment
     target.save()
 
 
-def _copy_player_slot_to_npc(player_slot, npc_bag, amount):
-    """Store a sold player item in the shared NPC inventory."""
-    target = npc_bag.slots.select_for_update().filter(
-        item_id=player_slot.item_id,
-        item_amount__gt=0,
-        rated=player_slot.rated,
-        rating_price=player_slot.rating_price,
-        overall_score=player_slot.overall_score,
-        ingredient=player_slot.ingredient,
-        cook_time=player_slot.cook_time,
-        dish_quality=player_slot.dish_quality,
-        remaining_uses=player_slot.remaining_uses,
-        review_comment=player_slot.review_comment,
-    ).first()
-    if target:
-        target.item_amount += amount
-        target.save(update_fields=["item_amount"])
-        return
-
-    max_idx = npc_bag.slots.aggregate(Max("slot_index"))["slot_index__max"]
-    NpcGlobalInventorySlot.objects.create(
-        bag=npc_bag,
-        slot_index=(max_idx + 1) if max_idx is not None else 0,
-        item_id=player_slot.item_id,
-        item_amount=amount,
-        rated=player_slot.rated,
-        rating_price=player_slot.rating_price,
-        overall_score=player_slot.overall_score,
-        ingredient=player_slot.ingredient,
-        item_bag_name=player_slot.item_bag_name,
-        cook_time=player_slot.cook_time,
-        dish_quality=player_slot.dish_quality,
-        hide_in_shop=True,
-        remaining_uses=player_slot.remaining_uses,
-        review_comment=player_slot.review_comment,
-    )
+def _character_trade_remove_slot(slot, amount):
+    slot.item_amount -= amount
+    slot.save(update_fields=["item_amount"])
+    clear_slot_if_empty(slot)
 
 
 @api_view(["POST"])
 @authentication_classes([EnvServerJWTAuthentication])
 @permission_classes([IsAuthenticated])
 @transaction.atomic
-def env_npc_trade(request):
-    """Execute a player/NPC trade in one database transaction.
+def character_trade(request):
+    """Execute a generic atomic trade between a player and/or an NPC.
 
-    Only the Env Server may call this endpoint.  Prices are derived from the
-    item catalogue, rather than accepting playerPay/npcPay from the caller.
+    The payload keeps the original giveItem/getItem semantics:
+    initiator gives giveItem/giveMoney and receives getItem/getMoney.
+    The other participant is the source of getItem/getMoney and receives the
+    initiator's giveItem/giveMoney.
     """
+    # import time as _time
+    # _trade_start = _time.monotonic()
     request_id = str(request.data.get("requestId") or "").strip()
-    player_id = str(request.data.get("playerId") or "").strip()
-    npc_id = str(request.data.get("npcId") or "").strip()
-    direction = str(request.data.get("direction") or "").lower()
-    item_id = request.data.get("itemId")
-    instance_id = request.data.get("instanceId")
+    requester_id = str(request.data.get("requesterId") or "").strip()
+    # print(f"[TradePerf] character_trade 开始: requestId={request_id}")
+    if not request_id:
+        return Response(error_response("缺少 requestId"), status=400)
 
-    try:
-        amount = int(request.data.get("amount", 0))
-    except (TypeError, ValueError):
-        amount = 0
+    initiator_raw = request.data.get("initiator")
+    other_raw = request.data.get("other")
+    if initiator_raw is None:
+        initiator_raw = {
+            "id": request.data.get("initiatorId"),
+            "type": request.data.get("initiatorType"),
+        }
+    if other_raw is None:
+        other_raw = {
+            "id": request.data.get("otherId"),
+            "type": request.data.get("otherType"),
+        }
 
-    if not request_id or not player_id or not npc_id or direction not in {"buy", "sell"}:
-        return Response(error_response("缺少或非法的 requestId、playerId、npcId 或 direction"), status=400)
-    if amount <= 0:
-        return Response(error_response("amount 必须大于0"), status=400)
+    # A player client may only know its username.  Env Server supplies the
+    # authenticated account ID as requesterId, so use it for the local player.
+    if isinstance(initiator_raw, dict) and str(initiator_raw.get("type") or "").lower() == "player":
+        if str(initiator_raw.get("id") or "").strip() in {"", "player", "self"} and requester_id:
+            initiator_raw = dict(initiator_raw)
+            initiator_raw["id"] = requester_id
+    if isinstance(other_raw, dict) and str(other_raw.get("type") or "").lower() == "player":
+        if str(other_raw.get("id") or "").strip() in {"", "player", "self"} and requester_id:
+            other_raw = dict(other_raw)
+            other_raw["id"] = requester_id
 
-    try:
-        player = GameAccount.objects.get(id=player_id, is_active=True)
-    except GameAccount.DoesNotExist:
-        return Response(error_response("玩家不存在或已禁用"), status=404)
+    initiator, error = _character_trade_owner(initiator_raw, "initiator")
+    if error:
+        return Response(error_response(error), status=400)
+    other, error = _character_trade_owner(other_raw, "other")
+    if error:
+        return Response(error_response(error), status=400)
+    if initiator["type"] == other["type"] and initiator["id"] == other["id"]:
+        return Response(error_response("交易双方不能是同一角色"), status=400)
 
-    receipt, created = EnvActionReceipt.objects.select_for_update().get_or_create(
-        player=player,
-        request_id=request_id,
-        defaults={"action": "npc_trade", "response_data": {}},
-    )
-    if not created:
-        return Response(receipt.response_data)
+    player_owners = [owner for owner in (initiator, other) if owner["type"] == "player"]
 
-    try:
-        npc_bag = NpcGlobalInventory.objects.select_for_update().get(npc__agent_id=npc_id)
-    except NpcGlobalInventory.DoesNotExist:
-        return Response(error_response("NPC库存不存在"), status=404)
+    requester = None
+    if requester_id:
+        # The client may send either the account UUID or the username.  The
+        # owner resolver normalizes both forms to the account UUID, so resolve
+        # requesterId the same way before comparing it with the participants.
+        try:
+            requester_account = GameAccount.objects.get(
+                id=requester_id, is_active=True
+            )
+        except (GameAccount.DoesNotExist, ValueError, TypeError):
+            requester_account = GameAccount.objects.filter(
+                username=requester_id, is_active=True
+            ).first()
 
-    player_bag, _ = InventoryBag.objects.get_or_create(player=player, character_id=player.username)
-    player_bag = InventoryBag.objects.select_for_update().get(pk=player_bag.pk)
+        if requester_account is not None:
+            requester = next(
+                (
+                    owner for owner in player_owners
+                    if owner["account"].id == requester_account.id
+                ),
+                None,
+            )
+            if requester is not None:
+                requester_id = str(requester_account.id)
 
-    if direction == "buy":
-        if item_id is None:
-            return Response(error_response("购买缺少 itemId"), status=400)
-        npc_slot = npc_bag.slots.select_for_update().filter(item_id=item_id, item_amount__gt=0).first()
-        if not npc_slot or npc_slot.item_amount < amount:
-            return Response(error_response("NPC库存不足"), status=400)
-        item = Item.objects.filter(item_id=item_id).first()
-        if not item:
-            return Response(error_response("物品配置不存在"), status=400)
-        total_price = item.item_price * amount
-        if player_bag.money < total_price:
-            return Response(error_response("金币不足"), status=400)
-
-        _copy_npc_slot_to_player(npc_slot, player_bag, amount)
-        npc_slot.item_amount -= amount
-        if npc_slot.item_amount == 0:
-            npc_slot.delete()
-        else:
-            npc_slot.save(update_fields=["item_amount"])
-        player_bag.money -= total_price
-        player_bag._money_change_source = "env_npc_buy"
-        player_bag.save()
-        npc_bag.money += total_price
-        npc_bag.save(update_fields=["money"])
-        message = "购买成功"
+        if requester is None:
+            return Response(error_response("requesterId 不是交易参与玩家"), status=400)
     else:
-        player_slot = (
-            player_bag.slots.select_for_update().filter(instance_id=instance_id, item_amount__gt=0).first()
-            if instance_id else player_bag.slots.select_for_update().filter(item_id=item_id, item_amount__gt=0).first()
-        )
-        if not player_slot or player_slot.item_amount < amount:
-            return Response(error_response("玩家背包物品不足"), status=400)
-        item = Item.objects.filter(item_id=player_slot.item_id).first()
-        if not item:
-            return Response(error_response("物品配置不存在"), status=400)
-        total_price = int(item.item_price * item.sell_percentage) * amount
-        if npc_bag.money < total_price:
-            return Response(error_response("NPC金币不足"), status=400)
+        requester = player_owners[0] if player_owners else None
+        requester_id = str(requester["account"].id) if requester else ""
 
-        _copy_player_slot_to_npc(player_slot, npc_bag, amount)
-        player_slot.item_amount -= amount
-        player_slot.save(update_fields=["item_amount"])
-        clear_slot_if_empty(player_slot)
-        player_bag.money += total_price
-        player_bag._money_change_source = "env_npc_sell"
-        player_bag.save()
-        npc_bag.money -= total_price
-        npc_bag.save(update_fields=["money"])
-        message = "出售成功"
+    receipt = None
+    if requester is not None:
+        receipt = EnvActionReceipt.objects.select_for_update().filter(
+            player=requester["account"], request_id=request_id
+        ).first()
+    if receipt is not None:
+        if receipt.response_data:
+            return Response(receipt.response_data)
+        receipt.delete()
+
+    # Lock both owner rows before validating or mutating any slot.  The tables
+    # are different for players and NPCs, but deterministic ordering prevents
+    # two concurrent player/NPC transactions from waiting in opposite order.
+    locked_owners = sorted(
+        (initiator, other),
+        key=lambda owner: (owner["type"], owner["id"]),
+    )
+    for owner in locked_owners:
+        if owner["type"] == "player":
+            owner["bag"] = InventoryBag.objects.select_for_update().get(pk=owner["bag"].pk)
+        else:
+            owner["bag"] = NpcGlobalInventory.objects.select_for_update().get(pk=owner["bag"].pk)
+
+    # Re-check after locking both inventories.  A concurrent retry with the
+    # same requestId may have waited on the owner lock while the first request
+    # committed its receipt.
+    if requester is not None:
+        receipt = EnvActionReceipt.objects.select_for_update().filter(
+            player=requester["account"], request_id=request_id
+        ).first()
+        if receipt is not None:
+            if receipt.response_data:
+                return Response(receipt.response_data)
+            receipt.delete()
+
+    give_items, error = _character_trade_items(request.data.get("giveItem"), "giveItem")
+    if error:
+        return Response(error_response(error), status=400)
+    get_items, error = _character_trade_items(request.data.get("getItem"), "getItem")
+    if error:
+        return Response(error_response(error), status=400)
+
+    try:
+        give_money = int(request.data.get("giveMoney", 0) or 0)
+        get_money = int(request.data.get("getMoney", 0) or 0)
+    except (TypeError, ValueError):
+        return Response(error_response("金币格式错误"), status=400)
+    if give_money < 0 or get_money < 0:
+        return Response(error_response("金币不能为负数"), status=400)
+    if not give_items and not get_items and give_money == 0 and get_money == 0:
+        return Response(error_response("交易内容不能为空"), status=400)
+
+    def resolve_all(owner, items, label):
+        resolved = {}
+        for item in items:
+            slot, slot_error = _character_trade_find_slot(owner, item)
+            if slot_error:
+                return None, f"{label}: {slot_error}"
+            if slot.item_amount < item["amount"]:
+                return None, f"{label}: 物品数量不足"
+            item_config = Item.objects.filter(item_id=item["item_id"]).first()
+            if item_config is None:
+                return None, f"{label}: 物品配置不存在({item['item_id']})"
+            key = slot.pk
+            if key not in resolved:
+                resolved[key] = {
+                    "slot": slot,
+                    "item": item_config,
+                    "amount": 0,
+                }
+            resolved[key]["amount"] += item["amount"]
+
+        for entry in resolved.values():
+            if entry["slot"].item_amount < entry["amount"]:
+                return None, f"{label}: 物品数量不足"
+        return list(resolved.values()), None
+
+    resolved_give, error = resolve_all(initiator, give_items, "给予物品")
+    if error:
+        return Response(error_response(error), status=400)
+    resolved_get, error = resolve_all(other, get_items, "获得物品")
+    if error:
+        return Response(error_response(error), status=400)
+
+    if initiator["bag"].money < give_money:
+        return Response(error_response("发起者金币不足"), status=400)
+    if other["bag"].money < get_money:
+        return Response(error_response("对方金币不足"), status=400)
+
+    for entry in resolved_give:
+        _character_trade_copy_slot(entry["slot"], other, entry["amount"])
+        _character_trade_remove_slot(entry["slot"], entry["amount"])
+    for entry in resolved_get:
+        _character_trade_copy_slot(entry["slot"], initiator, entry["amount"])
+        _character_trade_remove_slot(entry["slot"], entry["amount"])
+
+    initiator["bag"].money -= give_money
+    other["bag"].money += give_money
+    other["bag"].money -= get_money
+    initiator["bag"].money += get_money
+
+    if initiator["type"] == "player":
+        initiator["bag"]._money_change_source = "character_trade"
+        initiator["bag"].save()
+    else:
+        initiator["bag"].save(update_fields=["money"])
+    if other["type"] == "player":
+        other["bag"]._money_change_source = "character_trade"
+        other["bag"].save()
+    else:
+        other["bag"].save(update_fields=["money"])
+
+    def serialize_owner(owner):
+        if owner["type"] == "player":
+            return serialize_bag(owner["bag"])
+        return serialize_npc_global_bag(owner["bag"])
 
     response_data = {
         "success": True,
-        "message": message,
+        "message": "交易完成",
         "data": {
             "requestId": request_id,
-            "playerInventory": serialize_bag(player_bag),
-            "npcInventory": serialize_npc_global_bag(npc_bag),
+            "initiatorInventory": serialize_owner(initiator),
+            "otherInventory": serialize_owner(other),
         },
     }
-    receipt.response_data = response_data
-    receipt.save(update_fields=["response_data"])
+    if requester is not None:
+        EnvActionReceipt.objects.create(
+            player=requester["account"],
+            request_id=request_id,
+            action="character_trade",
+            response_data=response_data,
+        )
+    # _trade_elapsed = _time.monotonic() - _trade_start
+    # print(f"[TradePerf] character_trade 完成: requestId={request_id}, elapsed={_trade_elapsed:.3f}s")
     return Response(response_data)
 
 
@@ -1829,106 +1881,6 @@ def npc_global_inventory_update(request, character_id):
         "success": True,
         "message": "更新成功",
         "data": serialize_npc_global_bag(bag),
-    })
-
-
-@api_view(["POST"])
-@authentication_classes([EnvServerJWTAuthentication])
-@permission_classes([IsAuthenticated])
-@transaction.atomic
-def npc_global_inventory_trade(request, character_id):
-    """NPC全局库存交易：玩家从NPC购买物品。
-
-    请求体: {"itemId": 1, "amount": 1, "playerPay": 100}
-    响应: {"success": true, "data": {"npcBag": {...}, "tradeMessage": "..."}}
-    """
-    try:
-        bag = NpcGlobalInventory.objects.select_for_update().get(npc__agent_id=character_id)
-    except NpcGlobalInventory.DoesNotExist:
-        return Response(error_response(f"NPC {character_id} 库存不存在"))
-
-    item_id = request.data.get("itemId")
-    amount = request.data.get("amount", 1)
-    player_pay = request.data.get("playerPay", 0)
-
-    if not item_id:
-        return Response(error_response("缺少itemId"))
-
-    slot = bag.slots.filter(item_id=item_id, item_amount__gt=0).first()
-    if not slot:
-        return Response(error_response("NPC没有该物品"))
-    if slot.item_amount < amount:
-        return Response(error_response("NPC库存不足"))
-
-    # 扣NPC库存
-    slot.item_amount -= amount
-    slot.save()
-    if slot.item_amount <= 0:
-        slot.delete()
-
-    # 加金币
-    bag.money += player_pay
-    bag.save()
-
-    return Response({
-        "success": True,
-        "data": {
-            "npcBag": serialize_npc_global_bag(bag),
-            "tradeMessage": f"交易成功，获得 {amount} 个物品",
-        }
-    })
-
-
-@api_view(["POST"])
-@authentication_classes([EnvServerJWTAuthentication])
-@permission_classes([IsAuthenticated])
-@transaction.atomic
-def npc_global_inventory_sell(request, character_id):
-    """玩家向NPC出售物品到全局库存。
-
-    请求体: {"itemId": 1, "amount": 1, "itemData": {...}, "npcPay": 50}
-    """
-    try:
-        bag = NpcGlobalInventory.objects.select_for_update().get(npc__agent_id=character_id)
-    except NpcGlobalInventory.DoesNotExist:
-        return Response(error_response(f"NPC {character_id} 库存不存在"))
-
-    item_id = request.data.get("itemId")
-    amount = request.data.get("amount", 1)
-    item_data = request.data.get("itemData", {})
-    npc_pay = request.data.get("npcPay", 0)
-
-    if not item_id:
-        return Response(error_response("缺少itemId"))
-
-    # 查找已有slot或创建新slot
-    slot = bag.slots.filter(item_id=item_id, item_amount__gt=0).first()
-    if slot:
-        slot.item_amount += amount
-        slot.save()
-    else:
-        max_idx = bag.slots.aggregate(Max("slot_index"))["slot_index__max"]
-        next_idx = (max_idx + 1) if max_idx is not None else 0
-        NpcGlobalInventorySlot.objects.create(
-            bag=bag,
-            slot_index=next_idx,
-            item_id=item_id,
-            item_amount=amount,
-            item_bag_name=item_data.get("itemBagName", ""),
-            ingredient=item_data.get("ingredient", ""),
-            dish_quality=item_data.get("dishQuality", 3),
-        )
-
-    # 扣金币
-    bag.money = max(0, bag.money - npc_pay)
-    bag.save()
-
-    return Response({
-        "success": True,
-        "data": {
-            "npcBag": serialize_npc_global_bag(bag),
-            "tradeMessage": f"出售成功，获得 {npc_pay} 金币",
-        }
     })
 
 

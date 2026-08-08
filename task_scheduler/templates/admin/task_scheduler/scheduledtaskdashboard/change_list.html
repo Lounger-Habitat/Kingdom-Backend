@@ -1,0 +1,33 @@
+{% extends "admin/base_site.html" %}
+
+{% block content %}
+  <div id="content-main">
+    <p>以下任务由当前 Backend 进程内的调度器注册并执行。刷新页面可查看最新的下次执行时间。</p>
+    <div class="module" id="changelist">
+      <table id="result_list">
+        <thead>
+          <tr>
+            <th scope="col"><div class="text"><span>任务名称</span></div></th>
+            <th scope="col"><div class="text"><span>来源模块</span></div></th>
+            <th scope="col"><div class="text"><span>执行计划</span></div></th>
+            <th scope="col"><div class="text"><span>下次执行时间</span></div></th>
+            <th scope="col"><div class="text"><span>说明</span></div></th>
+          </tr>
+        </thead>
+        <tbody>
+          {% for task in tasks %}
+            <tr>
+              <th scope="row">{{ task.name }}</th>
+              <td>{{ task.source }}</td>
+              <td>{{ task.schedule }}</td>
+              <td>{% if task.next_run_time %}{{ task.next_run_time|date:"Y-m-d H:i:s T" }}{% else %}-{% endif %}</td>
+              <td>{{ task.description }}</td>
+            </tr>
+          {% empty %}
+            <tr><td colspan="5">当前进程尚未注册定时任务。请确认 Backend 已重启并正常启动。</td></tr>
+          {% endfor %}
+        </tbody>
+      </table>
+    </div>
+  </div>
+{% endblock %}

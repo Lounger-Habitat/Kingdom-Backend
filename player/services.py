@@ -1,23 +1,45 @@
 import uuid
 import logging
 from django.db import transaction
+from django.utils import timezone
 from account.models import GameAccount
 from inventory.models import InventoryBag, InventorySlot, BagTemplate, BagTemplateSlot
 from .models import PlayerState, PlayerRecipe, PlayerTitle, DefaultRecipe
+
+NATURAL_ACTION_POINT_CAP = 200
+ACTION_POINT_RECOVERY_SECONDS = 180
+
+
+def recover_action_points(player_state, now=None):
+    """按现实时间恢复行动力；自然恢复上限固定为 200。"""
+    now = now or timezone.now()
+    if player_state.action_points >= NATURAL_ACTION_POINT_CAP:
+        player_state.action_points_recovered_at = now
+        player_state.save(update_fields=["action_points_recovered_at"])
+        return player_state.action_points
+    elapsed = max(0, int((now - player_state.action_points_recovered_at).total_seconds()))
+    recovered = elapsed // ACTION_POINT_RECOVERY_SECONDS
+    if recovered:
+        player_state.action_points = min(NATURAL_ACTION_POINT_CAP, player_state.action_points + recovered)
+        player_state.action_points_recovered_at += timezone.timedelta(seconds=recovered * ACTION_POINT_RECOVERY_SECONDS)
+        player_state.save(update_fields=["action_points", "action_points_recovered_at"])
+    return player_state.action_points
+
+
+def spend_action_points(player_state, amount):
+    recover_action_points(player_state)
+    if player_state.action_points < amount:
+        return False
+    player_state.action_points -= amount
+    player_state.action_points_recovered_at = timezone.now()
+    player_state.save(update_fields=["action_points", "action_points_recovered_at"])
+    return True
 
 logger = logging.getLogger(__name__)
 
 # PlayerState 时间字段默认值（重置到第一天：2026年3月8日 07:00）
 _DEFAULTS = {
-    "game_day": 8,
-    "game_year": 2026,
-    "game_month": 3,
-    "game_hour": 7,
-    "game_minute": 0,
-    "season": 0,
-    "total_game_days": 1,
-    "time_initialized": False,
-    "action_points": 100,
+    "action_points": NATURAL_ACTION_POINT_CAP,
 }
 
 
@@ -46,7 +68,7 @@ def reset_player_data(player_id: str, options: dict) -> dict:
 
         if options.get("action_points"):
             _reset_action_points(player_state)
-            stats["action_points"] = 100
+            stats["action_points"] = NATURAL_ACTION_POINT_CAP
 
         if options.get("titles"):
             stats["titles"] = _reset_titles(player_state)
@@ -134,8 +156,9 @@ def _reset_recipes(player_state):
 
 def _reset_action_points(player_state):
     """行动力重置为 100。"""
-    player_state.action_points = 100
-    player_state.save(update_fields=["action_points"])
+    player_state.action_points = NATURAL_ACTION_POINT_CAP
+    player_state.action_points_recovered_at = timezone.now()
+    player_state.save(update_fields=["action_points", "action_points_recovered_at"])
 
 
 def _reset_titles(player_state):

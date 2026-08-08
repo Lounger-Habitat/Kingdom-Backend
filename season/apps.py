@@ -8,7 +8,7 @@ logger = logging.getLogger(__name__)
 class SeasonConfig(AppConfig):
     default_auto_field = "django.db.models.BigAutoField"
     name = "season"
-    verbose_name = "赛季"
+    verbose_name = "赛季管理"
 
     def ready(self):
         if os.environ.get("RUN_MAIN") == "true" or not os.environ.get("RUN_MAIN"):
@@ -32,6 +32,8 @@ class SeasonConfig(AppConfig):
             replace_existing=True,
         )
         scheduler.start()
+        from config.scheduler_registry import register_scheduler
+        register_scheduler("赛季管理", scheduler)
         logger.info("[scheduler] Season tasks scheduled: rotate at 00:05, settle at 04:00")
 
     @staticmethod

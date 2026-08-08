@@ -1,35 +1,28 @@
 from django.db import models
+from django.utils import timezone
 from account.models import GameAccount
 
 
 class PlayerState(models.Model):
     player_id = models.CharField(max_length=100, unique=True)
-    action_points = models.IntegerField(default=100)
+    action_points = models.IntegerField(default=200)
     action_points_max = models.IntegerField(default=1000)
+    action_points_recovered_at = models.DateTimeField(default=timezone.now)
     # 当前游戏内日历（最近一次客户端上报）。注意 game_day 现在表示"日历的日"(day-of-month)。
-    game_day = models.IntegerField(default=8)
-    game_year = models.IntegerField(default=2026)
-    game_month = models.IntegerField(default=3)
-    game_hour = models.IntegerField(default=7)
-    game_minute = models.IntegerField(default=0)
-    season = models.IntegerField(default=0)
     # 累计游戏天数（"第 N 天"），每次玩家点击下一日+1，赛季轮换时重置为1。
-    total_game_days = models.IntegerField(default=1)
     # 是否已用首次客户端上报作为基准；避免首报被算成跨数月的 delta。
-    time_initialized = models.BooleanField(default=False)
     # 当前玩家所在的赛季 ID（空表示尚未迁移，等效于当前活跃赛季）
     current_season_id = models.CharField(max_length=50, default="", blank=True)
     # 日初金币快照（用于富豪榜日榜计算：当前金币 - day_start_money）
-    day_start_money = models.IntegerField(default=0)
-    day_start_money_game_day = models.IntegerField(default=0, help_text="快照对应的 total_game_days")
     # 总榜金币快照（用于富豪榜总榜计算：snapshot + 当天增量）
-    total_wealth_snapshot = models.IntegerField(default=0, help_text="截至上一个游戏日结束时的累计金币")
 
     class Meta:
         ordering = ["player_id"]
+        verbose_name = "玩家状态"
+        verbose_name_plural = "玩家状态"
 
     def __str__(self):
-        return f"{self.player_id} AP={self.action_points} day={self.game_day}"
+        return f"{self.player_id} AP={self.action_points}"
 
 
 class PlayerRecipe(models.Model):
@@ -42,6 +35,8 @@ class PlayerRecipe(models.Model):
 
     class Meta:
         unique_together = [("player", "recipe_name")]
+        verbose_name = "玩家菜谱"
+        verbose_name_plural = "玩家菜谱"
 
     def __str__(self):
         return f"{self.player.player_id} - {self.recipe_name}"
@@ -53,6 +48,8 @@ class DefaultRecipe(models.Model):
 
     class Meta:
         ordering = ["recipe_name"]
+        verbose_name = "新玩家默认菜谱"
+        verbose_name_plural = "新玩家默认菜谱"
 
     def __str__(self):
         return self.recipe_name
@@ -64,6 +61,10 @@ class PlayerTitle(models.Model):
     title_name = models.CharField(max_length=100)
     obtained_at = models.BigIntegerField(default=0)
     is_active = models.BooleanField(default=False)
+
+    class Meta:
+        verbose_name = "玩家称号"
+        verbose_name_plural = "玩家称号"
 
     def __str__(self):
         return f"{self.player.player_id} - {self.title_name}"

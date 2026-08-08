@@ -57,6 +57,8 @@ class InventoryBag(models.Model):
 
     class Meta:
         unique_together = [("player", "character_id")]
+        verbose_name = "玩家背包"
+        verbose_name_plural = "玩家背包"
 
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
@@ -73,9 +75,9 @@ class InventoryBag(models.Model):
         if money_changed and self.player_id:
             try:
                 from player.models import PlayerState
+                from season.season_service import get_active_season
                 ps = PlayerState.objects.filter(player_id=str(self.player_id)).first()
-                game_day = ps.total_game_days if ps else None
-                season_id = ps.current_season_id if ps and ps.current_season_id else "default"
+                season_id = ps.current_season_id if ps and ps.current_season_id else get_active_season().season_id
 
                 from leaderboard.models import ReportEvent
                 ReportEvent.objects.create(
@@ -83,7 +85,6 @@ class InventoryBag(models.Model):
                     event_type="money_changed",
                     payload={"balance": self.money, "delta": delta, "source": source},
                     timestamp=int(__import__("time").time()),
-                    game_day=game_day,
                     season_id=season_id,
                 )
 
@@ -146,6 +147,8 @@ class BagTemplate(models.Model):
 
     class Meta:
         unique_together = [("npc",)]  # 每个NPC最多一个模板
+        verbose_name = "背包模板"
+        verbose_name_plural = "背包模板"
 
     def __str__(self):
         if self.npc:
@@ -313,6 +316,10 @@ class NpcGlobalInventory(models.Model):
                                related_name="global_inventory", help_text="关联NPC")
     money = models.IntegerField(default=0)
     updated_at = models.DateTimeField(auto_now=True)
+
+    class Meta:
+        verbose_name = "NPC 全局库存"
+        verbose_name_plural = "NPC 全局库存"
 
     def __str__(self):
         return f"全局库存: {self.npc.name} (money={self.money})"
