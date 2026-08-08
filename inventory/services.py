@@ -141,9 +141,16 @@ def restock_npc_bags(player):
 def restock_npc_bags_global():
     """全服统一补充NPC全局库存到模板数量（凌晨4点重置时调用）。"""
     from .models import NpcGlobalInventory, NpcGlobalInventorySlot, BagTemplate
+    from .village_policy import FORMAL_VILLAGE_NPC_IDS
+    from django.conf import settings
 
     # 获取所有绑定NPC的模板
-    templates = BagTemplate.objects.prefetch_related("slots__item").filter(npc__isnull=False)
+    templates = BagTemplate.objects.prefetch_related("slots__item").filter(
+        npc__isnull=False,
+        seed_only=False,
+    ).exclude(npc__agent_id__in=FORMAL_VILLAGE_NPC_IDS)
+    if not settings.VILLAGE_TEST_ASSET_ACTIONS_ENABLED:
+        templates = templates.exclude(npc__is_test_only=True)
     if not templates.exists():
         return
 

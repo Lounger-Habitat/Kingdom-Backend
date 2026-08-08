@@ -2,6 +2,7 @@ import os
 import logging
 
 from django.apps import AppConfig
+from django.conf import settings
 
 logger = logging.getLogger(__name__)
 
@@ -12,6 +13,9 @@ class AutobuyConfig(AppConfig):
     verbose_name = "自动购买"
 
     def ready(self):
+        if settings.DISABLE_BACKGROUND_SCHEDULERS:
+            logger.info("[scheduler] Auto-buy scheduler disabled by configuration")
+            return
         if os.environ.get("RUN_MAIN") == "true" or not os.environ.get("RUN_MAIN"):
             self._start_scheduler()
 

@@ -40,6 +40,7 @@ urlpatterns = [
     path("", include("cooking.urls")),
     path("", include("restaurant.urls")),
     path("", include("marketplace.urls")),
+    path("", include("village.urls")),
 ]
 
 if settings.DEBUG:

@@ -68,13 +68,14 @@ class BagTemplateSlotInline(admin.TabularInline):
 
 @admin.register(NpcDefinition)
 class NpcDefinitionAdmin(admin.ModelAdmin):
-    list_display = ["agent_id", "name"]
+    list_display = ["agent_id", "name", "is_test_only"]
     search_fields = ["agent_id", "name"]
+    list_filter = ["is_test_only"]
 
 
 @admin.register(BagTemplate)
 class BagTemplateAdmin(admin.ModelAdmin):
-    list_display = ["display_name", "money", "slot_count"]
+    list_display = ["display_name", "money", "seed_only", "is_test_only", "slot_count"]
     search_fields = ["npc__agent_id", "npc__name", "character_id"]
     list_filter = ["npc"]
     inlines = [BagTemplateSlotInline]
@@ -195,12 +196,35 @@ class NpcGlobalInventorySlotInline(admin.TabularInline):
     fields = ["slot_index", "item_id", "item_amount", "rated", "rating_price", "overall_score", "ingredient", "item_bag_name", "cook_time", "dish_quality", "hide_in_shop"]
     ordering = ["slot_index"]
 
+    @staticmethod
+    def _is_formal(obj):
+        return bool(obj and obj.npc.agent_id in {"10011", "10012", "10013", "10014", "10015"})
+
+    def has_add_permission(self, request, obj=None):
+        return False if self._is_formal(obj) else super().has_add_permission(request, obj)
+
+    def has_change_permission(self, request, obj=None):
+        return False if self._is_formal(obj) else super().has_change_permission(request, obj)
+
+    def has_delete_permission(self, request, obj=None):
+        return False if self._is_formal(obj) else super().has_delete_permission(request, obj)
+
 
 @admin.register(NpcGlobalInventory)
 class NpcGlobalInventoryAdmin(admin.ModelAdmin):
     list_display = ["npc_name", "npc_agent_id", "money", "slot_count", "updated_at"]
     search_fields = ["npc__agent_id", "npc__name"]
     inlines = [NpcGlobalInventorySlotInline]
+
+    def get_readonly_fields(self, request, obj=None):
+        if obj and obj.npc.agent_id in {"10011", "10012", "10013", "10014", "10015"}:
+            return ["npc", "money", "updated_at"]
+        return ["updated_at"]
+
+    def has_delete_permission(self, request, obj=None):
+        if obj and obj.npc.agent_id in {"10011", "10012", "10013", "10014", "10015"}:
+            return False
+        return super().has_delete_permission(request, obj)
 
     def npc_name(self, obj):
         return obj.npc.name

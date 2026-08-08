@@ -1,6 +1,7 @@
 import os
 import logging
 from django.apps import AppConfig
+from django.conf import settings
 
 logger = logging.getLogger(__name__)
 
@@ -11,6 +12,9 @@ class SeasonConfig(AppConfig):
     verbose_name = "赛季管理"
 
     def ready(self):
+        if settings.DISABLE_BACKGROUND_SCHEDULERS:
+            logger.info("[scheduler] Season scheduler disabled by configuration")
+            return
         if os.environ.get("RUN_MAIN") == "true" or not os.environ.get("RUN_MAIN"):
             self._start_scheduler()
 

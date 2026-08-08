@@ -128,6 +128,10 @@ class NpcDefinition(models.Model):
     agent_id = models.CharField(max_length=100, unique=True, db_index=True,
                                 help_text="Unity AgentController.agentID，如 10012")
     name = models.CharField(max_length=100, help_text="展示名，如 jack")
+    is_test_only = models.BooleanField(
+        default=False,
+        help_text="仅供隔离回归场景使用；正式村庄 NPC 必须为 False",
+    )
 
     class Meta:
         verbose_name = "NPC 定义"
@@ -144,6 +148,14 @@ class BagTemplate(models.Model):
     character_id = models.CharField(max_length=100, default="player",
                                     help_text="兼容字段：player=玩家模板，NPC模板由 npc FK 关联")
     money = models.IntegerField(default=0, help_text="初始金币")
+    seed_only = models.BooleanField(
+        default=False,
+        help_text="只在首次建档时复制，禁止作为每日补货目标",
+    )
+    is_test_only = models.BooleanField(
+        default=False,
+        help_text="仅供隔离测试 NPC 使用",
+    )
 
     class Meta:
         unique_together = [("npc",)]  # 每个NPC最多一个模板

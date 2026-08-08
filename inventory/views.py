@@ -23,6 +23,16 @@ from account.env_auth import EnvServerJWTAuthentication
 from account.authentication import GameJWTAuthentication
 from account.models import GameAccount
 from config.auth import get_player_id
+from .village_policy import (
+    ASSET_ACTION_BLOCKED,
+    FORMAL_VILLAGE_NPC_IDS,
+    LEGACY_WRITE_BLOCKED,
+    NOT_BOOTSTRAPPED,
+    TEST_ASSET_ACTIONS_DISABLED,
+    blocked_response,
+    is_formal_village_npc,
+    test_asset_actions_enabled,
+)
 
 
 def get_or_create_bag(player, character_id):
@@ -1624,6 +1634,34 @@ def character_trade(request):
             "type": request.data.get("otherType"),
         }
 
+    participant_ids = {
+        str(owner.get("id") or owner.get("characterId") or "").strip()
+        for owner in (initiator_raw, other_raw)
+        if isinstance(owner, dict)
+        and str(owner.get("type") or "").strip().lower() == "npc"
+    }
+    blocked_ids = sorted(participant_ids & FORMAL_VILLAGE_NPC_IDS)
+    if blocked_ids:
+        return Response(
+            blocked_response(
+                ASSET_ACTION_BLOCKED,
+                "正式村庄 NPC 的资产动作将在阶段三原子结算启用后开放",
+            ),
+            status=409,
+        )
+    has_test_only_participant = NpcDefinition.objects.filter(
+        agent_id__in=participant_ids,
+        is_test_only=True,
+    ).exists()
+    if has_test_only_participant and not test_asset_actions_enabled():
+        return Response(
+            blocked_response(
+                TEST_ASSET_ACTIONS_DISABLED,
+                "TestOnly NPC 资产动作需要显式测试开关",
+            ),
+            status=409,
+        )
+
     # A player client may only know its username.  Env Server supplies the
     # authenticated account ID as requesterId, so use it for the local player.
     if isinstance(initiator_raw, dict) and str(initiator_raw.get("type") or "").lower() == "player":
@@ -1826,10 +1864,13 @@ def npc_global_inventory_detail(request, character_id):
     try:
         bag = NpcGlobalInventory.objects.select_related("npc").get(npc__agent_id=character_id)
     except NpcGlobalInventory.DoesNotExist:
-        # 从BagTemplate初始化
-        bag = _init_npc_global_from_template(character_id)
-        if bag is None:
-            return Response(error_response(f"NPC {character_id} 无模板数据"))
+        return Response(
+            blocked_response(
+                NOT_BOOTSTRAPPED,
+                f"NPC {character_id} 尚未通过受控 Seed 初始化",
+            ),
+            status=409 if is_formal_village_npc(character_id) else 404,
+        )
     return Response({
         "success": True,
         "message": "获取成功",
@@ -1846,6 +1887,21 @@ def npc_global_inventory_update(request, character_id):
 
     请求体: {"money": 100, "items": [{"slotIndex": 0, "itemId": 1, "itemAmount": 5, ...}, ...]}
     """
+    if is_formal_village_npc(character_id):
+        return Response(
+            blocked_response(
+                LEGACY_WRITE_BLOCKED,
+                "正式村庄 NPC 禁止使用旧式全量库存覆盖接口",
+            ),
+            status=409,
+        )
+
+    if NpcDefinition.objects.filter(agent_id=character_id, is_test_only=True).exists() and not test_asset_actions_enabled():
+        return Response(
+            blocked_response(TEST_ASSET_ACTIONS_DISABLED, "TestOnly NPC 资产动作需要显式测试开关"),
+            status=409,
+        )
+
     npc = NpcDefinition.objects.filter(agent_id=character_id).first()
     if not npc:
         return Response(error_response(f"NPC {character_id} 不存在"))
@@ -1894,15 +1950,39 @@ def npc_global_inventory_restock(request):
     请求体: {"characterIds": ["zhplb", "hmzs"]} 或 {} 表示全部
     """
     character_ids = request.data.get("characterIds", [])
-    templates = BagTemplate.objects.prefetch_related("slots__item").all()
+    requested_ids = {str(value).strip() for value in character_ids if str(value).strip()}
+    if requested_ids & FORMAL_VILLAGE_NPC_IDS:
+        return Response(
+            blocked_response(
+                LEGACY_WRITE_BLOCKED,
+                "正式村庄 NPC 禁止使用模板补货接口",
+            ),
+            status=409,
+        )
+
+    if requested_ids and NpcDefinition.objects.filter(
+        agent_id__in=requested_ids,
+        is_test_only=True,
+    ).exists() and not test_asset_actions_enabled():
+        return Response(
+            blocked_response(TEST_ASSET_ACTIONS_DISABLED, "TestOnly NPC 资产动作需要显式测试开关"),
+            status=409,
+        )
+
+    templates = BagTemplate.objects.prefetch_related("slots__item").filter(seed_only=False)
     if character_ids:
-        templates = templates.filter(character_id__in=character_ids)
-    templates = templates.exclude(character_id="player")
+        templates = templates.filter(npc__agent_id__in=requested_ids)
+    templates = templates.filter(npc__isnull=False).exclude(
+        npc__agent_id__in=FORMAL_VILLAGE_NPC_IDS
+    )
+    if not test_asset_actions_enabled():
+        templates = templates.exclude(npc__is_test_only=True)
 
     restocked = 0
     for tmpl in templates:
         bag, _ = NpcGlobalInventory.objects.select_for_update().get_or_create(
-            character_id=tmpl.character_id
+            npc=tmpl.npc,
+            defaults={"money": tmpl.money},
         )
         for tmpl_slot in tmpl.slots.select_related("item").all():
             if not tmpl_slot.item:

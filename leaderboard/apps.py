@@ -2,6 +2,7 @@ import logging
 import os
 import sys
 from django.apps import AppConfig
+from django.conf import settings
 
 logger = logging.getLogger(__name__)
 
@@ -14,6 +15,9 @@ class LeaderboardConfig(AppConfig):
     _scheduler_started = False
 
     def ready(self):
+        if settings.DISABLE_BACKGROUND_SCHEDULERS:
+            logger.info("[scheduler] Leaderboard scheduler disabled by configuration")
+            return
         # Django 开发服务器会启动父、子两个进程；只在实际服务进程中注册任务。
         if "runserver" in sys.argv and os.environ.get("RUN_MAIN") != "true":
             return

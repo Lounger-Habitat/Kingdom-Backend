@@ -40,6 +40,7 @@ INSTALLED_APPS = [
     "restaurant.apps.RestaurantConfig",
     "marketplace.apps.MarketplaceConfig",
     "autobuy.apps.AutobuyConfig",
+    "village.apps.VillageConfig",
 ]
 
 MIDDLEWARE = [
@@ -155,6 +156,21 @@ SPECTACULAR_SETTINGS = {
 AI_SERVICE_URL = os.environ.get("AI_SERVICE_URL", "")
 AI_API_KEY = os.environ.get("AI_API_KEY", "")
 AI_REQUEST_TIMEOUT = int(os.environ.get("AI_REQUEST_TIMEOUT", "30"))
+
+# Tests and one-shot management commands must not start in-process schedulers.
+# Production deployments should use an external scheduler and can set this flag
+# while gradually moving away from the legacy AppConfig jobs.
+DISABLE_BACKGROUND_SCHEDULERS = os.environ.get(
+    "DISABLE_BACKGROUND_SCHEDULERS", "False"
+).lower() in {"1", "true", "yes", "on"}
+
+# Phase-zero safety gate. Formal village NPC assets remain read-only until the
+# atomic economy slice is implemented in phase three.
+VILLAGE_TEST_ASSET_ACTIONS_ENABLED = os.environ.get(
+    "VILLAGE_TEST_ASSET_ACTIONS_ENABLED", "False"
+).lower() in {"1", "true", "yes", "on"}
+
+DEPLOYMENT_ENV = os.environ.get("DEPLOYMENT_ENV", "development").strip().lower()
 
 # Logging: suppress noisy runserver access logs for /game/time/sync
 import logging

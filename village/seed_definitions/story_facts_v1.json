@@ -1,0 +1,11 @@
+{
+  "schemaVersion": 1,
+  "enabled": false,
+  "facts": [
+    {"factCode": "BRIDGE_FOUNDATION_WARNING", "ownerAgentId": "10011"},
+    {"factCode": "FOREST_OLD_ROUTE", "ownerAgentId": "10012"},
+    {"factCode": "DEFERRED_BRIDGE_BUDGET", "ownerAgentId": "10013"},
+    {"factCode": "BORROWED_RESERVE_SEEDS", "ownerAgentId": "10014"},
+    {"factCode": "EXPENSIVE_CARAVAN_OPTION", "ownerAgentId": "10015"}
+  ]
+}
