@@ -190,34 +190,59 @@ class BootstrapService:
     """启动快照服务。"""
 
     @staticmethod
+    @transaction.atomic
     def get_bootstrap() -> Dict[str, Any]:
         """获取启动快照。
 
         Returns:
             包含时间、NPC状态、配置等的字典
         """
-        # 获取时间
-        time_state = GlobalGameTimeState.get_instance()
+        # Bootstrap is a recovery boundary.  The global time row is the first
+        # lock acquired by every path that also changes/observes command
+        # lifecycle state.  Holding it through the sweep and response build
+        # makes the returned minute/revision a single authority snapshot, and
+        # has the same lock order as TimeService.advance_time (time first).
+        GlobalGameTimeState.get_instance()
+        time_state = GlobalGameTimeState.objects.select_for_update().get(pk=1)
+
+        # Lock the formal ownership set before validating or serializing it.
+        # Test-only NPCs are intentionally absent from this recovery boundary.
+        npcs = list(
+            NpcDefinition.objects.select_for_update()
+            .filter(is_test_only=False)
+            .order_by("agent_id")
+        )
+        formal_ids = {str(npc.agent_id) for npc in npcs}
+        if formal_ids != {"10011", "10012", "10013", "10014", "10015"}:
+            return {"error": ResultCode.BOOTSTRAP_NPC_SET_MISMATCH}
+
+        runtime_states = list(
+            NpcRuntimeState.objects.select_for_update()
+            .filter(npc__is_test_only=False)
+            .select_related("npc")
+            .order_by("npc__agent_id")
+        )
+        if {str(rt.npc.agent_id) for rt in runtime_states} != formal_ids:
+            return {"error": ResultCode.BOOTSTRAP_NPC_SET_MISMATCH}
 
         # Bootstrap is a recovery boundary, not a passive replay of commands
         # which are no longer executable.  Env may have crashed after accept
         # and before StartCommand.  Sweep that durable work through the same
         # authority path before exposing the recovery snapshot; it creates the
         # FAILED command, receipt, event and Outbox records atomically.
-        CommandService.terminalize_expired_prestart_commands(time_state)
+        CommandService.terminalize_expired_prestart_commands(
+            time_state, formal_ids=formal_ids
+        )
 
-        # 获取五名正式 NPC
-        npcs = NpcDefinition.objects.filter(is_test_only=False).order_by("agent_id")
-        formal_ids = {str(npc.agent_id) for npc in npcs}
-        if formal_ids != {"10011", "10012", "10013", "10014", "10015"}:
-            return {"error": ResultCode.BOOTSTRAP_NPC_SET_MISMATCH}
-
-        # 获取运行时状态
-        runtime_states = NpcRuntimeState.objects.filter(
-            npc__is_test_only=False
-        ).select_related("npc").order_by("npc__agent_id")
-        if {str(rt.npc.agent_id) for rt in runtime_states} != formal_ids:
-            return {"error": ResultCode.BOOTSTRAP_NPC_SET_MISMATCH}
+        # Terminalization may have changed runtime state.  Re-read it while
+        # retaining the authority-time lock; this is the snapshot Env restores.
+        time_state = GlobalGameTimeState.objects.select_for_update().get(pk=1)
+        runtime_states = list(
+            NpcRuntimeState.objects.select_for_update()
+            .filter(npc__is_test_only=False)
+            .select_related("npc")
+            .order_by("npc__agent_id")
+        )
 
         # 获取配置
         config = VillageSimulationConfig.objects.first()
@@ -273,9 +298,11 @@ class BootstrapService:
                 "active_command": serialize_command(active_cmd) if active_cmd else None,
             })
 
-        queued_commands = NpcCommandState.objects.filter(
-            npc__is_test_only=False, status__in=["RECEIVED", "QUEUED"]
-        ).order_by("npc__agent_id", "received_world_minute", "created_at")
+        queued_commands = list(
+            NpcCommandState.objects.select_for_update()
+            .filter(npc__is_test_only=False, status__in=["RECEIVED", "QUEUED"])
+            .order_by("npc__agent_id", "received_world_minute", "created_at")
+        )
 
         return {
             "world_minute": time_state.world_minute,
@@ -398,6 +425,25 @@ class CheckpointService:
         if not isinstance(checkpoints, list):
             return [CheckpointService._invalid_checkpoint(None)]
 
+        # A checkpoint that carries the simulation cursor observes authority
+        # time.  Acquire that row before any NPC runtime row so it cannot form
+        # an inverted lock order with Bootstrap recovery.
+        locked_time_state = None
+        if any(
+            isinstance(checkpoint, dict)
+            and "last_simulated_world_minute" in checkpoint
+            for checkpoint in checkpoints
+        ):
+            GlobalGameTimeState.get_instance()
+            try:
+                locked_time_state = GlobalGameTimeState.objects.select_for_update().get(pk=1)
+            except GlobalGameTimeState.DoesNotExist:
+                return [{
+                    "npc_id": checkpoint.get("npc_id") if isinstance(checkpoint, dict) else None,
+                    "success": False,
+                    "result_code": ResultCode.BACKEND_UNAVAILABLE,
+                } for checkpoint in checkpoints]
+
         results = []
 
         for cp in checkpoints:
@@ -438,15 +484,7 @@ class CheckpointService:
             if "last_simulated_world_minute" in cp:
                 # The local simulation cursor is permitted for recovery, but
                 # it cannot be used to skip ahead of Backend's authority time.
-                try:
-                    time_state = GlobalGameTimeState.objects.select_for_update().get(pk=1)
-                except GlobalGameTimeState.DoesNotExist:
-                    results.append({
-                        "npc_id": npc_id,
-                        "success": False,
-                        "result_code": ResultCode.BACKEND_UNAVAILABLE,
-                    })
-                    continue
+                time_state = locked_time_state
                 if cp["last_simulated_world_minute"] > time_state.world_minute:
                     results.append(CheckpointService._invalid_checkpoint(npc_id))
                     continue
@@ -574,6 +612,11 @@ class CommandService:
         # 计算 payload hash
         payload_sha256 = CommandService.compute_payload_sha256(content)
 
+        # Acquire authority time before runtime state.  Bootstrap uses this
+        # same global -> command/runtime lock order for recovery snapshots.
+        GlobalGameTimeState.get_instance()
+        time_state = GlobalGameTimeState.objects.select_for_update().get(pk=1)
+
         # 校验队列上限
         queue_count = NpcCommandState.objects.filter(
             npc=npc,
@@ -583,7 +626,7 @@ class CommandService:
             return False, ResultCode.QUEUE_FULL, None
 
         # 获取当前时间
-        time_state = GlobalGameTimeState.get_instance()
+        # ``time_state`` remains the authority row locked above.
 
         # 解析参数
         try:
@@ -633,6 +676,8 @@ class CommandService:
     @staticmethod
     def terminalize_expired_prestart_commands(
         time_state: GlobalGameTimeState,
+        *,
+        formal_ids: Optional[set[str]] = None,
     ) -> None:
         """Use StartCommand to terminalize work that expired while Env was down.
 
@@ -641,8 +686,14 @@ class CommandService:
         transaction instead of permitting a Unity-generated outcome.
         """
         now_ms = int(timezone.now().timestamp() * 1000)
+        formal_ids = formal_ids or {"10011", "10012", "10013", "10014", "10015"}
         expired_ids = list(
-            NpcCommandState.objects.filter(status__in=["RECEIVED", "QUEUED"])
+            NpcCommandState.objects.select_for_update()
+            .filter(
+                status__in=["RECEIVED", "QUEUED"],
+                npc__is_test_only=False,
+                npc__agent_id__in=[int(npc_id) for npc_id in formal_ids],
+            )
             .filter(
                 Q(
                     received_at_ms__isnull=False,
@@ -670,6 +721,12 @@ class CommandService:
         Returns:
             (success, result_code, command_state)
         """
+        # Global authority time is the canonical first lock for lifecycle
+        # paths.  Bootstrap holds this same row while building recovery state,
+        # so a StartCommand cannot observe or create a half-recovery snapshot.
+        GlobalGameTimeState.get_instance()
+        time_state = GlobalGameTimeState.objects.select_for_update().get(pk=1)
+
         try:
             command = NpcCommandState.objects.select_for_update().get(command_id=command_id)
         except NpcCommandState.DoesNotExist:
@@ -689,7 +746,6 @@ class CommandService:
         # Expiry has precedence over version/busy rejection for accepted
         # pre-start work.  This produces a deterministic Backend terminal fact
         # when a command ages out while Env is unavailable.
-        time_state = GlobalGameTimeState.get_instance()
         now_ms = int(timezone.now().timestamp() * 1000)
         if ((command.received_at_ms is not None and command.ttl_ms is not None and
              command.received_at_ms + command.ttl_ms < now_ms) or
@@ -718,8 +774,8 @@ class CommandService:
         if rt.action_status != "IDLE":
             return False, ResultCode.NPC_BUSY, None
 
-        # 获取当前时间
-        time_state = GlobalGameTimeState.get_instance()
+        # ``time_state`` remains locked from the first lifecycle read through
+        # transition to RUNNING; do not re-read an unlocked minute here.
         now_ms = int(timezone.now().timestamp() * 1000)
         if (command.not_before_world_minute is not None and
                 command.not_before_world_minute > time_state.world_minute):
@@ -786,6 +842,14 @@ class ActionService:
                 return True, ResultCode.COMMAND_REPLAYED, existing
             return False, ResultCode.REQUEST_ID_CONFLICT, None
 
+        # Lock authority time first.  Bootstrap, StartCommand and TimeService
+        # use this order too, preventing a command/runtime lock from waiting
+        # on Bootstrap while Bootstrap waits for that same command/runtime.
+        try:
+            time_state = GlobalGameTimeState.objects.select_for_update().get(pk=1)
+        except GlobalGameTimeState.DoesNotExist:
+            return False, ResultCode.BACKEND_UNAVAILABLE, None
+
         # 获取命令
         try:
             command = NpcCommandState.objects.select_for_update().get(command_id=command_id)
@@ -798,13 +862,8 @@ class ActionService:
         except NpcRuntimeState.DoesNotExist:
             return False, ResultCode.BOOTSTRAP_NPC_SET_MISMATCH, None
 
-        # Serialize completion with TimeService.advance_time.  A receipt and
-        # its event must observe one authoritative world_minute/revision pair,
-        # never a pre-tick snapshot while the tick is committing.
-        try:
-            time_state = GlobalGameTimeState.objects.select_for_update().get(pk=1)
-        except GlobalGameTimeState.DoesNotExist:
-            return False, ResultCode.BACKEND_UNAVAILABLE, None
+        # The time row remains locked through receipt/event/outbox creation, so
+        # all three observe one authority minute/revision pair.
 
         # Only the command currently owned by this NPC can produce a terminal
         # outcome.  This prevents a duplicate/corrupted Outcome with a new

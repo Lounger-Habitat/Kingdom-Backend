@@ -476,6 +476,52 @@ class PhaseOneFaultAcceptanceTests(TestCase):
                 {item["envelope"]["id"] for item in claimed},
             )
 
+    def test_bootstrap_sweeps_only_formal_npcs_and_returns_post_sweep_snapshot(self):
+        """Recovery expiration is a formal-village authority operation only.
+
+        This exercises the public Bootstrap boundary rather than a mocked
+        interleaving: an expired formal command becomes an Outbox-backed
+        failure, while an identically expired test-only command remains outside
+        the five-NPC recovery set.  The returned authority time is read after
+        that sweep under the same transaction/lock.
+        """
+        _content, formal_command = self._accept(
+            "10011", expires_world_minute=self.time_state.world_minute
+        )
+        _test_content, test_only_command = self._accept(
+            "10012", expires_world_minute=self.time_state.world_minute
+        )
+        test_npc = NpcDefinition.objects.create(
+            agent_id=90001, name="bootstrap-test-only", is_test_only=True
+        )
+        NpcRuntimeState.objects.create(
+            npc=test_npc,
+            current_location_code="TEST_ONLY",
+            action_status="IDLE",
+        )
+        test_only_command.npc = test_npc
+        test_only_command.save(update_fields=["npc", "updated_at"])
+
+        self.time_state.world_minute += 1
+        self.time_state.time_revision += 1
+        self.time_state.apply_world_minute(self.time_state.world_minute)
+        self.time_state.save()
+
+        bootstrap = BootstrapService.get_bootstrap()
+        self.time_state.refresh_from_db()
+        self.assertEqual(bootstrap["world_minute"], self.time_state.world_minute)
+        self.assertEqual(bootstrap["time_revision"], self.time_state.time_revision)
+
+        formal_command.refresh_from_db()
+        self.assertEqual(formal_command.status, "FAILED")
+        self.assertEqual(formal_command.result_code, ResultCode.MESSAGE_EXPIRED)
+        self.assertTrue(VillageActionReceipt.objects.filter(command=formal_command).exists())
+
+        test_only_command.refresh_from_db()
+        self.assertEqual(test_only_command.status, "RECEIVED")
+        self.assertFalse(VillageActionReceipt.objects.filter(command=test_only_command).exists())
+        self.assertFalse(VillageDeliveryOutbox.objects.filter(command=test_only_command).exists())
+
     def test_wuxi_village_five_npcs_run_for_three_consecutive_game_days(self):
         """Exercise the production accept/start/complete and authoritative tick path.
 
