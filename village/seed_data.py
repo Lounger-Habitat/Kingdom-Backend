@@ -108,12 +108,15 @@ SIMULATION_DEFAULTS = {
     "day_start_minute": 360,
     "day_close_minute": 1320,
     "max_catchup_days": 3,
-    "village_simulation_enabled": False,
+    # Phase one is the supported runtime.  Keep every later-stage capability
+    # disabled, but do not seed a fresh environment into the retired
+    # phase-zero/legacy command path.
+    "village_simulation_enabled": True,
     "village_needs_enabled": False,
     "village_economy_enabled": False,
     "village_social_enabled": False,
     "village_story_enabled": False,
-    "village_hub_command_adapter_enabled": False,
+    "village_hub_command_adapter_enabled": True,
     "village_offline_catchup_enabled": False,
     "village_debug_overlay_enabled": False,
     "debug_logs_enabled": False,

@@ -300,18 +300,80 @@ class BootstrapService:
 class CheckpointService:
     """批量状态检查点服务。"""
 
-    # 白名单字段
-    ALLOWED_FIELDS = {
+    # A checkpoint is a recovery hint from Env, not an authority-state update.
+    # In particular it must never be able to claim ownership of a command or
+    # change its lifecycle/time snapshot.  Keep this tuple ordered so both the
+    # persisted update and validation behaviour remain deterministic.
+    ALLOWED_FIELDS = (
         "current_location_code",
         "current_point_code",
         "current_goal",
-        "current_action",
-        "action_status",
-        "action_started_world_minute",
-        "action_ends_world_minute",
-        "active_command_id",
         "last_simulated_world_minute",
-    }
+    )
+    _IDENTITY_FIELDS = {"npc_id", "expected_state_version"}
+    _GOALS = {choice for choice, _label in NpcRuntimeState.GOAL_CHOICES}
+
+    @staticmethod
+    def _invalid_checkpoint(npc_id: Any) -> Dict[str, Any]:
+        return {
+            "npc_id": npc_id,
+            "success": False,
+            "result_code": ResultCode.INVALID_COMMAND_SCHEMA,
+        }
+
+    @classmethod
+    def _validate_checkpoint(cls, checkpoint: Any) -> Optional[Dict[str, Any]]:
+        """Return a stable rejection result for malformed checkpoint input."""
+        if not isinstance(checkpoint, dict):
+            return cls._invalid_checkpoint(None)
+
+        npc_id = checkpoint.get("npc_id")
+        expected_version = checkpoint.get("expected_state_version")
+        if (
+            any(not isinstance(field, str) for field in checkpoint)
+            or
+            isinstance(npc_id, bool)
+            or not isinstance(npc_id, (str, int))
+            or not str(npc_id).isascii()
+            or not str(npc_id).isdigit()
+            or len(str(npc_id)) > 100
+            or isinstance(expected_version, bool)
+            or not isinstance(expected_version, int)
+            or expected_version < 0
+        ):
+            return cls._invalid_checkpoint(npc_id)
+
+        invalid_fields = sorted(
+            set(checkpoint) - set(cls.ALLOWED_FIELDS) - cls._IDENTITY_FIELDS
+        )
+        if invalid_fields:
+            return {
+                "npc_id": npc_id,
+                "success": False,
+                "result_code": ResultCode.CHECKPOINT_FIELD_NOT_ALLOWED,
+                "invalid_fields": invalid_fields,
+            }
+
+        submitted_fields = [field for field in cls.ALLOWED_FIELDS if field in checkpoint]
+        if not submitted_fields:
+            return cls._invalid_checkpoint(npc_id)
+
+        for field in ("current_location_code", "current_point_code"):
+            if field in checkpoint and (
+                not isinstance(checkpoint[field], str)
+                or not checkpoint[field]
+                or len(checkpoint[field]) > 64
+            ):
+                return cls._invalid_checkpoint(npc_id)
+        if "current_goal" in checkpoint and checkpoint["current_goal"] not in cls._GOALS:
+            return cls._invalid_checkpoint(npc_id)
+        if "last_simulated_world_minute" in checkpoint and (
+            isinstance(checkpoint["last_simulated_world_minute"], bool)
+            or not isinstance(checkpoint["last_simulated_world_minute"], int)
+            or checkpoint["last_simulated_world_minute"] < 0
+        ):
+            return cls._invalid_checkpoint(npc_id)
+        return None
 
     @staticmethod
     @transaction.atomic
@@ -326,19 +388,19 @@ class CheckpointService:
         Returns:
             每个 NPC 的结果列表
         """
+        if not isinstance(checkpoints, list):
+            return [CheckpointService._invalid_checkpoint(None)]
+
         results = []
 
         for cp in checkpoints:
-            npc_id = cp.get("npc_id")
-            expected_version = cp.get("expected_state_version")
-
-            if not npc_id or expected_version is None:
-                results.append({
-                    "npc_id": npc_id,
-                    "success": False,
-                    "result_code": ResultCode.INVALID_COMMAND_SCHEMA,
-                })
+            validation_error = CheckpointService._validate_checkpoint(cp)
+            if validation_error:
+                results.append(validation_error)
                 continue
+
+            npc_id = cp["npc_id"]
+            expected_version = cp["expected_state_version"]
 
             # 锁定 NPC 运行时状态
             try:
@@ -354,7 +416,9 @@ class CheckpointService:
                 })
                 continue
 
-            # 校验版本
+            # select_for_update + this comparison is the checkpoint CAS.  The
+            # row remains locked through the write, so a second checkpoint with
+            # the same expected version deterministically observes this write.
             if rt.state_version != expected_version:
                 results.append({
                     "npc_id": npc_id,
@@ -364,23 +428,35 @@ class CheckpointService:
                 })
                 continue
 
-            # 校验白名单字段
-            invalid_fields = set(cp.keys()) - CheckpointService.ALLOWED_FIELDS - {"npc_id", "expected_state_version"}
-            if invalid_fields:
-                results.append({
-                    "npc_id": npc_id,
-                    "success": False,
-                    "result_code": ResultCode.CHECKPOINT_FIELD_NOT_ALLOWED,
-                    "invalid_fields": list(invalid_fields),
-                })
-                continue
+            if "last_simulated_world_minute" in cp:
+                # The local simulation cursor is permitted for recovery, but
+                # it cannot be used to skip ahead of Backend's authority time.
+                try:
+                    time_state = GlobalGameTimeState.objects.select_for_update().get(pk=1)
+                except GlobalGameTimeState.DoesNotExist:
+                    results.append({
+                        "npc_id": npc_id,
+                        "success": False,
+                        "result_code": ResultCode.BACKEND_UNAVAILABLE,
+                    })
+                    continue
+                if cp["last_simulated_world_minute"] > time_state.world_minute:
+                    results.append(CheckpointService._invalid_checkpoint(npc_id))
+                    continue
+                if cp["last_simulated_world_minute"] < rt.last_simulated_world_minute:
+                    results.append(CheckpointService._invalid_checkpoint(npc_id))
+                    continue
 
-            # 更新字段
+            # Update only recovery-safe fields and advance the runtime version
+            # in the same write.  No lifecycle, command, authority-time, or
+            # asset field can be altered by this endpoint.
+            submitted_fields = []
             for field in CheckpointService.ALLOWED_FIELDS:
                 if field in cp:
                     setattr(rt, field, cp[field])
-
-            rt.save()
+                    submitted_fields.append(field)
+            rt.state_version += 1
+            rt.save(update_fields=[*submitted_fields, "state_version", "updated_at"])
             results.append({
                 "npc_id": npc_id,
                 "success": True,

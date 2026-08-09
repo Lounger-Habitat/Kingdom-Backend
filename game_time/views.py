@@ -12,6 +12,7 @@ from config.auth import get_player_id
 from player.models import PlayerState
 from season.season_service import check_and_rotate_season, get_active_season, get_season_notice, transition_player_to_season
 from .models import GlobalGameTimeState
+from .services import TimeAuthorityService
 
 logger = logging.getLogger(__name__)
 
@@ -23,12 +24,14 @@ def _safe_date(year, month, day):
 
 
 def _payload(state, season=None, day_delta=0):
+    state = TimeAuthorityService.snapshot(state)
     season = season or get_active_season()
     return {
         "game_year": state.game_year, "game_month": state.game_month, "game_day": state.game_day,
         "game_hour": state.game_hour, "game_minute": state.game_minute, "season": state.season,
         "current_season_id": state.current_season_id, "seasonId": season.season_id,
         "seasonSequence": season.sequence, "seasonEndTime": season.end_time, "day_delta": day_delta,
+        "world_minute": state.world_minute, "time_revision": state.time_revision,
     }
 
 
@@ -115,11 +118,13 @@ def _run_time_hooks(state):
 @permission_classes([IsAuthenticated])
 def global_time_update(request):
     state = GlobalGameTimeState.get_instance()
-    active = _apply_time_update(state, request.data)
-    restaurant_updates = _run_time_hooks(state)
-    data = _payload(state, active)
-    data["restaurantUpdates"] = restaurant_updates
-    return Response({"success": True, "data": data})
+    # Env identity alone is not a time capability. Calendar writes must carry
+    # world_minute and expected_time_revision through Village TimeService CAS.
+    return Response({
+        "success": False,
+        "message": TimeAuthorityService.legacy_mutation_rejected(),
+        "data": _payload(state),
+    }, status=409)
 
 
 @api_view(["POST"])
@@ -128,23 +133,9 @@ def global_time_update(request):
 @transaction.atomic
 def global_time_day_advanced(request):
     """Env Server 的跨日提交：无最大天数、无累计天数限制。"""
-    from inventory.services import restock_npc_bags_global
-    GlobalGameTimeState.get_instance()
-    state = GlobalGameTimeState.objects.select_for_update().get(pk=1)
-    before = _safe_date(state.game_year, state.game_month, state.game_day)
-    candidate = _safe_date(request.data.get("game_year", state.game_year), request.data.get("game_month", state.game_month), request.data.get("game_day", state.game_day))
-    if candidate < before:
-        data = _payload(state)
-        data["restaurantUpdates"] = []
-        return Response({"success": True, "message": "stale time, ignored", "data": data})
-    active = _apply_time_update(state, request.data)
-    day_delta = 1 if candidate > before else 0
-    if day_delta:
-        try:
-            restock_npc_bags_global()
-        except Exception:
-            logger.exception("global npc restock failed")
-    restaurant_updates = _run_time_hooks(state)
-    data = _payload(state, active, day_delta)
-    data["restaurantUpdates"] = restaurant_updates
-    return Response({"success": True, "message": "day advanced", "data": data})
+    state = GlobalGameTimeState.get_instance()
+    return Response({
+        "success": False,
+        "message": TimeAuthorityService.legacy_mutation_rejected(),
+        "data": _payload(state),
+    }, status=409)

@@ -45,7 +45,12 @@ class GlobalGameTimeState(models.Model):
     @classmethod
     def get_instance(cls):
         """获取或创建单例实例。"""
-        obj, _ = cls.objects.get_or_create(pk=1)
+        # A fresh singleton must be internally coherent.  ``world_minute=0``
+        # represents 0001-01-01 00:00, not the calendar field defaults.
+        default_world_minute = cls.world_minute_from_calendar(2026, 3, 8, 7, 0)
+        obj, _ = cls.objects.get_or_create(
+            pk=1, defaults={"world_minute": default_world_minute}
+        )
         return obj
 
     def clean(self):
@@ -55,6 +60,12 @@ class GlobalGameTimeState(models.Model):
             raise ValidationError({"world_minute": "world_minute 不能为负"})
         if self.time_revision < 0:
             raise ValidationError({"time_revision": "time_revision 不能为负"})
+        expected_world_minute = self.world_minute_from_calendar(
+            self.game_year, self.game_month, self.game_day,
+            self.game_hour, self.game_minute,
+        )
+        if self.world_minute != expected_world_minute:
+            raise ValidationError({"world_minute": "world_minute 必须与日历投影一致"})
 
     @staticmethod
     def world_minute_from_calendar(year: int, month: int, day: int, hour: int, minute: int) -> int:
@@ -73,3 +84,17 @@ class GlobalGameTimeState(models.Model):
             self.game_year, self.game_month, self.game_day,
             self.game_hour, self.game_minute
         )
+
+    def apply_world_minute(self, world_minute: int):
+        """Project the authoritative minute onto the calendar fields."""
+        from datetime import date
+
+        if world_minute < 0:
+            raise ValidationError({"world_minute": "world_minute 不能为负"})
+        ordinal, minute_of_day = divmod(int(world_minute), 1440)
+        calendar = date.fromordinal(ordinal + 1)
+        self.world_minute = int(world_minute)
+        self.game_year = calendar.year
+        self.game_month = calendar.month
+        self.game_day = calendar.day
+        self.game_hour, self.game_minute = divmod(minute_of_day, 60)

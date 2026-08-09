@@ -50,7 +50,9 @@ def validate_bootstrap():
     config = VillageSimulationConfig.objects.filter(config_key="default").first()
     if config is None:
         errors.append("缺少 default VillageSimulationConfig")
-    elif any(getattr(config, field) for field in FLAG_FIELDS):
+    elif {
+        field for field in FLAG_FIELDS if getattr(config, field)
+    } != {"village_simulation_enabled", "village_hub_command_adapter_enabled"}:
         errors.append("阶段零要求所有自治 Feature Flag 保持关闭")
 
     return {

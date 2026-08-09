@@ -52,7 +52,7 @@ class SeedVillageTests(PhaseZeroTestCase):
         self.assertEqual(NpcProfile.objects.count(), 0)
         self.assertEqual(VillageLocationDefinition.objects.count(), 0)
 
-    def test_seed_is_idempotent_and_flags_are_off(self):
+    def test_seed_is_idempotent_and_enables_only_phase_one_runtime(self):
         self.seed()
         first_counts = (
             NpcDefinition.objects.filter(agent_id__in={row["agent_id"] for row in NPC_SEEDS}).count(),
@@ -76,7 +76,18 @@ class SeedVillageTests(PhaseZeroTestCase):
         )
         self.assertEqual(NpcDefinition.objects.filter(is_test_only=True).count(), 3)
         config = VillageSimulationConfig.objects.get(config_key="default")
-        self.assertTrue(all(not getattr(config, field) for field in FLAG_FIELDS))
+        self.assertTrue(config.village_simulation_enabled)
+        self.assertTrue(config.village_hub_command_adapter_enabled)
+        self.assertTrue(
+            all(
+                not getattr(config, field)
+                for field in FLAG_FIELDS
+                if field not in {
+                    "village_simulation_enabled",
+                    "village_hub_command_adapter_enabled",
+                }
+            )
+        )
         self.assertTrue(
             all(
                 BagTemplate.objects.filter(

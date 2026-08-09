@@ -14,6 +14,7 @@ from .runtime_services import (
     CommandService,
     EventService,
     OutboxService,
+    ResultCode,
     TimeService,
 )
 from .services import validate_bootstrap
@@ -137,20 +138,32 @@ def runtime_bootstrap(request):
 @permission_classes([IsAuthenticated])
 def runtime_checkpoint(request):
     """PUT /api/village/runtime/checkpoint"""
-    checkpoints = request.data.get("checkpoints", [])
-    if not checkpoints:
+    if (
+        not isinstance(request.data, dict)
+        or set(request.data) != {"checkpoints"}
+        or not isinstance(request.data["checkpoints"], list)
+        or not request.data["checkpoints"]
+    ):
         return Response(
-            {"success": False, "resultCode": "INVALID_COMMAND_SCHEMA", "message": "checkpoints 不能为空"},
+            {"success": False, "resultCode": ResultCode.INVALID_COMMAND_SCHEMA},
             status=400,
         )
 
+    checkpoints = request.data["checkpoints"]
     results = CheckpointService.submit_checkpoint(checkpoints)
     all_success = all(r.get("success") for r in results)
-
-    return Response({
+    response_data = {
         "success": all_success,
         "results": results,
-    })
+    }
+    if not all_success:
+        # Preserve every per-NPC result while giving callers a stable top-level
+        # rejection code for the batch response.
+        response_data["resultCode"] = next(
+            r["result_code"] for r in results if not r.get("success")
+        )
+        return Response(response_data, status=409)
+    return Response(response_data)
 
 
 @api_view(["PUT"])

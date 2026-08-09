@@ -135,6 +135,20 @@ class CheckpointServiceTest(TestCase):
 
         self.rt.refresh_from_db()
         self.assertEqual(self.rt.current_location_code, "IRONSMITH")
+        self.assertEqual(self.rt.state_version, 11)
+
+        # The same expected version must not be able to overwrite the first
+        # checkpoint.  This exercises the persisted, public-service CAS.
+        replay = CheckpointService.submit_checkpoint([{
+            "npc_id": "10011",
+            "expected_state_version": 10,
+            "current_location_code": "TAVERN",
+        }])[0]
+        self.assertFalse(replay["success"])
+        self.assertEqual(replay["result_code"], ResultCode.STALE_STATE_VERSION)
+        self.rt.refresh_from_db()
+        self.assertEqual(self.rt.current_location_code, "IRONSMITH")
+        self.assertEqual(self.rt.state_version, 11)
 
     def test_checkpoint_stale_version(self):
         """旧版本应拒绝"""
@@ -157,6 +171,33 @@ class CheckpointServiceTest(TestCase):
         self.assertEqual(len(results), 1)
         self.assertFalse(results[0]["success"])
         self.assertEqual(results[0]["result_code"], ResultCode.CHECKPOINT_FIELD_NOT_ALLOWED)
+
+    def test_checkpoint_cannot_mutate_lifecycle_or_authority_fields(self):
+        """Checkpoint is restricted to recovery-safe location/goal state."""
+        forbidden_fields = {
+            "action_status": "MOVING",
+            "current_action": "MOVE",
+            "action_started_world_minute": 5,
+            "action_ends_world_minute": 10,
+            "active_command_id": str(uuid.uuid4()),
+            "state_version": 999,
+            "time_revision": 999,
+            "world_minute": 999,
+            "inventory": {"gold": 999},
+        }
+        for field, value in forbidden_fields.items():
+            with self.subTest(field=field):
+                result = CheckpointService.submit_checkpoint([{
+                    "npc_id": "10011",
+                    "expected_state_version": 10,
+                    field: value,
+                }])[0]
+                self.assertFalse(result["success"])
+                self.assertEqual(result["result_code"], ResultCode.CHECKPOINT_FIELD_NOT_ALLOWED)
+                self.rt.refresh_from_db()
+                self.assertEqual(self.rt.state_version, 10)
+                self.assertEqual(self.rt.action_status, "IDLE")
+                self.assertEqual(self.rt.current_action, "")
 
 
 class CommandServiceTest(TestCase):

@@ -198,6 +198,14 @@ class PhaseOneFaultAcceptanceTests(TestCase):
         self.assertTrue(response.data["success"])
         self.runtimes["10011"].refresh_from_db()
         self.assertEqual(self.runtimes["10011"].current_location_code, "TAVERN")
+        self.assertEqual(self.runtimes["10011"].state_version, 1)
+
+        # The HTTP endpoint must expose a stable batch rejection code when a
+        # caller retries a checkpoint with its now-stale CAS version.
+        stale_response = client.put("/api/village/runtime/checkpoint", payload, format="json")
+        self.assertEqual(stale_response.status_code, 409)
+        self.assertFalse(stale_response.data["success"])
+        self.assertEqual(stale_response.data["resultCode"], ResultCode.STALE_STATE_VERSION)
 
     def test_strict_command_is_rechecked_at_start_after_another_action_completes(self):
         first_content, first = self._accept("10011", state_version=0)
