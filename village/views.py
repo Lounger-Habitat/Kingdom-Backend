@@ -241,6 +241,7 @@ def actions_complete(request):
         "data": {
             "request_id": str(receipt.request_id) if receipt else None,
             "world_minute": receipt.world_minute if receipt else None,
+            "time_revision": receipt.time_revision if receipt else None,
             "state_version": receipt.state_version if receipt else None,
         },
     })
@@ -276,8 +277,9 @@ def commands_accept(request):
     sender = request.data.get("sender")
     recipient = request.data.get("recipient")
     content = request.data.get("content")
+    timestamp_ms = request.data.get("timestamp")
 
-    if not all([envelope_id, sender, recipient, content]):
+    if not all([envelope_id, sender, recipient, content]) or timestamp_ms is None:
         return Response(
             {"success": False, "resultCode": "INVALID_COMMAND_SCHEMA", "message": "缺少必要字段"},
             status=400,
@@ -288,6 +290,7 @@ def commands_accept(request):
         sender=sender,
         recipient=recipient,
         content=content,
+        timestamp_ms=timestamp_ms,
     )
 
     if not ok:

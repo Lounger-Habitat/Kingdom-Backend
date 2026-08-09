@@ -2,6 +2,8 @@
 阶段一：Backend Runtime API 测试
 """
 import uuid
+import time
+from datetime import timedelta
 from django.test import TestCase
 from django.utils import timezone
 
@@ -183,6 +185,7 @@ class CommandServiceTest(TestCase):
             "params": {"location_code": "IRONSMITH"},
             "queue_mode": "STRICT",
             "expected_state_version": 10,
+            "ttl_ms": 30000,
         }
 
         ok, code, cmd = CommandService.accept_command(
@@ -190,6 +193,7 @@ class CommandServiceTest(TestCase):
             sender="10011",
             recipient="env-001",
             content=content,
+            timestamp_ms=int(time.time() * 1000),
         )
         self.assertTrue(ok)
         self.assertEqual(code, ResultCode.COMMAND_ACCEPTED)
@@ -203,6 +207,9 @@ class CommandServiceTest(TestCase):
             "request_id": str(uuid.uuid4()),
             "name": "invalid_action",
             "params": {},
+            "queue_mode": "STRICT",
+            "expected_state_version": 10,
+            "ttl_ms": 30000,
         }
 
         ok, code, cmd = CommandService.accept_command(
@@ -210,6 +217,7 @@ class CommandServiceTest(TestCase):
             sender="10011",
             recipient="env-001",
             content=content,
+            timestamp_ms=int(time.time() * 1000),
         )
         self.assertFalse(ok)
         self.assertEqual(code, ResultCode.UNKNOWN_ACTION)
@@ -222,6 +230,9 @@ class CommandServiceTest(TestCase):
             "request_id": str(uuid.uuid4()),
             "name": "move",
             "params": {"location_code": "IRONSMITH"},
+            "queue_mode": "STRICT",
+            "expected_state_version": 10,
+            "ttl_ms": 30000,
         }
 
         ok, code, cmd = CommandService.accept_command(
@@ -229,6 +240,7 @@ class CommandServiceTest(TestCase):
             sender="99999",
             recipient="env-001",
             content=content,
+            timestamp_ms=int(time.time() * 1000),
         )
         self.assertFalse(ok)
         self.assertEqual(code, ResultCode.SENDER_BINDING_INVALID)
@@ -244,6 +256,7 @@ class CommandServiceTest(TestCase):
             "params": {"location_code": "IRONSMITH"},
             "queue_mode": "STRICT",
             "expected_state_version": 10,
+            "ttl_ms": 30000,
         }
 
         ok, code, cmd = CommandService.accept_command(
@@ -251,6 +264,7 @@ class CommandServiceTest(TestCase):
             sender="10011",
             recipient="env-001",
             content=content,
+            timestamp_ms=int(time.time() * 1000),
         )
         self.assertTrue(ok)
 
@@ -427,6 +441,25 @@ class OutboxServiceTest(TestCase):
         ok, code = OutboxService.ack_delivery(uuid.uuid4())
         self.assertFalse(ok)
         self.assertEqual(code, ResultCode.OUTBOX_ACK_UNKNOWN)
+
+    def test_expired_lease_is_reclaimed_with_the_same_hub_envelope_id(self):
+        delivery_id = uuid.uuid4()
+        VillageDeliveryOutbox.objects.create(
+            delivery_id=delivery_id,
+            dedupe_key=f"reclaim:{delivery_id}",
+            recipient="10011",
+            message_kind="OUTCOME",
+            command=self.command,
+            receipt=self.receipt,
+            payload={"schema_version": "village.outcome.v1"},
+            status="IN_FLIGHT",
+            lease_until=timezone.now() - timedelta(seconds=1),
+        )
+
+        entries = OutboxService.claim_pending(recipient="10011", limit=1)
+        self.assertEqual(entries[0]["delivery_id"], str(delivery_id))
+        self.assertEqual(entries[0]["envelope"]["id"], str(delivery_id))
+        self.assertGreater(entries[0]["envelope"]["timestamp"], 1_000_000_000_000)
 
 
 class EventServiceTest(TestCase):

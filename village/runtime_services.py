@@ -201,16 +201,43 @@ class BootstrapService:
 
         # 获取五名正式 NPC
         npcs = NpcDefinition.objects.filter(is_test_only=False).order_by("agent_id")
-        if npcs.count() != 5:
+        formal_ids = {str(npc.agent_id) for npc in npcs}
+        if formal_ids != {"10011", "10012", "10013", "10014", "10015"}:
             return {"error": ResultCode.BOOTSTRAP_NPC_SET_MISMATCH}
 
         # 获取运行时状态
         runtime_states = NpcRuntimeState.objects.filter(
             npc__is_test_only=False
-        ).select_related("npc")
+        ).select_related("npc").order_by("npc__agent_id")
+        if {str(rt.npc.agent_id) for rt in runtime_states} != formal_ids:
+            return {"error": ResultCode.BOOTSTRAP_NPC_SET_MISMATCH}
 
         # 获取配置
         config = VillageSimulationConfig.objects.first()
+
+        def serialize_command(command: NpcCommandState) -> Dict[str, Any]:
+            """Return the complete, replay-safe command wire data required by Env recovery."""
+            return {
+                "envelope_id": str(command.message_id),
+                "timestamp": command.sent_at_ms,
+                "sender": command.sender_id,
+                "recipient": command.recipient_id,
+                "content": {
+                    "schema_version": command.schema_version,
+                    "id": str(command.command_id),
+                    "request_id": str(command.request_id),
+                    "name": command.kind.lower(),
+                    "target_id": command.target_id,
+                    "params": command.sanitized_parameters,
+                    "expected_state_version": command.validated_at_state_version,
+                    "queue_mode": command.queue_mode,
+                    "not_before_world_minute": command.not_before_world_minute,
+                    "expires_world_minute": command.expires_world_minute,
+                    "ttl_ms": command.ttl_ms,
+                    "duration_minutes": command.duration_minutes,
+                },
+                "status": command.status,
+            }
 
         # 构建响应
         npc_data = []
@@ -236,13 +263,12 @@ class BootstrapService:
                 "state_version": rt.state_version,
                 "last_simulated_world_minute": rt.last_simulated_world_minute,
                 "time_revision": rt.time_revision,
-                "active_command": {
-                    "command_id": str(active_cmd.command_id),
-                    "kind": active_cmd.kind,
-                    "status": active_cmd.status,
-                    "result_code": active_cmd.result_code,
-                } if active_cmd else None,
+                "active_command": serialize_command(active_cmd) if active_cmd else None,
             })
+
+        queued_commands = NpcCommandState.objects.filter(
+            npc__is_test_only=False, status__in=["RECEIVED", "QUEUED"]
+        ).order_by("npc__agent_id", "received_world_minute", "created_at")
 
         return {
             "world_minute": time_state.world_minute,
@@ -254,6 +280,7 @@ class BootstrapService:
             "game_minute": time_state.game_minute,
             "season": time_state.season,
             "npcs": npc_data,
+            "commands": [serialize_command(command) for command in queued_commands],
             "config": {
                 "tick_interval_seconds": config.tick_interval_seconds if config else 5,
                 "hub_command_timeout_seconds": config.hub_command_timeout_seconds if config else 30,
@@ -372,6 +399,7 @@ class CommandService:
 
     ALLOWED_ACTIONS = {"MOVE", "WAIT", "GO_HOME"}
     MAX_QUEUE_SIZE = 10
+    MAX_CLOCK_SKEW_MS = 5 * 60 * 1000
 
     @staticmethod
     def compute_payload_sha256(content: Dict[str, Any]) -> str:
@@ -386,6 +414,7 @@ class CommandService:
         sender: str,
         recipient: str,
         content: Dict[str, Any],
+        timestamp_ms: Optional[int] = None,
     ) -> Tuple[bool, str, Optional[NpcCommandState]]:
         """接受命令。
 
@@ -393,6 +422,25 @@ class CommandService:
             (success, result_code, command_state)
         """
         # 校验 sender
+        try:
+            message_id = uuid.UUID(str(envelope_id))
+            command_id = uuid.UUID(str(content["id"]))
+            request_id = uuid.UUID(str(content["request_id"]))
+            timestamp_ms = int(timestamp_ms)
+        except (KeyError, TypeError, ValueError, AttributeError):
+            return False, ResultCode.INVALID_COMMAND_SCHEMA, None
+        if timestamp_ms < 1_000_000_000_000 or not isinstance(content.get("params"), dict):
+            return False, ResultCode.INVALID_COMMAND_SCHEMA, None
+        if "parameters" in content or content.get("queue_mode") != "STRICT":
+            return False, ResultCode.INVALID_COMMAND_SCHEMA, None
+        ttl_ms = content.get("ttl_ms")
+        if not isinstance(ttl_ms, int) or ttl_ms <= 0:
+            return False, ResultCode.INVALID_COMMAND_SCHEMA, None
+        now_ms = int(timezone.now().timestamp() * 1000)
+        if timestamp_ms > now_ms + CommandService.MAX_CLOCK_SKEW_MS:
+            return False, ResultCode.CLOCK_SKEW, None
+        if timestamp_ms + ttl_ms < now_ms:
+            return False, ResultCode.MESSAGE_EXPIRED, None
         try:
             npc = NpcDefinition.objects.get(agent_id=int(sender), is_test_only=False)
         except (ValueError, NpcDefinition.DoesNotExist):
@@ -455,7 +503,19 @@ class CommandService:
         time_state = GlobalGameTimeState.get_instance()
 
         # 解析参数
-        params = content.get("params", {})
+        try:
+            runtime = NpcRuntimeState.objects.select_for_update().get(npc=npc)
+        except NpcRuntimeState.DoesNotExist:
+            return False, ResultCode.BOOTSTRAP_NPC_SET_MISMATCH, None
+        expected_version = content.get("expected_state_version")
+        if not isinstance(expected_version, int):
+            return False, ResultCode.INVALID_COMMAND_SCHEMA, None
+        if expected_version != runtime.state_version:
+            return False, ResultCode.STALE_STATE_VERSION, None
+        if (content.get("expires_world_minute") is not None and
+                content["expires_world_minute"] < time_state.world_minute):
+            return False, ResultCode.MESSAGE_EXPIRED, None
+        params = content["params"]
         location_code = params.get("location_code", "")
         point_code = params.get("point_code", "")
 
@@ -467,6 +527,7 @@ class CommandService:
             npc=npc,
             schema_version=schema_version,
             sender_id=sender,
+            recipient_id=recipient,
             kind=action_name,
             target_id=content.get("target_id", ""),
             location_code=location_code or point_code,
@@ -474,13 +535,14 @@ class CommandService:
             payload_sha256=payload_sha256,
             queue_mode=content.get("queue_mode", "STRICT"),
             status="RECEIVED",
-            sent_at_ms=content.get("ttl_ms"),
-            ttl_ms=content.get("ttl_ms"),
+            sent_at_ms=timestamp_ms,
+            received_at_ms=now_ms,
+            ttl_ms=ttl_ms,
             not_before_world_minute=content.get("not_before_world_minute"),
             expires_world_minute=content.get("expires_world_minute"),
             duration_minutes=content.get("duration_minutes"),
             received_world_minute=time_state.world_minute,
-            validated_at_state_version=content.get("expected_state_version"),
+            validated_at_state_version=expected_version,
         )
 
         return True, ResultCode.COMMAND_ACCEPTED, command
@@ -512,10 +574,11 @@ class CommandService:
         if command.queue_mode == "STRICT":
             if (command.validated_at_state_version is not None and
                     command.validated_at_state_version != rt.state_version):
-                command.status = "FAILED"
-                command.result_code = ResultCode.STALE_STATE_VERSION
-                command.completed_world_minute = rt.last_simulated_world_minute
-                command.save()
+                ActionService.complete_action(
+                    command.command_id, command.request_id, False,
+                    ResultCode.STALE_STATE_VERSION,
+                    message="State version changed before command start.",
+                )
                 return False, ResultCode.STALE_STATE_VERSION, None
 
         # 校验 NPC 是否空闲
@@ -524,6 +587,17 @@ class CommandService:
 
         # 获取当前时间
         time_state = GlobalGameTimeState.get_instance()
+        now_ms = int(timezone.now().timestamp() * 1000)
+        if ((command.received_at_ms is not None and command.ttl_ms is not None and
+             command.received_at_ms + command.ttl_ms < now_ms) or
+                (command.expires_world_minute is not None and
+                 command.expires_world_minute < time_state.world_minute)):
+            ActionService.complete_action(
+                command.command_id, command.request_id, False,
+                ResultCode.MESSAGE_EXPIRED,
+                message="Command expired before command start.",
+            )
+            return False, ResultCode.MESSAGE_EXPIRED, None
 
         # 更新命令状态
         command.status = "RUNNING"
@@ -653,7 +727,7 @@ class ActionService:
 
         VillageDeliveryOutbox.objects.create(
             delivery_id=delivery_id,
-            dedupe_key=f"outcome:{delivery_id}",
+            dedupe_key=f"outcome:{receipt.request_id}",
             recipient=command.sender_id,
             message_kind="OUTCOME",
             command=command,
@@ -661,6 +735,37 @@ class ActionService:
             event=event,
             payload=outcome_payload,
             priority=10,
+            status="PENDING",
+        )
+
+        VillageDeliveryOutbox.objects.create(
+            delivery_id=uuid.uuid4(),
+            dedupe_key=f"event:{event.event_id}",
+            recipient=command.sender_id,
+            message_kind="EVENT",
+            command=command,
+            receipt=receipt,
+            event=event,
+            payload={
+                "schema_version": "village.event.v1",
+                "event_id": str(event.event_id),
+                "event_sequence": event.event_sequence,
+                "event_type": event.event_type,
+                "world_minute": event.world_minute,
+                "time_revision": event.time_revision,
+                "actor_npc_id": str(command.npc.agent_id),
+                "participant_npc_ids": [str(command.npc.agent_id)],
+                "location_code": event.location_code,
+                "point_code": event.point_code,
+                "command_id": str(command.command_id),
+                "request_id": str(receipt.request_id),
+                "cause_event_id": None,
+                "visibility": event.visibility,
+                "public_status_code": rt.action_status,
+                "public_data": event.public_data,
+                "summary": event.hub_summary,
+            },
+            priority=5,
             status="PENDING",
         )
 
@@ -709,7 +814,18 @@ class OutboxService:
             results.append({
                 "delivery_id": str(entry.delivery_id),
                 "message_kind": entry.message_kind,
-                "payload": entry.payload,
+                # Hub must preserve this envelope id.  Ling uses it as its ACK key.
+                "envelope": {
+                    "id": str(entry.delivery_id),
+                    "timestamp": int(now.timestamp() * 1000),
+                    "type": "message",
+                    "sender": "env-server-001",
+                    "recipient": entry.recipient,
+                    "payload": {
+                        "type": "outcome" if entry.message_kind == "OUTCOME" else "event",
+                        "content": entry.payload,
+                    },
+                },
                 "attempt_count": entry.attempt_count,
             })
 

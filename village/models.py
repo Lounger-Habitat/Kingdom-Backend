@@ -206,6 +206,7 @@ class NpcCommandState(models.Model):
     )
     schema_version = models.CharField("协议版本", max_length=32, default="village.command.v1")
     sender_id = models.CharField("发送者ID", max_length=32)
+    recipient_id = models.CharField("接收者ID", max_length=128)
     kind = models.CharField("命令类型", max_length=32)
     target_id = models.CharField("目标ID", max_length=64, blank=True, default="")
     location_code = models.CharField("地点码", max_length=64, blank=True, default="")
@@ -216,6 +217,7 @@ class NpcCommandState(models.Model):
 
     # 时间字段
     sent_at_ms = models.BigIntegerField("发送时间戳(毫秒)", null=True, blank=True)
+    received_at_ms = models.BigIntegerField("服务端接收时间戳(毫秒)", null=True, blank=True)
     ttl_ms = models.IntegerField("TTL(毫秒)", null=True, blank=True)
     not_before_world_minute = models.BigIntegerField("不早于世界分钟", null=True, blank=True)
     expires_world_minute = models.BigIntegerField("过期世界分钟", null=True, blank=True)
