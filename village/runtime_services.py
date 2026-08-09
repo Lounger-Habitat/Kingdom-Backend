@@ -21,7 +21,7 @@ import uuid
 from datetime import datetime, timedelta
 from typing import Any, Dict, List, Optional, Tuple
 
-from django.db import models, transaction
+from django.db import IntegrityError, models, transaction
 from django.db.models import F, Q
 from django.utils import timezone
 
@@ -578,6 +578,7 @@ class CommandService:
                     command.command_id, command.request_id, False,
                     ResultCode.STALE_STATE_VERSION,
                     message="State version changed before command start.",
+                    allow_prestart_failure=True,
                 )
                 return False, ResultCode.STALE_STATE_VERSION, None
 
@@ -588,6 +589,13 @@ class CommandService:
         # 获取当前时间
         time_state = GlobalGameTimeState.get_instance()
         now_ms = int(timezone.now().timestamp() * 1000)
+        if (command.not_before_world_minute is not None and
+                command.not_before_world_minute > time_state.world_minute):
+            # The command is durable and will be restored from Bootstrap.  Do
+            # not consume it merely because Env attempted to start it early.
+            command.status = "QUEUED"
+            command.save(update_fields=["status", "updated_at"])
+            return False, ResultCode.ACTION_NOT_ALLOWED, None
         if ((command.received_at_ms is not None and command.ttl_ms is not None and
              command.received_at_ms + command.ttl_ms < now_ms) or
                 (command.expires_world_minute is not None and
@@ -596,6 +604,7 @@ class CommandService:
                 command.command_id, command.request_id, False,
                 ResultCode.MESSAGE_EXPIRED,
                 message="Command expired before command start.",
+                allow_prestart_failure=True,
             )
             return False, ResultCode.MESSAGE_EXPIRED, None
 
@@ -631,6 +640,7 @@ class ActionService:
         result_code: str,
         message: str = "",
         data: Optional[Dict[str, Any]] = None,
+        allow_prestart_failure: bool = False,
     ) -> Tuple[bool, str, Optional[VillageActionReceipt]]:
         """完成动作。
 
@@ -640,7 +650,9 @@ class ActionService:
         # 检查 request_id 幂等
         existing = VillageActionReceipt.objects.filter(request_id=request_id).first()
         if existing:
-            return True, ResultCode.COMMAND_REPLAYED, existing
+            if existing.command_id == command_id:
+                return True, ResultCode.COMMAND_REPLAYED, existing
+            return False, ResultCode.REQUEST_ID_CONFLICT, None
 
         # 获取命令
         try:
@@ -654,8 +666,27 @@ class ActionService:
         except NpcRuntimeState.DoesNotExist:
             return False, ResultCode.BOOTSTRAP_NPC_SET_MISMATCH, None
 
-        # 获取当前时间
-        time_state = GlobalGameTimeState.get_instance()
+        # Serialize completion with TimeService.advance_time.  A receipt and
+        # its event must observe one authoritative world_minute/revision pair,
+        # never a pre-tick snapshot while the tick is committing.
+        try:
+            time_state = GlobalGameTimeState.objects.select_for_update().get(pk=1)
+        except GlobalGameTimeState.DoesNotExist:
+            return False, ResultCode.BACKEND_UNAVAILABLE, None
+
+        # Only the command currently owned by this NPC can produce a terminal
+        # outcome.  This prevents a duplicate/corrupted Outcome with a new
+        # request_id from creating a second event, receipt and Outbox delivery.
+        prestart_failure = (
+            allow_prestart_failure
+            and not success
+            and command.status in ["RECEIVED", "QUEUED"]
+        )
+        if not prestart_failure and (
+            command.status != "RUNNING" or
+            (rt.active_command_id is not None and rt.active_command_id != command.command_id)
+        ):
+            return False, ResultCode.NPC_BUSY, None
 
         # 创建世界事件
         event_type = "NPC_ACTION_COMPLETED" if success else "NPC_ACTION_FAILED"
@@ -703,6 +734,7 @@ class ActionService:
         rt.action_ends_world_minute = None
         rt.active_command_id = None
         rt.last_simulated_world_minute = time_state.world_minute
+        rt.time_revision = time_state.time_revision
         rt.save()
 
         # 创建 Outbox 条目
@@ -770,6 +802,117 @@ class ActionService:
         )
 
         return True, result_code, receipt
+
+
+# ============================================================================
+# Reservation service
+# ============================================================================
+
+class ReservationService:
+    """Acquire/release phase-one multi-NPC reservations deterministically.
+
+    Participant runtime rows are locked in ascending formal NPC id order.
+    That order is part of the service contract: two overlapping requests then
+    contend for the same first row instead of forming a lock cycle.
+    """
+
+    @staticmethod
+    @transaction.atomic
+    def acquire(
+        *,
+        action_kind: str,
+        participant_ids: List[str],
+        world_minute: int,
+        expires_world_minute: int,
+        resource_key: str = "",
+        location_code: str = "",
+        point_code: str = "",
+        command_id: Optional[uuid.UUID] = None,
+        request_id: Optional[uuid.UUID] = None,
+    ) -> Tuple[bool, str, Optional[NpcActionReservation]]:
+        normalized_ids = sorted({str(npc_id) for npc_id in participant_ids})
+        if (not normalized_ids or expires_world_minute < world_minute or
+                action_kind not in CommandService.ALLOWED_ACTIONS):
+            return False, ResultCode.INVALID_COMMAND_SCHEMA, None
+
+        # This query intentionally materializes locks in a stable total order.
+        runtimes = list(
+            NpcRuntimeState.objects.select_for_update()
+            .select_related("npc")
+            .filter(npc__agent_id__in=normalized_ids, npc__is_test_only=False)
+            .order_by("npc__agent_id")
+        )
+        if [str(runtime.npc.agent_id) for runtime in runtimes] != normalized_ids:
+            return False, ResultCode.BOOTSTRAP_NPC_SET_MISMATCH, None
+
+        # Expired locks must not survive an Env/Backend restart.  Clearing the
+        # active key makes a later acquisition of the same resource possible.
+        expired = NpcActionReservation.objects.select_for_update().filter(
+            status="HELD", expires_world_minute__lt=world_minute
+        )
+        expired.update(
+            status="EXPIRED",
+            released_world_minute=world_minute,
+            active_lock_key=None,
+        )
+
+        held_by_participant = NpcActionReservation.objects.select_for_update().filter(
+            status="HELD",
+            participants__agent_id__in=normalized_ids,
+        ).distinct().first()
+        if held_by_participant:
+            return False, ResultCode.RESERVATION_CONFLICT, None
+
+        active_lock_key = (
+            f"resource:{resource_key}" if resource_key
+            else f"participants:{','.join(normalized_ids)}"
+        )
+        if NpcActionReservation.objects.select_for_update().filter(
+            active_lock_key=active_lock_key, status="HELD"
+        ).exists():
+            return False, ResultCode.RESERVATION_CONFLICT, None
+
+        try:
+            # A disjoint participant set can still race on resource_key.  The
+            # database unique key is the final arbiter for that case.
+            with transaction.atomic():
+                reservation = NpcActionReservation.objects.create(
+                    action_kind=action_kind,
+                    location_code=location_code,
+                    point_code=point_code,
+                    resource_key=resource_key,
+                    active_lock_key=active_lock_key,
+                    status="HELD",
+                    acquired_world_minute=world_minute,
+                    expires_world_minute=expires_world_minute,
+                    command_id=command_id,
+                    request_id=request_id,
+                )
+        except IntegrityError:
+            return False, ResultCode.RESERVATION_CONFLICT, None
+        reservation.participants.set([runtime.npc for runtime in runtimes])
+        return True, ResultCode.COMMAND_ACCEPTED, reservation
+
+    @staticmethod
+    @transaction.atomic
+    def release(reservation_id: uuid.UUID, world_minute: int) -> Tuple[bool, str]:
+        try:
+            reservation = NpcActionReservation.objects.select_for_update().get(
+                reservation_id=reservation_id
+            )
+        except NpcActionReservation.DoesNotExist:
+            return False, ResultCode.INVALID_COMMAND_SCHEMA
+
+        if reservation.status in ["RELEASED", "EXPIRED"]:
+            return True, ResultCode.COMMAND_REPLAYED
+
+        reservation.status = "RELEASED"
+        reservation.released_world_minute = world_minute
+        reservation.active_lock_key = None
+        reservation.save(update_fields=[
+            "status", "released_world_minute", "active_lock_key", "updated_at"
+        ])
+        return True, ResultCode.COMMAND_ACCEPTED
 
 
 # ============================================================================
