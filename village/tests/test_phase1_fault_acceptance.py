@@ -431,6 +431,51 @@ class PhaseOneFaultAcceptanceTests(TestCase):
         self.assertEqual(VillageActionReceipt.objects.filter(command=command).count(), 1)
         self.assertEqual(VillageWorldEvent.objects.filter(command_id=command.command_id).count(), 1)
 
+    def test_bootstrap_restart_terminalizes_ttl_and_world_expiry_via_outbox(self):
+        """Env crash after accept cannot leave old Hub timestamps stuck in Unity.
+
+        This uses a fresh Bootstrap read as the process-restart boundary.  Both
+        expiry modes must become Backend FAILED facts before the snapshot is
+        handed to Env; no command remains for a client-side synthetic Outcome.
+        """
+        _ttl_content, ttl_command = self._accept("10011")
+        _world_content, world_command = self._accept(
+            "10012", expires_world_minute=self.time_state.world_minute
+        )
+        NpcCommandState.objects.filter(command_id=ttl_command.command_id).update(
+            received_at_ms=int(time.time() * 1000) - ttl_command.ttl_ms - 1
+        )
+        self.time_state.world_minute += 1
+        self.time_state.time_revision += 1
+        self.time_state.save(update_fields=["world_minute", "time_revision"])
+
+        # A new Env process reads only persisted Backend state.
+        restarted_bootstrap = BootstrapService.get_bootstrap()
+        restored_ids = {
+            item["content"]["id"] for item in restarted_bootstrap["commands"]
+        }
+        self.assertNotIn(str(ttl_command.command_id), restored_ids)
+        self.assertNotIn(str(world_command.command_id), restored_ids)
+
+        for command in (ttl_command, world_command):
+            command.refresh_from_db()
+            self.assertEqual(command.status, "FAILED")
+            self.assertEqual(command.result_code, ResultCode.MESSAGE_EXPIRED)
+            receipt = VillageActionReceipt.objects.get(command=command)
+            self.assertFalse(receipt.success)
+            self.assertEqual(receipt.result_code, ResultCode.MESSAGE_EXPIRED)
+            self.assertEqual(
+                VillageWorldEvent.objects.filter(command_id=command.command_id).count(), 1
+            )
+            deliveries = list(VillageDeliveryOutbox.objects.filter(command=command))
+            self.assertEqual(len(deliveries), 2)
+            claimed = OutboxService.claim_pending(command.sender_id, limit=10)
+            self.assertEqual(len(claimed), 2)
+            self.assertEqual(
+                {item["delivery_id"] for item in claimed},
+                {item["envelope"]["id"] for item in claimed},
+            )
+
     def test_wuxi_village_five_npcs_run_for_three_consecutive_game_days(self):
         """Exercise the production accept/start/complete and authoritative tick path.
 

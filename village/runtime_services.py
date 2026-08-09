@@ -199,6 +199,13 @@ class BootstrapService:
         # 获取时间
         time_state = GlobalGameTimeState.get_instance()
 
+        # Bootstrap is a recovery boundary, not a passive replay of commands
+        # which are no longer executable.  Env may have crashed after accept
+        # and before StartCommand.  Sweep that durable work through the same
+        # authority path before exposing the recovery snapshot; it creates the
+        # FAILED command, receipt, event and Outbox records atomically.
+        CommandService.terminalize_expired_prestart_commands(time_state)
+
         # 获取五名正式 NPC
         npcs = NpcDefinition.objects.filter(is_test_only=False).order_by("agent_id")
         formal_ids = {str(npc.agent_id) for npc in npcs}
@@ -624,6 +631,38 @@ class CommandService:
         return True, ResultCode.COMMAND_ACCEPTED, command
 
     @staticmethod
+    def terminalize_expired_prestart_commands(
+        time_state: GlobalGameTimeState,
+    ) -> None:
+        """Use StartCommand to terminalize work that expired while Env was down.
+
+        IDs are materialized before invoking the transactional StartCommand
+        path.  Consequently recovery uses the normal receipt/event/Outbox
+        transaction instead of permitting a Unity-generated outcome.
+        """
+        now_ms = int(timezone.now().timestamp() * 1000)
+        expired_ids = list(
+            NpcCommandState.objects.filter(status__in=["RECEIVED", "QUEUED"])
+            .filter(
+                Q(
+                    received_at_ms__isnull=False,
+                    ttl_ms__isnull=False,
+                    received_at_ms__lt=now_ms - F("ttl_ms"),
+                )
+                | Q(
+                    expires_world_minute__isnull=False,
+                    expires_world_minute__lt=time_state.world_minute,
+                )
+            )
+            .order_by("created_at")
+            .values_list("command_id", flat=True)
+        )
+        for command_id in expired_ids:
+            # A concurrent StartCommand may have already claimed the command;
+            # that durable terminal/running status remains authoritative.
+            CommandService.start_command(command_id)
+
+    @staticmethod
     @transaction.atomic
     def start_command(command_id: uuid.UUID) -> Tuple[bool, str, Optional[NpcCommandState]]:
         """开始命令执行。
@@ -647,6 +686,23 @@ class CommandService:
             return False, ResultCode.BOOTSTRAP_NPC_SET_MISMATCH, None
 
         # STRICT 模式校验版本
+        # Expiry has precedence over version/busy rejection for accepted
+        # pre-start work.  This produces a deterministic Backend terminal fact
+        # when a command ages out while Env is unavailable.
+        time_state = GlobalGameTimeState.get_instance()
+        now_ms = int(timezone.now().timestamp() * 1000)
+        if ((command.received_at_ms is not None and command.ttl_ms is not None and
+             command.received_at_ms + command.ttl_ms < now_ms) or
+                (command.expires_world_minute is not None and
+                 command.expires_world_minute < time_state.world_minute)):
+            ActionService.complete_action(
+                command.command_id, command.request_id, False,
+                ResultCode.MESSAGE_EXPIRED,
+                message="Command expired before command start.",
+                allow_prestart_failure=True,
+            )
+            return False, ResultCode.MESSAGE_EXPIRED, None
+
         if command.queue_mode == "STRICT":
             if (command.validated_at_state_version is not None and
                     command.validated_at_state_version != rt.state_version):
