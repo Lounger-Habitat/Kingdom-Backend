@@ -376,6 +376,61 @@ class PhaseOneFaultAcceptanceTests(TestCase):
                     if item["content"]["id"] == str(command.command_id))
         self.assertEqual(wire["content"]["not_before_world_minute"], content["not_before_world_minute"])
 
+    def test_prestart_expiry_is_terminalized_by_backend_and_outbox_recovers(self):
+        """An accepted boundary-expiry STRICT command must never need a Unity Outcome.
+
+        The command is valid at accept when ``expires_world_minute == now``.  A
+        subsequent authoritative tick makes it expired before StartCommand; Backend
+        then owns the terminal receipt/event/outbox transaction and an Outbox relay
+        restart reuses the same delivery identities.
+        """
+        expires_at_accept = self.time_state.world_minute
+        _content, command = self._accept(
+            "10011", expires_world_minute=expires_at_accept
+        )
+
+        self.time_state.refresh_from_db()
+        ok, code, _ = TimeService.advance_time(
+            self.time_state.world_minute + 1,
+            self.time_state.time_revision,
+            uuid.uuid4(),
+        )
+        self.assertTrue(ok, code)
+
+        ok, code, started = CommandService.start_command(command.command_id)
+        self.assertFalse(ok)
+        self.assertEqual(code, ResultCode.MESSAGE_EXPIRED)
+        self.assertIsNone(started)
+
+        command.refresh_from_db()
+        self.assertEqual(command.status, "FAILED")
+        self.assertEqual(command.result_code, ResultCode.MESSAGE_EXPIRED)
+        receipt = VillageActionReceipt.objects.get(command=command)
+        self.assertFalse(receipt.success)
+        self.assertEqual(receipt.result_code, ResultCode.MESSAGE_EXPIRED)
+        event = VillageWorldEvent.objects.get(command_id=command.command_id)
+        self.assertEqual(event.event_type, "NPC_ACTION_FAILED")
+
+        initial = OutboxService.claim_pending("10011", limit=10)
+        self.assertEqual({item["message_kind"] for item in initial}, {"OUTCOME", "EVENT"})
+        self.assertEqual(
+            {item["delivery_id"] for item in initial},
+            {item["envelope"]["id"] for item in initial},
+        )
+
+        # Fault injection: relay crashed after send and before ACK. The recovered
+        # relay must redeliver the persisted records, not fabricate local outcomes.
+        VillageDeliveryOutbox.objects.filter(command=command).update(
+            lease_until=timezone.now() - timedelta(seconds=1)
+        )
+        recovered = OutboxService.claim_pending("10011", limit=10)
+        self.assertEqual(
+            {item["delivery_id"] for item in recovered},
+            {item["delivery_id"] for item in initial},
+        )
+        self.assertEqual(VillageActionReceipt.objects.filter(command=command).count(), 1)
+        self.assertEqual(VillageWorldEvent.objects.filter(command_id=command.command_id).count(), 1)
+
     def test_wuxi_village_five_npcs_run_for_three_consecutive_game_days(self):
         """Exercise the production accept/start/complete and authoritative tick path.
 
