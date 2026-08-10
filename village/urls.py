@@ -7,6 +7,8 @@ urlpatterns = [
     # 阶段零 API
     path("api/village/config", views.village_config, name="village-config"),
     path("api/village/npcs", views.village_npcs, name="village-npcs"),
+    path("api/village/npcs/<str:npc_id>/runtime-summary", views.npc_runtime_summary, name="village-npc-runtime-summary"),
+    path("api/village/npcs/<str:npc_id>/available-actions", views.npc_available_actions, name="village-npc-available-actions"),
     path("api/village/locations", views.village_locations, name="village-locations"),
     path(
         "api/village/bootstrap-validation",
@@ -17,7 +19,10 @@ urlpatterns = [
     path("api/village/runtime/bootstrap", views.runtime_bootstrap, name="village-runtime-bootstrap"),
     path("api/village/runtime/checkpoint", views.runtime_checkpoint, name="village-runtime-checkpoint"),
     path("api/village/runtime/time", views.runtime_time, name="village-runtime-time"),
+    path("api/village/runtime/advance-needs", views.runtime_advance_needs, name="village-runtime-advance-needs"),
+    path("api/village/runtime/summary", views.runtime_summary_view, name="village-runtime-summary"),
     path("api/village/actions/complete", views.actions_complete, name="village-actions-complete"),
+    path("api/village/life-actions/execute", views.life_actions_execute, name="village-life-actions-execute"),
     path("api/village/events", views.events_list, name="village-events"),
     # 阶段一 Command API
     path("api/village/commands/accept", views.commands_accept, name="village-commands-accept"),

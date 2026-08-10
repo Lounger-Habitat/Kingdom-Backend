@@ -11,6 +11,7 @@ from game_time.models import GlobalGameTimeState
 from inventory.models import NpcDefinition
 from village.models import (
     NpcCommandState,
+    NpcActionReservation,
     NpcRuntimeState,
     VillageActionReceipt,
     VillageDeliveryOutbox,
@@ -109,6 +110,30 @@ class BootstrapServiceTest(TestCase):
         data = BootstrapService.get_bootstrap()
         self.assertNotIn("error", data)
         self.assertEqual(len(data["npcs"]), 5)
+
+    def test_bootstrap_exposes_need_bands_and_shared_active_reservation(self):
+        npcs = []
+        for i, name in enumerate(["bill", "jack", "mark", "lucy", "nora"], start=10011):
+            npc, _ = NpcDefinition.objects.get_or_create(
+                agent_id=i, defaults={"name": name, "is_test_only": False},
+            )
+            NpcRuntimeState.objects.get_or_create(
+                npc=npc, defaults={"current_location_code": "VILLAGE_SQUARE"},
+            )
+            npcs.append(npc)
+        reservation = NpcActionReservation.objects.create(
+            reservation_id=uuid.uuid4(), action_kind="SOCIALIZE", location_code="VILLAGE_SQUARE",
+            active_lock_key="social:10011:10012", status="HELD", acquired_world_minute=0,
+            expires_world_minute=30,
+        )
+        reservation.participants.set(npcs[:2])
+        data = BootstrapService.get_bootstrap()
+        by_id = {row["npc_id"]: row for row in data["npcs"]}
+        self.assertIn("need_bands", by_id["10011"])
+        self.assertEqual(
+            by_id["10011"]["active_reservation"],
+            by_id["10012"]["active_reservation"],
+        )
 
 
 class CheckpointServiceTest(TestCase):

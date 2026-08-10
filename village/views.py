@@ -17,6 +17,7 @@ from .runtime_services import (
     ResultCode,
     TimeService,
 )
+from .phase2_services import LifeActionService, NeedsService, runtime_summary
 from .services import validate_bootstrap
 
 
@@ -258,6 +259,67 @@ def actions_complete(request):
             "state_version": receipt.state_version if receipt else None,
         },
     })
+
+
+@api_view(["POST"])
+@authentication_classes([EnvServerJWTAuthentication])
+@permission_classes([IsAuthenticated])
+def runtime_advance_needs(request):
+    """POST /api/village/runtime/advance-needs; no needs values are accepted."""
+    if not isinstance(request.data, dict):
+        return Response({"success": False, "resultCode": ResultCode.INVALID_COMMAND_SCHEMA}, status=400)
+    result = NeedsService.advance(dict(request.data))
+    status = 200 if result["success"] else 409
+    data = {key: value for key, value in result.items() if key not in {"receipt", "success", "result_code"}}
+    return Response({"success": result["success"], "resultCode": result["result_code"], "data": data}, status=status)
+
+
+@api_view(["POST"])
+@authentication_classes([EnvServerJWTAuthentication])
+@permission_classes([IsAuthenticated])
+def life_actions_execute(request):
+    """POST /api/village/life-actions/execute; Backend owns completion facts."""
+    if not isinstance(request.data, dict):
+        return Response({"success": False, "resultCode": ResultCode.INVALID_COMMAND_SCHEMA}, status=400)
+    result = LifeActionService.execute(dict(request.data))
+    status = 200 if result["success"] else 409
+    data = {key: value for key, value in result.items() if key not in {"receipt", "world_event", "success", "result_code"}}
+    return Response({"success": result["success"], "resultCode": result["result_code"], "data": data}, status=status)
+
+
+@api_view(["GET"])
+@authentication_classes([EnvServerJWTAuthentication])
+@permission_classes([IsAuthenticated])
+def runtime_summary_view(request):
+    npc_id = request.query_params.get("npc_id", "")
+    result = runtime_summary(npc_id)
+    status = 200 if result["success"] else 409
+    data = {key: value for key, value in result.items() if key not in {"success", "result_code"}}
+    return Response({"success": result["success"], "resultCode": result["result_code"], "data": data}, status=status)
+
+
+@api_view(["GET"])
+@authentication_classes([EnvServerJWTAuthentication])
+@permission_classes([IsAuthenticated])
+def npc_runtime_summary(request, npc_id):
+    """Frozen P4 route: GET /api/village/npcs/{npc_id}/runtime-summary."""
+    result = runtime_summary(npc_id)
+    status = 200 if result["success"] else 409
+    data = {key: value for key, value in result.items() if key not in {"success", "result_code"}}
+    return Response({"success": result["success"], "resultCode": result["result_code"], "data": data}, status=status)
+
+
+@api_view(["GET"])
+@authentication_classes([EnvServerJWTAuthentication])
+@permission_classes([IsAuthenticated])
+def npc_available_actions(request, npc_id):
+    """Frozen P4 route: GET /api/village/npcs/{npc_id}/available-actions."""
+    result = runtime_summary(npc_id)
+    status = 200 if result["success"] else 409
+    return Response({
+        "success": result["success"], "resultCode": result["result_code"],
+        "data": {"npc_id": result.get("npc_id"), "state_version": result.get("state_version"), "available_actions": result.get("available_actions", [])},
+    }, status=status)
 
 
 @api_view(["GET"])

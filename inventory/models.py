@@ -327,6 +327,9 @@ class NpcGlobalInventory(models.Model):
     npc = models.OneToOneField(NpcDefinition, on_delete=models.CASCADE,
                                related_name="global_inventory", help_text="关联NPC")
     money = models.IntegerField(default=0)
+    # Incremented only by the phase-two authoritative food-consumption
+    # transaction.  It is intentionally independent from phase-one state_version.
+    asset_version = models.BigIntegerField(default=0)
     updated_at = models.DateTimeField(auto_now=True)
 
     class Meta:

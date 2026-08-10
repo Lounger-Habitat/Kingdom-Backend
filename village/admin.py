@@ -3,9 +3,12 @@ from django.contrib import admin
 from .models import (
     NpcActionReservation,
     NpcCommandState,
+    NpcNeedsDaySummary,
     NpcProfile,
     NpcRuntimeState,
+    NpcSocialDailyCounter,
     VillageActionReceipt,
+    VillageCommunityMealDailyUsage,
     VillageDeliveryOutbox,
     VillageLocationDefinition,
     VillageSimulationConfig,
@@ -37,10 +40,34 @@ class VillageSimulationConfigAdmin(admin.ModelAdmin):
 
 @admin.register(NpcRuntimeState)
 class NpcRuntimeStateAdmin(admin.ModelAdmin):
-    list_display = ("npc", "action_status", "current_location_code", "state_version", "updated_at")
+    list_display = (
+        "npc", "action_status", "current_location_code", "state_version",
+        "needs_world_minute", "hunger_fp", "energy_fp", "health_fp", "updated_at",
+    )
     search_fields = ("npc__agent_id", "npc__name")
     list_filter = ("action_status",)
-    readonly_fields = ("state_version", "time_revision")
+    readonly_fields = ("state_version", "time_revision", "needs_world_minute")
+
+
+@admin.register(NpcNeedsDaySummary)
+class NpcNeedsDaySummaryAdmin(admin.ModelAdmin):
+    list_display = ("npc", "day_index", "sleep_minutes", "successful_meals", "severe_hunger_minutes", "injured", "finalized")
+    search_fields = ("npc__agent_id", "npc__name")
+    list_filter = ("injured", "finalized")
+    readonly_fields = ("updated_at",)
+
+
+@admin.register(NpcSocialDailyCounter)
+class NpcSocialDailyCounterAdmin(admin.ModelAdmin):
+    list_display = ("low_npc", "high_npc", "day_index", "socialize_count", "updated_at")
+    search_fields = ("low_npc__agent_id", "high_npc__agent_id")
+    readonly_fields = ("updated_at",)
+
+
+@admin.register(VillageCommunityMealDailyUsage)
+class VillageCommunityMealDailyUsageAdmin(admin.ModelAdmin):
+    list_display = ("day_index", "total_meals", "updated_at")
+    readonly_fields = ("updated_at",)
 
 
 @admin.register(NpcCommandState)
