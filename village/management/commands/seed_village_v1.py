@@ -1,7 +1,10 @@
+import uuid
+
 from django.conf import settings
 from django.core.management.base import BaseCommand, CommandError
 from django.db import transaction
 
+from game_time.models import GlobalGameTimeState
 from inventory.models import (
     BagTemplate,
     BagTemplateSlot,
@@ -10,13 +13,23 @@ from inventory.models import (
     NpcGlobalInventorySlot,
 )
 from items.models import Item
-from village.models import NpcProfile, VillageLocationDefinition, VillageSimulationConfig
+from village.models import (
+    NpcProfile,
+    NpcRuntimeState,
+    VillageLocationDefinition,
+    VillageSimulationConfig,
+)
 from village.seed_data import (
     LOCATION_SEEDS,
     NPC_SEEDS,
     SIMULATION_DEFAULTS,
     TEST_NPC_ISOLATION,
 )
+
+
+BASE_RATION_ITEM_ID = 29001
+BASE_RATION_ITEM_TYPE = "食物"
+BASE_RATION_INSTANCE_NAMESPACE = uuid.UUID("c1f4c9ec-b93a-4df3-8b0f-021c3c0f159f")
 
 
 class Command(BaseCommand):
@@ -168,7 +181,80 @@ class Command(BaseCommand):
                 self._replace_inventory_slots(bag, seed["items"], items)
             else:
                 summary["preserved_nonempty"] += 1
+            self._ensure_phase_two_runtime(npc)
+            self._ensure_phase_two_base_rations(npc, bag)
             summary["inventories"] += 1
+
+    @staticmethod
+    def _ensure_phase_two_runtime(npc):
+        """Seed only a missing runtime; existing phase-one/phase-two state wins."""
+        time_state = GlobalGameTimeState.get_instance()
+        NpcRuntimeState.objects.get_or_create(
+            npc=npc,
+            defaults={
+                "current_location_code": "VILLAGE_SQUARE",
+                "current_point_code": "VILLAGE_SQUARE",
+                "current_goal": "NONE",
+                "current_action": "",
+                "action_status": "IDLE",
+                "state_version": 0,
+                "last_simulated_world_minute": time_state.world_minute,
+                "time_revision": time_state.time_revision,
+                "hunger_fp": 200,
+                "energy_fp": 800,
+                "health_fp": 1000,
+                "social_fp": 200,
+                "stress_fp": 100,
+                "hunger_remainder": 0,
+                "energy_remainder": 0,
+                "health_remainder": 0,
+                "social_remainder": 0,
+                "stress_remainder": 0,
+                "needs_world_minute": time_state.world_minute,
+            },
+        )
+
+    @staticmethod
+    def _base_ration_instance_id(agent_id, ordinal):
+        return uuid.uuid5(
+            BASE_RATION_INSTANCE_NAMESPACE,
+            f"village.phase2.base-ration:{agent_id}:{ordinal}",
+        )
+
+    def _ensure_phase_two_base_rations(self, npc, bag):
+        """Append, never replace, the four deterministic phase-two rations."""
+        ration = Item.objects.filter(item_id=BASE_RATION_ITEM_ID).first()
+        if ration is None:
+            ration = Item.objects.create(
+                item_id=BASE_RATION_ITEM_ID,
+                item_name="村庄基础口粮",
+                item_type=BASE_RATION_ITEM_TYPE,
+                item_description="阶段二基础生活动作口粮",
+                item_price=0,
+                collectable=False,
+            )
+        elif ration.item_type != BASE_RATION_ITEM_TYPE or ration.is_deleted:
+            raise CommandError("阶段二基础口粮 item 29001 定义不兼容")
+
+        next_slot_index = bag.slots.order_by("-slot_index").values_list("slot_index", flat=True).first()
+        next_slot_index = 0 if next_slot_index is None else next_slot_index + 1
+        for ordinal in range(4):
+            instance_id = self._base_ration_instance_id(npc.agent_id, ordinal)
+            existing = NpcGlobalInventorySlot.objects.filter(instance_id=instance_id).first()
+            if existing is not None:
+                if existing.bag_id != bag.id:
+                    raise CommandError("阶段二基础口粮确定性实例已属于其他库存")
+                continue
+            NpcGlobalInventorySlot.objects.create(
+                bag=bag,
+                slot_index=next_slot_index,
+                instance_id=instance_id,
+                item_id=BASE_RATION_ITEM_ID,
+                item_amount=1,
+                item_bag_name="村庄基础口粮",
+                hide_in_shop=True,
+            )
+            next_slot_index += 1
 
     def _seed_test_npc_isolation(self, summary):
         """Clone legacy TestScent assets away from the five formal IDs once."""

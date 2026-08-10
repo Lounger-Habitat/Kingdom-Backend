@@ -51,6 +51,7 @@ class ResultCode:
     WAIT_COMPLETED = "WAIT_COMPLETED"
     GO_HOME_COMPLETED = "GO_HOME_COMPLETED"
     COMMAND_CANCELLED_ON_RECOVERY = "COMMAND_CANCELLED_ON_RECOVERY"
+    LIFE_ACTION_COMPLETED = "LIFE_ACTION_COMPLETED"
 
     # 失败码 - 协议和身份
     PROTOCOL_VERSION_UNSUPPORTED = "PROTOCOL_VERSION_UNSUPPORTED"
@@ -91,6 +92,23 @@ class ResultCode:
     BACKEND_UNAVAILABLE = "BACKEND_UNAVAILABLE"
     CHECKPOINT_FIELD_NOT_ALLOWED = "CHECKPOINT_FIELD_NOT_ALLOWED"
     BOOTSTRAP_NPC_SET_MISMATCH = "BOOTSTRAP_NPC_SET_MISMATCH"
+
+    # 阶段二需求与生活动作
+    VILLAGE_NEEDS_DISABLED = "VILLAGE_NEEDS_DISABLED"
+    NEEDS_FIELDS_NOT_ALLOWED = "NEEDS_FIELDS_NOT_ALLOWED"
+    INVALID_ACTIVITY_INTERVAL = "INVALID_ACTIVITY_INTERVAL"
+    STALE_NEEDS_MINUTE = "STALE_NEEDS_MINUTE"
+    HUNGER_TOO_HIGH = "HUNGER_TOO_HIGH"
+    ENERGY_TOO_LOW = "ENERGY_TOO_LOW"
+    HEALTH_TOO_LOW = "HEALTH_TOO_LOW"
+    INVALID_ACTION_DURATION = "INVALID_ACTION_DURATION"
+    INVALID_ACTION_LOCATION = "INVALID_ACTION_LOCATION"
+    LOCATION_CLOSED = "LOCATION_CLOSED"
+    FOOD_NOT_AVAILABLE = "FOOD_NOT_AVAILABLE"
+    FOOD_NOT_ALLOWED = "FOOD_NOT_ALLOWED"
+    ASSET_VERSION_CONFLICT = "ASSET_VERSION_CONFLICT"
+    SOCIAL_TARGET_BUSY = "SOCIAL_TARGET_BUSY"
+    SOCIAL_TARGET_INVALID = "SOCIAL_TARGET_INVALID"
 
     # 阶段边界
     ASSET_EFFECT_NOT_ALLOWED = "ASSET_EFFECT_NOT_ALLOWED"
@@ -281,6 +299,34 @@ class BootstrapService:
                     command_id=rt.active_command_id
                 ).first()
 
+            active_reservation = (
+                NpcActionReservation.objects.select_for_update()
+                .filter(
+                    participants=rt.npc, status="HELD",
+                    active_lock_key__isnull=False,
+                )
+                .prefetch_related("participants")
+                .order_by("acquired_world_minute", "reservation_id")
+                .first()
+            )
+            reservation_data = None
+            if active_reservation:
+                reservation_data = {
+                    "reservation_id": str(active_reservation.reservation_id),
+                    "action_kind": active_reservation.action_kind,
+                    "participant_npc_ids": sorted(
+                        str(npc.agent_id) for npc in active_reservation.participants.all()
+                    ),
+                    "location_code": active_reservation.location_code,
+                    "acquired_world_minute": active_reservation.acquired_world_minute,
+                    "expires_world_minute": active_reservation.expires_world_minute,
+                    "command_id": str(active_reservation.command_id) if active_reservation.command_id else None,
+                    "request_id": str(active_reservation.request_id) if active_reservation.request_id else None,
+                    "status": active_reservation.status,
+                }
+
+            from .phase2_services import need_bands
+
             npc_data.append({
                 "npc_id": str(rt.npc.agent_id),
                 "name": rt.npc.name,
@@ -295,6 +341,16 @@ class BootstrapService:
                 "state_version": rt.state_version,
                 "last_simulated_world_minute": rt.last_simulated_world_minute,
                 "time_revision": rt.time_revision,
+                "needs_world_minute": rt.needs_world_minute,
+                "public_needs": {
+                    "hunger": rt.hunger_fp / 10,
+                    "energy": rt.energy_fp / 10,
+                    "health": rt.health_fp / 10,
+                    "social": rt.social_fp / 10,
+                    "stress": rt.stress_fp / 10,
+                },
+                "need_bands": need_bands(rt),
+                "active_reservation": reservation_data,
                 "active_command": serialize_command(active_cmd) if active_cmd else None,
             })
 
@@ -323,6 +379,7 @@ class BootstrapService:
                 "day_close_minute": config.day_close_minute if config else 1320,
                 "village_simulation_enabled": config.village_simulation_enabled if config else False,
                 "village_hub_command_adapter_enabled": config.village_hub_command_adapter_enabled if config else False,
+                "village_needs_enabled": config.village_needs_enabled if config else False,
             },
         }
 
@@ -518,15 +575,70 @@ class CheckpointService:
 class CommandService:
     """命令生命周期服务。"""
 
-    ALLOWED_ACTIONS = {"MOVE", "WAIT", "GO_HOME"}
+    ALLOWED_ACTIONS = {"MOVE", "WAIT", "GO_HOME", "EAT", "REST", "SLEEP", "SOCIALIZE", "WORK_PLACEHOLDER"}
     MAX_QUEUE_SIZE = 10
     MAX_CLOCK_SKEW_MS = 5 * 60 * 1000
+    PHASE2_ACTIONS = {"EAT", "REST", "SLEEP", "SOCIALIZE", "WORK_PLACEHOLDER"}
+    NEEDS_FIELDS = {"hunger", "energy", "health", "social", "stress"}
 
     @staticmethod
     def compute_payload_sha256(content: Dict[str, Any]) -> str:
         """计算 payload SHA256。"""
         canonical = json.dumps(content, sort_keys=True, ensure_ascii=False)
         return hashlib.sha256(canonical.encode()).hexdigest()
+
+    @staticmethod
+    def validate_phase2_command(action_name: str, content: Dict[str, Any]) -> Optional[str]:
+        if action_name not in CommandService.PHASE2_ACTIONS:
+            return None
+        params = content.get("params")
+        if CommandService.NEEDS_FIELDS.intersection(content) or (
+            isinstance(params, dict) and CommandService.NEEDS_FIELDS.intersection(params)
+        ):
+            return ResultCode.NEEDS_FIELDS_NOT_ALLOWED
+        start = content.get("not_before_world_minute")
+        expires = content.get("expires_world_minute")
+        duration = content.get("duration_minutes")
+        if any(isinstance(value, bool) or not isinstance(value, int) for value in (start, expires, duration)):
+            return ResultCode.INVALID_COMMAND_SCHEMA
+        limits = {
+            "EAT": (30, 30), "REST": (30, 120), "SLEEP": (30, 600),
+            "SOCIALIZE": (30, 120), "WORK_PLACEHOLDER": (30, 240),
+        }
+        if start < 0 or expires < start or duration % 30 or not limits[action_name][0] <= duration <= limits[action_name][1]:
+            return ResultCode.INVALID_ACTION_DURATION
+        if action_name == "WORK_PLACEHOLDER" and start // 1440 != (start + duration - 1) // 1440:
+            return ResultCode.INVALID_ACTION_DURATION
+        allowed_params = {
+            "EAT": {"source", "food_instance_id", "expected_asset_version"},
+            "REST": set(), "SLEEP": set(), "WORK_PLACEHOLDER": set(),
+            "SOCIALIZE": {"target_npc_id", "reservation_id"},
+        }
+        if not isinstance(params, dict) or not set(params).issubset(allowed_params[action_name]):
+            return ResultCode.INVALID_COMMAND_SCHEMA
+        if action_name == "EAT":
+            source = params.get("source")
+            if source == "PERSONAL_INVENTORY":
+                try:
+                    uuid.UUID(str(params.get("food_instance_id")))
+                except (ValueError, TypeError):
+                    return ResultCode.INVALID_COMMAND_SCHEMA
+                version = params.get("expected_asset_version")
+                if set(params) != allowed_params[action_name] or isinstance(version, bool) or not isinstance(version, int) or version < 0:
+                    return ResultCode.INVALID_COMMAND_SCHEMA
+            elif source == "COMMUNITY_MEAL":
+                if set(params) != {"source"}:
+                    return ResultCode.INVALID_COMMAND_SCHEMA
+            else:
+                return ResultCode.FOOD_NOT_ALLOWED
+        if action_name == "SOCIALIZE":
+            if set(params) != allowed_params[action_name] or not str(params.get("target_npc_id", "")):
+                return ResultCode.INVALID_COMMAND_SCHEMA
+            try:
+                uuid.UUID(str(params.get("reservation_id")))
+            except (ValueError, TypeError):
+                return ResultCode.INVALID_COMMAND_SCHEMA
+        return None
 
     @staticmethod
     @transaction.atomic
@@ -576,6 +688,14 @@ class CommandService:
         action_name = content.get("name", "").upper()
         if action_name not in CommandService.ALLOWED_ACTIONS:
             return False, ResultCode.UNKNOWN_ACTION, None
+        phase2_validation = CommandService.validate_phase2_command(action_name, content)
+        if phase2_validation:
+            return False, phase2_validation, None
+        if action_name in CommandService.PHASE2_ACTIONS:
+            if not VillageSimulationConfig.objects.filter(
+                config_key="default", village_needs_enabled=True
+            ).exists():
+                return False, ResultCode.VILLAGE_NEEDS_DISABLED, None
 
         # 提取 ID
         message_id = uuid.UUID(envelope_id)
@@ -644,6 +764,8 @@ class CommandService:
         params = content["params"]
         location_code = params.get("location_code", "")
         point_code = params.get("point_code", "")
+        if action_name in CommandService.PHASE2_ACTIONS:
+            location_code = runtime.current_location_code
 
         # 创建命令
         command = NpcCommandState.objects.create(
@@ -736,11 +858,52 @@ class CommandService:
         if command.status not in ["RECEIVED", "QUEUED"]:
             return False, ResultCode.NPC_BUSY, None
 
-        # 获取 NPC 运行时状态
-        try:
-            rt = NpcRuntimeState.objects.select_for_update().get(npc=command.npc)
-        except NpcRuntimeState.DoesNotExist:
-            return False, ResultCode.BOOTSTRAP_NPC_SET_MISMATCH, None
+        # SOCIALIZE acquires both runtime rows in stable agent-id order before
+        # any reservation is created.  Every later start sees the HELD shared
+        # reservation and refuses to claim either participant.
+        social_runtimes = None
+        social_reservation_id = None
+        if command.kind == "SOCIALIZE":
+            target_id = str(command.sanitized_parameters.get("target_npc_id", ""))
+            try:
+                social_reservation_id = uuid.UUID(str(command.sanitized_parameters.get("reservation_id")))
+            except (ValueError, TypeError):
+                return False, ResultCode.INVALID_COMMAND_SCHEMA, None
+            participant_ids = sorted({str(command.npc.agent_id), target_id})
+            if len(participant_ids) != 2:
+                return False, ResultCode.SOCIAL_TARGET_INVALID, None
+            social_runtimes = list(
+                NpcRuntimeState.objects.select_for_update().select_related("npc")
+                .filter(npc__agent_id__in=participant_ids, npc__is_test_only=False)
+                .order_by("npc__agent_id")
+            )
+            if len(social_runtimes) != 2:
+                return False, ResultCode.SOCIAL_TARGET_INVALID, None
+            rt = next((row for row in social_runtimes if row.npc_id == command.npc_id), None)
+            if rt is None or any(row.action_status != "IDLE" for row in social_runtimes):
+                return False, ResultCode.NPC_BUSY, None
+            if len({row.current_location_code for row in social_runtimes}) != 1 or command.location_code != rt.current_location_code:
+                return False, ResultCode.SOCIAL_TARGET_BUSY, None
+            if NpcActionReservation.objects.filter(
+                participants__in=[row.npc for row in social_runtimes], status="HELD", active_lock_key__isnull=False
+            ).exists():
+                return False, ResultCode.NPC_BUSY, None
+        else:
+            try:
+                rt = NpcRuntimeState.objects.select_for_update().get(npc=command.npc)
+            except NpcRuntimeState.DoesNotExist:
+                return False, ResultCode.BOOTSTRAP_NPC_SET_MISMATCH, None
+
+        if command.kind in {"EAT", "REST", "SLEEP", "SOCIALIZE", "WORK_PLACEHOLDER"} and not VillageSimulationConfig.objects.filter(
+            config_key="default", village_needs_enabled=True
+        ).exists():
+            ActionService.complete_action(
+                command.command_id, command.request_id, False,
+                ResultCode.VILLAGE_NEEDS_DISABLED,
+                message="Phase-two needs feature is disabled.",
+                allow_prestart_failure=True,
+            )
+            return False, ResultCode.VILLAGE_NEEDS_DISABLED, None
 
         # STRICT 模式校验版本
         # Expiry has precedence over version/busy rejection for accepted
@@ -773,6 +936,10 @@ class CommandService:
         # 校验 NPC 是否空闲
         if rt.action_status != "IDLE":
             return False, ResultCode.NPC_BUSY, None
+        if NpcActionReservation.objects.filter(
+            participants=rt.npc, status="HELD", active_lock_key__isnull=False
+        ).exists():
+            return False, ResultCode.NPC_BUSY, None
 
         # ``time_state`` remains locked from the first lifecycle read through
         # transition to RUNNING; do not re-read an unlocked minute here.
@@ -796,7 +963,69 @@ class CommandService:
             )
             return False, ResultCode.MESSAGE_EXPIRED, None
 
+        if command.kind in {"EAT", "REST", "SLEEP", "SOCIALIZE", "WORK_PLACEHOLDER"}:
+            gate_runtimes = social_runtimes if social_runtimes is not None else [rt]
+            if any(row.needs_world_minute != time_state.world_minute for row in gate_runtimes):
+                ActionService.complete_action(
+                    command.command_id, command.request_id, False,
+                    ResultCode.STALE_NEEDS_MINUTE,
+                    message="Needs cursor must reach the authoritative start minute.",
+                    allow_prestart_failure=True,
+                )
+                return False, ResultCode.STALE_NEEDS_MINUTE, None
+            duration = command.duration_minutes or 0
+            if command.kind in {"SOCIALIZE", "WORK_PLACEHOLDER"} and (
+                time_state.world_minute // 1440 !=
+                (time_state.world_minute + duration - 1) // 1440
+            ):
+                ActionService.complete_action(
+                    command.command_id, command.request_id, False,
+                    ResultCode.INVALID_ACTION_DURATION,
+                    message="This life action cannot cross an absolute day boundary.",
+                    allow_prestart_failure=True,
+                )
+                return False, ResultCode.INVALID_ACTION_DURATION, None
+            threshold_code = None
+            if command.kind == "WORK_PLACEHOLDER":
+                if rt.hunger_fp >= 900:
+                    threshold_code = ResultCode.HUNGER_TOO_HIGH
+                elif rt.energy_fp <= 100:
+                    threshold_code = ResultCode.ENERGY_TOO_LOW
+                elif rt.health_fp <= 300:
+                    threshold_code = ResultCode.HEALTH_TOO_LOW
+            elif command.kind == "SOCIALIZE" and any(row.health_fp <= 300 for row in gate_runtimes):
+                threshold_code = ResultCode.HEALTH_TOO_LOW
+            if threshold_code:
+                ActionService.complete_action(
+                    command.command_id, command.request_id, False,
+                    threshold_code, message="Life action rejected by authoritative need threshold.",
+                    allow_prestart_failure=True,
+                )
+                return False, threshold_code, None
+
+        if social_runtimes is not None:
+            lock_key = "social:" + ":".join(str(row.npc.agent_id) for row in social_runtimes)
+            try:
+                reservation = NpcActionReservation.objects.create(
+                    reservation_id=social_reservation_id,
+                    action_kind="SOCIALIZE",
+                    location_code=rt.current_location_code,
+                    resource_key=lock_key,
+                    active_lock_key=lock_key,
+                    status="HELD",
+                    acquired_world_minute=time_state.world_minute,
+                    expires_world_minute=command.expires_world_minute or time_state.world_minute + (command.duration_minutes or 120),
+                    command_id=command.command_id,
+                    request_id=command.request_id,
+                )
+            except IntegrityError:
+                return False, ResultCode.RESERVATION_CONFLICT, None
+            reservation.participants.set([row.npc for row in social_runtimes])
+
         # 更新命令状态
+        command.status = "RUNNING"
+        # Mark the durable command RUNNING only after any shared reservation
+        # has been acquired successfully.
         command.status = "RUNNING"
         command.started_world_minute = time_state.world_minute
         command.state_version = rt.state_version
@@ -804,8 +1033,12 @@ class CommandService:
 
         # 更新 NPC 运行时状态
         rt.current_action = command.kind
-        rt.action_status = "MOVING" if command.kind == "MOVE" else "ACTING"
+        rt.action_status = "MOVING" if command.kind == "MOVE" else "SLEEPING" if command.kind == "SLEEP" else "ACTING"
         rt.action_started_world_minute = time_state.world_minute
+        rt.action_ends_world_minute = (
+            time_state.world_minute + command.duration_minutes
+            if command.duration_minutes is not None else None
+        )
         rt.active_command_id = command.command_id
         rt.save()
 
@@ -855,6 +1088,12 @@ class ActionService:
             command = NpcCommandState.objects.select_for_update().get(command_id=command_id)
         except NpcCommandState.DoesNotExist:
             return False, ResultCode.INVALID_COMMAND_SCHEMA, None
+
+        # Phase-two life actions are completed only by LifeActionService so
+        # Unity cannot turn a local animation completion into an asset/needs
+        # success fact through the stage-one generic endpoint.
+        if command.kind in {"EAT", "REST", "SLEEP", "SOCIALIZE", "WORK_PLACEHOLDER"} and success:
+            return False, ResultCode.ACTION_NOT_ALLOWED, None
 
         # 获取 NPC 运行时状态
         try:
@@ -927,6 +1166,15 @@ class ActionService:
         rt.last_simulated_world_minute = time_state.world_minute
         rt.time_revision = time_state.time_revision
         rt.save()
+
+        # A failed SOCIALIZE command is terminal only after its shared HELD
+        # reservation is released.  This also lets normal phase-one restart
+        # recovery clear both participants instead of leaving a permanent
+        # busy target.
+        if not success and command.kind == "SOCIALIZE":
+            NpcActionReservation.objects.select_for_update().filter(
+                command_id=command.command_id, status="HELD"
+            ).update(status="RELEASED", active_lock_key=None, released_world_minute=time_state.world_minute)
 
         # 创建 Outbox 条目
         delivery_id = uuid.uuid4()
@@ -1231,6 +1479,8 @@ class EventService:
                 "visibility": e.visibility,
                 "player_summary": e.player_summary,
                 "hub_summary": e.hub_summary,
+                "effects": e.effects,
+                "public_data": e.public_data,
                 "created_at": e.created_at.isoformat(),
             }
             for e in qs

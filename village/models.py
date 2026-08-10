@@ -155,6 +155,20 @@ class NpcRuntimeState(models.Model):
     state_version = models.BigIntegerField("状态版本", default=0)
     last_simulated_world_minute = models.BigIntegerField("最后模拟世界分钟", default=0)
     time_revision = models.BigIntegerField("时间版本", default=0, help_text="状态最后确认时观察到的时钟 revision")
+    # Phase two needs.  These are deliberately kept on the phase-one runtime
+    # row so the mutation lane can lock one authoritative record per NPC.
+    # Public projections divide the fixed-point values by NEEDS_SCALE (10).
+    hunger_fp = models.IntegerField("饥饿 fixed-point", default=200)
+    energy_fp = models.IntegerField("精力 fixed-point", default=800)
+    health_fp = models.IntegerField("健康 fixed-point", default=1000)
+    social_fp = models.IntegerField("社交 fixed-point", default=200)
+    stress_fp = models.IntegerField("压力 fixed-point", default=100)
+    hunger_remainder = models.IntegerField("饥饿余数", default=0)
+    energy_remainder = models.IntegerField("精力余数", default=0)
+    health_remainder = models.IntegerField("健康余数", default=0)
+    social_remainder = models.IntegerField("社交余数", default=0)
+    stress_remainder = models.IntegerField("压力余数", default=0)
+    needs_world_minute = models.BigIntegerField("需求推进世界分钟", default=0)
     updated_at = models.DateTimeField("更新时间", auto_now=True)
 
     class Meta:
@@ -171,10 +185,129 @@ class NpcRuntimeState(models.Model):
                 | models.Q(action_ends_world_minute__isnull=True)
                 | models.Q(action_started_world_minute__isnull=True),
             ),
+            models.CheckConstraint(
+                name="npc_runtime_needs_fp_in_range",
+                condition=(
+                    models.Q(hunger_fp__gte=0, hunger_fp__lte=1000)
+                    & models.Q(energy_fp__gte=0, energy_fp__lte=1000)
+                    & models.Q(health_fp__gte=0, health_fp__lte=1000)
+                    & models.Q(social_fp__gte=0, social_fp__lte=1000)
+                    & models.Q(stress_fp__gte=0, stress_fp__lte=1000)
+                ),
+            ),
+            models.CheckConstraint(
+                name="npc_runtime_needs_remainder_in_range",
+                condition=(
+                    models.Q(hunger_remainder__gte=-29, hunger_remainder__lte=29)
+                    & models.Q(energy_remainder__gte=-29, energy_remainder__lte=29)
+                    & models.Q(health_remainder__gte=-29, health_remainder__lte=29)
+                    & models.Q(social_remainder__gte=-29, social_remainder__lte=29)
+                    & models.Q(stress_remainder__gte=-29, stress_remainder__lte=29)
+                ),
+            ),
+            models.CheckConstraint(
+                name="npc_runtime_needs_minute_non_negative",
+                condition=models.Q(needs_world_minute__gte=0),
+            ),
         ]
 
     def __str__(self):
         return f"{self.npc.agent_id} - {self.action_status} (v{self.state_version})"
+
+
+class NpcNeedsDaySummary(models.Model):
+    """One authoritative daily needs summary per NPC and absolute day."""
+
+    npc = models.ForeignKey(
+        "inventory.NpcDefinition",
+        on_delete=models.CASCADE,
+        related_name="needs_day_summaries",
+    )
+    day_index = models.BigIntegerField()
+    sleep_minutes = models.PositiveIntegerField(default=0)
+    successful_meals = models.PositiveIntegerField(default=0)
+    severe_hunger_minutes = models.PositiveIntegerField(default=0)
+    injured = models.BooleanField(default=False)
+    finalized = models.BooleanField(default=False)
+    updated_at = models.DateTimeField(auto_now=True)
+
+    class Meta:
+        verbose_name = "NPC 每日需求摘要"
+        verbose_name_plural = "NPC 每日需求摘要"
+        constraints = [
+            models.UniqueConstraint(
+                fields=["npc", "day_index"],
+                name="npc_needs_day_summary_unique",
+            ),
+            models.CheckConstraint(
+                name="npc_needs_day_index_non_negative",
+                condition=models.Q(day_index__gte=0),
+            ),
+        ]
+
+    def __str__(self):
+        return f"{self.npc.agent_id} day={self.day_index}"
+
+
+class NpcSocialDailyCounter(models.Model):
+    """Daily count for a pair canonicalized by the service's stable agent_id order."""
+
+    low_npc = models.ForeignKey(
+        "inventory.NpcDefinition",
+        on_delete=models.CASCADE,
+        related_name="social_daily_counters_as_low",
+    )
+    high_npc = models.ForeignKey(
+        "inventory.NpcDefinition",
+        on_delete=models.CASCADE,
+        related_name="social_daily_counters_as_high",
+    )
+    day_index = models.BigIntegerField()
+    socialize_count = models.PositiveIntegerField(default=0)
+    updated_at = models.DateTimeField(auto_now=True)
+
+    class Meta:
+        verbose_name = "NPC 每日社交计数"
+        verbose_name_plural = "NPC 每日社交计数"
+        constraints = [
+            models.UniqueConstraint(
+                fields=["low_npc", "high_npc", "day_index"],
+                name="npc_social_day_counter_unique",
+            ),
+            models.CheckConstraint(
+                name="npc_social_day_index_non_negative",
+                condition=models.Q(day_index__gte=0),
+            ),
+        ]
+
+    def __str__(self):
+        return f"{self.low_npc.agent_id}/{self.high_npc.agent_id} day={self.day_index}"
+
+
+class VillageCommunityMealDailyUsage(models.Model):
+    """Locked per-day community meal quota, including each NPC's use count."""
+
+    day_index = models.BigIntegerField(unique=True)
+    total_meals = models.PositiveIntegerField(default=0)
+    npc_usage = models.JSONField(default=dict, blank=True)
+    updated_at = models.DateTimeField(auto_now=True)
+
+    class Meta:
+        verbose_name = "村庄社区餐每日用量"
+        verbose_name_plural = "村庄社区餐每日用量"
+        constraints = [
+            models.CheckConstraint(
+                name="community_meal_day_index_non_negative",
+                condition=models.Q(day_index__gte=0),
+            ),
+            models.CheckConstraint(
+                name="community_meal_total_at_most_five",
+                condition=models.Q(total_meals__gte=0, total_meals__lte=5),
+            ),
+        ]
+
+    def __str__(self):
+        return f"community meals day={self.day_index}: {self.total_meals}/5"
 
 
 class NpcCommandState(models.Model):
