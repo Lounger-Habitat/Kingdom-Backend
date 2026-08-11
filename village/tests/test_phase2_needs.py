@@ -71,6 +71,19 @@ class NeedsServiceTests(TestCase):
         self.assertEqual([summary.severe_hunger_minutes for summary in summaries[1:]], [1440, 1440])
         self.assertEqual(self.runtime.health_fp, 840)
 
+    def test_oversized_cutover_gap_is_rejected_without_replay(self):
+        time_state = GlobalGameTimeState.get_instance()
+        time_state.world_minute = 3 * 1440 + 1
+        time_state.save(update_fields=["world_minute"])
+
+        result = NeedsService.advance(self.payload(end=3 * 1440 + 1))
+
+        self.assertFalse(result["success"])
+        self.assertEqual(result["result_code"], ResultCode.STALE_NEEDS_MINUTE)
+        self.runtime.refresh_from_db()
+        self.assertEqual(self.runtime.needs_world_minute, 0)
+        self.assertFalse(NpcNeedsDaySummary.objects.filter(npc=self.runtime.npc).exists())
+
     def test_frozen_runtime_summary_and_available_actions_http_routes(self):
         user = GameAccount.objects.create(username="phase2-env", password="unused")
         factory = APIRequestFactory()

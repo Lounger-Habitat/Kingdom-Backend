@@ -189,7 +189,7 @@ class Command(BaseCommand):
     def _ensure_phase_two_runtime(npc):
         """Seed only a missing runtime; existing phase-one/phase-two state wins."""
         time_state = GlobalGameTimeState.get_instance()
-        NpcRuntimeState.objects.get_or_create(
+        runtime, created = NpcRuntimeState.objects.get_or_create(
             npc=npc,
             defaults={
                 "current_location_code": "VILLAGE_SQUARE",
@@ -213,6 +213,14 @@ class Command(BaseCommand):
                 "needs_world_minute": time_state.world_minute,
             },
         )
+        # A runtime may have been created after the phase-two cutover migration
+        # but before the formal seed.  Cursor zero would replay the entire world
+        # history minute-by-minute.  Align only that untouched sentinel; never
+        # overwrite a non-zero phase-two cursor or any need value.
+        if not created and runtime.needs_world_minute == 0 and time_state.world_minute > 0:
+            runtime.needs_world_minute = time_state.world_minute
+            runtime.time_revision = time_state.time_revision
+            runtime.save(update_fields=["needs_world_minute", "time_revision", "updated_at"])
 
     @staticmethod
     def _base_ration_instance_id(agent_id, ordinal):

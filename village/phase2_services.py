@@ -295,6 +295,10 @@ class NeedsService:
             return _result(False, ResultCode.STALE_NEEDS_MINUTE)
         if runtime.state_version != payload["expected_state_version"]:
             return _result(False, ResultCode.STALE_STATE_VERSION, state_version=runtime.state_version)
+        config = VillageSimulationConfig.objects.filter(config_key="default").first()
+        max_catchup_days = max(1, config.max_catchup_days if config else 3)
+        if payload["advance_to_world_minute"] - runtime.needs_world_minute > max_catchup_days * MINUTES_PER_DAY:
+            return _result(False, ResultCode.STALE_NEEDS_MINUTE)
         changed = payload["advance_to_world_minute"] != runtime.needs_world_minute
         code = cls.advance_locked(runtime, payload["advance_to_world_minute"], payload["activity_intervals"])
         if code:

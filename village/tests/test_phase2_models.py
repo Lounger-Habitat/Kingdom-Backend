@@ -128,6 +128,24 @@ class PhaseTwoSeedMigrationTests(TestCase):
             20,
         )
 
+    def test_seed_aligns_only_an_existing_zero_needs_cursor(self):
+        npc = NpcDefinition.objects.get_or_create(
+            agent_id="10011", defaults={"name": "bill"},
+        )[0]
+        runtime, _ = NpcRuntimeState.objects.get_or_create(npc=npc)
+        runtime.hunger_fp = 777
+        runtime.needs_world_minute = 0
+        runtime.save(update_fields=["hunger_fp", "needs_world_minute"])
+
+        call_command("seed_village_v1", stdout=StringIO())
+
+        runtime.refresh_from_db()
+        self.assertEqual(runtime.hunger_fp, 777)
+        self.assertEqual(
+            runtime.needs_world_minute,
+            GlobalGameTimeState.get_instance().world_minute,
+        )
+
     def test_data_migration_is_idempotent_and_reverse_keeps_consumed_seed(self):
         npcs = [
             NpcDefinition.objects.get_or_create(
