@@ -30,7 +30,7 @@ from .models import (
     VillageWorldEvent,
     NpcCommandState,
 )
-from .runtime_services import ResultCode
+from .runtime_services import ResultCode, _fast_integration_enabled
 
 
 NEEDS_FIELDS = ("hunger", "energy", "health", "social", "stress")
@@ -340,19 +340,22 @@ class LifeActionService:
 
     @staticmethod
     def _validate(payload: Dict[str, Any]) -> Optional[str]:
+        fast_integration = _fast_integration_enabled()
         required = {"request_id", "command_id", "npc_id", "action", "start_world_minute", "completion_world_minute", "location_code", "expected_state_version", "params"}
-        if set(payload) != required or not isinstance(payload.get("params"), dict):
+        if ((not fast_integration and set(payload) != required) or
+                (fast_integration and not required.issubset(payload)) or
+                not isinstance(payload.get("params"), dict)):
             return ResultCode.INVALID_COMMAND_SCHEMA
         if payload["action"] not in LifeActionService.ACTIONS:
             return ResultCode.UNKNOWN_ACTION
         if any(isinstance(payload[name], bool) or not isinstance(payload[name], int) for name in ("start_world_minute", "completion_world_minute", "expected_state_version")):
             return ResultCode.INVALID_COMMAND_SCHEMA
         duration = payload["completion_world_minute"] - payload["start_world_minute"]
-        if duration <= 0 or duration % 30:
+        if duration <= 0 or (not fast_integration and duration % 30):
             return ResultCode.INVALID_ACTION_DURATION
         action = payload["action"]
         limits = {"EAT": (30, 30), "REST": (30, 120), "SLEEP": (30, 600), "SOCIALIZE": (30, 120), "WORK_PLACEHOLDER": (30, 240)}
-        if not limits[action][0] <= duration <= limits[action][1]:
+        if not fast_integration and not limits[action][0] <= duration <= limits[action][1]:
             return ResultCode.INVALID_ACTION_DURATION
         try:
             uuid.UUID(str(payload["request_id"])); uuid.UUID(str(payload["command_id"]))
@@ -364,19 +367,21 @@ class LifeActionService:
             "REST": set(), "SLEEP": set(), "WORK_PLACEHOLDER": set(),
             "SOCIALIZE": {"target_npc_id", "reservation_id"},
         }
-        if not set(params).issubset(action_params[action]):
+        if not fast_integration and not set(params).issubset(action_params[action]):
             return ResultCode.INVALID_COMMAND_SCHEMA
         if action == "EAT":
             source = params.get("source")
             if source == "PERSONAL_INVENTORY":
-                if set(params) != action_params[action] or isinstance(params.get("expected_asset_version"), bool) or not isinstance(params.get("expected_asset_version"), int):
+                if ((not fast_integration and set(params) != action_params[action]) or
+                        (not fast_integration and (isinstance(params.get("expected_asset_version"), bool) or
+                                                   not isinstance(params.get("expected_asset_version"), int)))):
                     return ResultCode.INVALID_COMMAND_SCHEMA
             elif source == "COMMUNITY_MEAL":
-                if set(params) != {"source"}:
+                if not fast_integration and set(params) != {"source"}:
                     return ResultCode.INVALID_COMMAND_SCHEMA
             else:
                 return ResultCode.FOOD_NOT_ALLOWED
-        if action == "SOCIALIZE" and set(params) != action_params[action]:
+        if action == "SOCIALIZE" and not fast_integration and set(params) != action_params[action]:
             return ResultCode.INVALID_COMMAND_SCHEMA
         return None
 
@@ -474,10 +479,11 @@ class LifeActionService:
     @classmethod
     @transaction.atomic
     def execute(cls, payload: Dict[str, Any]) -> Dict[str, Any]:
+        fast_integration = _fast_integration_enabled()
         validation = cls._validate(payload)
         if validation:
             return _result(False, validation)
-        if not _config_enabled():
+        if not fast_integration and not _config_enabled():
             return _result(False, ResultCode.VILLAGE_NEEDS_DISABLED)
         request_id, command_id = uuid.UUID(str(payload["request_id"])), uuid.UUID(str(payload["command_id"]))
         payload_hash = _hash(payload)
@@ -497,7 +503,7 @@ class LifeActionService:
                 return _result(False, ResultCode.REQUEST_ID_CONFLICT)
             public_response = {key: value for key, value in existing.response_data.items() if key != "request_payload_sha256"}
             return _result(existing.success, ResultCode.COMMAND_REPLAYED if existing.success else existing.result_code, receipt=existing, **public_response)
-        if payload["completion_world_minute"] > time_state.world_minute:
+        if not fast_integration and payload["completion_world_minute"] > time_state.world_minute:
             return _result(False, ResultCode.STALE_NEEDS_MINUTE)
 
         action = payload["action"]
@@ -534,23 +540,23 @@ class LifeActionService:
                 time_state=time_state, location=payload.get("location_code", ""),
             )
 
-        if runtime.state_version != payload["expected_state_version"]:
+        if not fast_integration and runtime.state_version != payload["expected_state_version"]:
             return terminal(ResultCode.STALE_STATE_VERSION)
         profile = NpcProfile.objects.filter(npc=runtime.npc, is_active=True).first()
-        if not profile:
+        if not fast_integration and not profile:
             return terminal(ResultCode.INVALID_ACTION_LOCATION)
         location = payload["location_code"]
-        if start < runtime.needs_world_minute or start > time_state.world_minute:
+        if not fast_integration and (start < runtime.needs_world_minute or start > time_state.world_minute):
             return terminal(ResultCode.STALE_NEEDS_MINUTE)
-        if runtime.current_location_code != location:
+        if not fast_integration and runtime.current_location_code != location:
             return terminal(ResultCode.INVALID_ACTION_LOCATION)
-        if action == "REST" and location not in {profile.home_location_code, "RESTAURANT"}:
+        if not fast_integration and action == "REST" and location not in {profile.home_location_code, "RESTAURANT"}:
             return terminal(ResultCode.INVALID_ACTION_LOCATION)
-        if action == "REST" and location == "RESTAURANT" and not cls._location_open(location):
+        if not fast_integration and action == "REST" and location == "RESTAURANT" and not cls._location_open(location):
             return terminal(ResultCode.LOCATION_CLOSED)
-        if action == "SLEEP" and location != profile.home_location_code:
+        if not fast_integration and action == "SLEEP" and location != profile.home_location_code:
             return terminal(ResultCode.INVALID_ACTION_LOCATION)
-        if action == "WORK_PLACEHOLDER":
+        if action == "WORK_PLACEHOLDER" and not fast_integration:
             if location != profile.work_location_code:
                 return terminal(ResultCode.INVALID_ACTION_LOCATION)
             if start // MINUTES_PER_DAY != (end - 1) // MINUTES_PER_DAY:
@@ -559,17 +565,19 @@ class LifeActionService:
             source = payload["params"].get("source")
             if source not in {"PERSONAL_INVENTORY", "COMMUNITY_MEAL"}:
                 return terminal(ResultCode.FOOD_NOT_ALLOWED)
-            if source == "COMMUNITY_MEAL" and (location != "RESTAURANT" or not cls._location_open(location)):
+            if not fast_integration and source == "COMMUNITY_MEAL" and (location != "RESTAURANT" or not cls._location_open(location)):
                 return terminal(ResultCode.LOCATION_CLOSED)
         if action == "SOCIALIZE":
             other = runtime_by_id.get(target_id)
             if other is None or other.npc_id == runtime.npc_id:
                 return terminal(ResultCode.SOCIAL_TARGET_INVALID)
-            if other.action_status != "IDLE" or other.current_location_code != runtime.current_location_code or location != runtime.current_location_code:
+            if (not fast_integration and
+                    (other.action_status != "IDLE" or other.current_location_code != runtime.current_location_code or
+                     location != runtime.current_location_code)):
                 return terminal(ResultCode.SOCIAL_TARGET_BUSY)
-            if start < other.needs_world_minute:
+            if not fast_integration and start < other.needs_world_minute:
                 return terminal(ResultCode.STALE_NEEDS_MINUTE)
-        elif action != "EAT" and not cls._location_open(location):
+        elif not fast_integration and action != "EAT" and not cls._location_open(location):
             return terminal(ResultCode.LOCATION_CLOSED)
 
         # Preflight every business resource before advancing needs.  A terminal
@@ -594,7 +602,8 @@ class LifeActionService:
                 try:
                     food_id = uuid.UUID(str(payload["params"]["food_instance_id"]))
                     inventory = NpcGlobalInventory.objects.select_for_update().get(npc=runtime.npc)
-                    if payload["params"]["expected_asset_version"] != inventory.asset_version:
+                    if (not fast_integration and
+                            payload["params"]["expected_asset_version"] != inventory.asset_version):
                         return terminal(ResultCode.ASSET_VERSION_CONFLICT)
                     slot = NpcGlobalInventorySlot.objects.select_for_update().get(bag=inventory, instance_id=food_id)
                 except (ValueError, TypeError, NpcGlobalInventory.DoesNotExist, NpcGlobalInventorySlot.DoesNotExist):
@@ -608,7 +617,7 @@ class LifeActionService:
             else:
                 usage, _ = VillageCommunityMealDailyUsage.objects.select_for_update().get_or_create(day_index=(end - 1) // MINUTES_PER_DAY)
                 key = str(runtime.npc.agent_id)
-                if usage.total_meals >= 5 or int(usage.npc_usage.get(key, 0)) >= 1:
+                if not fast_integration and (usage.total_meals >= 5 or int(usage.npc_usage.get(key, 0)) >= 1):
                     return terminal(ResultCode.FOOD_NOT_AVAILABLE)
                 prepared.update(usage=usage, usage_key=key)
 
@@ -623,16 +632,17 @@ class LifeActionService:
             )
             if error:
                 return terminal(error)
-        if action == "WORK_PLACEHOLDER":
+        if action == "WORK_PLACEHOLDER" and not fast_integration:
             if runtime.hunger_fp >= 900:
                 return terminal(ResultCode.HUNGER_TOO_HIGH)
             if runtime.energy_fp <= 100:
                 return terminal(ResultCode.ENERGY_TOO_LOW)
             if runtime.health_fp <= 300:
                 return terminal(ResultCode.HEALTH_TOO_LOW)
-        if action == "SOCIALIZE" and runtime.health_fp <= 300:
+        if action == "SOCIALIZE" and not fast_integration and runtime.health_fp <= 300:
             return terminal(ResultCode.HEALTH_TOO_LOW)
-        if action == "SOCIALIZE" and start // MINUTES_PER_DAY != (end - 1) // MINUTES_PER_DAY:
+        if (action == "SOCIALIZE" and not fast_integration and
+                start // MINUTES_PER_DAY != (end - 1) // MINUTES_PER_DAY):
             return terminal(ResultCode.INVALID_ACTION_DURATION)
 
         action_start_needs = public_needs(runtime)
@@ -661,7 +671,7 @@ class LifeActionService:
                 )
                 if other_error:
                     return terminal(other_error)
-            if other.health_fp <= 300:
+            if not fast_integration and other.health_fp <= 300:
                 return terminal(ResultCode.HEALTH_TOO_LOW)
             low, high = sorted((runtime, other), key=lambda rt: str(rt.npc.agent_id))
             day_index = (end - 1) // MINUTES_PER_DAY
@@ -763,7 +773,7 @@ def runtime_summary(npc_id: str) -> Dict[str, Any]:
     except NpcRuntimeState.DoesNotExist:
         return _result(False, ResultCode.BOOTSTRAP_NPC_SET_MISMATCH)
     available = []
-    if _config_enabled() and runtime.action_status == "IDLE":
+    if (_fast_integration_enabled() or _config_enabled()) and runtime.action_status == "IDLE":
         actions = set(LifeActionService.ACTIONS)
         if runtime.hunger_fp >= 900 or runtime.energy_fp <= 100 or runtime.health_fp <= 300:
             actions.discard("WORK_PLACEHOLDER")

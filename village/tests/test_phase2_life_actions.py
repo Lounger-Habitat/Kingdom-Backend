@@ -1,6 +1,6 @@
 import uuid
 
-from django.test import TestCase
+from django.test import TestCase, override_settings
 
 from game_time.models import GlobalGameTimeState
 from inventory.models import NpcDefinition, NpcGlobalInventory, NpcGlobalInventorySlot
@@ -64,6 +64,19 @@ class LifeActionServiceTests(TestCase):
         replay = LifeActionService.execute(payload)
         self.assertEqual(replay["result_code"], ResultCode.COMMAND_REPLAYED)
         self.slot.refresh_from_db(); self.assertEqual(self.slot.item_amount, 0)
+
+    @override_settings(VILLAGE_FAST_COMMAND_INTEGRATION=True)
+    def test_fast_integration_skips_location_and_state_version_gates(self):
+        payload = self.payload(
+            "REST", {}, location="NOT_A_REAL_LOCATION", version=999,
+        )
+        self.arm(payload)
+
+        result = LifeActionService.execute(payload)
+
+        self.assertTrue(result["success"], result)
+        self.runtime.refresh_from_db()
+        self.assertEqual(self.runtime.action_status, "IDLE")
 
     def test_socialize_uses_both_runtimes_without_relationships(self):
         payload = self.payload("SOCIALIZE", {"target_npc_id": "10012", "reservation_id": str(uuid.uuid4())})

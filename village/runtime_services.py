@@ -21,6 +21,7 @@ import uuid
 from datetime import datetime, timedelta
 from typing import Any, Dict, List, Optional, Tuple
 
+from django.conf import settings
 from django.db import IntegrityError, models, transaction
 from django.db.models import F, Q
 from django.utils import timezone
@@ -37,6 +38,10 @@ from .models import (
 )
 from game_time.models import GlobalGameTimeState
 from inventory.models import NpcDefinition
+
+
+def _fast_integration_enabled() -> bool:
+    return bool(getattr(settings, "VILLAGE_FAST_COMMAND_INTEGRATION", False))
 
 
 # ============================================================================
@@ -231,7 +236,10 @@ class BootstrapService:
             .order_by("agent_id")
         )
         formal_ids = {str(npc.agent_id) for npc in npcs}
-        if formal_ids != {"10011", "10012", "10013", "10014", "10015"}:
+        expected_formal_ids = {"10011", "10012", "10013", "10014", "10015"}
+        if ((_fast_integration_enabled() and
+             (not formal_ids or not formal_ids.issubset(expected_formal_ids))) or
+                (not _fast_integration_enabled() and formal_ids != expected_formal_ids)):
             return {"error": ResultCode.BOOTSTRAP_NPC_SET_MISMATCH}
 
         runtime_states = list(
@@ -596,6 +604,26 @@ class CommandService:
             isinstance(params, dict) and CommandService.NEEDS_FIELDS.intersection(params)
         ):
             return ResultCode.NEEDS_FIELDS_NOT_ALLOWED
+        if _fast_integration_enabled():
+            if not isinstance(params, dict):
+                return ResultCode.INVALID_COMMAND_SCHEMA
+            if action_name == "EAT":
+                source = params.get("source")
+                if source == "PERSONAL_INVENTORY":
+                    try:
+                        uuid.UUID(str(params.get("food_instance_id")))
+                    except (ValueError, TypeError):
+                        return ResultCode.INVALID_COMMAND_SCHEMA
+                elif source != "COMMUNITY_MEAL":
+                    return ResultCode.FOOD_NOT_ALLOWED
+            if action_name == "SOCIALIZE":
+                if not str(params.get("target_npc_id", "")):
+                    return ResultCode.INVALID_COMMAND_SCHEMA
+                try:
+                    uuid.UUID(str(params.get("reservation_id")))
+                except (ValueError, TypeError):
+                    return ResultCode.INVALID_COMMAND_SCHEMA
+            return None
         start = content.get("not_before_world_minute")
         expires = content.get("expires_world_minute")
         duration = content.get("duration_minutes")
@@ -655,6 +683,30 @@ class CommandService:
             (success, result_code, command_state)
         """
         # 校验 sender
+        fast_integration = _fast_integration_enabled()
+        content = dict(content or {})
+        content["params"] = dict(content.get("params") or {})
+        if fast_integration:
+            content["schema_version"] = "village.command.v1"
+            content["queue_mode"] = "STRICT"
+            content["ttl_ms"] = 86_400_000
+            content["not_before_world_minute"] = 0
+            content["expires_world_minute"] = None
+            timestamp_ms = timestamp_ms or int(timezone.now().timestamp() * 1000)
+            action = str(content.get("name", "")).upper()
+            if action == "EAT":
+                content["duration_minutes"] = 30
+                if content["params"].get("source") == "PERSONAL_INVENTORY":
+                    content["params"].setdefault("expected_asset_version", 0)
+            elif action in CommandService.PHASE2_ACTIONS:
+                requested = content.get("duration_minutes")
+                requested = requested if isinstance(requested, int) and not isinstance(requested, bool) else 30
+                requested = max(30, ((max(1, requested) + 29) // 30) * 30)
+                maximum = 600 if action == "SLEEP" else 240 if action == "WORK_PLACEHOLDER" else 120
+                content["duration_minutes"] = min(requested, maximum)
+                if action == "SOCIALIZE":
+                    content["params"].setdefault("reservation_id", str(content.get("request_id", "")))
+
         try:
             message_id = uuid.UUID(str(envelope_id))
             command_id = uuid.UUID(str(content["id"]))
@@ -662,17 +714,17 @@ class CommandService:
             timestamp_ms = int(timestamp_ms)
         except (KeyError, TypeError, ValueError, AttributeError):
             return False, ResultCode.INVALID_COMMAND_SCHEMA, None
-        if timestamp_ms < 1_000_000_000_000 or not isinstance(content.get("params"), dict):
+        if (not fast_integration and timestamp_ms < 1_000_000_000_000) or not isinstance(content.get("params"), dict):
             return False, ResultCode.INVALID_COMMAND_SCHEMA, None
-        if "parameters" in content or content.get("queue_mode") != "STRICT":
+        if "parameters" in content or (not fast_integration and content.get("queue_mode") != "STRICT"):
             return False, ResultCode.INVALID_COMMAND_SCHEMA, None
         ttl_ms = content.get("ttl_ms")
-        if not isinstance(ttl_ms, int) or ttl_ms <= 0:
+        if not fast_integration and (not isinstance(ttl_ms, int) or ttl_ms <= 0):
             return False, ResultCode.INVALID_COMMAND_SCHEMA, None
         now_ms = int(timezone.now().timestamp() * 1000)
-        if timestamp_ms > now_ms + CommandService.MAX_CLOCK_SKEW_MS:
+        if not fast_integration and timestamp_ms > now_ms + CommandService.MAX_CLOCK_SKEW_MS:
             return False, ResultCode.CLOCK_SKEW, None
-        if timestamp_ms + ttl_ms < now_ms:
+        if not fast_integration and timestamp_ms + ttl_ms < now_ms:
             return False, ResultCode.MESSAGE_EXPIRED, None
         try:
             npc = NpcDefinition.objects.get(agent_id=int(sender), is_test_only=False)
@@ -691,7 +743,7 @@ class CommandService:
         phase2_validation = CommandService.validate_phase2_command(action_name, content)
         if phase2_validation:
             return False, phase2_validation, None
-        if action_name in CommandService.PHASE2_ACTIONS:
+        if action_name in CommandService.PHASE2_ACTIONS and not fast_integration:
             if not VillageSimulationConfig.objects.filter(
                 config_key="default", village_needs_enabled=True
             ).exists():
@@ -742,7 +794,7 @@ class CommandService:
             npc=npc,
             status__in=["RECEIVED", "QUEUED", "RUNNING"],
         ).count()
-        if queue_count >= CommandService.MAX_QUEUE_SIZE:
+        if not fast_integration and queue_count >= CommandService.MAX_QUEUE_SIZE:
             return False, ResultCode.QUEUE_FULL, None
 
         # 获取当前时间
@@ -754,11 +806,14 @@ class CommandService:
         except NpcRuntimeState.DoesNotExist:
             return False, ResultCode.BOOTSTRAP_NPC_SET_MISMATCH, None
         expected_version = content.get("expected_state_version")
+        if fast_integration:
+            expected_version = runtime.state_version
+            content["expected_state_version"] = expected_version
         if not isinstance(expected_version, int):
             return False, ResultCode.INVALID_COMMAND_SCHEMA, None
-        if expected_version != runtime.state_version:
+        if not fast_integration and expected_version != runtime.state_version:
             return False, ResultCode.STALE_STATE_VERSION, None
-        if (content.get("expires_world_minute") is not None and
+        if (not fast_integration and content.get("expires_world_minute") is not None and
                 content["expires_world_minute"] < time_state.world_minute):
             return False, ResultCode.MESSAGE_EXPIRED, None
         params = content["params"]
@@ -846,6 +901,7 @@ class CommandService:
         # Global authority time is the canonical first lock for lifecycle
         # paths.  Bootstrap holds this same row while building recovery state,
         # so a StartCommand cannot observe or create a half-recovery snapshot.
+        fast_integration = _fast_integration_enabled()
         GlobalGameTimeState.get_instance()
         time_state = GlobalGameTimeState.objects.select_for_update().get(pk=1)
 
@@ -880,11 +936,13 @@ class CommandService:
             if len(social_runtimes) != 2:
                 return False, ResultCode.SOCIAL_TARGET_INVALID, None
             rt = next((row for row in social_runtimes if row.npc_id == command.npc_id), None)
-            if rt is None or any(row.action_status != "IDLE" for row in social_runtimes):
+            if rt is None or (not fast_integration and any(row.action_status != "IDLE" for row in social_runtimes)):
                 return False, ResultCode.NPC_BUSY, None
-            if len({row.current_location_code for row in social_runtimes}) != 1 or command.location_code != rt.current_location_code:
+            if (not fast_integration and
+                    (len({row.current_location_code for row in social_runtimes}) != 1 or
+                     command.location_code != rt.current_location_code)):
                 return False, ResultCode.SOCIAL_TARGET_BUSY, None
-            if NpcActionReservation.objects.filter(
+            if not fast_integration and NpcActionReservation.objects.filter(
                 participants__in=[row.npc for row in social_runtimes], status="HELD", active_lock_key__isnull=False
             ).exists():
                 return False, ResultCode.NPC_BUSY, None
@@ -894,9 +952,10 @@ class CommandService:
             except NpcRuntimeState.DoesNotExist:
                 return False, ResultCode.BOOTSTRAP_NPC_SET_MISMATCH, None
 
-        if command.kind in {"EAT", "REST", "SLEEP", "SOCIALIZE", "WORK_PLACEHOLDER"} and not VillageSimulationConfig.objects.filter(
+        if (not fast_integration and
+                command.kind in {"EAT", "REST", "SLEEP", "SOCIALIZE", "WORK_PLACEHOLDER"} and not VillageSimulationConfig.objects.filter(
             config_key="default", village_needs_enabled=True
-        ).exists():
+        ).exists()):
             ActionService.complete_action(
                 command.command_id, command.request_id, False,
                 ResultCode.VILLAGE_NEEDS_DISABLED,
@@ -910,10 +969,10 @@ class CommandService:
         # pre-start work.  This produces a deterministic Backend terminal fact
         # when a command ages out while Env is unavailable.
         now_ms = int(timezone.now().timestamp() * 1000)
-        if ((command.received_at_ms is not None and command.ttl_ms is not None and
+        if (not fast_integration and ((command.received_at_ms is not None and command.ttl_ms is not None and
              command.received_at_ms + command.ttl_ms < now_ms) or
                 (command.expires_world_minute is not None and
-                 command.expires_world_minute < time_state.world_minute)):
+                 command.expires_world_minute < time_state.world_minute))):
             ActionService.complete_action(
                 command.command_id, command.request_id, False,
                 ResultCode.MESSAGE_EXPIRED,
@@ -922,7 +981,7 @@ class CommandService:
             )
             return False, ResultCode.MESSAGE_EXPIRED, None
 
-        if command.queue_mode == "STRICT":
+        if command.queue_mode == "STRICT" and not fast_integration:
             if (command.validated_at_state_version is not None and
                     command.validated_at_state_version != rt.state_version):
                 ActionService.complete_action(
@@ -934,9 +993,9 @@ class CommandService:
                 return False, ResultCode.STALE_STATE_VERSION, None
 
         # 校验 NPC 是否空闲
-        if rt.action_status != "IDLE":
+        if not fast_integration and rt.action_status != "IDLE":
             return False, ResultCode.NPC_BUSY, None
-        if NpcActionReservation.objects.filter(
+        if not fast_integration and NpcActionReservation.objects.filter(
             participants=rt.npc, status="HELD", active_lock_key__isnull=False
         ).exists():
             return False, ResultCode.NPC_BUSY, None
@@ -944,17 +1003,17 @@ class CommandService:
         # ``time_state`` remains locked from the first lifecycle read through
         # transition to RUNNING; do not re-read an unlocked minute here.
         now_ms = int(timezone.now().timestamp() * 1000)
-        if (command.not_before_world_minute is not None and
+        if (not fast_integration and command.not_before_world_minute is not None and
                 command.not_before_world_minute > time_state.world_minute):
             # The command is durable and will be restored from Bootstrap.  Do
             # not consume it merely because Env attempted to start it early.
             command.status = "QUEUED"
             command.save(update_fields=["status", "updated_at"])
             return False, ResultCode.ACTION_NOT_ALLOWED, None
-        if ((command.received_at_ms is not None and command.ttl_ms is not None and
+        if (not fast_integration and ((command.received_at_ms is not None and command.ttl_ms is not None and
              command.received_at_ms + command.ttl_ms < now_ms) or
                 (command.expires_world_minute is not None and
-                 command.expires_world_minute < time_state.world_minute)):
+                 command.expires_world_minute < time_state.world_minute))):
             ActionService.complete_action(
                 command.command_id, command.request_id, False,
                 ResultCode.MESSAGE_EXPIRED,
@@ -965,7 +1024,12 @@ class CommandService:
 
         if command.kind in {"EAT", "REST", "SLEEP", "SOCIALIZE", "WORK_PLACEHOLDER"}:
             gate_runtimes = social_runtimes if social_runtimes is not None else [rt]
-            if any(row.needs_world_minute != time_state.world_minute for row in gate_runtimes):
+            if fast_integration:
+                for row in gate_runtimes:
+                    if row.needs_world_minute != time_state.world_minute:
+                        row.needs_world_minute = time_state.world_minute
+                        row.save(update_fields=["needs_world_minute", "updated_at"])
+            if not fast_integration and any(row.needs_world_minute != time_state.world_minute for row in gate_runtimes):
                 ActionService.complete_action(
                     command.command_id, command.request_id, False,
                     ResultCode.STALE_NEEDS_MINUTE,
@@ -974,7 +1038,7 @@ class CommandService:
                 )
                 return False, ResultCode.STALE_NEEDS_MINUTE, None
             duration = command.duration_minutes or 0
-            if command.kind in {"SOCIALIZE", "WORK_PLACEHOLDER"} and (
+            if not fast_integration and command.kind in {"SOCIALIZE", "WORK_PLACEHOLDER"} and (
                 time_state.world_minute // 1440 !=
                 (time_state.world_minute + duration - 1) // 1440
             ):
@@ -995,7 +1059,7 @@ class CommandService:
                     threshold_code = ResultCode.HEALTH_TOO_LOW
             elif command.kind == "SOCIALIZE" and any(row.health_fp <= 300 for row in gate_runtimes):
                 threshold_code = ResultCode.HEALTH_TOO_LOW
-            if threshold_code:
+            if threshold_code and not fast_integration:
                 ActionService.complete_action(
                     command.command_id, command.request_id, False,
                     threshold_code, message="Life action rejected by authoritative need threshold.",

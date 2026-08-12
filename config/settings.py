@@ -1,4 +1,5 @@
 import os
+import sys
 from datetime import timedelta
 from pathlib import Path
 from dotenv import load_dotenv
@@ -171,6 +172,17 @@ VILLAGE_TEST_ASSET_ACTIONS_ENABLED = os.environ.get(
 ).lower() in {"1", "true", "yes", "on"}
 
 DEPLOYMENT_ENV = os.environ.get("DEPLOYMENT_ENV", "development").strip().lower()
+
+# Development-only command path used for Hub -> Env Server -> Backend integration.
+# Production always fails closed even if the environment variable is accidentally set.
+VILLAGE_FAST_COMMAND_INTEGRATION = (
+    DEPLOYMENT_ENV != "production"
+    and os.environ.get(
+        "VILLAGE_FAST_COMMAND_INTEGRATION",
+        "False" if ("test" in sys.argv or "pytest" in Path(sys.argv[0]).name.lower()) else "True",
+    ).lower()
+    in {"1", "true", "yes", "on"}
+)
 
 # Logging: suppress noisy runserver access logs for /game/time/sync
 import logging
