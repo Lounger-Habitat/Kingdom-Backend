@@ -18,16 +18,9 @@ urlpatterns = [
     # 阶段一 Runtime API
     path("api/village/runtime/bootstrap", views.runtime_bootstrap, name="village-runtime-bootstrap"),
     path("api/village/runtime/checkpoint", views.runtime_checkpoint, name="village-runtime-checkpoint"),
-    path("api/village/runtime/time", views.runtime_time, name="village-runtime-time"),
-    path("api/village/runtime/advance-needs", views.runtime_advance_needs, name="village-runtime-advance-needs"),
     path("api/village/runtime/summary", views.runtime_summary_view, name="village-runtime-summary"),
     path("api/village/actions/complete", views.actions_complete, name="village-actions-complete"),
-    path("api/village/life-actions/execute", views.life_actions_execute, name="village-life-actions-execute"),
     path("api/village/events", views.events_list, name="village-events"),
     # 阶段一 Command API
-    path("api/village/commands/accept", views.commands_accept, name="village-commands-accept"),
-    path("api/village/commands/<str:command_id>/start", views.commands_start, name="village-commands-start"),
     # 阶段一 Outbox API
-    path("api/village/deliveries/pending", views.deliveries_pending, name="village-deliveries-pending"),
-    path("api/village/deliveries/<str:delivery_id>/ack", views.deliveries_ack, name="village-deliveries-ack"),
 ]

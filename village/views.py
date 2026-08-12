@@ -19,6 +19,7 @@ from .runtime_services import (
 )
 from .phase2_services import LifeActionService, NeedsService, runtime_summary
 from .services import validate_bootstrap
+from .trusted_persistence import save_result, save_snapshots
 
 
 def _config_data(config):
@@ -138,33 +139,14 @@ def runtime_bootstrap(request):
 @authentication_classes([EnvServerJWTAuthentication])
 @permission_classes([IsAuthenticated])
 def runtime_checkpoint(request):
-    """PUT /api/village/runtime/checkpoint"""
-    if (
-        not isinstance(request.data, dict)
-        or set(request.data) != {"checkpoints"}
-        or not isinstance(request.data["checkpoints"], list)
-        or not request.data["checkpoints"]
-    ):
-        return Response(
-            {"success": False, "resultCode": ResultCode.INVALID_COMMAND_SCHEMA},
-            status=400,
-        )
-
-    checkpoints = request.data["checkpoints"]
-    results = CheckpointService.submit_checkpoint(checkpoints)
-    all_success = all(r.get("success") for r in results)
-    response_data = {
-        "success": all_success,
-        "results": results,
-    }
-    if not all_success:
-        # Preserve every per-NPC result while giving callers a stable top-level
-        # rejection code for the batch response.
-        response_data["resultCode"] = next(
-            r["result_code"] for r in results if not r.get("success")
-        )
-        return Response(response_data, status=409)
-    return Response(response_data)
+    """Persist a trusted Unity snapshot using last-write-wins semantics."""
+    result = save_snapshots(dict(request.data) if isinstance(request.data, dict) else {})
+    status = 200 if result["success"] else 400
+    return Response({
+        "success": result["success"],
+        "resultCode": result["result_code"],
+        "results": result.get("results", []),
+    }, status=status)
 
 
 @api_view(["PUT"])
@@ -215,12 +197,18 @@ def runtime_time(request):
 @permission_classes([IsAuthenticated])
 def actions_complete(request):
     """POST /api/village/actions/complete"""
-    command_id = request.data.get("command_id")
-    request_id = request.data.get("request_id")
-    success = request.data.get("success", True)
-    result_code = request.data.get("result_code", "")
-    message = request.data.get("message", "")
-    data = request.data.get("data", {})
+    # Unity is the sole runtime authority. Persist its terminal report exactly.
+    trusted = save_result(dict(request.data) if isinstance(request.data, dict) else {})
+    trusted_status = 200 if trusted["success"] else 400
+    trusted_data = {
+        key: value for key, value in trusted.items()
+        if key not in {"success", "result_code", "receipt", "world_event"}
+    }
+    return Response({
+        "success": trusted["success"],
+        "resultCode": trusted["result_code"],
+        "data": trusted_data,
+    }, status=trusted_status)
 
     if not command_id or not request_id:
         return Response(

@@ -301,38 +301,6 @@ class BootstrapService:
         npc_data = []
         for rt in runtime_states:
             # 获取活动命令
-            active_cmd = None
-            if rt.active_command_id:
-                active_cmd = NpcCommandState.objects.filter(
-                    command_id=rt.active_command_id
-                ).first()
-
-            active_reservation = (
-                NpcActionReservation.objects.select_for_update()
-                .filter(
-                    participants=rt.npc, status="HELD",
-                    active_lock_key__isnull=False,
-                )
-                .prefetch_related("participants")
-                .order_by("acquired_world_minute", "reservation_id")
-                .first()
-            )
-            reservation_data = None
-            if active_reservation:
-                reservation_data = {
-                    "reservation_id": str(active_reservation.reservation_id),
-                    "action_kind": active_reservation.action_kind,
-                    "participant_npc_ids": sorted(
-                        str(npc.agent_id) for npc in active_reservation.participants.all()
-                    ),
-                    "location_code": active_reservation.location_code,
-                    "acquired_world_minute": active_reservation.acquired_world_minute,
-                    "expires_world_minute": active_reservation.expires_world_minute,
-                    "command_id": str(active_reservation.command_id) if active_reservation.command_id else None,
-                    "request_id": str(active_reservation.request_id) if active_reservation.request_id else None,
-                    "status": active_reservation.status,
-                }
-
             from .phase2_services import need_bands
 
             npc_data.append({
@@ -340,12 +308,13 @@ class BootstrapService:
                 "name": rt.npc.name,
                 "current_location_code": rt.current_location_code,
                 "current_point_code": rt.current_point_code,
-                "current_goal": rt.current_goal,
-                "current_action": rt.current_action,
-                "action_status": rt.action_status,
-                "action_started_world_minute": rt.action_started_world_minute,
-                "action_ends_world_minute": rt.action_ends_world_minute,
-                "active_command_id": str(rt.active_command_id) if rt.active_command_id else None,
+                # Runtime work is process-local to Unity and is discarded on restart.
+                "current_goal": "NONE",
+                "current_action": "",
+                "action_status": "IDLE",
+                "action_started_world_minute": None,
+                "action_ends_world_minute": None,
+                "active_command_id": None,
                 "state_version": rt.state_version,
                 "last_simulated_world_minute": rt.last_simulated_world_minute,
                 "time_revision": rt.time_revision,
@@ -358,15 +327,9 @@ class BootstrapService:
                     "stress": rt.stress_fp / 10,
                 },
                 "need_bands": need_bands(rt),
-                "active_reservation": reservation_data,
-                "active_command": serialize_command(active_cmd) if active_cmd else None,
+                "active_reservation": None,
+                "active_command": None,
             })
-
-        queued_commands = list(
-            NpcCommandState.objects.select_for_update()
-            .filter(npc__is_test_only=False, status__in=["RECEIVED", "QUEUED"])
-            .order_by("npc__agent_id", "received_world_minute", "created_at")
-        )
 
         return {
             "world_minute": time_state.world_minute,
@@ -378,7 +341,7 @@ class BootstrapService:
             "game_minute": time_state.game_minute,
             "season": time_state.season,
             "npcs": npc_data,
-            "commands": [serialize_command(command) for command in queued_commands],
+            "commands": [],
             "config": {
                 "tick_interval_seconds": config.tick_interval_seconds if config else 5,
                 "hub_command_timeout_seconds": config.hub_command_timeout_seconds if config else 30,

@@ -198,14 +198,12 @@ class PhaseOneFaultAcceptanceTests(TestCase):
         self.assertTrue(response.data["success"])
         self.runtimes["10011"].refresh_from_db()
         self.assertEqual(self.runtimes["10011"].current_location_code, "TAVERN")
-        self.assertEqual(self.runtimes["10011"].state_version, 1)
+        self.assertEqual(self.runtimes["10011"].state_version, 0)
 
-        # The HTTP endpoint must expose a stable batch rejection code when a
-        # caller retries a checkpoint with its now-stale CAS version.
-        stale_response = client.put("/api/village/runtime/checkpoint", payload, format="json")
-        self.assertEqual(stale_response.status_code, 409)
-        self.assertFalse(stale_response.data["success"])
-        self.assertEqual(stale_response.data["resultCode"], ResultCode.STALE_STATE_VERSION)
+        # Unity snapshots are trusted last-write-wins reports, so replay is harmless.
+        replay_response = client.put("/api/village/runtime/checkpoint", payload, format="json")
+        self.assertEqual(replay_response.status_code, 200)
+        self.assertTrue(replay_response.data["success"])
 
     def test_strict_command_is_rechecked_at_start_after_another_action_completes(self):
         first_content, first = self._accept("10011", state_version=0)
@@ -341,7 +339,7 @@ class PhaseOneFaultAcceptanceTests(TestCase):
         self.assertTrue(ok, code)
         self.assertNotEqual(replacement.reservation_id, reservation.reservation_id)
 
-    def test_bootstrap_restores_queued_and_running_command_wire_data(self):
+    def test_bootstrap_discards_legacy_queued_and_running_command_wire_data(self):
         queued_content, queued = self._accept("10011")
         running_content, running = self._accept("10012")
         ok, code, _ = CommandService.start_command(running.command_id)
@@ -349,20 +347,13 @@ class PhaseOneFaultAcceptanceTests(TestCase):
 
         data = BootstrapService.get_bootstrap()
         self.assertEqual([npc["npc_id"] for npc in data["npcs"]], list(FORMAL_NPC_IDS))
-        queued_wire = next(item for item in data["commands"] if item["content"]["id"] == str(queued.command_id))
         running_npc = next(item for item in data["npcs"] if item["npc_id"] == "10012")
-        self.assertEqual(queued_wire["content"], {
-            **queued_content,
-            "name": "move",
-            "target_id": "",
-            "not_before_world_minute": None,
-            "expires_world_minute": None,
-            "duration_minutes": None,
-        })
-        self.assertEqual(running_npc["active_command"]["content"]["id"], str(running.command_id))
-        self.assertEqual(running_npc["active_command"]["content"]["params"], running_content["params"])
+        self.assertEqual(data["commands"], [])
+        self.assertIsNone(running_npc["active_command"])
+        self.assertIsNone(running_npc["active_command_id"])
+        self.assertEqual(running_npc["action_status"], "IDLE")
 
-    def test_not_before_command_remains_durable_for_bootstrap_recovery(self):
+    def test_not_before_legacy_command_is_not_restored_into_unity_queue(self):
         content, command = self._accept(
             "10011", not_before_world_minute=self.time_state.world_minute + 5
         )
@@ -372,9 +363,7 @@ class PhaseOneFaultAcceptanceTests(TestCase):
         self.assertIsNone(started)
         command.refresh_from_db()
         self.assertEqual(command.status, "QUEUED")
-        wire = next(item for item in BootstrapService.get_bootstrap()["commands"]
-                    if item["content"]["id"] == str(command.command_id))
-        self.assertEqual(wire["content"]["not_before_world_minute"], content["not_before_world_minute"])
+        self.assertEqual(BootstrapService.get_bootstrap()["commands"], [])
 
     def test_prestart_expiry_is_terminalized_by_backend_and_outbox_recovers(self):
         """An accepted boundary-expiry STRICT command must never need a Unity Outcome.
