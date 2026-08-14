@@ -16,14 +16,22 @@ from items.models import Item
 from village.models import (
     NpcProfile,
     NpcRuntimeState,
+    VillageAccount,
+    VillageFarmPlot,
     VillageLocationDefinition,
+    VillageRestaurantState,
     VillageSimulationConfig,
 )
 from village.seed_data import (
+    FARM_PLOT_SEEDS,
+    INITIAL_SUPPLEMENTARY_GRANTS,
+    INITIAL_TOOL_GRANTS,
     LOCATION_SEEDS,
     NPC_SEEDS,
     SIMULATION_DEFAULTS,
     TEST_NPC_ISOLATION,
+    TOOL_ITEM_SEEDS,
+    VILLAGE_ACCOUNT_SEEDS,
 )
 
 
@@ -60,6 +68,11 @@ class Command(BaseCommand):
             "inventories": 0,
             "preserved_nonempty": 0,
             "test_npcs": 0,
+            "farm_plots": 0,
+            "village_accounts": 0,
+            "tool_items": 0,
+            "tool_grants": 0,
+            "supplement_grants": 0,
         }
 
         with transaction.atomic():
@@ -69,6 +82,11 @@ class Command(BaseCommand):
             self._seed_npcs(summary, reset_demo=reset_demo)
             self._seed_test_npc_isolation(summary)
             summary["test_npcs"] = NpcDefinition.objects.filter(is_test_only=True).count()
+            # Phase 3 seeds
+            self._seed_tool_items(summary)
+            self._seed_farm_plots(summary)
+            self._seed_village_accounts(summary)
+            self._seed_phase3_grants(summary)
             if dry_run:
                 transaction.set_rollback(True)
 
@@ -364,3 +382,135 @@ class Command(BaseCommand):
                 for index, (item_id, amount) in enumerate(seed_items)
             ]
         )
+
+    # ── Phase 3 seed methods ───────────────────────────────────────
+
+    @staticmethod
+    def _seed_tool_items(summary):
+        """Idempotently create Phase 3 tool items (4001/4002).
+
+        If the item already exists with different properties, raise
+        CommandError to avoid silent overwrites.
+        """
+        for seed in TOOL_ITEM_SEEDS:
+            item, created = Item.objects.get_or_create(
+                item_id=seed["item_id"],
+                defaults={
+                    "item_name": seed["item_name"],
+                    "item_type": seed["item_type"],
+                    "item_description": seed["item_description"],
+                    "item_price": seed["item_price"],
+                    "collectable": seed["collectable"],
+                },
+            )
+            if not created:
+                # Validate existing item is compatible
+                if item.item_type != seed["item_type"]:
+                    raise CommandError(
+                        f"工具 item {seed['item_id']} 已存在但类型不匹配: "
+                        f"expected {seed['item_type']}, got {item.item_type}"
+                    )
+            summary["tool_items"] += 1
+
+    @staticmethod
+    def _seed_farm_plots(summary):
+        """Idempotently create the three farm plots, all EMPTY."""
+        for seed in FARM_PLOT_SEEDS:
+            VillageFarmPlot.objects.get_or_create(
+                plot_code=seed["plot_code"],
+                defaults={"status": "EMPTY"},
+            )
+            summary["farm_plots"] += 1
+
+    @staticmethod
+    def _seed_village_accounts(summary):
+        """Idempotently create village accounts (PUBLIC_FUND)."""
+        time_state = GlobalGameTimeState.objects.filter(pk=1).first()
+        current_day = max(0, int(time_state.world_minute) // 1440) if time_state else 0
+        # A newly enabled economy starts at the current day boundary; it must not
+        # replay every historical game-time day that existed before Phase 3.
+        initial_last_closed_day = current_day - 1
+        for seed in VILLAGE_ACCOUNT_SEEDS:
+            VillageAccount.objects.get_or_create(
+                account_code=seed["account_code"],
+                defaults={
+                    "balance": seed["balance"],
+                    "last_closed_day_index": initial_last_closed_day,
+                },
+            )
+            summary["village_accounts"] += 1
+
+    def _seed_phase3_grants(self, summary):
+        """Grant initial tools and supplementary items to NPCs.
+
+        Only adds items if the NPC doesn't already have that tool/supplement.
+        Uses a deterministic instance_id to ensure idempotency.
+        """
+        tool_items = Item.objects.in_bulk([s["item_id"] for s in TOOL_ITEM_SEEDS])
+        grant_namespace = uuid.UUID("a3f7c9ec-b93a-4df3-8b0f-021c3c0f159f")
+
+        # Tool grants
+        for agent_id, tool_item_id, amount, uses in INITIAL_TOOL_GRANTS:
+            if tool_item_id not in tool_items:
+                continue
+            npc = NpcDefinition.objects.filter(agent_id=agent_id).first()
+            if npc is None:
+                continue
+            bag = NpcGlobalInventory.objects.filter(npc=npc).first()
+            if bag is None:
+                continue
+            instance_id = uuid.uuid5(
+                grant_namespace,
+                f"village.phase3.tool:{agent_id}:{tool_item_id}",
+            )
+            existing = NpcGlobalInventorySlot.objects.filter(instance_id=instance_id).first()
+            if existing is not None:
+                summary["tool_grants"] += 1
+                continue
+            next_slot = bag.slots.order_by("-slot_index").values_list("slot_index", flat=True).first()
+            next_slot = 0 if next_slot is None else next_slot + 1
+            NpcGlobalInventorySlot.objects.create(
+                bag=bag,
+                slot_index=next_slot,
+                instance_id=instance_id,
+                item_id=tool_item_id,
+                item_amount=amount,
+                remaining_uses=uses,
+                item_bag_name=f"{tool_items[tool_item_id].item_name}_tool",
+                hide_in_shop=True,
+            )
+            summary["tool_grants"] += 1
+
+        # Supplementary grants (seeds, ingredients)
+        # Skip gracefully if items don't exist in the database (e.g. test env)
+        sup_items_needed = {iid for _, iid, _ in INITIAL_SUPPLEMENTARY_GRANTS}
+        sup_items = Item.objects.in_bulk(sup_items_needed)
+        for agent_id, item_id, amount in INITIAL_SUPPLEMENTARY_GRANTS:
+            if item_id not in sup_items:
+                continue
+            npc = NpcDefinition.objects.filter(agent_id=agent_id).first()
+            if npc is None:
+                continue
+            bag = NpcGlobalInventory.objects.filter(npc=npc).first()
+            if bag is None:
+                continue
+            instance_id = uuid.uuid5(
+                grant_namespace,
+                f"village.phase3.supplement:{agent_id}:{item_id}",
+            )
+            existing = NpcGlobalInventorySlot.objects.filter(instance_id=instance_id).first()
+            if existing is not None:
+                summary["supplement_grants"] += 1
+                continue
+            next_slot = bag.slots.order_by("-slot_index").values_list("slot_index", flat=True).first()
+            next_slot = 0 if next_slot is None else next_slot + 1
+            NpcGlobalInventorySlot.objects.create(
+                bag=bag,
+                slot_index=next_slot,
+                instance_id=instance_id,
+                item_id=item_id,
+                item_amount=amount,
+                item_bag_name=f"{sup_items[item_id].item_name}_supplement",
+                hide_in_shop=True,
+            )
+            summary["supplement_grants"] += 1

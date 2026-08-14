@@ -31,6 +31,7 @@ from .models import (
     NpcCommandState,
     NpcProfile,
     NpcRuntimeState,
+    VillageActionDurationConfig,
     VillageActionReceipt,
     VillageDeliveryOutbox,
     VillageSimulationConfig,
@@ -270,8 +271,18 @@ class BootstrapService:
             .order_by("npc__agent_id")
         )
 
-        # 获取配置
+        # 获取配置。动作时长在 Admin 中维护；缺少行时保留默认值，
+        # 以便旧数据库或尚未迁移的环境仍可安全启动。
         config = VillageSimulationConfig.objects.first()
+        action_durations = VillageActionDurationConfig.default_durations()
+        navigation_timeouts = VillageActionDurationConfig.default_navigation_timeouts()
+        for action_name, duration_minutes, timeout_seconds in VillageActionDurationConfig.objects.values_list(
+            "action_name", "duration_minutes", "navigation_timeout_seconds"
+        ):
+            if duration_minutes:
+                action_durations[action_name] = duration_minutes
+            if timeout_seconds:
+                navigation_timeouts[action_name] = timeout_seconds
 
         def serialize_command(command: NpcCommandState) -> Dict[str, Any]:
             """Return the complete, replay-safe command wire data required by Env recovery."""
@@ -351,6 +362,17 @@ class BootstrapService:
                 "village_simulation_enabled": config.village_simulation_enabled if config else False,
                 "village_hub_command_adapter_enabled": config.village_hub_command_adapter_enabled if config else False,
                 "village_needs_enabled": config.village_needs_enabled if config else False,
+                "village_economy_enabled": config.village_economy_enabled if config else False,
+                # action_durations is the unified Phase 1/2/3 timer map.
+                "action_durations": action_durations,
+                "navigation_action_timeout_seconds": navigation_timeouts,
+                # Compatibility for Env builds that only know Phase 3 durations.
+                "economy_action_durations": {
+                    action: action_durations[action]
+                    for action, metadata in VillageActionDurationConfig.ACTION_METADATA.items()
+                    if metadata[0] == "阶段三"
+                    if action in action_durations
+                },
             },
         }
 
@@ -553,6 +575,19 @@ class CommandService:
     NEEDS_FIELDS = {"hunger", "energy", "health", "social", "stress"}
 
     @staticmethod
+    def apply_admin_duration(action_name: str, content: Dict[str, Any]) -> None:
+        """Replace a wire duration with the Backend-managed value for known timers."""
+        if action_name not in VillageActionDurationConfig.DEFAULT_DURATIONS:
+            return
+        duration_minutes = VillageActionDurationConfig.default_durations()[action_name]
+        configured = VillageActionDurationConfig.objects.filter(
+            action_name=action_name
+        ).values_list("duration_minutes", flat=True).first()
+        if configured:
+            duration_minutes = configured
+        content["duration_minutes"] = duration_minutes
+
+    @staticmethod
     def compute_payload_sha256(content: Dict[str, Any]) -> str:
         """计算 payload SHA256。"""
         canonical = json.dumps(content, sort_keys=True, ensure_ascii=False)
@@ -706,6 +741,9 @@ class CommandService:
         phase2_validation = CommandService.validate_phase2_command(action_name, content)
         if phase2_validation:
             return False, phase2_validation, None
+        # Preserve protocol validation of the caller-provided value first, then
+        # make the accepted command use the Backend-administered duration.
+        CommandService.apply_admin_duration(action_name, content)
         if action_name in CommandService.PHASE2_ACTIONS and not fast_integration:
             if not VillageSimulationConfig.objects.filter(
                 config_key="default", village_needs_enabled=True

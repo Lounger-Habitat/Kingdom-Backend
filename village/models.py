@@ -3,6 +3,13 @@ import uuid
 from django.core.exceptions import ValidationError
 from django.db import models
 
+from .phase3_contract import (
+    ListingStatus,
+    PriceMode,
+    StoreOperationalStatus,
+    TradeOfferStatus,
+)
+
 
 class VillageLocationDefinition(models.Model):
     """Stable Backend definition for a Unity village location."""
@@ -91,6 +98,7 @@ class VillageSimulationConfig(models.Model):
     village_simulation_enabled = models.BooleanField(default=False)
     village_needs_enabled = models.BooleanField(default=False)
     village_economy_enabled = models.BooleanField(default=False)
+    village_direct_trade_enabled = models.BooleanField(default=False)
     village_social_enabled = models.BooleanField(default=False)
     village_story_enabled = models.BooleanField(default=False)
     village_hub_command_adapter_enabled = models.BooleanField(default=False)
@@ -105,6 +113,130 @@ class VillageSimulationConfig(models.Model):
 
     def __str__(self):
         return self.config_key
+
+
+class VillageActionDurationConfig(models.Model):
+    """Backend-managed durations for every executable village action."""
+
+    ACTION_METADATA = {
+        "MOVE": ("阶段一", "移动", "前往指定地点；以寻路到达为准，仅“导航超时（秒）”生效。"),
+        "WAIT": ("阶段一", "等待", "原地等待；使用“时长（世界分钟）”。"),
+        "GO_HOME": ("阶段一", "回家", "返回 NPC 住所；以寻路到达为准，仅“导航超时（秒）”生效。"),
+        "EAT": ("阶段二", "进食", "进食并结算饥饿值；时长固定为 30 个世界分钟。"),
+        "REST": ("阶段二", "休息", "在家或餐厅休息；30–120 个世界分钟，且必须为 30 的倍数。"),
+        "SLEEP": ("阶段二", "睡眠", "在家睡眠；30–600 个世界分钟，且必须为 30 的倍数。"),
+        "SOCIALIZE": ("阶段二", "社交", "与另一名 NPC 社交；30–120 个世界分钟，且必须为 30 的倍数。"),
+        "WORK_PLACEHOLDER": ("阶段二", "工作", "在工作地点执行工作；30–240 个世界分钟，且必须为 30 的倍数。"),
+        "PLANT": ("阶段三", "播种", "在 Bill 农田播种；使用“时长（世界分钟）”。"),
+        "HARVEST": ("阶段三", "收获", "在 Bill 农田收获；使用“时长（世界分钟）”。"),
+        "HUNT": ("阶段三", "狩猎", "在狩猎入口狩猎；使用“时长（世界分钟）”。"),
+        "COOK": ("阶段三", "烹饪", "在餐厅烹饪；使用“时长（世界分钟）”。"),
+        "CREATE_ORDER": ("阶段三", "创建订单", "创建交易订单；使用“时长（世界分钟）”。"),
+        "CANCEL_ORDER": ("阶段三", "取消订单", "取消自己的开放订单；使用“时长（世界分钟）”。"),
+        "START_DELIVERY": ("阶段三", "开始配送", "开始已匹配订单的配送；使用“时长（世界分钟）”。"),
+        "IMPORT_GOODS": ("阶段三", "外部进货", "在贸易道路向商队进货；使用“时长（世界分钟）”。"),
+        "EXPORT_GOODS": ("阶段三", "外部出货", "在贸易道路向商队出货；使用“时长（世界分钟）”。"),
+        "RATE_DISH": ("阶段三", "菜品评分", "在档案馆为菜品评分；使用“时长（世界分钟）”。"),
+        "PUBLISH_PRICE_INDEX": ("阶段三", "发布价格指数", "在档案馆发布当日价格指数；使用“时长（世界分钟）”。"),
+        "AUDIT_PUBLIC_FUND": ("阶段三", "审计公款", "在档案馆审计公共资金；使用“时长（世界分钟）”。"),
+        "PROPOSE_TRADE": ("阶段三", "发起交易报价", "向指定 NPC 发起结构化定向报价；使用“时长（世界分钟）”。"),
+        "RESPOND_TRADE": ("阶段三", "响应交易报价", "接受或拒绝交易报价；使用“时长（世界分钟）”。"),
+        "CANCEL_TRADE_OFFER": ("阶段三", "取消交易报价", "发起方取消待处理报价；使用“时长（世界分钟）”。"),
+        "LIST_STORE_ITEM": ("阶段三", "上架商品", "经营 NPC 将个人物品转入商店并上架；使用“时长（世界分钟）”。"),
+        "UPDATE_STORE_PRICE": ("阶段三", "修改商品价格", "经营 NPC 修改上架商品单价；使用“时长（世界分钟）”。"),
+        "DELIST_STORE_ITEM": ("阶段三", "下架商品", "经营 NPC 下架商品并取回库存；使用“时长（世界分钟）”。"),
+        "BUY_FROM_STORE": ("阶段三", "商店购买", "其他 NPC 按上架记录价格购买商品；使用“时长（世界分钟）”。"),
+        "INSPECT_STORE_INVENTORY": ("阶段三", "查看商店库存", "只读查询，不进入经济结算。"),
+    }
+    ACTION_CHOICES = [(action, f"{label}（{action}）") for action, (_, label, _) in ACTION_METADATA.items()]
+    NAVIGATION_ACTIONS = frozenset({"MOVE", "GO_HOME"})
+    PHASE2_DURATION_LIMITS = {
+        "EAT": (30, 30), "REST": (30, 120), "SLEEP": (30, 600),
+        "SOCIALIZE": (30, 120), "WORK_PLACEHOLDER": (30, 240),
+    }
+    DEFAULT_DURATIONS = {
+        "WAIT": 1,
+        "EAT": 30,
+        "REST": 30,
+        "SLEEP": 30,
+        "SOCIALIZE": 30,
+        "WORK_PLACEHOLDER": 30,
+        "PLANT": 60,
+        "HARVEST": 90,
+        "HUNT": 120,
+        "COOK": 90,
+        "CREATE_ORDER": 1,
+        "CANCEL_ORDER": 1,
+        "START_DELIVERY": 1,
+        "IMPORT_GOODS": 120,
+        "EXPORT_GOODS": 120,
+        "RATE_DISH": 30,
+        "PUBLISH_PRICE_INDEX": 30,
+        "AUDIT_PUBLIC_FUND": 30,
+        "PROPOSE_TRADE": 1,
+        "RESPOND_TRADE": 1,
+        "CANCEL_TRADE_OFFER": 1,
+        "LIST_STORE_ITEM": 1,
+        "UPDATE_STORE_PRICE": 1,
+        "DELIST_STORE_ITEM": 1,
+        "BUY_FROM_STORE": 1,
+        "INSPECT_STORE_INVENTORY": 5,
+    }
+    DEFAULT_NAVIGATION_TIMEOUT_SECONDS = {
+        "MOVE": 180,
+        "GO_HOME": 180,
+    }
+
+    action_name = models.CharField("动作", max_length=32, unique=True, choices=ACTION_CHOICES)
+    duration_minutes = models.PositiveIntegerField("时长（世界分钟）", null=True, blank=True)
+    navigation_timeout_seconds = models.PositiveIntegerField("导航超时（秒）", null=True, blank=True)
+    updated_at = models.DateTimeField("更新时间", auto_now=True)
+
+    class Meta:
+        verbose_name = "村庄动作时长配置"
+        verbose_name_plural = "村庄动作时长配置"
+        ordering = ["action_name"]
+        constraints = [
+            models.CheckConstraint(
+                name="village_action_duration_positive",
+                condition=models.Q(duration_minutes__isnull=True) | models.Q(duration_minutes__gt=0),
+            ),
+            models.CheckConstraint(
+                name="village_navigation_timeout_positive",
+                condition=models.Q(navigation_timeout_seconds__isnull=True) | models.Q(navigation_timeout_seconds__gt=0),
+            ),
+        ]
+
+    @classmethod
+    def default_durations(cls):
+        return dict(cls.DEFAULT_DURATIONS)
+
+    @classmethod
+    def default_navigation_timeouts(cls):
+        return dict(cls.DEFAULT_NAVIGATION_TIMEOUT_SECONDS)
+
+    @classmethod
+    def metadata(cls, action_name):
+        return cls.ACTION_METADATA.get(action_name, ("未知阶段", action_name, ""))
+
+    def clean(self):
+        super().clean()
+        if self.action_name in self.NAVIGATION_ACTIONS:
+            if not self.navigation_timeout_seconds:
+                raise ValidationError({"navigation_timeout_seconds": "移动和回家必须设置大于 0 的导航超时秒数。"})
+            return
+        if not self.duration_minutes:
+            raise ValidationError({"duration_minutes": "此动作必须设置大于 0 的世界分钟时长。"})
+        limits = self.PHASE2_DURATION_LIMITS.get(self.action_name)
+        if limits and (self.duration_minutes % 30 or not limits[0] <= self.duration_minutes <= limits[1]):
+            raise ValidationError({
+                "duration_minutes": f"{self.action_name} 必须在 {limits[0]}–{limits[1]} 之间，且为 30 的倍数。"
+            })
+
+    def __str__(self):
+        value = self.navigation_timeout_seconds if self.action_name in self.NAVIGATION_ACTIONS else self.duration_minutes
+        unit = "秒" if self.action_name in self.NAVIGATION_ACTIONS else "世界分钟"
+        return f"{self.action_name}: {value}{unit}"
 
 
 # ============================================================================
@@ -590,3 +722,488 @@ class VillageDeliveryOutbox(models.Model):
 
     def __str__(self):
         return f"{self.delivery_id} - {self.message_kind} - {self.status}"
+
+
+# ============================================================================
+# Phase 3: Economy models
+# ============================================================================
+
+
+class EconomicLedgerEntry(models.Model):
+    """Economic ledger entry recording every asset mutation in Phase 3."""
+
+    request_id = models.UUIDField("请求ID", unique=True)
+    entry_type = models.CharField("类型", max_length=32)
+    # PRODUCTION, TRADE, CONSUMPTION, IMPORT, EXPORT, PUBLIC_FUND,
+    # SPOILAGE, TRAVELER_SALE, SALARY, CARAVAN, etc.
+    actor_npc = models.ForeignKey(
+        "inventory.NpcDefinition",
+        on_delete=models.SET_NULL,
+        null=True,
+        blank=True,
+        related_name="ledger_entries",
+    )
+    changes = models.JSONField("变更", default=dict)
+    # {npc_id: {item_id: delta, money: delta}, ...}
+    external_delta = models.IntegerField("外部差额", default=0)
+    # positive=external income, negative=external expense
+    world_minute = models.BigIntegerField("世界分钟")
+    event = models.ForeignKey(
+        VillageWorldEvent,
+        on_delete=models.SET_NULL,
+        null=True,
+        blank=True,
+        related_name="ledger_entries",
+    )
+    created_at = models.DateTimeField("创建时间", auto_now_add=True)
+
+    class Meta:
+        verbose_name = "经济账目"
+        verbose_name_plural = "经济账目"
+
+    def __str__(self):
+        return f"{self.entry_type} request={self.request_id} wm={self.world_minute}"
+
+
+class VillageAccount(models.Model):
+    """Village-level account (e.g. PUBLIC_FUND)."""
+
+    account_code = models.CharField("账户代码", max_length=32, unique=True)
+    balance = models.IntegerField("余额", default=0)
+    asset_version = models.BigIntegerField("资产版本", default=0)
+    last_caravan_day = models.IntegerField("上次商队日", null=True, blank=True)
+    last_closed_day_index = models.IntegerField("上次关闭日索引", default=-1)
+    updated_at = models.DateTimeField("更新时间", auto_now=True)
+
+    class Meta:
+        verbose_name = "村庄账户"
+        verbose_name_plural = "村庄账户"
+        constraints = [
+            models.CheckConstraint(
+                name="village_account_balance_non_negative",
+                condition=models.Q(balance__gte=0),
+            ),
+        ]
+
+    def __str__(self):
+        return f"{self.account_code} balance={self.balance}"
+
+
+class VillageFarmPlot(models.Model):
+    """A single farm plot on the village."""
+
+    plot_code = models.CharField("地块代码", max_length=32, unique=True)
+    status = models.CharField("状态", max_length=16, default="EMPTY")
+    # EMPTY / GROWING / MATURE
+    batch_id = models.UUIDField("批次ID", null=True, blank=True, unique=True)
+    crop_code = models.CharField("作物代码", max_length=32, default="", blank=True)
+    planted_world_minute = models.BigIntegerField("播种世界分钟", null=True, blank=True)
+    mature_world_minute = models.BigIntegerField("成熟世界分钟", null=True, blank=True)
+    yield_seed = models.IntegerField("预期产量种子", null=True, blank=True)
+    source_request_id = models.UUIDField("来源请求ID", null=True, blank=True)
+    updated_at = models.DateTimeField("更新时间", auto_now=True)
+
+    class Meta:
+        verbose_name = "农田地块"
+        verbose_name_plural = "农田地块"
+
+    def __str__(self):
+        return f"{self.plot_code} status={self.status} crop={self.crop_code}"
+
+
+class NpcTradeOrder(models.Model):
+    """An NPC trade order (BUY or SELL)."""
+
+    order_id = models.UUIDField("订单ID", primary_key=True, default=uuid.uuid4)
+    request_id = models.UUIDField("请求ID", unique=True)
+    side = models.CharField("方向", max_length=4)  # BUY / SELL
+    npc = models.ForeignKey(
+        "inventory.NpcDefinition",
+        on_delete=models.CASCADE,
+        related_name="trade_orders",
+    )
+    item_id = models.IntegerField("物品ID")
+    amount = models.IntegerField("数量")
+    unit_price = models.IntegerField("单价")
+    delivery_point_code = models.CharField("交付点", max_length=64)
+    expires_world_minute = models.BigIntegerField("过期世界分钟")
+    status = models.CharField("状态", max_length=16, default="OPEN")
+    # OPEN / MATCHED / FILLED / CANCELLED / EXPIRED
+    matched_order = models.ForeignKey(
+        "self",
+        on_delete=models.SET_NULL,
+        null=True,
+        blank=True,
+        related_name="+",
+    )
+    created_at = models.DateTimeField("创建时间", auto_now_add=True)
+    updated_at = models.DateTimeField("更新时间", auto_now=True)
+
+    class Meta:
+        verbose_name = "NPC 交易订单"
+        verbose_name_plural = "NPC 交易订单"
+        constraints = [
+            models.CheckConstraint(
+                name="trade_order_amount_positive",
+                condition=models.Q(amount__gt=0),
+            ),
+            models.CheckConstraint(
+                name="trade_order_unit_price_positive",
+                condition=models.Q(unit_price__gt=0),
+            ),
+        ]
+
+    def __str__(self):
+        return f"{self.order_id} {self.side} item={self.item_id} x{self.amount} @{self.unit_price}"
+
+
+class NpcTradeDelivery(models.Model):
+    """A delivery record linking a buyer and seller order."""
+
+    delivery_id = models.UUIDField("交付ID", primary_key=True, default=uuid.uuid4)
+    buyer_order = models.ForeignKey(
+        NpcTradeOrder,
+        on_delete=models.CASCADE,
+        related_name="buyer_deliveries",
+    )
+    seller_order = models.ForeignKey(
+        NpcTradeOrder,
+        on_delete=models.CASCADE,
+        related_name="seller_deliveries",
+    )
+    seller_slot_instance_id = models.UUIDField("卖方槽位批次ID")
+    reserved_amount = models.IntegerField("预留数量")
+    reserved_money = models.IntegerField("预留金额")
+    delivery_point_code = models.CharField("交付点", max_length=64)
+    expires_world_minute = models.BigIntegerField("过期世界分钟")
+    status = models.CharField("状态", max_length=16, default="ACTIVE")
+    # ACTIVE / COMPLETED / CANCELLED / EXPIRED
+    created_at = models.DateTimeField("创建时间", auto_now_add=True)
+    updated_at = models.DateTimeField("更新时间", auto_now=True)
+
+    class Meta:
+        verbose_name = "NPC 交易交付"
+        verbose_name_plural = "NPC 交易交付"
+        constraints = [
+            models.CheckConstraint(
+                name="delivery_reserved_amount_non_negative",
+                condition=models.Q(reserved_amount__gte=0),
+            ),
+            models.CheckConstraint(
+                name="delivery_reserved_money_non_negative",
+                condition=models.Q(reserved_money__gte=0),
+            ),
+        ]
+
+    def __str__(self):
+        return f"{self.delivery_id} {self.status}"
+
+
+class DailyPriceSnapshot(models.Model):
+    """Daily price snapshot for village economy."""
+
+    day_index = models.IntegerField("日索引", unique=True)
+    prices = models.JSONField("价格", default=dict)
+    # {item_id: price, ...}
+    status = models.CharField("状态", max_length=16, default="DRAFT")
+    # DRAFT / PUBLISHED
+    published_by_npc_id = models.IntegerField("发布NPC ID", null=True, blank=True)
+    published_world_minute = models.BigIntegerField("发布世界分钟", null=True, blank=True)
+    created_at = models.DateTimeField("创建时间", auto_now_add=True)
+
+    class Meta:
+        verbose_name = "每日价格快照"
+        verbose_name_plural = "每日价格快照"
+        constraints = [
+            models.CheckConstraint(
+                name="daily_price_day_index_non_negative",
+                condition=models.Q(day_index__gte=0),
+            ),
+        ]
+
+    def __str__(self):
+        return f"day={self.day_index} status={self.status}"
+
+
+class VillageRestaurantState(models.Model):
+    """Daily restaurant state for Lucy's diner."""
+
+    day_index = models.IntegerField("日索引", unique=True)
+    status = models.CharField("状态", max_length=16, default="OPEN")
+    # OPEN / LOW_STOCK / SOLD_OUT
+    traveler_sales_count = models.IntegerField("旅客销售数", default=0)
+    traveler_revenue = models.IntegerField("旅客收入", default=0)
+    asset_version = models.BigIntegerField("资产版本", default=0)
+    updated_at = models.DateTimeField("更新时间", auto_now=True)
+
+    class Meta:
+        verbose_name = "餐厅状态"
+        verbose_name_plural = "餐厅状态"
+        constraints = [
+            models.CheckConstraint(
+                name="restaurant_traveler_sales_non_negative",
+                condition=models.Q(traveler_sales_count__gte=0),
+            ),
+            models.CheckConstraint(
+                name="restaurant_traveler_revenue_non_negative",
+                condition=models.Q(traveler_revenue__gte=0),
+            ),
+        ]
+
+    def __str__(self):
+        return f"day={self.day_index} status={self.status}"
+
+
+# ============================================================================
+# Phase 3: Store & direct trade models
+# ============================================================================
+
+STORE_OPERATIONAL_STATUS_CHOICES = [
+    (StoreOperationalStatus.OPEN.value, "营业中"),
+    (StoreOperationalStatus.CLOSED.value, "打烊"),
+    (StoreOperationalStatus.SUSPENDED.value, "停业"),
+]
+
+LISTING_STATUS_CHOICES = [
+    (ListingStatus.ACTIVE.value, "在售"),
+    (ListingStatus.SOLD_OUT.value, "售罄"),
+    (ListingStatus.DELISTED.value, "已下架"),
+]
+
+PRICE_MODE_CHOICES = [
+    (PriceMode.ORIGINAL.value, "原价"),
+    (PriceMode.CUSTOM.value, "自定义"),
+]
+
+TRADE_OFFER_STATUS_CHOICES = [
+    (TradeOfferStatus.PENDING.value, "待处理"),
+    (TradeOfferStatus.ACCEPTED.value, "已接受"),
+    (TradeOfferStatus.REJECTED.value, "已拒绝"),
+    (TradeOfferStatus.CANCELLED.value, "已取消"),
+    (TradeOfferStatus.EXPIRED.value, "已过期"),
+]
+
+
+class VillageStore(models.Model):
+    """Independent store entity with its own inventory, listing and account."""
+
+    store_code = models.CharField("商店代码", max_length=64, primary_key=True)
+    location_code = models.CharField("地点码", max_length=64)
+    operator_npc = models.ForeignKey(
+        "inventory.NpcDefinition",
+        on_delete=models.SET_NULL,
+        null=True,
+        blank=True,
+        related_name="operated_stores",
+    )
+    display_name = models.CharField("商店名称", max_length=100)
+    status = models.CharField(
+        "经营状态",
+        max_length=16,
+        choices=STORE_OPERATIONAL_STATUS_CHOICES,
+        default=StoreOperationalStatus.OPEN.value,
+    )
+    transaction_fee_bps = models.IntegerField("交易费率(基点)", default=500)
+    minimum_fee = models.IntegerField("最低费用", default=1)
+    inventory_version = models.BigIntegerField("库存版本", default=0)
+    updated_at = models.DateTimeField("更新时间", auto_now=True)
+
+    class Meta:
+        verbose_name = "村庄商店"
+        verbose_name_plural = "村庄商店"
+        ordering = ["store_code"]
+        constraints = [
+            models.CheckConstraint(
+                name="village_store_fee_bps_in_range",
+                condition=models.Q(transaction_fee_bps__gte=0, transaction_fee_bps__lte=10000),
+            ),
+            models.CheckConstraint(
+                name="village_store_minimum_fee_non_negative",
+                condition=models.Q(minimum_fee__gte=0),
+            ),
+        ]
+
+    def __str__(self):
+        return f"{self.store_code} - {self.display_name}"
+
+
+class VillageStoreAccount(models.Model):
+    """Store's independent money account (never the operator's personal wallet)."""
+
+    store = models.OneToOneField(
+        VillageStore,
+        on_delete=models.CASCADE,
+        primary_key=True,
+        related_name="account",
+    )
+    balance = models.IntegerField("余额", default=0)
+    account_version = models.BigIntegerField("账户版本", default=0)
+    updated_at = models.DateTimeField("更新时间", auto_now=True)
+
+    class Meta:
+        verbose_name = "商店账户"
+        verbose_name_plural = "商店账户"
+        constraints = [
+            models.CheckConstraint(
+                name="village_store_account_balance_non_negative",
+                condition=models.Q(balance__gte=0),
+            ),
+        ]
+
+    def __str__(self):
+        return f"{self.store.store_code} balance={self.balance}"
+
+
+class VillageStoreInventorySlot(models.Model):
+    """A store-owned item batch, preserving batch attributes on list/delist."""
+
+    instance_id = models.UUIDField("批次ID", unique=True, default=uuid.uuid4)
+    store = models.ForeignKey(
+        VillageStore,
+        on_delete=models.CASCADE,
+        related_name="inventory_slots",
+    )
+    listing = models.ForeignKey(
+        "VillageStoreListing",
+        on_delete=models.SET_NULL,
+        null=True,
+        blank=True,
+        related_name="inventory_slots",
+    )
+    item_id = models.IntegerField("物品ID")
+    item_amount = models.IntegerField("数量", default=0)
+    produced_world_minute = models.BigIntegerField("生产世界分钟", null=True, blank=True)
+    expires_world_minute = models.BigIntegerField("过期世界分钟", null=True, blank=True)
+    source_npc = models.ForeignKey(
+        "inventory.NpcDefinition",
+        on_delete=models.SET_NULL,
+        null=True,
+        blank=True,
+        related_name="store_inventory_slots",
+    )
+    source_slot_instance_id = models.UUIDField("来源批次ID", null=True, blank=True)
+    reserved_amount = models.IntegerField("预留数量", default=0)
+
+    class Meta:
+        verbose_name = "商店库存批次"
+        verbose_name_plural = "商店库存批次"
+        constraints = [
+            models.CheckConstraint(
+                name="village_store_slot_amount_non_negative",
+                condition=models.Q(item_amount__gte=0),
+            ),
+            models.CheckConstraint(
+                name="village_store_slot_reserved_non_negative",
+                condition=models.Q(reserved_amount__gte=0),
+            ),
+        ]
+
+    def __str__(self):
+        return f"{self.store.store_code} item={self.item_id} x{self.item_amount}"
+
+
+class VillageStoreListing(models.Model):
+    """A store's authoritative price listing for one item/price tier."""
+
+    listing_id = models.UUIDField("上架ID", primary_key=True, default=uuid.uuid4)
+    store = models.ForeignKey(
+        VillageStore,
+        on_delete=models.CASCADE,
+        related_name="listings",
+    )
+    item_id = models.IntegerField("物品ID")
+    price_mode = models.CharField(
+        "价格模式",
+        max_length=16,
+        choices=PRICE_MODE_CHOICES,
+        default=PriceMode.ORIGINAL.value,
+    )
+    unit_price = models.IntegerField("单价")
+    status = models.CharField(
+        "状态",
+        max_length=16,
+        choices=LISTING_STATUS_CHOICES,
+        default=ListingStatus.ACTIVE.value,
+    )
+    listed_by_npc = models.ForeignKey(
+        "inventory.NpcDefinition",
+        on_delete=models.PROTECT,
+        related_name="store_listings",
+    )
+    created_request_id = models.UUIDField("首次上架幂等键", unique=True)
+    listed_world_minute = models.BigIntegerField("上架世界分钟")
+    updated_at = models.DateTimeField("更新时间", auto_now=True)
+
+    class Meta:
+        verbose_name = "商店上架记录"
+        verbose_name_plural = "商店上架记录"
+        constraints = [
+            models.CheckConstraint(
+                name="village_store_listing_unit_price_positive",
+                condition=models.Q(unit_price__gt=0),
+            ),
+        ]
+
+    def __str__(self):
+        return f"{self.store.store_code} item={self.item_id} @{self.unit_price} {self.status}"
+
+
+class VillageTradeOffer(models.Model):
+    """Immutable directed NPC-to-NPC trade offer."""
+
+    offer_id = models.UUIDField("报价ID", primary_key=True, default=uuid.uuid4)
+    buyer_npc = models.ForeignKey(
+        "inventory.NpcDefinition",
+        on_delete=models.CASCADE,
+        related_name="trade_offers_as_buyer",
+    )
+    seller_npc = models.ForeignKey(
+        "inventory.NpcDefinition",
+        on_delete=models.CASCADE,
+        related_name="trade_offers_as_seller",
+    )
+    item_id = models.IntegerField("物品ID")
+    amount = models.IntegerField("数量")
+    gold_amount = models.IntegerField("金币总额")
+    conversation_id = models.CharField("会话ID", max_length=128, null=True, blank=True)
+    location_code = models.CharField("地点码", max_length=64)
+    status = models.CharField(
+        "状态",
+        max_length=16,
+        choices=TRADE_OFFER_STATUS_CHOICES,
+        default=TradeOfferStatus.PENDING.value,
+    )
+    expected_seller_asset_version = models.BigIntegerField("期望卖方资产版本", null=True, blank=True)
+    expires_world_minute = models.BigIntegerField("过期世界分钟")
+    created_request_id = models.UUIDField("创建幂等键", unique=True)
+    resolved_request_id = models.UUIDField("结束幂等键", null=True, blank=True)
+    created_world_minute = models.BigIntegerField("创建世界分钟")
+    resolved_world_minute = models.BigIntegerField("结束世界分钟", null=True, blank=True)
+    created_at = models.DateTimeField("创建时间", auto_now_add=True)
+    updated_at = models.DateTimeField("更新时间", auto_now=True)
+
+    class Meta:
+        verbose_name = "NPC 交易报价"
+        verbose_name_plural = "NPC 交易报价"
+        constraints = [
+            models.CheckConstraint(
+                name="village_trade_offer_amount_positive",
+                condition=models.Q(amount__gt=0),
+            ),
+            models.CheckConstraint(
+                name="village_trade_offer_gold_positive",
+                condition=models.Q(gold_amount__gt=0),
+            ),
+            models.CheckConstraint(
+                name="village_trade_offer_buyer_not_seller",
+                condition=~models.Q(buyer_npc=models.F("seller_npc")),
+            ),
+            models.UniqueConstraint(
+                fields=["resolved_request_id"],
+                name="village_trade_offer_resolved_request_unique",
+                condition=models.Q(resolved_request_id__isnull=False),
+            ),
+        ]
+
+    def __str__(self):
+        return f"{self.offer_id} {self.buyer_npc.agent_id}->{self.seller_npc.agent_id} item={self.item_id} {self.status}"

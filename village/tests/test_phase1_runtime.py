@@ -13,8 +13,10 @@ from village.models import (
     NpcCommandState,
     NpcActionReservation,
     NpcRuntimeState,
+    VillageActionDurationConfig,
     VillageActionReceipt,
     VillageDeliveryOutbox,
+    VillageSimulationConfig,
     VillageWorldEvent,
 )
 from village.runtime_services import (
@@ -110,6 +112,57 @@ class BootstrapServiceTest(TestCase):
         data = BootstrapService.get_bootstrap()
         self.assertNotIn("error", data)
         self.assertEqual(len(data["npcs"]), 5)
+
+    def test_bootstrap_exposes_economy_feature_flag(self):
+        for i, name in enumerate(["bill", "jack", "mark", "lucy", "nora"], start=10011):
+            npc, _ = NpcDefinition.objects.get_or_create(
+                agent_id=i, defaults={"name": name, "is_test_only": False},
+            )
+            NpcRuntimeState.objects.get_or_create(
+                npc=npc,
+                defaults={"current_location_code": "VILLAGE_SQUARE", "action_status": "IDLE"},
+            )
+        config, _ = VillageSimulationConfig.objects.get_or_create(config_key="default")
+        config.village_economy_enabled = True
+        config.save(update_fields=["village_economy_enabled"])
+
+        data = BootstrapService.get_bootstrap()
+
+        self.assertIs(data["config"]["village_economy_enabled"], True)
+
+    def test_bootstrap_exposes_all_admin_managed_action_configs(self):
+        for i, name in enumerate(["bill", "jack", "mark", "lucy", "nora"], start=10011):
+            npc, _ = NpcDefinition.objects.get_or_create(
+                agent_id=i, defaults={"name": name, "is_test_only": False},
+            )
+            NpcRuntimeState.objects.get_or_create(
+                npc=npc,
+                defaults={"current_location_code": "VILLAGE_SQUARE", "action_status": "IDLE"},
+            )
+        VillageActionDurationConfig.objects.update_or_create(
+            action_name="PLANT", defaults={"duration_minutes": 5},
+        )
+        VillageActionDurationConfig.objects.update_or_create(
+            action_name="MOVE", defaults={"navigation_timeout_seconds": 45},
+        )
+
+        data = BootstrapService.get_bootstrap()
+
+        durations = data["config"]["action_durations"]
+        self.assertEqual(durations["PLANT"], 5)
+        self.assertEqual(set(durations), set(VillageActionDurationConfig.default_durations()))
+        self.assertEqual(data["config"]["navigation_action_timeout_seconds"]["MOVE"], 45)
+        self.assertEqual(data["config"]["economy_action_durations"]["PLANT"], 5)
+
+    def test_command_duration_is_replaced_by_admin_configuration(self):
+        VillageActionDurationConfig.objects.update_or_create(
+            action_name="REST", defaults={"duration_minutes": 60},
+        )
+        content = {"duration_minutes": 30}
+
+        CommandService.apply_admin_duration("REST", content)
+
+        self.assertEqual(content["duration_minutes"], 60)
 
     def test_bootstrap_exposes_need_bands_and_shared_active_reservation(self):
         npcs = []

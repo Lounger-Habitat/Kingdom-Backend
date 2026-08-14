@@ -1,6 +1,7 @@
 from django.urls import path
 
 from . import views
+from . import phase3_views
 
 
 urlpatterns = [
@@ -23,4 +24,13 @@ urlpatterns = [
     path("api/village/events", views.events_list, name="village-events"),
     # 阶段一 Command API
     # 阶段一 Outbox API
+    # Phase 3 economy API
+    path("api/village/economy/actions/complete", phase3_views.economy_actions_complete, name="village-economy-actions-complete"),
+    path("api/village/economy/snapshot", phase3_views.economy_snapshot, name="village-economy-snapshot"),
+    path("api/village/economy/day-close", phase3_views.economy_day_close, name="village-economy-day-close"),
+    path(
+        "api/village/economy/stores/<str:store_code>/inventory",
+        phase3_views.economy_store_inventory,
+        name="village-economy-store-inventory",
+    ),
 ]

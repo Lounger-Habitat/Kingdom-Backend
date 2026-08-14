@@ -1,17 +1,30 @@
 from django.contrib import admin
 
 from .models import (
+    DailyPriceSnapshot,
+    EconomicLedgerEntry,
     NpcActionReservation,
     NpcCommandState,
     NpcNeedsDaySummary,
     NpcProfile,
     NpcRuntimeState,
     NpcSocialDailyCounter,
+    NpcTradeDelivery,
+    NpcTradeOrder,
+    VillageAccount,
+    VillageActionDurationConfig,
     VillageActionReceipt,
     VillageCommunityMealDailyUsage,
     VillageDeliveryOutbox,
+    VillageFarmPlot,
     VillageLocationDefinition,
+    VillageRestaurantState,
     VillageSimulationConfig,
+    VillageStore,
+    VillageStoreAccount,
+    VillageStoreInventorySlot,
+    VillageStoreListing,
+    VillageTradeOffer,
     VillageWorldEvent,
 )
 
@@ -36,6 +49,39 @@ class VillageSimulationConfigAdmin(admin.ModelAdmin):
 
     def has_add_permission(self, request):
         return not VillageSimulationConfig.objects.exists()
+
+
+@admin.register(VillageActionDurationConfig)
+class VillageActionDurationConfigAdmin(admin.ModelAdmin):
+    list_display = (
+        "action_code", "action_label", "phase", "explanation",
+        "duration_minutes", "navigation_timeout_seconds", "updated_at",
+    )
+    list_editable = ("duration_minutes", "navigation_timeout_seconds")
+    readonly_fields = ("action_name", "updated_at")
+    ordering = ("action_name",)
+
+    @admin.display(description="动作代码", ordering="action_name")
+    def action_code(self, obj):
+        return obj.action_name
+
+    @admin.display(description="中文动作")
+    def action_label(self, obj):
+        return VillageActionDurationConfig.metadata(obj.action_name)[1]
+
+    @admin.display(description="阶段")
+    def phase(self, obj):
+        return VillageActionDurationConfig.metadata(obj.action_name)[0]
+
+    @admin.display(description="中文说明")
+    def explanation(self, obj):
+        return VillageActionDurationConfig.metadata(obj.action_name)[2]
+
+    def has_add_permission(self, request):
+        return False
+
+    def has_delete_permission(self, request, obj=None):
+        return False
 
 
 @admin.register(NpcRuntimeState)
@@ -106,3 +152,96 @@ class VillageDeliveryOutboxAdmin(admin.ModelAdmin):
     list_display = ("delivery_id", "recipient", "message_kind", "status", "attempt_count", "created_at")
     search_fields = ("delivery_id", "recipient")
     list_filter = ("status", "message_kind")
+
+
+# ── Phase 3 admin registrations ────────────────────────────────────
+
+
+@admin.register(EconomicLedgerEntry)
+class EconomicLedgerEntryAdmin(admin.ModelAdmin):
+    list_display = ("request_id", "entry_type", "actor_npc", "external_delta", "world_minute", "created_at")
+    search_fields = ("request_id",)
+    list_filter = ("entry_type",)
+    readonly_fields = ("request_id", "created_at")
+
+
+@admin.register(VillageAccount)
+class VillageAccountAdmin(admin.ModelAdmin):
+    list_display = ("account_code", "balance", "asset_version", "last_caravan_day", "last_closed_day_index", "updated_at")
+    readonly_fields = ("updated_at",)
+
+
+@admin.register(VillageFarmPlot)
+class VillageFarmPlotAdmin(admin.ModelAdmin):
+    list_display = ("plot_code", "status", "crop_code", "planted_world_minute", "mature_world_minute", "updated_at")
+    list_filter = ("status",)
+    readonly_fields = ("updated_at",)
+
+
+@admin.register(NpcTradeOrder)
+class NpcTradeOrderAdmin(admin.ModelAdmin):
+    list_display = ("order_id", "side", "npc", "item_id", "amount", "unit_price", "status", "created_at")
+    search_fields = ("order_id", "request_id")
+    list_filter = ("side", "status")
+    readonly_fields = ("order_id", "created_at")
+
+
+@admin.register(NpcTradeDelivery)
+class NpcTradeDeliveryAdmin(admin.ModelAdmin):
+    list_display = ("delivery_id", "buyer_order", "seller_order", "reserved_amount", "reserved_money", "status", "created_at")
+    search_fields = ("delivery_id",)
+    list_filter = ("status",)
+    readonly_fields = ("delivery_id", "created_at")
+
+
+@admin.register(DailyPriceSnapshot)
+class DailyPriceSnapshotAdmin(admin.ModelAdmin):
+    list_display = ("day_index", "status", "published_by_npc_id", "published_world_minute", "created_at")
+    list_filter = ("status",)
+    readonly_fields = ("created_at",)
+
+
+@admin.register(VillageRestaurantState)
+class VillageRestaurantStateAdmin(admin.ModelAdmin):
+    list_display = ("day_index", "status", "traveler_sales_count", "traveler_revenue", "updated_at")
+    list_filter = ("status",)
+    readonly_fields = ("updated_at",)
+
+
+@admin.register(VillageStore)
+class VillageStoreAdmin(admin.ModelAdmin):
+    list_display = ("store_code", "display_name", "location_code", "operator_npc", "status", "transaction_fee_bps", "minimum_fee", "inventory_version", "updated_at")
+    search_fields = ("store_code", "display_name", "operator_npc__agent_id")
+    list_filter = ("status",)
+    readonly_fields = ("store_code", "updated_at")
+
+
+@admin.register(VillageStoreAccount)
+class VillageStoreAccountAdmin(admin.ModelAdmin):
+    list_display = ("store", "balance", "account_version", "updated_at")
+    search_fields = ("store__store_code",)
+    readonly_fields = ("store", "updated_at")
+
+
+@admin.register(VillageStoreInventorySlot)
+class VillageStoreInventorySlotAdmin(admin.ModelAdmin):
+    list_display = ("instance_id", "store", "listing", "item_id", "item_amount", "reserved_amount", "expires_world_minute")
+    search_fields = ("instance_id", "store__store_code")
+    list_filter = ("store",)
+    readonly_fields = ("instance_id",)
+
+
+@admin.register(VillageStoreListing)
+class VillageStoreListingAdmin(admin.ModelAdmin):
+    list_display = ("listing_id", "store", "item_id", "price_mode", "unit_price", "status", "listed_by_npc", "listed_world_minute", "updated_at")
+    search_fields = ("listing_id", "store__store_code", "listed_by_npc__agent_id")
+    list_filter = ("status", "price_mode", "store")
+    readonly_fields = ("listing_id", "updated_at")
+
+
+@admin.register(VillageTradeOffer)
+class VillageTradeOfferAdmin(admin.ModelAdmin):
+    list_display = ("offer_id", "buyer_npc", "seller_npc", "item_id", "amount", "gold_amount", "status", "location_code", "expires_world_minute", "created_at")
+    search_fields = ("offer_id", "buyer_npc__agent_id", "seller_npc__agent_id")
+    list_filter = ("status",)
+    readonly_fields = ("offer_id", "created_at")

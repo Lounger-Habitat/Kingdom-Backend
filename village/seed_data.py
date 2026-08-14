@@ -128,3 +128,63 @@ TEST_NPC_ISOLATION = [
     ("10013", "TEST_10013", "mark_test", 5_689),
     ("10014", "TEST_10014", "lucy_test", 1_000_000),
 ]
+
+
+# ── Phase 3: Farm plot seeds ───────────────────────────────────────
+
+FARM_PLOT_SEEDS = [
+    {"plot_code": "FARM_PLOT_A"},
+    {"plot_code": "FARM_PLOT_B"},
+    {"plot_code": "FARM_PLOT_C"},
+]
+
+
+# ── Phase 3: Village account seeds ────────────────────────────────
+
+VILLAGE_ACCOUNT_SEEDS = [
+    {"account_code": "PUBLIC_FUND", "balance": 0},
+]
+
+
+# ── Phase 3: Tool item definitions ────────────────────────────────
+# These items must exist in the Item table before Phase 3 seed runs.
+
+TOOL_ITEM_SEEDS = [
+    {
+        "item_id": 4001,
+        "item_name": "阶段三农具",
+        "item_type": "HoeTool",
+        "item_description": "阶段三农田专用工具，可使用20次",
+        "item_price": 50,
+        "collectable": False,
+    },
+    {
+        "item_id": 4002,
+        "item_name": "阶段三猎具",
+        "item_type": "CollectTool",
+        "item_description": "阶段三狩猎专用工具，可使用20次",
+        "item_price": 50,
+        "collectable": False,
+    },
+]
+
+
+# ── Phase 3: Initial tool grants per NPC ──────────────────────────
+# (agent_id, tool_item_id, amount, remaining_uses)
+
+INITIAL_TOOL_GRANTS = [
+    ("10011", 4001, 1, 20),   # Bill: 1 农具
+    ("10012", 4002, 1, 20),   # Jack: 1 猎具
+]
+
+
+# ── Phase 3: Initial supplementary grants ─────────────────────────
+# Seeds and ingredients granted to NPCs for the economy loop.
+# (agent_id, item_id, amount)
+
+INITIAL_SUPPLEMENTARY_GRANTS = [
+    ("10011", 1051, 6),   # Bill: 6 玉米种子
+    ("10014", 1040, 4),   # Lucy: 4 红辣椒
+    ("10014", 1026, 4),   # Lucy: 4 奶酪
+    ("10014", 1050, 4),   # Lucy: 4 糖
+]

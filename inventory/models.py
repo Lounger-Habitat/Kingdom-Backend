@@ -357,6 +357,10 @@ class NpcGlobalInventorySlot(models.Model):
     hide_in_shop = models.BooleanField(default=False)
     remaining_uses = models.IntegerField(null=True, blank=True)
     review_comment = models.TextField(default="", blank=True)
+    # Phase 3 batch tracking fields
+    produced_world_minute = models.BigIntegerField("生产世界分钟", null=True, blank=True)
+    expires_world_minute = models.BigIntegerField("过期世界分钟", null=True, blank=True)
+    source_request_id = models.UUIDField("来源请求ID", null=True, blank=True)
 
     class Meta:
         ordering = ["slot_index"]

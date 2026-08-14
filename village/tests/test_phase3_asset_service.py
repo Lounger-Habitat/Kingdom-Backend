@@ -1,0 +1,270 @@
+"""Tests for Phase 3 unified asset service: commit_economy_action.
+
+Covers feature flag, actor/location validation, idempotency, version
+conflict, replay, request conflict, and transaction rollback.
+"""
+
+import uuid
+
+from django.test import TestCase, override_settings
+
+from game_time.models import GlobalGameTimeState
+from inventory.models import (
+    NpcDefinition,
+    NpcGlobalInventory,
+    NpcGlobalInventorySlot,
+)
+from village.models import (
+    EconomicLedgerEntry,
+    VillageActionReceipt,
+    VillageFarmPlot,
+    VillageSimulationConfig,
+    VillageWorldEvent,
+)
+from village.phase3_asset_service import commit_economy_action
+from village.phase3_contract import (
+    VILLAGE_ECONOMY_ACTION_V1,
+    ResultCode,
+)
+
+
+def _base_payload(**overrides):
+    """Build a minimal valid economy action payload."""
+    data = {
+        "schema_version": VILLAGE_ECONOMY_ACTION_V1,
+        "command_id": str(uuid.uuid4()),
+        "request_id": str(uuid.uuid4()),
+        "message_id": str(uuid.uuid4()),
+        "command_name": "PLANT",
+        "npc_id": 10011,
+        "completed_world_minute": 700,
+        "time_revision": 700,
+        "current_location_code": "BILL_FARM",
+        "params": {
+            "plot_code": "FARM_PLOT_A",
+            "crop_code": "CORN",
+            "expected_asset_version": 0,
+        },
+    }
+    data.update(overrides)
+    if "params" in overrides and isinstance(overrides["params"], dict):
+        data["params"] = {**data.get("params", {}), **overrides["params"]}
+    return data
+
+
+class Phase3AssetServiceBase(TestCase):
+    """Shared setUp for all asset service tests."""
+
+    def setUp(self):
+        self.config = VillageSimulationConfig.objects.create(
+            config_key="default", village_economy_enabled=True,
+        )
+        self.time = GlobalGameTimeState.get_instance()
+        self.time.world_minute = 700
+        self.time.time_revision = 700
+        self.time.save()
+
+        self.bill, _ = NpcDefinition.objects.get_or_create(
+            agent_id="10011", defaults={"name": "bill"},
+        )
+        self.jack, _ = NpcDefinition.objects.get_or_create(
+            agent_id="10012", defaults={"name": "jack"},
+        )
+        self.lucy, _ = NpcDefinition.objects.get_or_create(
+            agent_id="10014", defaults={"name": "lucy"},
+        )
+
+        self.bill_inv, _ = NpcGlobalInventory.objects.get_or_create(
+            npc=self.bill, defaults={"money": 200},
+        )
+
+        # Clear migration-seeded slots for a clean test state
+        NpcGlobalInventorySlot.objects.filter(bag=self.bill_inv).delete()
+
+        # Farm plots
+        for code in ("FARM_PLOT_A", "FARM_PLOT_B", "FARM_PLOT_C"):
+            VillageFarmPlot.objects.get_or_create(
+                plot_code=code, defaults={"status": "EMPTY"},
+            )
+
+
+class FeatureDisabledTest(Phase3AssetServiceBase):
+    def setUp(self):
+        super().setUp()
+        self.config.village_economy_enabled = False
+        self.config.save(update_fields=["village_economy_enabled"])
+
+    def test_feature_disabled_returns_p3_feature_disabled(self):
+        resp = commit_economy_action(_base_payload())
+        self.assertEqual(resp["result_code"], ResultCode.P3_FEATURE_DISABLED)
+
+
+class ActorValidationTest(Phase3AssetServiceBase):
+    def test_wrong_actor_for_plant_returns_forbidden(self):
+        """PLANT only allowed for Bill (10011)."""
+        resp = commit_economy_action(_base_payload(npc_id=10012))
+        self.assertEqual(resp["result_code"], ResultCode.P3_FORBIDDEN_ACTOR)
+
+    def test_wrong_actor_for_hunt_returns_forbidden(self):
+        """HUNT only allowed for Jack (10012)."""
+        resp = commit_economy_action(_base_payload(
+            command_name="HUNT", npc_id=10011,
+            current_location_code="HUNTING_GATE",
+            params={"hunt_code": "HUNT_CHICKEN", "expected_asset_version": 0},
+        ))
+        self.assertEqual(resp["result_code"], ResultCode.P3_FORBIDDEN_ACTOR)
+
+
+class LocationValidationTest(Phase3AssetServiceBase):
+    def test_wrong_location_returns_wrong_location(self):
+        resp = commit_economy_action(_base_payload(
+            current_location_code="VILLAGE_SQUARE",
+        ))
+        self.assertEqual(resp["result_code"], ResultCode.P3_WRONG_LOCATION)
+
+
+class AssetVersionConflictTest(Phase3AssetServiceBase):
+    def test_version_mismatch_returns_conflict(self):
+        self.bill_inv.asset_version = 5
+        self.bill_inv.save(update_fields=["asset_version"])
+
+        resp = commit_economy_action(_base_payload(
+            params={"plot_code": "FARM_PLOT_A", "crop_code": "CORN",
+                    "expected_asset_version": 3},
+        ))
+        self.assertEqual(resp["result_code"], ResultCode.P3_ASSET_VERSION_CONFLICT)
+
+
+class IdempotencyTest(Phase3AssetServiceBase):
+    def setUp(self):
+        super().setUp()
+        # Seeds and tool for a successful PLANT
+        NpcGlobalInventorySlot.objects.create(
+            bag=self.bill_inv, slot_index=0, item_id=1051, item_amount=5,
+        )
+        NpcGlobalInventorySlot.objects.create(
+            bag=self.bill_inv, slot_index=1, item_id=4001, item_amount=10,
+            remaining_uses=20,
+        )
+
+    def test_same_request_id_same_payload_returns_replayed(self):
+        payload = _base_payload()
+        resp1 = commit_economy_action(payload)
+        self.assertEqual(resp1["result_code"], ResultCode.OK)
+        self.assertFalse(resp1["replayed"])
+
+        record_counts = (
+            VillageActionReceipt.objects.count(),
+            VillageWorldEvent.objects.count(),
+            EconomicLedgerEntry.objects.count(),
+        )
+
+        resp2 = commit_economy_action(payload)
+        self.assertEqual(resp2["result_code"], ResultCode.OK)
+        self.assertTrue(resp2["replayed"])
+        self.assertTrue(resp2["event"]["event_id"])
+        self.assertEqual(resp2["event"], resp1["event"])
+
+        comparable_resp1 = dict(resp1)
+        comparable_resp1["replayed"] = True
+        self.assertEqual(resp2, comparable_resp1)
+        self.assertEqual(
+            (
+                VillageActionReceipt.objects.count(),
+                VillageWorldEvent.objects.count(),
+                EconomicLedgerEntry.objects.count(),
+            ),
+            record_counts,
+        )
+
+    def test_same_request_id_different_payload_returns_conflict(self):
+        payload = _base_payload()
+        resp1 = commit_economy_action(payload)
+        self.assertEqual(resp1["result_code"], ResultCode.OK)
+
+        # Same request_id but different command_name
+        payload2 = {**payload, "command_name": "HARVEST"}
+        resp2 = commit_economy_action(payload2)
+        self.assertEqual(resp2["result_code"], ResultCode.P3_REQUEST_CONFLICT)
+
+
+class PersistenceTest(Phase3AssetServiceBase):
+    def setUp(self):
+        super().setUp()
+        NpcGlobalInventorySlot.objects.create(
+            bag=self.bill_inv, slot_index=0, item_id=1051, item_amount=5,
+        )
+        NpcGlobalInventorySlot.objects.create(
+            bag=self.bill_inv, slot_index=1, item_id=4001, item_amount=10,
+            remaining_uses=20,
+        )
+
+    def test_success_creates_receipt_event_ledger(self):
+        payload = _base_payload()
+        resp = commit_economy_action(payload)
+        self.assertEqual(resp["result_code"], ResultCode.OK)
+
+        request_id = uuid.UUID(payload["request_id"])
+        self.assertTrue(VillageActionReceipt.objects.filter(request_id=request_id).exists())
+        self.assertTrue(EconomicLedgerEntry.objects.filter(request_id=request_id).exists())
+        self.assertTrue(VillageWorldEvent.objects.filter(request_id=request_id).exists())
+
+    def test_failure_does_not_create_receipt(self):
+        """Failed dispatch should not write success receipt/ledger."""
+        resp = commit_economy_action(_base_payload(
+            params={"plot_code": "FARM_PLOT_A", "crop_code": "CORN",
+                    "expected_asset_version": 999},
+        ))
+        self.assertEqual(resp["result_code"], ResultCode.P3_ASSET_VERSION_CONFLICT)
+
+        request_id = uuid.UUID(_base_payload()["request_id"])
+        # The _base_payload above has a DIFFERENT request_id; check no receipt
+        # was written for the conflict request_id
+        self.assertFalse(
+            VillageActionReceipt.objects.filter(
+                request_id=uuid.UUID(resp.get("request_id", str(uuid.uuid4())))
+            ).exists()
+        )
+
+
+class InvalidPayloadTest(Phase3AssetServiceBase):
+    def test_wrong_schema_version_returns_invalid_params(self):
+        payload = _base_payload(schema_version="wrong.version")
+        resp = commit_economy_action(payload)
+        self.assertEqual(resp["result_code"], ResultCode.P3_INVALID_PARAMS)
+
+    def test_unknown_command_returns_invalid_params(self):
+        payload = _base_payload(command_name="UNKNOWN_ACTION")
+        resp = commit_economy_action(payload)
+        self.assertEqual(resp["result_code"], ResultCode.P3_INVALID_PARAMS)
+
+    def test_unknown_param_returns_invalid_params(self):
+        payload = _base_payload()
+        payload["params"]["extra_field"] = "bad"
+        resp = commit_economy_action(payload)
+        self.assertEqual(resp["result_code"], ResultCode.P3_INVALID_PARAMS)
+
+
+class TransactionRollbackTest(Phase3AssetServiceBase):
+    def test_failed_dispatch_does_not_change_inventory(self):
+        """Insufficient item error should leave inventory unchanged."""
+        # Only 0 seeds -- will fail
+        NpcGlobalInventorySlot.objects.create(
+            bag=self.bill_inv, slot_index=0, item_id=1051, item_amount=0,
+        )
+        NpcGlobalInventorySlot.objects.create(
+            bag=self.bill_inv, slot_index=1, item_id=4001, item_amount=10,
+            remaining_uses=20,
+        )
+
+        tool_before = NpcGlobalInventorySlot.objects.get(
+            bag=self.bill_inv, item_id=4001,
+        ).remaining_uses
+
+        resp = commit_economy_action(_base_payload())
+        self.assertEqual(resp["result_code"], ResultCode.P3_INSUFFICIENT_ITEM)
+
+        tool_after = NpcGlobalInventorySlot.objects.get(
+            bag=self.bill_inv, item_id=4001,
+        ).remaining_uses
+        self.assertEqual(tool_before, tool_after)

@@ -93,3 +93,14 @@ class UnityAuthorityPersistenceTests(TestCase):
             "/api/village/deliveries/pending",
         ):
             self.assertEqual(client.post(path, {}, format="json").status_code, 404)
+
+    def test_economy_routes_are_reachable(self):
+        """Phase 3 economy routes exist (may return 400/401 but not 404)."""
+        client = APIClient()
+        for path in (
+            "/api/village/economy/actions/complete",
+            "/api/village/economy/snapshot",
+            "/api/village/economy/day-close",
+        ):
+            resp = client.post(path, {}, format="json")
+            self.assertNotEqual(resp.status_code, 404, f"{path} should not be 404")
