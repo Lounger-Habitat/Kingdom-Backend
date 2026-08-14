@@ -130,6 +130,23 @@ class BootstrapServiceTest(TestCase):
 
         self.assertIs(data["config"]["village_economy_enabled"], True)
 
+    def test_bootstrap_exposes_social_feature_flag(self):
+        for i, name in enumerate(["bill", "jack", "mark", "lucy", "nora"], start=10011):
+            npc, _ = NpcDefinition.objects.get_or_create(
+                agent_id=i, defaults={"name": name, "is_test_only": False},
+            )
+            NpcRuntimeState.objects.get_or_create(
+                npc=npc,
+                defaults={"current_location_code": "VILLAGE_SQUARE", "action_status": "IDLE"},
+            )
+        config, _ = VillageSimulationConfig.objects.get_or_create(config_key="default")
+        config.village_social_enabled = True
+        config.save(update_fields=["village_social_enabled"])
+
+        data = BootstrapService.get_bootstrap()
+
+        self.assertIs(data["config"]["village_social_enabled"], True)
+
     def test_bootstrap_exposes_all_admin_managed_action_configs(self):
         for i, name in enumerate(["bill", "jack", "mark", "lucy", "nora"], start=10011):
             npc, _ = NpcDefinition.objects.get_or_create(

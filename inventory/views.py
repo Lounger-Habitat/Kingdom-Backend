@@ -1640,8 +1640,15 @@ def character_trade(request):
         if isinstance(owner, dict)
         and str(owner.get("type") or "").strip().lower() == "npc"
     }
+    player_to_formal_npc = (
+        isinstance(initiator_raw, dict)
+        and isinstance(other_raw, dict)
+        and str(initiator_raw.get("type") or "").strip().lower() == "player"
+        and str(other_raw.get("type") or "").strip().lower() == "npc"
+        and str(other_raw.get("id") or other_raw.get("characterId") or "").strip() in FORMAL_VILLAGE_NPC_IDS
+    )
     blocked_ids = sorted(participant_ids & FORMAL_VILLAGE_NPC_IDS)
-    if blocked_ids:
+    if blocked_ids and not player_to_formal_npc:
         return Response(
             blocked_response(
                 ASSET_ACTION_BLOCKED,
@@ -1767,6 +1774,22 @@ def character_trade(request):
     if not give_items and not get_items and give_money == 0 and get_money == 0:
         return Response(error_response("交易内容不能为空"), status=400)
 
+    if player_to_formal_npc:
+        if get_items or get_money:
+            return Response(error_response("正式 NPC 只接受玩家单向救急赠予"), status=409)
+        from village.phase3_catalog import SAFE_STOCKS
+        from village.phase3_asset_service import get_available_slot_amount
+        from game_time.models import GlobalGameTimeState
+        world_minute = GlobalGameTimeState.get_instance().world_minute
+        for gift in give_items:
+            stock = sum(
+                get_available_slot_amount(slot)
+                for slot in other["bag"].slots.filter(item_id=gift["item_id"], item_amount__gt=0)
+                if slot.expires_world_minute is None or slot.expires_world_minute > world_minute
+            )
+            if gift["item_id"] not in SAFE_STOCKS or stock >= SAFE_STOCKS[gift["item_id"]]:
+                return Response(error_response("该正式 NPC 当前不符合救急缺货条件"), status=409)
+
     def resolve_all(owner, items, label):
         resolved = {}
         for item in items:
@@ -1841,6 +1864,32 @@ def character_trade(request):
             "otherInventory": serialize_owner(other),
         },
     }
+    if player_to_formal_npc:
+        from game_time.models import GlobalGameTimeState
+        from village.models import NpcRuntimeState, VillageWorldEvent
+        from village.phase4_visibility import enqueue_event_deliveries, resolve_witnesses
+
+        clock = GlobalGameTimeState.objects.filter(pk=1).values("world_minute", "time_revision").first() or {}
+        runtime = NpcRuntimeState.objects.filter(npc_id=other["bag"].npc_id).first()
+        location = runtime.current_location_code if runtime else ""
+        try:
+            event_request_id = uuid.UUID(request_id)
+        except (ValueError, TypeError, AttributeError):
+            event_request_id = uuid.uuid5(uuid.NAMESPACE_URL, request_id)
+        event = VillageWorldEvent.objects.create(
+            dedupe_key=f"player-rescue-gift:{request_id}",
+            event_type="PLAYER_RESCUE_GIFT",
+            world_minute=int(clock.get("world_minute", 0)),
+            time_revision=int(clock.get("time_revision", 0)),
+            participant_npc_ids=[str(other["id"])],
+            witness_npc_ids=resolve_witnesses(location, [str(other["id"])]),
+            player_ids=[requester_id],
+            location_code=location,
+            request_id=event_request_id,
+            visibility="PRESENT",
+            public_data={"hub_summary": "A player delivered emergency supplies.", "player_summary": "Emergency supplies delivered."},
+        )
+        enqueue_event_deliveries(event)
     if requester is not None:
         EnvActionReceipt.objects.create(
             player=requester["account"],

@@ -352,7 +352,7 @@ class Phase3TradeActionContractTest(TestCase):
             PARAM_WHITELIST[ActionName.PROPOSE_TRADE],
             frozenset({
                 "target_npc_id", "item_id", "amount", "gold_amount",
-                "conversation_id", "expected_seller_asset_version", "expires_world_minute",
+                "conversation_id", "expected_seller_asset_version", "expires_world_minute", "commitment_id",
             }),
         )
 

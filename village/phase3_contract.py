@@ -288,6 +288,7 @@ PARAM_WHITELIST = {
     ActionName.PROPOSE_TRADE: frozenset({
         "target_npc_id", "item_id", "amount", "gold_amount",
         "conversation_id", "expected_seller_asset_version", "expires_world_minute",
+        "commitment_id",
     }),
     ActionName.RESPOND_TRADE: frozenset({"offer_id", "decision"}),
     ActionName.CANCEL_TRADE_OFFER: frozenset({"offer_id"}),

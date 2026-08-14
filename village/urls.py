@@ -2,6 +2,7 @@ from django.urls import path
 
 from . import views
 from . import phase3_views
+from . import phase4_views
 
 
 urlpatterns = [
@@ -24,6 +25,12 @@ urlpatterns = [
     path("api/village/events", views.events_list, name="village-events"),
     # 阶段一 Command API
     # 阶段一 Outbox API
+    path("api/village/deliveries/pending", views.deliveries_pending, name="village-deliveries-pending"),
+    path("api/village/deliveries/<str:delivery_id>/ack", views.deliveries_ack, name="village-deliveries-ack"),
+    # Phase 4 social read APIs
+    path("api/village/social/npcs/<str:npc_id>", phase4_views.social_npc, name="village-social-npc"),
+    path("api/village/social/player/facts", phase4_views.player_facts, name="village-social-player-facts"),
+    path("api/village/social/actions/complete", phase4_views.complete_social_action, name="village-social-action-complete"),
     # Phase 3 economy API
     path("api/village/economy/actions/complete", phase3_views.economy_actions_complete, name="village-economy-actions-complete"),
     path("api/village/economy/snapshot", phase3_views.economy_snapshot, name="village-economy-snapshot"),

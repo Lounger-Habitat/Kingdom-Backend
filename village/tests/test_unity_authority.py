@@ -90,7 +90,6 @@ class UnityAuthorityPersistenceTests(TestCase):
             "/api/village/life-actions/execute",
             "/api/village/commands/accept",
             f"/api/village/commands/{uuid.uuid4()}/start",
-            "/api/village/deliveries/pending",
         ):
             self.assertEqual(client.post(path, {}, format="json").status_code, 404)
 

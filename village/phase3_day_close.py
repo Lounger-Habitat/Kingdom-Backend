@@ -45,6 +45,7 @@ from .phase3_contract import (
     ResultCode,
     StoreStatus,
 )
+from .phase4_social import breach_due_commitments, social_enabled
 
 
 # ── Price calculation ────────────────────────────────────────────────────────
@@ -220,6 +221,11 @@ def handle_day_close(
         total_external_delta = 0
         ledger_summaries: List[Dict[str, Any]] = []
 
+        all_changes["commitments_breached"] = (
+            breach_due_commitments(day_end_minute, time_revision=world_minute)
+            if social_enabled() else 0
+        )
+
         # ── Step 1: Expire orders and deliveries ─────────────────────────────
         expire_result = _expire_orders_and_deliveries(day_end_minute)
         all_changes["expired"] = expire_result
@@ -305,6 +311,8 @@ def handle_day_close(
             visibility="PUBLIC",
             public_data={"day_index": day_index, "restaurant_status": restaurant_status},
         )
+        from .phase4_visibility import enqueue_event_deliveries
+        enqueue_event_deliveries(event)
         result["event"] = {
             "event_id": str(event.event_id),
             "event_sequence": event.event_sequence,

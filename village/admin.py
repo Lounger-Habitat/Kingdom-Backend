@@ -7,7 +7,11 @@ from .models import (
     NpcCommandState,
     NpcNeedsDaySummary,
     NpcProfile,
+    NpcCommitment,
+    NpcRelationship,
+    NpcRelationshipChange,
     NpcRuntimeState,
+    NpcStoryFactAccess,
     NpcSocialDailyCounter,
     NpcTradeDelivery,
     NpcTradeOrder,
@@ -26,6 +30,7 @@ from .models import (
     VillageStoreListing,
     VillageTradeOffer,
     VillageWorldEvent,
+    PlayerStoryFactAccess,
 )
 
 
@@ -134,10 +139,22 @@ class VillageActionReceiptAdmin(admin.ModelAdmin):
 
 @admin.register(VillageWorldEvent)
 class VillageWorldEventAdmin(admin.ModelAdmin):
-    list_display = ("event_sequence", "event_type", "world_minute", "visibility", "created_at")
-    search_fields = ("event_id", "event_type")
+    list_display = (
+        "event_sequence", "event_type", "visibility", "actor_npc", "location_code",
+        "world_minute", "participant_npc_ids", "witness_npc_ids", "created_at",
+    )
+    search_fields = ("event_id", "event_type", "actor_npc__agent_id", "location_code")
     list_filter = ("event_type", "visibility")
-    readonly_fields = ("event_sequence", "event_id")
+    readonly_fields = tuple(field.name for field in VillageWorldEvent._meta.fields)
+
+    def has_add_permission(self, request):
+        return False
+
+    def has_change_permission(self, request, obj=None):
+        return False
+
+    def has_delete_permission(self, request, obj=None):
+        return False
 
 
 @admin.register(NpcActionReservation)
@@ -149,9 +166,22 @@ class NpcActionReservationAdmin(admin.ModelAdmin):
 
 @admin.register(VillageDeliveryOutbox)
 class VillageDeliveryOutboxAdmin(admin.ModelAdmin):
-    list_display = ("delivery_id", "recipient", "message_kind", "status", "attempt_count", "created_at")
-    search_fields = ("delivery_id", "recipient")
+    list_display = (
+        "delivery_id", "message_kind", "recipient", "status", "attempt_count",
+        "last_sent_at", "acked_at", "last_error_code", "created_at",
+    )
+    search_fields = ("delivery_id", "recipient", "last_error_code")
     list_filter = ("status", "message_kind")
+    readonly_fields = tuple(field.name for field in VillageDeliveryOutbox._meta.fields)
+
+    def has_add_permission(self, request):
+        return False
+
+    def has_change_permission(self, request, obj=None):
+        return False
+
+    def has_delete_permission(self, request, obj=None):
+        return False
 
 
 # ── Phase 3 admin registrations ────────────────────────────────────
@@ -245,3 +275,93 @@ class VillageTradeOfferAdmin(admin.ModelAdmin):
     search_fields = ("offer_id", "buyer_npc__agent_id", "seller_npc__agent_id")
     list_filter = ("status",)
     readonly_fields = ("offer_id", "created_at")
+
+
+@admin.register(NpcRelationship)
+class NpcRelationshipAdmin(admin.ModelAdmin):
+    list_display = ("from_npc", "to_npc", "affinity", "trust", "obligation", "conflict", "version", "updated_at")
+    search_fields = ("from_npc__agent_id", "to_npc__agent_id")
+    readonly_fields = tuple(field.name for field in NpcRelationship._meta.fields)
+
+    def has_add_permission(self, request):
+        return False
+
+    def has_change_permission(self, request, obj=None):
+        return False
+
+    def has_delete_permission(self, request, obj=None):
+        return False
+
+
+@admin.register(NpcRelationshipChange)
+class NpcRelationshipChangeAdmin(admin.ModelAdmin):
+    list_display = (
+        "change_id", "relationship", "category", "world_day", "requested_delta",
+        "applied_delta", "before_values", "after_values", "source_event", "created_at",
+    )
+    search_fields = ("change_id", "relationship__from_npc__agent_id", "relationship__to_npc__agent_id")
+    list_filter = ("category", "world_day")
+    readonly_fields = ("change_id", "relationship", "source_event", "category", "world_day", "requested_delta", "applied_delta", "before_values", "after_values", "created_at")
+
+    def has_add_permission(self, request):
+        return False
+
+    def has_change_permission(self, request, obj=None):
+        return False
+
+    def has_delete_permission(self, request, obj=None):
+        return False
+
+
+@admin.register(NpcCommitment)
+class NpcCommitmentAdmin(admin.ModelAdmin):
+    list_display = (
+        "commitment_id", "commitment_type", "promisor_npc", "beneficiary_npc",
+        "status", "target", "created_world_minute", "due_world_minute",
+        "settled_world_minute", "created_event", "settled_event",
+    )
+    search_fields = ("commitment_id", "promisor_npc__agent_id", "beneficiary_npc__agent_id")
+    list_filter = ("commitment_type", "status")
+    readonly_fields = tuple(field.name for field in NpcCommitment._meta.fields)
+
+    def has_add_permission(self, request):
+        return False
+
+    def has_change_permission(self, request, obj=None):
+        return False
+
+    def has_delete_permission(self, request, obj=None):
+        return False
+
+
+@admin.register(NpcStoryFactAccess)
+class NpcStoryFactAccessAdmin(admin.ModelAdmin):
+    list_display = ("npc", "fact_code", "unlocked_world_minute", "is_public", "unlocked_by_event")
+    search_fields = ("npc__agent_id", "fact_code")
+    list_filter = ("is_public",)
+    readonly_fields = tuple(field.name for field in NpcStoryFactAccess._meta.fields)
+
+    def has_add_permission(self, request):
+        return False
+
+    def has_change_permission(self, request, obj=None):
+        return False
+
+    def has_delete_permission(self, request, obj=None):
+        return False
+
+
+@admin.register(PlayerStoryFactAccess)
+class PlayerStoryFactAccessAdmin(admin.ModelAdmin):
+    list_display = ("player_id", "fact_code", "unlocked_world_minute", "unlocked_by_event")
+    search_fields = ("player_id", "fact_code")
+    readonly_fields = tuple(field.name for field in PlayerStoryFactAccess._meta.fields)
+
+    def has_add_permission(self, request):
+        return False
+
+    def has_change_permission(self, request, obj=None):
+        return False
+
+    def has_delete_permission(self, request, obj=None):
+        return False

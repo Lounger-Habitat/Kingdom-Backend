@@ -33,6 +33,7 @@ from .phase3_contract import (
     ActionName,
     ResultCode,
 )
+from .phase4_visibility import enqueue_event_deliveries
 
 
 # ── Response builders ────────────────────────────────────────────────────────
@@ -92,6 +93,9 @@ _DIRECT_TRADE_COMMANDS = frozenset({
     "UPDATE_STORE_PRICE",
     "DELIST_STORE_ITEM",
     "BUY_FROM_STORE",
+})
+_PARTICIPANT_TRADE_EVENTS = frozenset({
+    "PROPOSE_TRADE", "RESPOND_TRADE", "CANCEL_TRADE_OFFER",
 })
 
 
@@ -421,6 +425,10 @@ def commit_economy_action(payload: Dict[str, Any]) -> Dict[str, Any]:
             npc_obj = NpcDefinition.objects.get(agent_id=str(npc_id))
 
             # VillageWorldEvent
+            event_visibility = result.get(
+                "event_visibility",
+                "PARTICIPANTS" if command_name in _PARTICIPANT_TRADE_EVENTS else "PUBLIC",
+            )
             event = VillageWorldEvent.objects.create(
                 dedupe_key=f"economy:{request_id}",
                 event_type=f"ECONOMY_{command_name}",
@@ -428,13 +436,26 @@ def commit_economy_action(payload: Dict[str, Any]) -> Dict[str, Any]:
                 time_revision=int(payload.get("time_revision", world_minute)),
                 actor_npc=npc_obj,
                 participant_npc_ids=result.get("participant_npc_ids") or [str(npc_id)],
+                witness_npc_ids=result.get("witness_npc_ids") or [],
+                player_ids=result.get("player_ids") or [],
                 location_code=location,
                 command_id=uuid.UUID(str(payload["command_id"])),
                 request_id=request_id,
                 effects=result.get("effects", {}),
-                visibility="PUBLIC",
+                visibility=event_visibility,
                 public_data={"result_code": result.get("event_result_code", result["result_code"])},
             )
+            enqueue_event_deliveries(event)
+            if command_name == "RESPOND_TRADE" and result.get("data", {}).get("status") == "ACCEPTED":
+                commitment_id = result.get("data", {}).get("commitment_id")
+                if commitment_id:
+                    from .phase4_social import complete_delivery_commitment
+                    complete_delivery_commitment(
+                        commitment_id,
+                        event,
+                        world_minute=world_minute,
+                        emergency=bool(result.get("data", {}).get("emergency_supply")),
+                    )
             result["event"] = {
                 "event_id": str(event.event_id),
                 "event_sequence": event.event_sequence,

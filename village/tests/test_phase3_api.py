@@ -578,7 +578,6 @@ class Phase3EconomyApiTests(TestCase):
             "/api/village/life-actions/execute",
             "/api/village/commands/accept",
             f"/api/village/commands/{uuid.uuid4()}/start",
-            "/api/village/deliveries/pending",
             "/api/village/runtime/advance-needs",
         ):
             resp = client.post(path, {}, format="json")

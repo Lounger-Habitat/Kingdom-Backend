@@ -1,4 +1,6 @@
+import json
 import uuid
+from pathlib import Path
 
 from django.conf import settings
 from django.core.management.base import BaseCommand, CommandError
@@ -15,19 +17,25 @@ from inventory.models import (
 from items.models import Item
 from village.models import (
     NpcProfile,
+    NpcRelationship,
+    NpcStoryFactAccess,
     NpcRuntimeState,
     VillageAccount,
     VillageFarmPlot,
     VillageLocationDefinition,
     VillageRestaurantState,
     VillageSimulationConfig,
+    VillageActionDurationConfig,
 )
 from village.seed_data import (
+    FORMAL_NPC_AGENT_IDS,
     FARM_PLOT_SEEDS,
     INITIAL_SUPPLEMENTARY_GRANTS,
     INITIAL_TOOL_GRANTS,
     LOCATION_SEEDS,
     NPC_SEEDS,
+    NPC_RELATIONSHIP_SEEDS,
+    PHASE4_ACTION_DURATION_SEEDS,
     SIMULATION_DEFAULTS,
     TEST_NPC_ISOLATION,
     TOOL_ITEM_SEEDS,
@@ -73,6 +81,9 @@ class Command(BaseCommand):
             "tool_items": 0,
             "tool_grants": 0,
             "supplement_grants": 0,
+            "relationships": 0,
+            "story_fact_access": 0,
+            "phase4_action_configs": 0,
         }
 
         with transaction.atomic():
@@ -82,6 +93,7 @@ class Command(BaseCommand):
             self._seed_npcs(summary, reset_demo=reset_demo)
             self._seed_test_npc_isolation(summary)
             summary["test_npcs"] = NpcDefinition.objects.filter(is_test_only=True).count()
+            self._seed_phase4_social(summary)
             # Phase 3 seeds
             self._seed_tool_items(summary)
             self._seed_farm_plots(summary)
@@ -97,6 +109,51 @@ class Command(BaseCommand):
                 + ", ".join(f"{key}={value}" for key, value in summary.items())
             )
         )
+
+    def _seed_phase4_social(self, summary):
+        """Seed directed relationships, initial facts, and fixed social durations."""
+        npcs = {
+            npc.agent_id: npc
+            for npc in NpcDefinition.objects.filter(agent_id__in=FORMAL_NPC_AGENT_IDS)
+        }
+        keyed_values = {
+            (from_id, to_id): (affinity, trust, obligation, conflict)
+            for from_id, to_id, affinity, trust, obligation, conflict in NPC_RELATIONSHIP_SEEDS
+        }
+        for from_id in FORMAL_NPC_AGENT_IDS:
+            for to_id in FORMAL_NPC_AGENT_IDS:
+                if from_id == to_id or from_id not in npcs or to_id not in npcs:
+                    continue
+                values = keyed_values.get((from_id, to_id), (0, 0, 0, 0))
+                NpcRelationship.objects.get_or_create(
+                    from_npc=npcs[from_id],
+                    to_npc=npcs[to_id],
+                    defaults=dict(zip(("affinity", "trust", "obligation", "conflict"), values)),
+                )
+                summary["relationships"] += 1
+
+        facts_path = Path(__file__).resolve().parents[2] / "seed_definitions" / "story_facts_v1.json"
+        with facts_path.open(encoding="utf-8") as handle:
+            definition = json.load(handle)
+        world_minute = GlobalGameTimeState.get_instance().world_minute
+        for fact in definition.get("facts", []):
+            npc = npcs.get(str(fact.get("ownerAgentId", "")))
+            fact_code = str(fact.get("factCode", "")).strip()
+            if not definition.get("enabled") or npc is None or not fact_code:
+                continue
+            NpcStoryFactAccess.objects.get_or_create(
+                npc=npc,
+                fact_code=fact_code,
+                defaults={"unlocked_world_minute": world_minute, "is_public": False},
+            )
+            summary["story_fact_access"] += 1
+
+        for action_name, duration_minutes in PHASE4_ACTION_DURATION_SEEDS.items():
+            VillageActionDurationConfig.objects.get_or_create(
+                action_name=action_name,
+                defaults={"duration_minutes": duration_minutes},
+            )
+            summary["phase4_action_configs"] += 1
 
     def _seed_locations(self, summary):
         for code, display_name, center, location_type, capacity in LOCATION_SEEDS:

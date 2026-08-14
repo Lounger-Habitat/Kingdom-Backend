@@ -147,6 +147,11 @@ class VillageActionDurationConfig(models.Model):
         "DELIST_STORE_ITEM": ("阶段三", "下架商品", "经营 NPC 下架商品并取回库存；使用“时长（世界分钟）”。"),
         "BUY_FROM_STORE": ("阶段三", "商店购买", "其他 NPC 按上架记录价格购买商品；使用“时长（世界分钟）”。"),
         "INSPECT_STORE_INVENTORY": ("阶段三", "查看商店库存", "只读查询，不进入经济结算。"),
+        "JOINT_WORK": ("阶段四", "共同工作", "与另一名 NPC 在指定地点共同工作；固定使用 120 个世界分钟。"),
+        "MEETING": ("阶段四", "见面", "与另一名 NPC 在指定地点会面；固定使用 30 个世界分钟。"),
+        "CREATE_COMMITMENT": ("阶段四", "创建承诺", "创建结构化 NPC 承诺；使用 1 个世界分钟。"),
+        "CANCEL_COMMITMENT": ("阶段四", "取消承诺", "取消仍开放的 NPC 承诺；使用 1 个世界分钟。"),
+        "PERFORM_COMMITMENT": ("阶段四", "履行承诺", "履行短时承诺；共同工作和见面使用各自固定时长。"),
     }
     ACTION_CHOICES = [(action, f"{label}（{action}）") for action, (_, label, _) in ACTION_METADATA.items()]
     NAVIGATION_ACTIONS = frozenset({"MOVE", "GO_HOME"})
@@ -181,6 +186,11 @@ class VillageActionDurationConfig(models.Model):
         "DELIST_STORE_ITEM": 1,
         "BUY_FROM_STORE": 1,
         "INSPECT_STORE_INVENTORY": 5,
+        "JOINT_WORK": 120,
+        "MEETING": 30,
+        "CREATE_COMMITMENT": 1,
+        "CANCEL_COMMITMENT": 1,
+        "PERFORM_COMMITMENT": 1,
     }
     DEFAULT_NAVIGATION_TIMEOUT_SECONDS = {
         "MOVE": 180,
@@ -578,8 +588,9 @@ class VillageWorldEvent(models.Model):
 
     VISIBILITY_CHOICES = [
         ("PUBLIC", "公开"),
+        ("PARTICIPANTS", "参与者"),
         ("PRESENT", "在场者"),
-        ("PRIVATE", "私密"),
+        ("PLAYER_PRIVATE", "玩家私密"),
         ("SYSTEM", "系统"),
     ]
 
@@ -597,6 +608,8 @@ class VillageWorldEvent(models.Model):
         blank=True,
     )
     participant_npc_ids = models.JSONField("参与者NPC ID列表", default=list, blank=True)
+    witness_npc_ids = models.JSONField("见证者NPC ID列表", default=list, blank=True)
+    player_ids = models.JSONField("指定玩家ID列表", default=list, blank=True)
     location_code = models.CharField("地点码", max_length=64, blank=True, default="")
     point_code = models.CharField("点位码", max_length=64, blank=True, default="")
     command_id = models.UUIDField("命令ID", null=True, blank=True)
@@ -1162,6 +1175,13 @@ class VillageTradeOffer(models.Model):
         on_delete=models.CASCADE,
         related_name="trade_offers_as_seller",
     )
+    commitment = models.ForeignKey(
+        "NpcCommitment",
+        on_delete=models.SET_NULL,
+        related_name="trade_offers",
+        null=True,
+        blank=True,
+    )
     item_id = models.IntegerField("物品ID")
     amount = models.IntegerField("数量")
     gold_amount = models.IntegerField("金币总额")
@@ -1207,3 +1227,245 @@ class VillageTradeOffer(models.Model):
 
     def __str__(self):
         return f"{self.offer_id} {self.buyer_npc.agent_id}->{self.seller_npc.agent_id} item={self.item_id} {self.status}"
+
+
+class NpcRelationship(models.Model):
+    """Current directed relationship values between two formal NPCs."""
+
+    from_npc = models.ForeignKey(
+        "inventory.NpcDefinition",
+        on_delete=models.CASCADE,
+        related_name="relationships_from",
+    )
+    to_npc = models.ForeignKey(
+        "inventory.NpcDefinition",
+        on_delete=models.CASCADE,
+        related_name="relationships_to",
+    )
+    affinity = models.SmallIntegerField(default=0)
+    trust = models.SmallIntegerField(default=0)
+    obligation = models.SmallIntegerField(default=0)
+    conflict = models.PositiveSmallIntegerField(default=0)
+    version = models.BigIntegerField(default=0)
+    last_meaningful_event = models.ForeignKey(
+        VillageWorldEvent,
+        on_delete=models.SET_NULL,
+        related_name="last_relationships",
+        null=True,
+        blank=True,
+    )
+    updated_at = models.DateTimeField(auto_now=True)
+
+    class Meta:
+        verbose_name = "NPC 关系"
+        verbose_name_plural = "NPC 关系"
+        ordering = ["from_npc__agent_id", "to_npc__agent_id"]
+        constraints = [
+            models.UniqueConstraint(
+                fields=["from_npc", "to_npc"],
+                name="npc_relationship_pair_unique",
+            ),
+            models.CheckConstraint(
+                condition=~models.Q(from_npc=models.F("to_npc")),
+                name="npc_relationship_distinct_npcs",
+            ),
+            models.CheckConstraint(
+                condition=(
+                    models.Q(affinity__gte=-100, affinity__lte=100)
+                    & models.Q(trust__gte=-100, trust__lte=100)
+                    & models.Q(obligation__gte=-100, obligation__lte=100)
+                    & models.Q(conflict__gte=0, conflict__lte=100)
+                    & models.Q(version__gte=0)
+                ),
+                name="npc_relationship_values_in_range",
+            ),
+        ]
+
+    def __str__(self):
+        return f"{self.from_npc.agent_id}->{self.to_npc.agent_id}"
+
+
+class NpcRelationshipChange(models.Model):
+    """Idempotent audit record for one applied relationship change."""
+
+    CATEGORY_CHOICES = [
+        ("DELIVERY", "交货"),
+        ("EMERGENCY_SUPPLY", "紧急供货"),
+        ("BREACH", "违约"),
+        ("JOINT_WORK", "共同工作"),
+        ("RESCUE_GIFT", "救急赠予"),
+    ]
+
+    change_id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
+    relationship = models.ForeignKey(
+        NpcRelationship,
+        on_delete=models.CASCADE,
+        related_name="changes",
+    )
+    source_event = models.ForeignKey(
+        VillageWorldEvent,
+        on_delete=models.CASCADE,
+        related_name="relationship_changes",
+    )
+    category = models.CharField(max_length=24, choices=CATEGORY_CHOICES)
+    world_day = models.BigIntegerField()
+    requested_delta = models.JSONField(default=dict)
+    applied_delta = models.JSONField(default=dict)
+    before_values = models.JSONField(default=dict)
+    after_values = models.JSONField(default=dict)
+    created_at = models.DateTimeField(auto_now_add=True)
+
+    class Meta:
+        verbose_name = "NPC 关系变更"
+        verbose_name_plural = "NPC 关系变更"
+        indexes = [
+            models.Index(
+                fields=["relationship", "world_day", "category"],
+                name="npc_rel_change_day_idx",
+            ),
+        ]
+        constraints = [
+            models.UniqueConstraint(
+                fields=["relationship", "source_event"],
+                name="npc_rel_change_event_unique",
+            ),
+            models.CheckConstraint(
+                condition=models.Q(world_day__gte=0),
+                name="npc_rel_change_day_non_negative",
+            ),
+        ]
+
+    def __str__(self):
+        return f"{self.relationship} {self.category} day={self.world_day}"
+
+
+class NpcCommitment(models.Model):
+    """One shared model for all five structured NPC commitment types."""
+
+    COMMITMENT_TYPE_CHOICES = [
+        ("DELIVERY", "交货"),
+        ("REPAYMENT", "还款"),
+        ("DONATION", "捐赠"),
+        ("JOINT_WORK", "共同工作"),
+        ("MEETING", "见面"),
+    ]
+    STATUS_CHOICES = [
+        ("OPEN", "开放"),
+        ("COMPLETED", "已完成"),
+        ("BREACHED", "已违约"),
+        ("CANCELLED", "已取消"),
+    ]
+
+    commitment_id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
+    commitment_type = models.CharField(max_length=16, choices=COMMITMENT_TYPE_CHOICES)
+    promisor_npc = models.ForeignKey(
+        "inventory.NpcDefinition",
+        on_delete=models.CASCADE,
+        related_name="commitments_as_promisor",
+    )
+    beneficiary_npc = models.ForeignKey(
+        "inventory.NpcDefinition",
+        on_delete=models.CASCADE,
+        related_name="commitments_as_beneficiary",
+    )
+    target = models.JSONField(default=dict)
+    due_world_minute = models.BigIntegerField()
+    status = models.CharField(max_length=16, choices=STATUS_CHOICES, default="OPEN")
+    source_request_id = models.UUIDField(unique=True)
+    created_event = models.ForeignKey(
+        VillageWorldEvent,
+        on_delete=models.PROTECT,
+        related_name="created_commitments",
+    )
+    settled_event = models.ForeignKey(
+        VillageWorldEvent,
+        on_delete=models.SET_NULL,
+        related_name="settled_commitments",
+        null=True,
+        blank=True,
+    )
+    created_world_minute = models.BigIntegerField()
+    settled_world_minute = models.BigIntegerField(null=True, blank=True)
+    created_at = models.DateTimeField(auto_now_add=True)
+    updated_at = models.DateTimeField(auto_now=True)
+
+    class Meta:
+        verbose_name = "NPC 承诺"
+        verbose_name_plural = "NPC 承诺"
+        ordering = ["-created_at"]
+        constraints = [
+            models.CheckConstraint(
+                condition=~models.Q(promisor_npc=models.F("beneficiary_npc")),
+                name="npc_commitment_distinct_npcs",
+            ),
+            models.CheckConstraint(
+                condition=models.Q(due_world_minute__gte=0) & models.Q(created_world_minute__gte=0),
+                name="npc_commitment_minutes_non_negative",
+            ),
+        ]
+
+    def __str__(self):
+        return f"{self.commitment_id} {self.commitment_type} {self.status}"
+
+
+class NpcStoryFactAccess(models.Model):
+    """Structured story facts currently unlocked for one NPC."""
+
+    npc = models.ForeignKey(
+        "inventory.NpcDefinition",
+        on_delete=models.CASCADE,
+        related_name="story_fact_access",
+    )
+    fact_code = models.CharField(max_length=64)
+    unlocked_by_event = models.ForeignKey(
+        VillageWorldEvent,
+        on_delete=models.SET_NULL,
+        related_name="npc_fact_unlocks",
+        null=True,
+        blank=True,
+    )
+    unlocked_world_minute = models.BigIntegerField()
+    is_public = models.BooleanField(default=False)
+
+    class Meta:
+        verbose_name = "NPC 剧情事实权限"
+        verbose_name_plural = "NPC 剧情事实权限"
+        constraints = [
+            models.UniqueConstraint(
+                fields=["npc", "fact_code"],
+                name="npc_story_fact_access_unique",
+            ),
+        ]
+        ordering = ["npc__agent_id", "fact_code"]
+
+    def __str__(self):
+        return f"{self.npc.agent_id}:{self.fact_code}"
+
+
+class PlayerStoryFactAccess(models.Model):
+    """Private structured story facts unlocked for one authenticated player."""
+
+    player_id = models.CharField(max_length=100)
+    fact_code = models.CharField(max_length=64)
+    unlocked_by_event = models.ForeignKey(
+        VillageWorldEvent,
+        on_delete=models.SET_NULL,
+        related_name="player_fact_unlocks",
+        null=True,
+        blank=True,
+    )
+    unlocked_world_minute = models.BigIntegerField()
+
+    class Meta:
+        verbose_name = "玩家剧情事实权限"
+        verbose_name_plural = "玩家剧情事实权限"
+        constraints = [
+            models.UniqueConstraint(
+                fields=["player_id", "fact_code"],
+                name="player_story_fact_access_unique",
+            ),
+        ]
+        ordering = ["player_id", "fact_code"]
+
+    def __str__(self):
+        return f"{self.player_id}:{self.fact_code}"

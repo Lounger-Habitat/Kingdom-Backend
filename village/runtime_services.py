@@ -363,6 +363,7 @@ class BootstrapService:
                 "village_hub_command_adapter_enabled": config.village_hub_command_adapter_enabled if config else False,
                 "village_needs_enabled": config.village_needs_enabled if config else False,
                 "village_economy_enabled": config.village_economy_enabled if config else False,
+                "village_social_enabled": config.village_social_enabled if config else False,
                 # action_durations is the unified Phase 1/2/3 timer map.
                 "action_durations": action_durations,
                 "navigation_action_timeout_seconds": navigation_timeouts,
@@ -742,8 +743,10 @@ class CommandService:
         if phase2_validation:
             return False, phase2_validation, None
         # Preserve protocol validation of the caller-provided value first, then
-        # make the accepted command use the Backend-administered duration.
-        CommandService.apply_admin_duration(action_name, content)
+        # make normal commands use the Backend-administered duration.  Fast
+        # integration intentionally keeps its caller duration for harnesses.
+        if not fast_integration:
+            CommandService.apply_admin_duration(action_name, content)
         if action_name in CommandService.PHASE2_ACTIONS and not fast_integration:
             if not VillageSimulationConfig.objects.filter(
                 config_key="default", village_needs_enabled=True

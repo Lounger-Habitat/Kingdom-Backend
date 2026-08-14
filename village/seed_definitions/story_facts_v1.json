@@ -1,6 +1,6 @@
 {
   "schemaVersion": 1,
-  "enabled": false,
+  "enabled": true,
   "facts": [
     {"factCode": "BRIDGE_FOUNDATION_WARNING", "ownerAgentId": "10011"},
     {"factCode": "FOREST_OLD_ROUTE", "ownerAgentId": "10012"},

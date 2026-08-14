@@ -55,6 +55,7 @@ from inventory.models import NpcDefinition, NpcGlobalInventory, NpcGlobalInvento
 
 from .models import (
     EconomicLedgerEntry,
+    NpcCommitment,
     NpcRuntimeState,
     NpcTradeDelivery,
     NpcTradeOrder,
@@ -316,6 +317,7 @@ def _do_propose_trade(
     conversation_id = params.get("conversation_id")
     expected_seller_asset_version = params.get("expected_seller_asset_version")
     expires_world_minute = params.get("expires_world_minute")
+    commitment_id = _parse_uuid(params.get("commitment_id"))
 
     if target_npc_id is None or str(target_npc_id) == str(npc_id):
         return _fail(ResultCode.TRADE_TARGET_NOT_FOUND)
@@ -346,9 +348,33 @@ def _do_propose_trade(
     if buyer_rt.current_location_code != seller_rt.current_location_code:
         return _fail(ResultCode.TRADE_NOT_COLOCATED)
 
+    commitment = None
+    if commitment_id is not None:
+        from .phase4_social import social_enabled
+        if not social_enabled():
+            return _fail("VILLAGE_SOCIAL_DISABLED")
+        commitment = NpcCommitment.objects.select_for_update().filter(
+            commitment_id=commitment_id,
+            commitment_type="DELIVERY",
+            status="OPEN",
+            promisor_npc=seller,
+            beneficiary_npc=buyer,
+        ).first()
+        if commitment is None:
+            return _fail("COMMITMENT_NOT_FOUND")
+        target = commitment.target or {}
+        if (
+            target.get("item_id") != item_id
+            or target.get("amount") != amount
+            or target.get("gold_amount") != gold_amount
+            or commitment.due_world_minute < world_minute
+        ):
+            return _fail("COMMITMENT_TARGET_MISMATCH")
+
     offer = VillageTradeOffer.objects.create(
         buyer_npc=buyer,
         seller_npc=seller,
+        commitment=commitment,
         item_id=item_id,
         amount=amount,
         gold_amount=gold_amount,
@@ -370,6 +396,7 @@ def _do_propose_trade(
         "amount": amount,
         "gold_amount": gold_amount,
         "expires_world_minute": expires_world_minute,
+        "commitment_id": str(commitment.commitment_id) if commitment else None,
     }
 
     return _ok(
@@ -410,6 +437,31 @@ def _do_respond_trade(
         if offer.status != TradeOfferStatus.PENDING.value:
             return _fail(ResultCode.TRADE_OFFER_ALREADY_RESOLVED)
 
+        # DELIVERY commits use the same lock order as the asset settlement:
+        # offer -> commitment -> inventories.
+        if offer.commitment_id:
+            from .phase4_social import social_enabled
+            if not social_enabled():
+                return _fail("VILLAGE_SOCIAL_DISABLED")
+            commitment = NpcCommitment.objects.select_for_update().filter(
+                pk=offer.commitment_id,
+                status="OPEN",
+                commitment_type="DELIVERY",
+                promisor_npc=offer.seller_npc,
+                beneficiary_npc=offer.buyer_npc,
+            ).first()
+            if commitment is None:
+                return _fail("COMMITMENT_ALREADY_RESOLVED")
+            if world_minute >= commitment.due_world_minute:
+                return _fail("COMMITMENT_EXPIRED")
+            target = commitment.target or {}
+            if (
+                target.get("item_id") != offer.item_id
+                or target.get("amount") != offer.amount
+                or target.get("gold_amount") != offer.gold_amount
+            ):
+                return _fail("COMMITMENT_TARGET_MISMATCH")
+
         if decision == "REJECT":
             offer.status = TradeOfferStatus.REJECTED.value
             offer.resolved_request_id = request_id
@@ -418,12 +470,6 @@ def _do_respond_trade(
                 "status", "resolved_request_id", "resolved_world_minute", "updated_at",
             ])
             return _ok(
-                data={
-                    "offer_id": str(offer.offer_id),
-                    "buyer_npc_id": str(offer.buyer_npc.agent_id),
-                    "decision": "REJECT",
-                    "status": TradeOfferStatus.REJECTED.value,
-                },
                 effects={
                     "offer_id": str(offer.offer_id),
                     "decision": "REJECT",
@@ -436,6 +482,13 @@ def _do_respond_trade(
                 participant_npc_ids=[
                     str(offer.buyer_npc.agent_id), str(offer.seller_npc.agent_id),
                 ],
+                data={
+                    "offer_id": str(offer.offer_id),
+                    "buyer_npc_id": str(offer.buyer_npc.agent_id),
+                    "decision": "REJECT",
+                    "status": TradeOfferStatus.REJECTED.value,
+                    "commitment_id": str(offer.commitment_id) if offer.commitment_id else None,
+                },
             )
 
         # ACCEPT
@@ -474,6 +527,20 @@ def _do_respond_trade(
         item_id = offer.item_id
         amount = offer.amount
         gold_amount = offer.gold_amount
+
+        emergency_supply = False
+        if offer.commitment_id and item_id in SAFE_STOCKS:
+            buyer_available = sum(
+                get_available_slot_amount(slot)
+                for slot in NpcGlobalInventorySlot.objects.select_for_update().filter(
+                    bag=buyer_inv, item_id=item_id, item_amount__gt=0
+                )
+                if slot.expires_world_minute is None or slot.expires_world_minute > world_minute
+            )
+            emergency_supply = (
+                buyer_available < SAFE_STOCKS[item_id]
+                and gold_amount <= BASE_PRICES[item_id] * amount
+            )
 
         # Re-validate resources under lock.  All checks run before any mutation:
         # buyer money first, then seller items (the consume helper also validates
@@ -531,6 +598,8 @@ def _do_respond_trade(
             "item_id": item_id,
             "amount": amount,
             "gold_amount": gold_amount,
+            "commitment_id": str(offer.commitment_id) if offer.commitment_id else None,
+            "emergency_supply": emergency_supply,
         },
         participant_npc_ids=[buyer_id, seller_id],
     )
