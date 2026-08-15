@@ -3,6 +3,7 @@ import uuid
 from django.test import TestCase
 from rest_framework.test import APIClient
 
+from game_time.models import GlobalGameTimeState
 from inventory.models import NpcDefinition
 from village.models import (
     NpcCommandState,
@@ -15,6 +16,10 @@ from village.trusted_persistence import save_result, save_snapshots
 
 class UnityAuthorityPersistenceTests(TestCase):
     def setUp(self):
+        time_state = GlobalGameTimeState.get_instance()
+        time_state.world_minute = 19_000
+        time_state.time_revision = 6
+        time_state.save()
         self.npc = NpcDefinition.objects.create(
             agent_id="10011", name="bill", is_test_only=False
         )
@@ -22,7 +27,7 @@ class UnityAuthorityPersistenceTests(TestCase):
             npc=self.npc,
             current_location_code="OLD_LOCATION",
             current_point_code="OLD_LOCATION",
-            state_version=99,
+            state_version=2,
         )
 
     def test_snapshot_is_last_write_wins_without_cas(self):

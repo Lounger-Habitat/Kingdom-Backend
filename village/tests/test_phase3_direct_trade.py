@@ -29,6 +29,8 @@ from village.models import (
     VillageAccount,
     VillageActionReceipt,
     VillageSimulationConfig,
+    VillageStoryArc,
+    VillageStoryFact,
     VillageStore,
     VillageStoreAccount,
     VillageStoreInventorySlot,
@@ -956,6 +958,39 @@ class IdempotencyAndVersionTest(DirectTradeTestBase):
         self.public_fund.refresh_from_db()
         self.assertEqual(self.bill_inv.asset_version, bill_ver + 1)
         self.assertEqual(self.public_fund.asset_version, fund_ver + 1)
+
+
+class RationLimitTradeTest(DirectTradeTestBase):
+    def test_story_ration_limit_rejects_second_buy(self):
+        cfg = VillageSimulationConfig.objects.get(config_key="default")
+        cfg.village_story_enabled = True
+        cfg.save(update_fields=["village_story_enabled"])
+        arc = VillageStoryArc.objects.create(
+            arc_code="BROKEN_TRADE_ROUTE_V1", current_phase="EXECUTION",
+            current_plan="RATION_AND_WAIT", start_day=0, phase_entered_day=0,
+        )
+        VillageStoryFact.objects.create(
+            arc=arc, store_limits_enabled=True, ration_daily_limits={"1030": 1},
+        )
+        self._set_location(10015, "GENERAL_STORE")
+        self._give_item(self.nora_inv, 1030, 20)
+        self._list(10015, "GENERAL_STORE", 1030, 20, PriceMode.ORIGINAL)
+        listing = VillageStoreListing.objects.get(store=self.store, item_id=1030)
+        self._set_location(10011, "GENERAL_STORE")
+
+        first = self._buy(10011, listing.listing_id, 1)
+        self.assertEqual(first["result_code"], ResultCode.OK)
+        self.bill_inv.refresh_from_db()
+        second = self._buy(
+            10011, listing.listing_id, 1,
+            exp_store=self.store.inventory_version,
+            exp_buyer=self.bill_inv.asset_version,
+        )
+        self.assertEqual(second["result_code"], "STORY_RATION_LIMIT_REACHED")
+        listing.refresh_from_db()
+        self.assertEqual(
+            sum(slot.item_amount for slot in listing.inventory_slots.all()), 19,
+        )
 
 
 class AuditAndLedgerTest(DirectTradeTestBase):

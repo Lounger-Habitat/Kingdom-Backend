@@ -9,6 +9,7 @@ from .phase3_contract import (
     StoreOperationalStatus,
     TradeOfferStatus,
 )
+from .phase5_contract import StoryOutcome, StoryPhase, StoryPlan
 
 
 class VillageLocationDefinition(models.Model):
@@ -105,6 +106,13 @@ class VillageSimulationConfig(models.Model):
     village_offline_catchup_enabled = models.BooleanField(default=False)
     village_debug_overlay_enabled = models.BooleanField(default=False)
     debug_logs_enabled = models.BooleanField(default=False)
+    story_fixed_seed = models.CharField(max_length=128, default="village-story-v1")
+    story_repair_fund_target = models.PositiveIntegerField(default=500)
+    story_repair_wood_target = models.PositiveIntegerField(default=10)
+    story_repair_metal_target = models.PositiveIntegerField(default=4)
+    story_repair_labor_target = models.PositiveIntegerField(default=24)
+    story_public_trust_minimum = models.SmallIntegerField(default=20)
+    story_latest_day = models.PositiveIntegerField(default=25)
     updated_at = models.DateTimeField(auto_now=True)
 
     class Meta:
@@ -311,6 +319,7 @@ class NpcRuntimeState(models.Model):
     social_remainder = models.IntegerField("社交余数", default=0)
     stress_remainder = models.IntegerField("压力余数", default=0)
     needs_world_minute = models.BigIntegerField("需求推进世界分钟", default=0)
+    away_until_world_minute = models.BigIntegerField("撤离返回世界分钟", null=True, blank=True)
     updated_at = models.DateTimeField("更新时间", auto_now=True)
 
     class Meta:
@@ -1469,3 +1478,125 @@ class PlayerStoryFactAccess(models.Model):
 
     def __str__(self):
         return f"{self.player_id}:{self.fact_code}"
+
+
+# ============================================================================
+# Phase 5: Broken Trade Route story state
+# ============================================================================
+
+
+class VillageStoryArc(models.Model):
+    PHASE_CHOICES = [(value.value, value.value) for value in StoryPhase]
+    PLAN_CHOICES = [(value.value, value.value) for value in StoryPlan]
+    OUTCOME_CHOICES = [(value.value, value.value) for value in StoryOutcome]
+
+    arc_code = models.CharField(max_length=64, primary_key=True)
+    current_phase = models.CharField(max_length=32, choices=PHASE_CHOICES)
+    current_plan = models.CharField(max_length=32, choices=PLAN_CHOICES, blank=True, default="")
+    start_day = models.PositiveIntegerField(default=0)
+    phase_entered_day = models.PositiveIntegerField(default=0)
+    story_version = models.PositiveBigIntegerField(default=0)
+    is_completed = models.BooleanField(default=False)
+    outcome = models.CharField(max_length=32, choices=OUTCOME_CHOICES, blank=True, default="")
+    last_crisis_day = models.IntegerField(null=True, blank=True)
+    ration_until_day = models.IntegerField(null=True, blank=True)
+    review_count = models.PositiveIntegerField(default=0)
+    updated_at = models.DateTimeField(auto_now=True)
+
+
+class VillageStoryFact(models.Model):
+    arc = models.OneToOneField(VillageStoryArc, on_delete=models.CASCADE, related_name="facts")
+    bridge_condition = models.CharField(max_length=24, default="BROKEN")
+    tool_stock_coverage_days = models.DecimalField(max_digits=8, decimal_places=2, default=0)
+    food_stock_coverage_days = models.DecimalField(max_digits=8, decimal_places=2, default=0)
+    repair_fund = models.PositiveIntegerField(default=0)
+    repair_wood = models.PositiveIntegerField(default=0)
+    repair_metal = models.PositiveIntegerField(default=0)
+    repair_labor_hours = models.PositiveIntegerField(default=0)
+    public_trust = models.SmallIntegerField(default=50)
+    forest_route_known = models.BooleanField(default=False)
+    forest_route_scouted = models.PositiveIntegerField(default=0)
+    forest_route_supply = models.PositiveIntegerField(default=0)
+    emergency_caravan_contacted = models.BooleanField(default=False)
+    emergency_caravan_succeeded = models.BooleanField(default=False)
+    bill_warning_revealed = models.BooleanField(default=False)
+    mark_budget_delay_revealed = models.BooleanField(default=False)
+    ration_rules_published = models.BooleanField(default=False)
+    store_limits_enabled = models.BooleanField(default=False)
+    ration_daily_limits = models.JSONField(default=dict, blank=True)
+    community_meals = models.PositiveIntegerField(default=0)
+    last_progress_day = models.IntegerField(default=0)
+    stagnant_days = models.PositiveIntegerField(default=0)
+    updated_at = models.DateTimeField(auto_now=True)
+
+
+class VillageStoryMeeting(models.Model):
+    STATUS_CHOICES = [("OPEN", "开放"), ("SETTLED", "已结算"), ("FAILED", "已失败")]
+    meeting_id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
+    arc = models.ForeignKey(VillageStoryArc, on_delete=models.CASCADE, related_name="meetings")
+    meeting_type = models.CharField(max_length=32, default="FIRST_COUNCIL")
+    opened_day = models.PositiveIntegerField()
+    closes_day = models.PositiveIntegerField()
+    candidate_plans = models.JSONField(default=list)
+    retry_count = models.PositiveSmallIntegerField(default=0)
+    status = models.CharField(max_length=16, choices=STATUS_CHOICES, default="OPEN")
+    selected_plan = models.CharField(max_length=32, blank=True, default="")
+    settled_day = models.IntegerField(null=True, blank=True)
+    attendance_count = models.PositiveSmallIntegerField(default=0)
+    failure_code = models.CharField(max_length=64, blank=True, default="")
+    created_at = models.DateTimeField(auto_now_add=True)
+    updated_at = models.DateTimeField(auto_now=True)
+
+    class Meta:
+        constraints = [models.UniqueConstraint(
+            fields=["arc", "meeting_type", "opened_day"],
+            name="village_story_meeting_day_unique",
+        )]
+
+
+class VillageStoryVote(models.Model):
+    VOTER_CHOICES = [("NPC", "NPC"), ("PLAYER", "PLAYER")]
+    vote_id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
+    meeting = models.ForeignKey(VillageStoryMeeting, on_delete=models.CASCADE, related_name="votes")
+    voter_type = models.CharField(max_length=16, choices=VOTER_CHOICES)
+    voter_id = models.CharField(max_length=100)
+    plan_code = models.CharField(max_length=32)
+    player_support = models.BooleanField(default=False)
+    request_id = models.UUIDField(unique=True)
+    payload_hash = models.CharField(max_length=64)
+    submitted_world_minute = models.BigIntegerField()
+    is_valid = models.BooleanField(default=True)
+    updated_at = models.DateTimeField(auto_now=True)
+
+    class Meta:
+        constraints = [models.UniqueConstraint(
+            fields=["meeting", "voter_type", "voter_id"],
+            name="village_story_vote_latest_unique",
+        )]
+
+
+class VillageStoryTransitionReceipt(models.Model):
+    request_id = models.UUIDField(primary_key=True, editable=False)
+    arc = models.ForeignKey(VillageStoryArc, on_delete=models.CASCADE, related_name="transition_receipts")
+    from_phase = models.CharField(max_length=32)
+    to_phase = models.CharField(max_length=32)
+    selected_plan = models.CharField(max_length=32, blank=True, default="")
+    source_day = models.PositiveIntegerField()
+    world_event = models.ForeignKey(VillageWorldEvent, on_delete=models.PROTECT, related_name="story_transitions")
+    applied = models.BooleanField(default=True)
+    response_data = models.JSONField(default=dict, blank=True)
+    created_at = models.DateTimeField(auto_now_add=True)
+
+
+class VillageRouteAttempt(models.Model):
+    route_attempt_id = models.UUIDField(primary_key=True, editable=False)
+    arc = models.ForeignKey(VillageStoryArc, on_delete=models.CASCADE, related_name="route_attempts")
+    request_id = models.UUIDField(unique=True)
+    frozen_input = models.JSONField(default=dict)
+    seed = models.CharField(max_length=128)
+    result_code = models.CharField(max_length=32)
+    cost = models.JSONField(default=dict, blank=True)
+    injury = models.JSONField(default=dict, blank=True)
+    progress = models.JSONField(default=dict, blank=True)
+    created_world_minute = models.BigIntegerField()
+    created_at = models.DateTimeField(auto_now_add=True)

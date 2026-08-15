@@ -140,6 +140,10 @@ class TimeService:
     ) -> Tuple[bool, str, Optional[VillageActionReceipt]]:
         """推进世界时间（CAS）。
 
+        .. deprecated::
+            保留仅供旧单元测试使用，不挂生产路由。生产时间写入统一走
+            :meth:`receive_time`（Unity 权威，单调被动接收）。
+
         Returns:
             (success, result_code, receipt)
         """
@@ -204,6 +208,36 @@ class TimeService:
         )
 
         return True, ResultCode.COMMAND_ACCEPTED, receipt
+
+    @staticmethod
+    @transaction.atomic
+    def receive_time(
+        world_minute: int,
+        time_revision: int,
+    ) -> Tuple[bool, str, Optional[GlobalGameTimeState]]:
+        """单调被动接收 Unity 权威时间（生产唯一时间写入入口）。
+
+        - world_minute 前进：要求 time_revision > 当前 revision，保存并做日历投影；
+        - world_minute == 当前：幂等成功，不修改 revision；
+        - world_minute 回退：返回 WORLD_TIME_REGRESSION，不修改全局时间。
+
+        Returns:
+            (success, result_code, state)
+        """
+        try:
+            state = GlobalGameTimeState.objects.select_for_update().get(pk=1)
+        except GlobalGameTimeState.DoesNotExist:
+            return False, ResultCode.BACKEND_UNAVAILABLE, None
+
+        if world_minute < state.world_minute:
+            return False, ResultCode.WORLD_TIME_REGRESSION, state
+        if world_minute > state.world_minute:
+            if time_revision <= state.time_revision:
+                return False, ResultCode.STALE_TIME_REVISION, state
+            state.apply_world_minute(world_minute)
+            state.time_revision = time_revision
+            state.save()
+        return True, ResultCode.COMMAND_ACCEPTED, state
 
 
 # ============================================================================
@@ -364,6 +398,7 @@ class BootstrapService:
                 "village_needs_enabled": config.village_needs_enabled if config else False,
                 "village_economy_enabled": config.village_economy_enabled if config else False,
                 "village_social_enabled": config.village_social_enabled if config else False,
+                "village_story_enabled": config.village_story_enabled if config else False,
                 # action_durations is the unified Phase 1/2/3 timer map.
                 "action_durations": action_durations,
                 "navigation_action_timeout_seconds": navigation_timeouts,
@@ -569,7 +604,8 @@ class CheckpointService:
 class CommandService:
     """命令生命周期服务。"""
 
-    ALLOWED_ACTIONS = {"MOVE", "WAIT", "GO_HOME", "EAT", "REST", "SLEEP", "SOCIALIZE", "WORK_PLACEHOLDER"}
+    ALLOWED_ACTIONS = {"MOVE", "WAIT", "GO_HOME", "EAT", "REST", "SLEEP", "SOCIALIZE", "WORK_PLACEHOLDER", "STORY_VOTE", "STORY_ACT"}
+    STORY_ACTIONS = {"STORY_VOTE", "STORY_ACT"}
     MAX_QUEUE_SIZE = 10
     MAX_CLOCK_SKEW_MS = 5 * 60 * 1000
     PHASE2_ACTIONS = {"EAT", "REST", "SLEEP", "SOCIALIZE", "WORK_PLACEHOLDER"}
@@ -784,6 +820,22 @@ class CommandService:
                 return True, ResultCode.COMMAND_REPLAYED, existing
             else:
                 return False, ResultCode.REQUEST_ID_CONFLICT, None
+
+        if action_name in CommandService.STORY_ACTIONS:
+            from .phase5_story import dispatch_story_command
+            story_payload = dict(content)
+            story_payload["command"] = action_name
+            story_payload["npc_id"] = str(sender)
+            story_payload["current_location_code"] = (
+                NpcRuntimeState.objects.filter(npc=npc)
+                .values_list("current_location_code", flat=True)
+                .first()
+                or ""
+            )
+            story_result = dispatch_story_command(story_payload)
+            if story_result.get("result_code") != "OK":
+                return False, story_result.get("result_code", ResultCode.ACTION_NOT_ALLOWED), None
+            return True, story_result.get("result_code", ResultCode.COMMAND_ACCEPTED), None
 
         # 计算 payload hash
         payload_sha256 = CommandService.compute_payload_sha256(content)

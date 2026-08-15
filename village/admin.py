@@ -31,6 +31,12 @@ from .models import (
     VillageTradeOffer,
     VillageWorldEvent,
     PlayerStoryFactAccess,
+    VillageStoryArc,
+    VillageStoryFact,
+    VillageStoryMeeting,
+    VillageStoryVote,
+    VillageStoryTransitionReceipt,
+    VillageRouteAttempt,
 )
 
 
@@ -50,7 +56,10 @@ class VillageLocationDefinitionAdmin(admin.ModelAdmin):
 
 @admin.register(VillageSimulationConfig)
 class VillageSimulationConfigAdmin(admin.ModelAdmin):
-    list_display = ("config_key", "village_simulation_enabled", "updated_at")
+    list_display = (
+        "config_key", "village_simulation_enabled", "village_hub_command_adapter_enabled",
+        "village_economy_enabled", "village_social_enabled", "village_story_enabled", "updated_at",
+    )
 
     def has_add_permission(self, request):
         return not VillageSimulationConfig.objects.exists()
@@ -365,3 +374,77 @@ class PlayerStoryFactAccessAdmin(admin.ModelAdmin):
 
     def has_delete_permission(self, request, obj=None):
         return False
+
+
+class StoryReadOnlyAdmin(admin.ModelAdmin):
+    def get_readonly_fields(self, request, obj=None):
+        return tuple(field.name for field in self.model._meta.fields)
+
+    def has_add_permission(self, request):
+        return False
+
+    def has_change_permission(self, request, obj=None):
+        return False
+
+    def has_delete_permission(self, request, obj=None):
+        return False
+
+
+@admin.register(VillageStoryArc)
+class VillageStoryArcAdmin(StoryReadOnlyAdmin):
+    list_display = (
+        "arc_code", "is_completed", "current_phase", "current_plan", "outcome",
+        "story_version", "phase_entered_day", "review_count", "updated_at",
+    )
+    list_filter = ("is_completed", "current_phase", "current_plan", "outcome")
+    search_fields = ("arc_code",)
+
+
+@admin.register(VillageStoryFact)
+class VillageStoryFactAdmin(StoryReadOnlyAdmin):
+    list_display = (
+        "arc", "bridge_condition", "repair_fund", "repair_wood", "repair_metal",
+        "repair_labor_hours", "public_trust", "food_stock_coverage_days",
+        "tool_stock_coverage_days", "last_progress_day", "updated_at",
+    )
+    list_filter = ("bridge_condition", "forest_route_known", "ration_rules_published", "store_limits_enabled")
+    search_fields = ("arc__arc_code",)
+
+
+@admin.register(VillageStoryMeeting)
+class VillageStoryMeetingAdmin(StoryReadOnlyAdmin):
+    list_display = (
+        "meeting_id", "arc", "meeting_type", "status", "selected_plan",
+        "attendance_count", "retry_count", "opened_day", "closes_day", "updated_at",
+    )
+    list_filter = ("status", "meeting_type", "selected_plan")
+    search_fields = ("meeting_id", "arc__arc_code")
+
+
+@admin.register(VillageStoryVote)
+class VillageStoryVoteAdmin(StoryReadOnlyAdmin):
+    list_display = (
+        "vote_id", "meeting", "voter_type", "voter_id", "plan_code",
+        "player_support", "is_valid", "submitted_world_minute",
+    )
+    list_filter = ("voter_type", "plan_code", "player_support", "is_valid")
+    search_fields = ("vote_id", "meeting__meeting_id", "voter_id")
+
+
+@admin.register(VillageStoryTransitionReceipt)
+class VillageStoryTransitionReceiptAdmin(StoryReadOnlyAdmin):
+    list_display = (
+        "request_id", "arc", "from_phase", "to_phase", "selected_plan",
+        "source_day", "applied", "created_at",
+    )
+    list_filter = ("from_phase", "to_phase", "selected_plan", "applied")
+    search_fields = ("request_id", "arc__arc_code")
+
+
+@admin.register(VillageRouteAttempt)
+class VillageRouteAttemptAdmin(StoryReadOnlyAdmin):
+    list_display = (
+        "route_attempt_id", "arc", "result_code", "created_world_minute", "created_at",
+    )
+    list_filter = ("result_code",)
+    search_fields = ("route_attempt_id", "request_id", "arc__arc_code")

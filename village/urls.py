@@ -3,6 +3,7 @@ from django.urls import path
 from . import views
 from . import phase3_views
 from . import phase4_views
+from . import phase5_views
 
 
 urlpatterns = [
@@ -40,4 +41,9 @@ urlpatterns = [
         phase3_views.economy_store_inventory,
         name="village-economy-store-inventory",
     ),
+    path("api/village/story/snapshot", phase5_views.story_snapshot, name="village-story-snapshot"),
+    path("api/village/story/vote", phase5_views.story_vote, name="village-story-vote"),
+    path("api/village/story/actions/complete", phase5_views.story_action_complete, name="village-story-action-complete"),
+    path("api/village/story/command", phase5_views.story_command, name="village-story-command"),
+    path("api/village/story/meeting/<uuid:meeting_id>/settle", phase5_views.story_meeting_settle, name="village-story-meeting-settle"),
 ]

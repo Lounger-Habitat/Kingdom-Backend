@@ -108,9 +108,8 @@ SIMULATION_DEFAULTS = {
     "day_start_minute": 360,
     "day_close_minute": 1320,
     "max_catchup_days": 3,
-    # Phase one is the supported runtime.  Keep every later-stage capability
-    # disabled, but do not seed a fresh environment into the retired
-    # phase-zero/legacy command path.
+    # Phase one is the supported default runtime.  Later-stage capabilities
+    # remain independently switchable for explicit phase integration runs.
     "village_simulation_enabled": True,
     "village_needs_enabled": False,
     "village_economy_enabled": False,
@@ -164,6 +163,14 @@ TOOL_ITEM_SEEDS = [
         "item_type": "CollectTool",
         "item_description": "阶段三狩猎专用工具，可使用20次",
         "item_price": 50,
+        "collectable": False,
+    },
+    {
+        "item_id": 4003,
+        "item_name": "修桥金属件",
+        "item_type": "RepairMaterial",
+        "item_description": "断桥主线固定使用的金属维修件",
+        "item_price": 40,
         "collectable": False,
     },
 ]

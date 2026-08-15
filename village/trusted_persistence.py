@@ -25,7 +25,7 @@ from .models import (
     VillageActionReceipt,
     VillageWorldEvent,
 )
-from .runtime_services import ResultCode
+from .runtime_services import ResultCode, TimeService
 
 
 NEED_FIELDS = ("hunger", "energy", "health", "social", "stress")
@@ -42,14 +42,6 @@ def _payload_hash(payload: Dict[str, Any]) -> str:
 
 def _uuid(value: Any) -> uuid.UUID:
     return uuid.UUID(str(value))
-
-
-def _save_time(world_minute: int, time_revision: int) -> GlobalGameTimeState:
-    state = GlobalGameTimeState.get_instance()
-    state.apply_world_minute(int(world_minute))
-    state.time_revision = int(time_revision)
-    state.save()
-    return state
 
 
 def _apply_snapshot(runtime: NpcRuntimeState, snapshot: Dict[str, Any]) -> None:
@@ -84,28 +76,50 @@ def _apply_snapshot(runtime: NpcRuntimeState, snapshot: Dict[str, Any]) -> None:
 
 @transaction.atomic
 def save_snapshots(payload: Dict[str, Any]) -> Dict[str, Any]:
-    """Persist Unity runtime snapshots without CAS or lifecycle validation."""
+    """Persist Unity runtime snapshots monotonically (time first, then NPCs)."""
     try:
         time_state = GlobalGameTimeState.get_instance()
         world_minute = int(payload.get("world_minute", time_state.world_minute))
         time_revision = int(payload.get("time_revision", time_state.time_revision))
         checkpoints = payload.get("checkpoints") or []
-        _save_time(world_minute, time_revision)
-        results = []
-        for snapshot in checkpoints:
-            npc_id = str(snapshot.get("npc_id", ""))
+    except (TypeError, ValueError) as exc:
+        return _result(False, ResultCode.INVALID_COMMAND_SCHEMA, message=str(exc))
+
+    ok, code, _ = TimeService.receive_time(world_minute, time_revision)
+    if not ok:
+        # 时间回退/非单调：拒绝整个旧 checkpoint，不落任何 NPC 快照。
+        return _result(False, code)
+
+    results = []
+    for snapshot in checkpoints:
+        npc_id = str(snapshot.get("npc_id", ""))
+        try:
             npc = NpcDefinition.objects.get(agent_id=npc_id, is_test_only=False)
             runtime, _ = NpcRuntimeState.objects.get_or_create(npc=npc)
-            _apply_snapshot(runtime, dict(snapshot))
-            results.append({
-                "success": True,
-                "npc_id": npc_id,
-                "result_code": ResultCode.COMMAND_ACCEPTED,
-                "state_version": runtime.state_version,
-            })
-        return _result(True, ResultCode.COMMAND_ACCEPTED, results=results)
-    except (TypeError, ValueError, NpcDefinition.DoesNotExist) as exc:
-        return _result(False, ResultCode.INVALID_COMMAND_SCHEMA, message=str(exc))
+        except NpcDefinition.DoesNotExist as exc:
+            return _result(False, ResultCode.INVALID_COMMAND_SCHEMA, message=str(exc))
+        if "state_version" in snapshot:
+            try:
+                if int(snapshot["state_version"]) < runtime.state_version:
+                    # 旧 checkpoint 不允许覆盖较新的 NPC/Needs/位置状态。
+                    results.append({
+                        "success": True,
+                        "npc_id": npc_id,
+                        "result_code": ResultCode.STALE_STATE_VERSION,
+                        "state_version": runtime.state_version,
+                        "skipped": True,
+                    })
+                    continue
+            except (TypeError, ValueError) as exc:
+                return _result(False, ResultCode.INVALID_COMMAND_SCHEMA, message=str(exc))
+        _apply_snapshot(runtime, dict(snapshot))
+        results.append({
+            "success": True,
+            "npc_id": npc_id,
+            "result_code": ResultCode.COMMAND_ACCEPTED,
+            "state_version": runtime.state_version,
+        })
+    return _result(True, ResultCode.COMMAND_ACCEPTED, results=results)
 
 
 @transaction.atomic
@@ -124,7 +138,8 @@ def save_result(payload: Dict[str, Any]) -> Dict[str, Any]:
     except (KeyError, TypeError, ValueError, NpcDefinition.DoesNotExist) as exc:
         return _result(False, ResultCode.INVALID_COMMAND_SCHEMA, message=str(exc))
 
-    _save_time(world_minute, time_revision)
+    # 延迟到达的旧动作结果仍保存为历史；其携带的旧时间不得覆盖全局时间。
+    TimeService.receive_time(world_minute, time_revision)
     runtime, _ = NpcRuntimeState.objects.get_or_create(npc=npc)
     snapshot = payload.get("state") if isinstance(payload.get("state"), dict) else {}
     _apply_snapshot(runtime, snapshot)

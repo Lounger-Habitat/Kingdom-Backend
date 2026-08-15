@@ -1046,6 +1046,14 @@ def _do_buy_from_store(
         if listing.status != ListingStatus.ACTIVE.value:
             return _fail(ResultCode.TRADE_LISTING_NOT_ACTIVE)
 
+        from .phase5_story import get_store_purchase_limit
+        remaining_limit = get_store_purchase_limit(npc_id, listing.item_id, world_minute)
+        if remaining_limit is not None and amount > remaining_limit:
+            return _fail("STORY_RATION_LIMIT_REACHED", data={
+                "item_id": listing.item_id,
+                "remaining": remaining_limit,
+            })
+
         if store.status not in _TRADABLE_STORE_STATUSES:
             return _fail(ResultCode.TRADE_STORE_CLOSED)
 

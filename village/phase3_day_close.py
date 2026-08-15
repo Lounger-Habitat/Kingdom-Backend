@@ -370,6 +370,15 @@ def handle_day_close(
             world_event=event,
         )
 
+        # Phase 5 is an optional projection in the same day-close transaction.
+        # When disabled this import/call is a no-op and Phase 3/4 semantics stay unchanged.
+        if VillageSimulationConfig.objects.filter(
+            config_key="default", village_story_enabled=True
+        ).exists():
+            from .phase5_story import process_day_close
+            story_result = process_day_close(day_index, world_minute, request_id)
+            result["story"] = story_result.get("data", {})
+
         return result
 
 
