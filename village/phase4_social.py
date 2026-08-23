@@ -785,7 +785,7 @@ def complete_social_action(payload: Mapping[str, Any]) -> dict[str, Any]:
         response = dict(result)
         response["request_payload_sha256"] = digest
         event = VillageWorldEvent.objects.filter(event_id=_uuid(result.get("world_event_id"))).first()
-        VillageActionReceipt.objects.create(
+        receipt = VillageActionReceipt.objects.create(
             request_id=request_id,
             command=command,
             npc=_npc(npc_id),
@@ -798,5 +798,7 @@ def complete_social_action(payload: Mapping[str, Any]) -> dict[str, Any]:
             state_version=result["state_version"],
             world_event=event,
         )
+        from .runtime_services import OutboxService
+        OutboxService.ensure_outcome(receipt)
         response.pop("request_payload_sha256", None)
         return response

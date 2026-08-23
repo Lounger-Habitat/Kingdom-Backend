@@ -16,6 +16,8 @@ from inventory.models import (
 )
 from village.models import (
     EconomicLedgerEntry,
+    NpcCommandState,
+    NpcRuntimeState,
     VillageActionReceipt,
     VillageFarmPlot,
     VillageSimulationConfig,
@@ -209,6 +211,53 @@ class PersistenceTest(Phase3AssetServiceBase):
         self.assertTrue(EconomicLedgerEntry.objects.filter(request_id=request_id).exists())
         self.assertTrue(VillageWorldEvent.objects.filter(request_id=request_id).exists())
 
+    def test_success_reuses_running_command_and_releases_runtime(self):
+        payload = _base_payload()
+        command_id = uuid.UUID(payload["command_id"])
+        request_id = uuid.UUID(payload["request_id"])
+        message_id = uuid.uuid4()
+        command = NpcCommandState.objects.create(
+            command_id=command_id,
+            message_id=message_id,
+            request_id=request_id,
+            npc=self.bill,
+            sender_id="10011",
+            recipient_id="WuxiVillage",
+            kind="PLANT",
+            payload_sha256="0" * 64,
+            status="RUNNING",
+            started_world_minute=700,
+        )
+        runtime, _ = NpcRuntimeState.objects.update_or_create(
+            npc=self.bill,
+            defaults={
+                "current_location_code": "BILL_FARM",
+                "current_point_code": "BILL_FARM",
+                "current_action": "PLANT",
+                "action_status": "ACTING",
+                "active_command_id": command_id,
+                "state_version": 3,
+            },
+        )
+        # Unity economy completion uses command_id as message_id; the durable
+        # command keeps the original Hub envelope message_id.
+        payload["message_id"] = payload["command_id"]
+
+        resp = commit_economy_action(payload)
+
+        self.assertEqual(resp["result_code"], ResultCode.OK)
+        self.assertEqual(NpcCommandState.objects.filter(command_id=command_id).count(), 1)
+        command.refresh_from_db()
+        runtime.refresh_from_db()
+        receipt = VillageActionReceipt.objects.get(request_id=request_id)
+        self.assertEqual(command.message_id, message_id)
+        self.assertEqual(command.status, "SUCCEEDED")
+        self.assertEqual(receipt.command_id, command_id)
+        self.assertEqual(receipt.state_version, 4)
+        self.assertEqual(runtime.state_version, 4)
+        self.assertEqual(runtime.action_status, "IDLE")
+        self.assertIsNone(runtime.active_command_id)
+
     def test_failure_does_not_create_receipt(self):
         """Failed dispatch should not write success receipt/ledger."""
         resp = commit_economy_action(_base_payload(
@@ -243,6 +292,20 @@ class InvalidPayloadTest(Phase3AssetServiceBase):
         payload["params"]["extra_field"] = "bad"
         resp = commit_economy_action(payload)
         self.assertEqual(resp["result_code"], ResultCode.P3_INVALID_PARAMS)
+
+    def test_wire_tunnel_param_key_is_tolerated(self):
+        """Hub 线缆隧道键 __village_command_v1 不是业务参数，白名单校验应忽略。"""
+        NpcGlobalInventorySlot.objects.create(
+            bag=self.bill_inv, slot_index=0, item_id=1051, item_amount=5,
+        )
+        NpcGlobalInventorySlot.objects.create(
+            bag=self.bill_inv, slot_index=1, item_id=4001, item_amount=10,
+            remaining_uses=20,
+        )
+        payload = _base_payload()
+        payload["params"]["__village_command_v1"] = {"schema_version": "village.command.v1"}
+        resp = commit_economy_action(payload)
+        self.assertEqual(resp["result_code"], ResultCode.OK)
 
 
 class TransactionRollbackTest(Phase3AssetServiceBase):

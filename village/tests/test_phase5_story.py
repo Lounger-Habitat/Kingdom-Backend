@@ -138,9 +138,10 @@ class PhaseFiveStoryTest(TestCase):
                 "duration_minutes": 1,
             },
         )
-        self.assertTrue(ok)
+        self.assertTrue(ok, result_code)
         self.assertEqual(result_code, "OK")
-        self.assertIsNone(command)
+        self.assertIsNotNone(command)
+        self.assertEqual(command.status, "SUCCEEDED")
         self.assertEqual(VillageStoryFact.objects.get().repair_labor_hours, 1)
 
     def test_npc_fact_can_unlock_route_but_player_private_fact_cannot(self):

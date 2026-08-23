@@ -471,9 +471,11 @@ class NpcCommandState(models.Model):
         ("RECEIVED", "已接收"),
         ("QUEUED", "已排队"),
         ("RUNNING", "执行中"),
+        ("SETTLING", "结算中"),
         ("SUCCEEDED", "成功"),
         ("FAILED", "失败"),
         ("CANCELLED", "已取消"),
+        ("EXPIRED", "已过期"),
     ]
 
     QUEUE_MODE_CHOICES = [
@@ -744,6 +746,18 @@ class VillageDeliveryOutbox(models.Model):
 
     def __str__(self):
         return f"{self.delivery_id} - {self.message_kind} - {self.status}"
+
+
+class VillageDeliveryCursor(models.Model):
+    """Per-recipient event cursor persisted with delivery acknowledgements."""
+
+    recipient = models.CharField("接收者", max_length=32, primary_key=True)
+    last_event_sequence = models.PositiveBigIntegerField("最后事件序列", default=0)
+    updated_at = models.DateTimeField(auto_now=True)
+
+    class Meta:
+        verbose_name = "村庄投递游标"
+        verbose_name_plural = "村庄投递游标"
 
 
 # ============================================================================

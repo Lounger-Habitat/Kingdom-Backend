@@ -521,6 +521,14 @@ class LifeActionService:
             command = NpcCommandState.objects.select_for_update().get(command_id=command_id)
         except NpcCommandState.DoesNotExist:
             return _result(False, ResultCode.INVALID_COMMAND_SCHEMA)
+
+        def terminal(code: str) -> Dict[str, Any]:
+            return cls._terminal_failure(
+                runtime=runtime, command=command, request_id=request_id,
+                payload_hash=payload_hash, action=action, code=code,
+                time_state=time_state, location=payload.get("location_code", ""),
+            )
+
         if (
             command.npc_id != runtime.npc_id or command.request_id != request_id
             or command.kind != action or command.status != "RUNNING"
@@ -529,16 +537,11 @@ class LifeActionService:
             or command.duration_minutes != end - start
             or runtime.action_ends_world_minute != end
         ):
-            return _result(False, ResultCode.NPC_BUSY)
+            # 身份/区间不一致是终态拒绝：Unity 不会重放该动作，命令若保持 RUNNING
+            # 会成僵尸且发送方永远等不到 OUTCOME。走终态失败落库并投递失败结果。
+            return terminal(ResultCode.NPC_BUSY)
         if runtime.action_status not in {"ACTING", "SLEEPING"}:
-            return _result(False, ResultCode.NPC_BUSY)
-
-        def terminal(code: str) -> Dict[str, Any]:
-            return cls._terminal_failure(
-                runtime=runtime, command=command, request_id=request_id,
-                payload_hash=payload_hash, action=action, code=code,
-                time_state=time_state, location=payload.get("location_code", ""),
-            )
+            return terminal(ResultCode.NPC_BUSY)
 
         if not fast_integration and runtime.state_version != payload["expected_state_version"]:
             return terminal(ResultCode.STALE_STATE_VERSION)
@@ -651,14 +654,18 @@ class LifeActionService:
         # its only special needs effect is the committed completion effect.
         activity = "WORK" if action == "WORK_PLACEHOLDER" else "IDLE" if action == "EAT" else action
         if action != "SOCIALIZE":
-            error = NeedsService.advance_locked(
-                runtime, end,
-                [{"interval_id": str(uuid.uuid4()), "start_world_minute": start,
-                  "end_world_minute": end, "activity": activity}],
-                finalize_days=False,
-            )
-            if error:
-                return terminal(error)
+            # fast 模式下 needs 游标会被实时推进，可能已越过动作开始时间；
+            # 区间起点取两者较大值，避免 validate_intervals 因起点滞后而拒绝结算。
+            interval_start = max(start, runtime.needs_world_minute) if fast_integration else start
+            if interval_start < end:
+                error = NeedsService.advance_locked(
+                    runtime, end,
+                    [{"interval_id": str(uuid.uuid4()), "start_world_minute": interval_start,
+                      "end_world_minute": end, "activity": activity}],
+                    finalize_days=False,
+                )
+                if error:
+                    return terminal(error)
         effects: Dict[str, Any] = {}
         if action == "SOCIALIZE":
             other = runtime_by_id[target_id]
@@ -678,8 +685,13 @@ class LifeActionService:
             counter, _ = NpcSocialDailyCounter.objects.select_for_update().get_or_create(low_npc=low.npc, high_npc=high.npc, day_index=day_index)
             multiplier = 100 if counter.socialize_count == 0 else 50 if counter.socialize_count == 1 else 25
             counter.socialize_count += 1; counter.save(update_fields=["socialize_count", "updated_at"])
-            actor_error = NeedsService.advance_social_scaled_locked(runtime, start, end, multiplier)
-            other_error = NeedsService.advance_social_scaled_locked(other, start, end, multiplier)
+            # fast 模式下 checkpoint 会把 needs 游标实时推到动作起点之后（与
+            # line 656 非社交动作的宽容一致）：结算区间起点取 max(start, 游标)，
+            # 避免 advance_social_scaled_locked 因游标超前而拒绝结算。
+            actor_span_start = max(start, runtime.needs_world_minute) if fast_integration else start
+            other_span_start = max(start, other.needs_world_minute) if fast_integration else start
+            actor_error = NeedsService.advance_social_scaled_locked(runtime, actor_span_start, end, multiplier)
+            other_error = NeedsService.advance_social_scaled_locked(other, other_span_start, end, multiplier)
             if actor_error or other_error:
                 return terminal(actor_error or other_error)
             reservation = prepared["reservation"]

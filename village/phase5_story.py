@@ -297,11 +297,13 @@ def _record(request_id, payload_hash, action, result, *, actor=None, players=Non
     result["event"] = {"event_id": str(event.event_id), "event_sequence": event.event_sequence}
     stored = dict(result)
     stored["request_payload_sha256"] = payload_hash
-    VillageActionReceipt.objects.create(
+    receipt = VillageActionReceipt.objects.create(
         request_id=request_id, action_kind=action, success=result["status"] == "SUCCEEDED",
         result_code=result["result_code"], response_data=stored, world_minute=world_minute,
         time_revision=time_revision, npc=actor, world_event=event,
     )
+    from .runtime_services import OutboxService
+    OutboxService.ensure_outcome(receipt)
     if ledger is not None:
         EconomicLedgerEntry.objects.create(
             request_id=request_id, entry_type=f"STORY_{action}", actor_npc=actor,

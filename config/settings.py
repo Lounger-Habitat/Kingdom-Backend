@@ -93,7 +93,12 @@ else:
             "ENGINE": "django.db.backends.sqlite3",
             "NAME": BASE_DIR / "db.sqlite3",
             "OPTIONS": {
-                "timeout": 30,  # 秒，等待锁释放
+                "timeout": 60,  # 秒，等待锁释放
+                # 开发服务器是多线程的，Unity 并发写 checkpoint/accept/complete
+                # 会抢 SQLite 文件锁导致间歇 500（database is locked）。
+                # WAL：读写不互斥；IMMEDIATE：BEGIN 即取写锁，配合 busy 等待串行化写事务。
+                "init_command": "PRAGMA journal_mode=WAL;",
+                "transaction_mode": "IMMEDIATE",
             },
         }
     }
@@ -179,7 +184,7 @@ VILLAGE_FAST_COMMAND_INTEGRATION = (
     DEPLOYMENT_ENV != "production"
     and os.environ.get(
         "VILLAGE_FAST_COMMAND_INTEGRATION",
-        "False" if ("test" in sys.argv or "pytest" in Path(sys.argv[0]).name.lower()) else "True",
+        "False" if ("test" in sys.argv or "pytest" in Path(sys.argv[0]).name.lower()) else "False",
     ).lower()
     in {"1", "true", "yes", "on"}
 )

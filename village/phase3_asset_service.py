@@ -19,6 +19,7 @@ from inventory.models import NpcDefinition, NpcGlobalInventory, NpcGlobalInvento
 from .models import (
     EconomicLedgerEntry,
     NpcCommandState,
+    NpcRuntimeState,
     VillageActionReceipt,
     VillageFarmPlot,
     VillageSimulationConfig,
@@ -384,7 +385,10 @@ def commit_economy_action(payload: Dict[str, Any]) -> Dict[str, Any]:
         return _fail(ResultCode.P3_WRONG_LOCATION)
 
     allowed_params = PARAM_WHITELIST.get(action_enum, frozenset())
-    unknown = set(params.keys()) - allowed_params
+    # 线缆兼容隧道键：部署的 Hub 只转发 action id/name/params，命令元数据经 params
+    # 隧道传输（Unity EnvironmentWS.TryRestoreVillageCommandV1FromParams 恢复后原样
+    # 透传给 Backend）。它不是业务参数，白名单校验必须忽略。
+    unknown = set(params.keys()) - allowed_params - {"__village_command_v1"}
     if unknown:
         return _fail(ResultCode.P3_INVALID_PARAMS)
 
@@ -410,6 +414,25 @@ def commit_economy_action(payload: Dict[str, Any]) -> Dict[str, Any]:
                     response_data["replayed"] = True
                     return response_data
                 return _fail(ResultCode.P3_REQUEST_CONFLICT, status="CONFLICT")
+
+            command_id = uuid.UUID(str(payload["command_id"]))
+            command = NpcCommandState.objects.select_for_update().filter(command_id=command_id).first()
+            runtime = None
+            if command is not None:
+                if (
+                    command.request_id != request_id
+                    or str(command.npc.agent_id) != str(npc_id)
+                    or command.kind != command_name
+                ):
+                    return _fail(ResultCode.P3_REQUEST_CONFLICT, status="CONFLICT")
+                runtime = NpcRuntimeState.objects.select_for_update().filter(npc=command.npc).first()
+                if runtime is None:
+                    return _fail(ResultCode.P3_INVALID_PARAMS)
+                if command.status != "RUNNING" or (
+                    runtime.active_command_id is not None
+                    and runtime.active_command_id != command.command_id
+                ):
+                    return _fail(ResultCode.P3_REQUEST_CONFLICT, status="CONFLICT")
 
             # Dispatch to production handler
             result = handler(npc_id, params, world_minute, request_id)
@@ -469,27 +492,37 @@ def commit_economy_action(payload: Dict[str, Any]) -> Dict[str, Any]:
             response_data["request_payload_sha256"] = payload_hash
 
             # NpcCommandState (terminal)
-            command = NpcCommandState.objects.create(
-                command_id=uuid.UUID(str(payload["command_id"])),
-                message_id=uuid.UUID(str(payload["message_id"])),
-                request_id=request_id,
-                npc=npc_obj,
-                schema_version=VILLAGE_ECONOMY_ACTION_V1,
-                sender_id=str(npc_id),
-                recipient_id="economy-service",
-                kind=command_name,
-                location_code=location,
-                sanitized_parameters=params,
-                payload_sha256=payload_hash,
-                queue_mode="ECONOMY",
-                status="SUCCEEDED",
-                completed_world_minute=world_minute,
-                received_world_minute=world_minute,
-                result_code=ResultCode.OK,
-            )
+            if command is None:
+                command = NpcCommandState.objects.create(
+                    command_id=command_id,
+                    message_id=uuid.UUID(str(payload["message_id"])),
+                    request_id=request_id,
+                    npc=npc_obj,
+                    schema_version=VILLAGE_ECONOMY_ACTION_V1,
+                    sender_id=str(npc_id),
+                    recipient_id="economy-service",
+                    kind=command_name,
+                    location_code=location,
+                    sanitized_parameters=params,
+                    payload_sha256=payload_hash,
+                    queue_mode="ECONOMY",
+                    status="SUCCEEDED",
+                    completed_world_minute=world_minute,
+                    received_world_minute=world_minute,
+                    result_code=ResultCode.OK,
+                )
+            else:
+                command.status = "SUCCEEDED"
+                command.result_code = ResultCode.OK
+                command.location_code = location
+                command.completed_world_minute = world_minute
+                command.save(update_fields=[
+                    "status", "result_code", "location_code",
+                    "completed_world_minute", "updated_at",
+                ])
 
             # VillageActionReceipt
-            VillageActionReceipt.objects.create(
+            receipt = VillageActionReceipt.objects.create(
                 request_id=request_id,
                 command=command,
                 npc=npc_obj,
@@ -499,8 +532,21 @@ def commit_economy_action(payload: Dict[str, Any]) -> Dict[str, Any]:
                 response_data=response_data,
                 world_minute=world_minute,
                 time_revision=int(payload.get("time_revision", world_minute)),
+                state_version=runtime.state_version + 1 if runtime is not None else None,
                 world_event=event,
             )
+            if runtime is not None:
+                runtime.state_version += 1
+                runtime.current_action = ""
+                runtime.action_status = "IDLE"
+                runtime.action_started_world_minute = None
+                runtime.action_ends_world_minute = None
+                runtime.active_command_id = None
+                runtime.last_simulated_world_minute = world_minute
+                runtime.time_revision = time_state.time_revision
+                runtime.save()
+            from .runtime_services import OutboxService
+            OutboxService.ensure_outcome(receipt)
 
             # EconomicLedgerEntry
             EconomicLedgerEntry.objects.create(

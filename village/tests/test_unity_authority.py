@@ -87,7 +87,7 @@ class UnityAuthorityPersistenceTests(TestCase):
         self.assertTrue(VillageActionReceipt.objects.filter(request_id=request_id).exists())
         self.assertFalse(VillageDeliveryOutbox.objects.exists())
 
-    def test_legacy_runtime_authority_routes_are_gone(self):
+    def test_formal_runtime_authority_routes_are_protected(self):
         client = APIClient()
         for path in (
             "/api/village/runtime/time",
@@ -96,7 +96,7 @@ class UnityAuthorityPersistenceTests(TestCase):
             "/api/village/commands/accept",
             f"/api/village/commands/{uuid.uuid4()}/start",
         ):
-            self.assertEqual(client.post(path, {}, format="json").status_code, 404)
+            self.assertNotEqual(client.post(path, {}, format="json").status_code, 404)
 
     def test_economy_routes_are_reachable(self):
         """Phase 3 economy routes exist (may return 400/401 but not 404)."""

@@ -12,6 +12,7 @@ urlpatterns = [
     path("api/village/npcs", views.village_npcs, name="village-npcs"),
     path("api/village/npcs/<str:npc_id>/runtime-summary", views.npc_runtime_summary, name="village-npc-runtime-summary"),
     path("api/village/npcs/<str:npc_id>/available-actions", views.npc_available_actions, name="village-npc-available-actions"),
+    path("api/village/npcs/<str:npc_id>/discover", views.npc_discover, name="village-npc-discover"),
     path("api/village/locations", views.village_locations, name="village-locations"),
     path(
         "api/village/bootstrap-validation",
@@ -22,12 +23,20 @@ urlpatterns = [
     path("api/village/runtime/bootstrap", views.runtime_bootstrap, name="village-runtime-bootstrap"),
     path("api/village/runtime/checkpoint", views.runtime_checkpoint, name="village-runtime-checkpoint"),
     path("api/village/runtime/summary", views.runtime_summary_view, name="village-runtime-summary"),
+    path("api/village/runtime/time", views.runtime_time, name="village-runtime-time"),
+    path("api/village/runtime/advance-needs", views.runtime_advance_needs, name="village-runtime-advance-needs"),
+    path("api/village/life-actions/execute", views.life_actions_execute, name="village-life-actions-execute"),
     path("api/village/actions/complete", views.actions_complete, name="village-actions-complete"),
     path("api/village/events", views.events_list, name="village-events"),
     # 阶段一 Command API
     # 阶段一 Outbox API
     path("api/village/deliveries/pending", views.deliveries_pending, name="village-deliveries-pending"),
     path("api/village/deliveries/<str:delivery_id>/ack", views.deliveries_ack, name="village-deliveries-ack"),
+    path("api/village/deliveries/cursor", views.deliveries_cursor, name="village-deliveries-cursor"),
+    path("api/village/commands/accept", views.commands_accept, name="village-commands-accept"),
+    path("api/village/commands/<str:command_id>/start", views.commands_start, name="village-commands-start"),
+    path("api/village/commands/<str:command_id>/status", views.commands_status, name="village-commands-status"),
+    path("api/village/commands/<str:command_id>/cancel", views.commands_cancel, name="village-commands-cancel"),
     # Phase 4 social read APIs
     path("api/village/social/npcs/<str:npc_id>", phase4_views.social_npc, name="village-social-npc"),
     path("api/village/social/player/facts", phase4_views.player_facts, name="village-social-player-facts"),

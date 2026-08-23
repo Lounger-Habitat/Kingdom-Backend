@@ -17,6 +17,7 @@
 
 import hashlib
 import json
+import time
 import uuid
 from datetime import datetime, timedelta
 from typing import Any, Dict, List, Optional, Tuple
@@ -33,6 +34,7 @@ from .models import (
     NpcRuntimeState,
     VillageActionDurationConfig,
     VillageActionReceipt,
+    VillageDeliveryCursor,
     VillageDeliveryOutbox,
     VillageSimulationConfig,
     VillageWorldEvent,
@@ -122,6 +124,11 @@ class ResultCode:
     # Outbox
     OUTBOX_ACK_UNKNOWN = "OUTBOX_ACK_UNKNOWN"
     OUTBOX_DELIVERY_FAILED = "OUTBOX_DELIVERY_FAILED"
+    COMMAND_EXPIRED = "COMMAND_EXPIRED"
+    COMMAND_NOT_FOUND = "COMMAND_NOT_FOUND"
+    COMMAND_NOT_CANCELLABLE = "COMMAND_NOT_CANCELLABLE"
+    SETTLEMENT_IN_PROGRESS = "SETTLEMENT_IN_PROGRESS"
+    HANDSHAKE_REQUIRED = "HANDSHAKE_REQUIRED"
 
 
 # ============================================================================
@@ -318,6 +325,13 @@ class BootstrapService:
             if timeout_seconds:
                 navigation_timeouts[action_name] = timeout_seconds
 
+        active_commands = list(
+            NpcCommandState.objects.select_for_update()
+            .filter(status__in=["RECEIVED", "QUEUED", "RUNNING", "SETTLING"])
+            .select_related("npc")
+            .order_by("created_at")
+        )
+
         def serialize_command(command: NpcCommandState) -> Dict[str, Any]:
             """Return the complete, replay-safe command wire data required by Env recovery."""
             return {
@@ -340,6 +354,9 @@ class BootstrapService:
                     "duration_minutes": command.duration_minutes,
                 },
                 "status": command.status,
+                "started_world_minute": command.started_world_minute,
+                "completed_world_minute": command.completed_world_minute,
+                "state_version": command.state_version,
             }
 
         # 构建响应
@@ -348,18 +365,24 @@ class BootstrapService:
             # 获取活动命令
             from .phase2_services import need_bands
 
+            npc_commands = [c for c in active_commands if c.npc_id == rt.npc_id]
+            active = next((c for c in npc_commands if c.status in {"RUNNING", "SETTLING"}), None)
+
             npc_data.append({
                 "npc_id": str(rt.npc.agent_id),
                 "name": rt.npc.name,
                 "current_location_code": rt.current_location_code,
                 "current_point_code": rt.current_point_code,
-                # Runtime work is process-local to Unity and is discarded on restart.
                 "current_goal": "NONE",
-                "current_action": "",
-                "action_status": "IDLE",
-                "action_started_world_minute": None,
-                "action_ends_world_minute": None,
-                "active_command_id": None,
+                "current_action": active.kind if active else rt.current_action,
+                "action_status": rt.action_status if active else "IDLE",
+                "action_started_world_minute": active.started_world_minute if active else None,
+                "action_ends_world_minute": (
+                    active.started_world_minute + active.duration_minutes
+                    if active and active.started_world_minute is not None and active.duration_minutes
+                    else None
+                ),
+                "active_command_id": str(active.command_id) if active else None,
                 "state_version": rt.state_version,
                 "last_simulated_world_minute": rt.last_simulated_world_minute,
                 "time_revision": rt.time_revision,
@@ -373,7 +396,8 @@ class BootstrapService:
                 },
                 "need_bands": need_bands(rt),
                 "active_reservation": None,
-                "active_command": None,
+                "active_command": serialize_command(active) if active else None,
+                "queued_commands": [serialize_command(c) for c in npc_commands if c is not active],
             })
 
         return {
@@ -386,7 +410,7 @@ class BootstrapService:
             "game_minute": time_state.game_minute,
             "season": time_state.season,
             "npcs": npc_data,
-            "commands": [],
+            "commands": [serialize_command(command) for command in active_commands],
             "config": {
                 "tick_interval_seconds": config.tick_interval_seconds if config else 5,
                 "hub_command_timeout_seconds": config.hub_command_timeout_seconds if config else 30,
@@ -604,7 +628,16 @@ class CheckpointService:
 class CommandService:
     """命令生命周期服务。"""
 
-    ALLOWED_ACTIONS = {"MOVE", "WAIT", "GO_HOME", "EAT", "REST", "SLEEP", "SOCIALIZE", "WORK_PLACEHOLDER", "STORY_VOTE", "STORY_ACT"}
+    ALLOWED_ACTIONS = {
+        "MOVE", "WAIT", "GO_HOME", "EAT", "REST", "SLEEP", "SOCIALIZE", "WORK_PLACEHOLDER",
+        "STORY_VOTE", "STORY_ACT",
+        "PLANT", "HARVEST", "HUNT", "COOK", "CREATE_ORDER", "CANCEL_ORDER",
+        "START_DELIVERY", "IMPORT_GOODS", "EXPORT_GOODS", "RATE_DISH",
+        "PUBLISH_PRICE_INDEX", "AUDIT_PUBLIC_FUND", "PROPOSE_TRADE", "RESPOND_TRADE",
+        "CANCEL_TRADE_OFFER", "LIST_STORE_ITEM", "UPDATE_STORE_PRICE", "DELIST_STORE_ITEM",
+        "BUY_FROM_STORE", "INSPECT_STORE_INVENTORY", "INSPECT_SOCIAL_STATE",
+        "CREATE_COMMITMENT", "CANCEL_COMMITMENT", "PERFORM_COMMITMENT",
+    }
     STORY_ACTIONS = {"STORY_VOTE", "STORY_ACT"}
     MAX_QUEUE_SIZE = 10
     MAX_CLOCK_SKEW_MS = 5 * 60 * 1000
@@ -821,22 +854,6 @@ class CommandService:
             else:
                 return False, ResultCode.REQUEST_ID_CONFLICT, None
 
-        if action_name in CommandService.STORY_ACTIONS:
-            from .phase5_story import dispatch_story_command
-            story_payload = dict(content)
-            story_payload["command"] = action_name
-            story_payload["npc_id"] = str(sender)
-            story_payload["current_location_code"] = (
-                NpcRuntimeState.objects.filter(npc=npc)
-                .values_list("current_location_code", flat=True)
-                .first()
-                or ""
-            )
-            story_result = dispatch_story_command(story_payload)
-            if story_result.get("result_code") != "OK":
-                return False, story_result.get("result_code", ResultCode.ACTION_NOT_ALLOWED), None
-            return True, story_result.get("result_code", ResultCode.COMMAND_ACCEPTED), None
-
         # 计算 payload hash
         payload_sha256 = CommandService.compute_payload_sha256(content)
 
@@ -863,6 +880,9 @@ class CommandService:
             return False, ResultCode.BOOTSTRAP_NPC_SET_MISMATCH, None
         expected_version = content.get("expected_state_version")
         if fast_integration:
+            expected_version = runtime.state_version
+            content["expected_state_version"] = expected_version
+        elif action_name in CommandService.STORY_ACTIONS and expected_version is None:
             expected_version = runtime.state_version
             content["expected_state_version"] = expected_version
         if not isinstance(expected_version, int):
@@ -904,7 +924,91 @@ class CommandService:
             validated_at_state_version=expected_version,
         )
 
+        # Story mutations already have a Backend transaction service. Keep the
+        # command row as the durable lifecycle anchor instead of introducing a
+        # second executor in Unity.
+        if action_name in CommandService.STORY_ACTIONS:
+            from .phase5_story import dispatch_story_command
+            story_payload = dict(content)
+            story_payload["command"] = action_name
+            story_payload["npc_id"] = str(sender)
+            story_payload["current_location_code"] = runtime.current_location_code
+            story_result = dispatch_story_command(story_payload)
+            story_code = story_result.get("result_code", ResultCode.ACTION_NOT_ALLOWED)
+            receipt = VillageActionReceipt.objects.filter(request_id=request_id).first()
+            if receipt is not None:
+                receipt.command = command
+                receipt.save(update_fields=["command"])
+                command.status = "SUCCEEDED" if receipt.success else "FAILED"
+                command.result_code = receipt.result_code
+                command.completed_world_minute = receipt.world_minute
+                command.state_version = runtime.state_version
+                command.save(update_fields=["status", "result_code", "completed_world_minute", "state_version", "updated_at"])
+                OutboxService.ensure_outcome(receipt)
+                return receipt.success, story_code, command
+            ActionService.complete_action(
+                command.command_id, command.request_id, False, story_code,
+                message="Story command rejected by Backend story rules.",
+                data=story_result, allow_prestart_failure=True,
+            )
+            return False, story_code, command
+
         return True, ResultCode.COMMAND_ACCEPTED, command
+
+    @staticmethod
+    def serialize_status(command: NpcCommandState) -> Dict[str, Any]:
+        receipt = VillageActionReceipt.objects.filter(command=command).first()
+        return {
+            "command_id": str(command.command_id),
+            "message_id": str(command.message_id),
+            "request_id": str(command.request_id),
+            "npc_id": str(command.npc.agent_id),
+            "action": command.kind,
+            "status": command.status,
+            "result_code": command.result_code,
+            "state_version": command.state_version,
+            "received_world_minute": command.received_world_minute,
+            "started_world_minute": command.started_world_minute,
+            "completed_world_minute": command.completed_world_minute,
+            "receipt": {
+                "success": receipt.success,
+                "result_code": receipt.result_code,
+                "data": receipt.response_data,
+            } if receipt else None,
+        }
+
+    @staticmethod
+    @transaction.atomic
+    def get_status(command_id: uuid.UUID) -> Tuple[bool, str, Optional[Dict[str, Any]]]:
+        command = NpcCommandState.objects.select_related("npc").filter(command_id=command_id).first()
+        if command is None:
+            return False, ResultCode.COMMAND_NOT_FOUND, None
+        return True, command.result_code or ResultCode.COMMAND_ACCEPTED, CommandService.serialize_status(command)
+
+    @staticmethod
+    @transaction.atomic
+    def cancel_command(command_id: uuid.UUID) -> Tuple[bool, str, Optional[NpcCommandState]]:
+        command = NpcCommandState.objects.select_for_update().filter(command_id=command_id).first()
+        if command is None:
+            return False, ResultCode.COMMAND_NOT_FOUND, None
+        if command.status in {"SUCCEEDED", "FAILED", "CANCELLED", "EXPIRED"}:
+            return True, ResultCode.COMMAND_REPLAYED, command
+        if command.status == "SETTLING":
+            return False, ResultCode.SETTLEMENT_IN_PROGRESS, command
+        if command.status not in {"RECEIVED", "QUEUED", "RUNNING"}:
+            return False, ResultCode.COMMAND_NOT_CANCELLABLE, command
+        ok, code, _receipt = ActionService.complete_action(
+            command.command_id,
+            command.request_id,
+            False,
+            ResultCode.COMMAND_CANCELLED_ON_RECOVERY,
+            message="Command cancelled by the authority.",
+            allow_prestart_failure=command.status in {"RECEIVED", "QUEUED"},
+        )
+        if ok:
+            command.status = "CANCELLED"
+            command.save(update_fields=["status", "updated_at"])
+        return ok, code, command
 
     @staticmethod
     def terminalize_expired_prestart_commands(
@@ -948,8 +1052,16 @@ class CommandService:
 
     @staticmethod
     @transaction.atomic
-    def start_command(command_id: uuid.UUID) -> Tuple[bool, str, Optional[NpcCommandState]]:
+    def start_command(
+        command_id: uuid.UUID,
+        start_world_minute: Optional[int] = None,
+    ) -> Tuple[bool, str, Optional[NpcCommandState]]:
         """开始命令执行。
+
+        Args:
+            command_id: 命令 ID。
+            start_world_minute: Unity 权威的实际开始世界分钟；为 None 时（旧调用方/
+                过期扫描等恢复路径）回退后端本地钟。
 
         Returns:
             (success, result_code, command_state)
@@ -967,6 +1079,10 @@ class CommandService:
             return False, ResultCode.INVALID_COMMAND_SCHEMA, None
 
         # 校验状态
+        if command.status in {"SUCCEEDED", "FAILED", "CANCELLED", "EXPIRED"}:
+            return True, ResultCode.COMMAND_REPLAYED, command
+        if command.status == "SETTLING":
+            return False, ResultCode.SETTLEMENT_IN_PROGRESS, command
         if command.status not in ["RECEIVED", "QUEUED"]:
             return False, ResultCode.NPC_BUSY, None
 
@@ -1035,6 +1151,8 @@ class CommandService:
                 message="Command expired before command start.",
                 allow_prestart_failure=True,
             )
+            command.status = "EXPIRED"
+            command.save(update_fields=["status", "updated_at"])
             return False, ResultCode.MESSAGE_EXPIRED, None
 
         if command.queue_mode == "STRICT" and not fast_integration:
@@ -1076,6 +1194,8 @@ class CommandService:
                 message="Command expired before command start.",
                 allow_prestart_failure=True,
             )
+            command.status = "EXPIRED"
+            command.save(update_fields=["status", "updated_at"])
             return False, ResultCode.MESSAGE_EXPIRED, None
 
         if command.kind in {"EAT", "REST", "SLEEP", "SOCIALIZE", "WORK_PLACEHOLDER"}:
@@ -1147,16 +1267,20 @@ class CommandService:
         # Mark the durable command RUNNING only after any shared reservation
         # has been acquired successfully.
         command.status = "RUNNING"
-        command.started_world_minute = time_state.world_minute
+        # Unity 是时间权威：命令武装区间以 Unity 上报的开始分钟为准，而非后端
+        # 本地钟，保证结算（life-actions/execute 的身份校验）与 Unity 本地动作
+        # 区间精确一致，避免本地钟偏差导致 NPC_BUSY。
+        start_minute = start_world_minute if start_world_minute is not None else time_state.world_minute
+        command.started_world_minute = start_minute
         command.state_version = rt.state_version
         command.save()
 
         # 更新 NPC 运行时状态
         rt.current_action = command.kind
         rt.action_status = "MOVING" if command.kind == "MOVE" else "SLEEPING" if command.kind == "SLEEP" else "ACTING"
-        rt.action_started_world_minute = time_state.world_minute
+        rt.action_started_world_minute = start_minute
         rt.action_ends_world_minute = (
-            time_state.world_minute + command.duration_minutes
+            start_minute + command.duration_minutes
             if command.duration_minutes is not None else None
         )
         rt.active_command_id = command.command_id
@@ -1238,6 +1362,9 @@ class ActionService:
         ):
             return False, ResultCode.NPC_BUSY, None
 
+        command.status = "SETTLING"
+        command.save(update_fields=["status", "updated_at"])
+
         # 创建世界事件
         event_type = "NPC_ACTION_COMPLETED" if success else "NPC_ACTION_FAILED"
         event = VillageWorldEvent.objects.create(
@@ -1316,28 +1443,31 @@ class ActionService:
             "data": data or {},
         }
 
-        VillageDeliveryOutbox.objects.create(
-            delivery_id=delivery_id,
+        VillageDeliveryOutbox.objects.get_or_create(
             dedupe_key=f"outcome:{receipt.request_id}",
-            recipient=command.sender_id,
-            message_kind="OUTCOME",
-            command=command,
-            receipt=receipt,
-            event=event,
-            payload=outcome_payload,
-            priority=10,
-            status="PENDING",
+            defaults={
+                "delivery_id": delivery_id,
+                "recipient": command.sender_id,
+                "message_kind": "OUTCOME",
+                "command": command,
+                "receipt": receipt,
+                "event": event,
+                "payload": outcome_payload,
+                "priority": 10,
+                "status": "PENDING",
+            },
         )
 
-        VillageDeliveryOutbox.objects.create(
-            delivery_id=uuid.uuid4(),
+        VillageDeliveryOutbox.objects.get_or_create(
             dedupe_key=f"event:{event.event_id}",
-            recipient=command.sender_id,
-            message_kind="EVENT",
-            command=command,
-            receipt=receipt,
-            event=event,
-            payload={
+            defaults={
+                "delivery_id": uuid.uuid4(),
+                "recipient": command.sender_id,
+                "message_kind": "EVENT",
+                "command": command,
+                "receipt": receipt,
+                "event": event,
+                "payload": {
                 "schema_version": "village.event.v1",
                 "event_id": str(event.event_id),
                 "event_sequence": event.event_sequence,
@@ -1355,9 +1485,10 @@ class ActionService:
                 "public_status_code": rt.action_status,
                 "public_data": event.public_data,
                 "summary": event.hub_summary,
+                },
+                "priority": 5,
+                "status": "PENDING",
             },
-            priority=5,
-            status="PENDING",
         )
 
         return True, result_code, receipt
@@ -1485,7 +1616,51 @@ class OutboxService:
 
     @staticmethod
     @transaction.atomic
-    def claim_pending(recipient: str, limit: int = 10) -> List[Dict[str, Any]]:
+    def ensure_outcome(receipt: VillageActionReceipt) -> VillageDeliveryOutbox:
+        """Create the durable final result for domain services that already made a receipt."""
+        command = receipt.command
+        recipient = command.sender_id if command else str(receipt.npc.agent_id) if receipt.npc else "env-server-001"
+        payload = dict(receipt.response_data or {})
+        payload["schema_version"] = "village.outcome.v1"
+        payload.setdefault("request_id", str(receipt.request_id))
+        payload.setdefault("npc_id", str(receipt.npc.agent_id) if receipt.npc else None)
+        payload.setdefault("success", receipt.success)
+        payload.setdefault("result_code", receipt.result_code)
+        payload.setdefault("world_minute", receipt.world_minute)
+        payload.setdefault("time_revision", receipt.time_revision)
+        if command:
+            payload.setdefault("ref_id", str(command.command_id))
+            payload.setdefault("original_message_id", str(command.message_id))
+        if receipt.world_event_id:
+            payload.setdefault("world_event_id", str(receipt.world_event_id))
+        entry, _ = VillageDeliveryOutbox.objects.get_or_create(
+            dedupe_key=f"outcome:{receipt.request_id}",
+            defaults={
+                "recipient": recipient,
+                "message_kind": "OUTCOME",
+                "command": command,
+                "receipt": receipt,
+                "event": receipt.world_event,
+                "payload": payload,
+                "priority": 10,
+                "status": "PENDING",
+            },
+        )
+        if command and (entry.command_id is None or entry.receipt_id is None):
+            payload.setdefault("ref_id", str(command.command_id))
+            payload.setdefault("original_message_id", str(command.message_id))
+            entry.command = command
+            entry.receipt = receipt
+            entry.recipient = command.sender_id
+            entry.payload = payload
+            entry.save(update_fields=["command", "receipt", "recipient", "payload"])
+        return entry
+
+    @staticmethod
+    @transaction.atomic
+    def claim_pending(
+        recipient: str, limit: int = 10, after_sequence: Optional[int] = None
+    ) -> List[Dict[str, Any]]:
         """领取待发送的 Outbox 条目。
 
         Returns:
@@ -1494,16 +1669,25 @@ class OutboxService:
         now = timezone.now()
         lease_until = now + timedelta(minutes=OutboxService.LEASE_DURATION_MINUTES)
 
-        # 领取 PENDING 或租约过期的 IN_FLIGHT 条目
-        entries = VillageDeliveryOutbox.objects.select_for_update(skip_locked=True).filter(
+        limit = max(1, min(int(limit), 100))
+        # 领取 PENDING 或租约过期的 IN_FLIGHT 条目；事件可按接收方游标重放。
+        # 游标过滤必须在 LIMIT 之前完成：否则取出的前 limit 行若全是已过游标的
+        # 旧事件，过滤后为 0 行，新的 OUTCOME/事件会被积压饿死。
+        qs = VillageDeliveryOutbox.objects.select_for_update(skip_locked=True).filter(
             recipient=recipient,
             status__in=["PENDING", "IN_FLIGHT"],
         ).filter(
             Q(status="PENDING") |
-            Q(status="IN_FLIGHT", lease_until__lt=now)
-        ).order_by(
-            "-priority", "created_at"
-        )[:limit]
+            Q(status="IN_FLIGHT", lease_until__lte=now)
+        ).filter(
+            Q(next_attempt_at__isnull=True) | Q(next_attempt_at__lte=now)
+        )
+        if after_sequence is not None:
+            qs = qs.filter(
+                Q(message_kind="OUTCOME") |
+                Q(event__event_sequence__gt=int(after_sequence))
+            )
+        entries = list(qs.order_by("-priority", "created_at")[:limit])
 
         results = []
         for entry in entries:
@@ -1535,7 +1719,11 @@ class OutboxService:
 
     @staticmethod
     @transaction.atomic
-    def ack_delivery(delivery_id: uuid.UUID) -> Tuple[bool, str]:
+    def ack_delivery(
+        delivery_id: uuid.UUID,
+        event_sequence: Optional[int] = None,
+        recipient: Optional[str] = None,
+    ) -> Tuple[bool, str]:
         """确认投递。
 
         Returns:
@@ -1548,6 +1736,20 @@ class OutboxService:
         except VillageDeliveryOutbox.DoesNotExist:
             return False, ResultCode.OUTBOX_ACK_UNKNOWN
 
+        if recipient and entry.recipient != recipient:
+            return False, ResultCode.SENDER_BINDING_INVALID
+
+        sequence = event_sequence
+        if sequence is None and entry.event_id:
+            sequence = entry.event.event_sequence
+        if sequence is not None:
+            cursor, _ = VillageDeliveryCursor.objects.select_for_update().get_or_create(
+                recipient=entry.recipient
+            )
+            if int(sequence) > cursor.last_event_sequence:
+                cursor.last_event_sequence = int(sequence)
+                cursor.save(update_fields=["last_event_sequence", "updated_at"])
+
         if entry.status == "ACKED":
             return True, ResultCode.COMMAND_REPLAYED
 
@@ -1556,6 +1758,52 @@ class OutboxService:
         entry.save()
 
         return True, ResultCode.COMMAND_ACCEPTED
+
+    @staticmethod
+    def get_cursor(recipient: str) -> int:
+        return int(
+            VillageDeliveryCursor.objects.filter(recipient=recipient)
+            .values_list("last_event_sequence", flat=True).first() or 0
+        )
+
+    @staticmethod
+    @transaction.atomic
+    def cleanup(retention_days: int = 7) -> Dict[str, int]:
+        """Summarize and remove only old, acknowledged low-priority events."""
+        cutoff = timezone.now() - timedelta(days=max(1, int(retention_days)))
+        old = VillageDeliveryOutbox.objects.select_for_update().filter(
+            message_kind="EVENT", status="ACKED", priority__lt=10, created_at__lt=cutoff
+        )
+        grouped: Dict[str, list[VillageDeliveryOutbox]] = {}
+        for entry in old:
+            grouped.setdefault(entry.recipient, []).append(entry)
+        summarized = 0
+        deleted = 0
+        for recipient, entries in grouped.items():
+            key = f"summary:{recipient}:{cutoff.date().isoformat()}"
+            if not VillageDeliveryOutbox.objects.filter(dedupe_key=key).exists():
+                last_sequence = max(
+                    (entry.event.event_sequence for entry in entries if entry.event_id), default=0
+                )
+                VillageDeliveryOutbox.objects.create(
+                    dedupe_key=key,
+                    recipient=recipient,
+                    message_kind="EVENT",
+                    payload={
+                        "schema_version": "village.event.v1",
+                        "event_type": "VILLAGE_EVENT_SUMMARY",
+                        "event_sequence": last_sequence,
+                        "summary": f"{len(entries)} acknowledged village events summarized.",
+                        "count": len(entries),
+                    },
+                    priority=1,
+                    status="PENDING",
+                )
+                summarized += 1
+            deleted += entries and VillageDeliveryOutbox.objects.filter(
+                delivery_id__in=[entry.delivery_id for entry in entries]
+            ).delete()[0] or 0
+        return {"summarized": summarized, "deleted": deleted}
 
 
 # ============================================================================

@@ -409,3 +409,62 @@ class LifeActionServiceTests(TestCase):
         reservation = NpcActionReservation.objects.get(reservation_id=social["params"]["reservation_id"])
         self.runtime.refresh_from_db()
         self.assertEqual((self.runtime.action_status, reservation.status, reservation.active_lock_key), ("IDLE", "RELEASED", None))
+
+    @override_settings(VILLAGE_FAST_COMMAND_INTEGRATION=True)
+    def test_start_command_arms_interval_from_unity_start_world_minute(self):
+        """Unity 是时间权威：start 请求携带的开始分钟用于武装命令区间。"""
+        command = NpcCommandState.objects.create(
+            command_id=uuid.uuid4(), message_id=uuid.uuid4(), request_id=uuid.uuid4(),
+            npc=self.npc, schema_version="village.command.v1", sender_id="10011",
+            recipient_id="env", kind="REST", payload_sha256="test",
+            status="QUEUED", duration_minutes=30,
+        )
+        started, code, _ = CommandService.start_command(command.command_id, start_world_minute=500)
+        self.assertTrue(started, code)
+        command.refresh_from_db()
+        self.assertEqual(command.started_world_minute, 500)
+        self.runtime.refresh_from_db()
+        self.assertEqual(self.runtime.action_started_world_minute, 500)
+        self.assertEqual(self.runtime.action_ends_world_minute, 530)
+        self.assertEqual(self.runtime.action_status, "ACTING")
+        self.assertEqual(self.runtime.active_command_id, command.command_id)
+
+    @override_settings(VILLAGE_FAST_COMMAND_INTEGRATION=True)
+    def test_socialize_fast_mode_tolerates_needs_cursor_ahead_of_start(self):
+        """fast 模式下 checkpoint 已把 needs 游标推到动作起点之后，SOCIALIZE
+        结算不应因游标超前而被 INVALID_ACTIVITY_INTERVAL 拒绝。"""
+        payload = self.payload("SOCIALIZE", {"target_npc_id": "10012", "reservation_id": str(uuid.uuid4())})
+        self.arm(payload)
+        self.runtime.needs_world_minute = 20
+        self.other_runtime.needs_world_minute = 25
+        self.runtime.save(update_fields=["needs_world_minute"])
+        self.other_runtime.save(update_fields=["needs_world_minute"])
+
+        result = LifeActionService.execute(payload)
+
+        self.assertTrue(result["success"], result)
+        self.runtime.refresh_from_db()
+        self.other_runtime.refresh_from_db()
+        self.assertEqual(self.runtime.action_status, "IDLE")
+        self.assertEqual(self.runtime.needs_world_minute, 30)
+        self.assertEqual(self.other_runtime.needs_world_minute, 30)
+
+    def test_settlement_interval_mismatch_terminalizes_npc_busy_with_outcome(self):
+        """结算区间与武装区间不一致是终态拒绝：落 FAILED 并投递失败 OUTCOME，
+        不能留下僵尸 RUNNING 命令让发送方无限等待。"""
+        payload = self.payload("REST", {})
+        self.arm(payload)
+        # 模拟 Unity/后端时钟偏差：结算区间与武装区间不再一致。
+        payload["start_world_minute"] = 1
+        payload["completion_world_minute"] = 31
+        result = LifeActionService.execute(payload)
+        self.assertFalse(result["success"])
+        self.assertEqual(result["result_code"], ResultCode.NPC_BUSY)
+        self.runtime.refresh_from_db()
+        self.assertEqual(self.runtime.action_status, "IDLE")
+        self.assertIsNone(self.runtime.active_command_id)
+        command = NpcCommandState.objects.get(command_id=uuid.UUID(payload["command_id"]))
+        self.assertEqual(command.status, "FAILED")
+        self.assertTrue(VillageActionReceipt.objects.filter(command=command).exists())
+        self.assertEqual(
+            VillageDeliveryOutbox.objects.filter(command=command, message_kind="OUTCOME").count(), 1)

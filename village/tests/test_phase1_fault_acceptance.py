@@ -339,7 +339,7 @@ class PhaseOneFaultAcceptanceTests(TestCase):
         self.assertTrue(ok, code)
         self.assertNotEqual(replacement.reservation_id, reservation.reservation_id)
 
-    def test_bootstrap_discards_legacy_queued_and_running_command_wire_data(self):
+    def test_bootstrap_restores_queued_and_running_command_wire_data(self):
         queued_content, queued = self._accept("10011")
         running_content, running = self._accept("10012")
         ok, code, _ = CommandService.start_command(running.command_id)
@@ -348,12 +348,11 @@ class PhaseOneFaultAcceptanceTests(TestCase):
         data = BootstrapService.get_bootstrap()
         self.assertEqual([npc["npc_id"] for npc in data["npcs"]], list(FORMAL_NPC_IDS))
         running_npc = next(item for item in data["npcs"] if item["npc_id"] == "10012")
-        self.assertEqual(data["commands"], [])
-        self.assertIsNone(running_npc["active_command"])
-        self.assertIsNone(running_npc["active_command_id"])
-        self.assertEqual(running_npc["action_status"], "IDLE")
+        self.assertEqual(len(data["commands"]), 2)
+        self.assertEqual(running_npc["active_command"]["status"], "RUNNING")
+        self.assertEqual(running_npc["active_command_id"], str(running.command_id))
 
-    def test_not_before_legacy_command_is_not_restored_into_unity_queue(self):
+    def test_not_before_command_is_restored_into_unity_queue(self):
         content, command = self._accept(
             "10011", not_before_world_minute=self.time_state.world_minute + 5
         )
@@ -363,7 +362,9 @@ class PhaseOneFaultAcceptanceTests(TestCase):
         self.assertIsNone(started)
         command.refresh_from_db()
         self.assertEqual(command.status, "QUEUED")
-        self.assertEqual(BootstrapService.get_bootstrap()["commands"], [])
+        restored = BootstrapService.get_bootstrap()["commands"]
+        self.assertEqual(len(restored), 1)
+        self.assertEqual(restored[0]["status"], "QUEUED")
 
     def test_prestart_expiry_is_terminalized_by_backend_and_outbox_recovers(self):
         """An accepted boundary-expiry STRICT command must never need a Unity Outcome.
@@ -392,7 +393,7 @@ class PhaseOneFaultAcceptanceTests(TestCase):
         self.assertIsNone(started)
 
         command.refresh_from_db()
-        self.assertEqual(command.status, "FAILED")
+        self.assertEqual(command.status, "EXPIRED")
         self.assertEqual(command.result_code, ResultCode.MESSAGE_EXPIRED)
         receipt = VillageActionReceipt.objects.get(command=command)
         self.assertFalse(receipt.success)
@@ -448,7 +449,7 @@ class PhaseOneFaultAcceptanceTests(TestCase):
 
         for command in (ttl_command, world_command):
             command.refresh_from_db()
-            self.assertEqual(command.status, "FAILED")
+            self.assertEqual(command.status, "EXPIRED")
             self.assertEqual(command.result_code, ResultCode.MESSAGE_EXPIRED)
             receipt = VillageActionReceipt.objects.get(command=command)
             self.assertFalse(receipt.success)
@@ -502,7 +503,7 @@ class PhaseOneFaultAcceptanceTests(TestCase):
         self.assertEqual(bootstrap["time_revision"], self.time_state.time_revision)
 
         formal_command.refresh_from_db()
-        self.assertEqual(formal_command.status, "FAILED")
+        self.assertEqual(formal_command.status, "EXPIRED")
         self.assertEqual(formal_command.result_code, ResultCode.MESSAGE_EXPIRED)
         self.assertTrue(VillageActionReceipt.objects.filter(command=formal_command).exists())
 

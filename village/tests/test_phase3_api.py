@@ -568,10 +568,10 @@ class Phase3EconomyApiTests(TestCase):
         )
         self.assertEqual(resp.status_code, 400)
 
-    # ── Old routes still 404 ──────────────────────────────────────────────────
+    # ── Phase-six routes are protected and reachable ──────────────────────────
 
-    def test_old_routes_still_404(self):
-        """Legacy routes remain 404."""
+    def test_phase_six_routes_are_not_removed(self):
+        """The formerly disabled authority routes now exist behind auth."""
         client = APIClient()
         for path in (
             "/api/village/runtime/time",
@@ -581,4 +581,4 @@ class Phase3EconomyApiTests(TestCase):
             "/api/village/runtime/advance-needs",
         ):
             resp = client.post(path, {}, format="json")
-            self.assertEqual(resp.status_code, 404, f"{path} should still be 404")
+            self.assertNotEqual(resp.status_code, 404, f"{path} must be registered")

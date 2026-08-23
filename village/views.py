@@ -19,7 +19,7 @@ from .runtime_services import (
 )
 from .phase2_services import LifeActionService, NeedsService, runtime_summary
 from .services import validate_bootstrap
-from .trusted_persistence import save_result, save_snapshots
+from .trusted_persistence import save_snapshots
 
 
 def _config_data(config):
@@ -197,19 +197,12 @@ def runtime_time(request):
 @permission_classes([IsAuthenticated])
 def actions_complete(request):
     """POST /api/village/actions/complete"""
-    # Unity is the sole runtime authority. Persist its terminal report exactly.
-    trusted = save_result(dict(request.data) if isinstance(request.data, dict) else {})
-    trusted_status = 200 if trusted["success"] else 400
-    trusted_data = {
-        key: value for key, value in trusted.items()
-        if key not in {"success", "result_code", "receipt", "world_event"}
-    }
-    return Response({
-        "success": trusted["success"],
-        "resultCode": trusted["result_code"],
-        "data": trusted_data,
-    }, status=trusted_status)
-
+    command_id = request.data.get("command_id")
+    request_id = request.data.get("request_id")
+    success = bool(request.data.get("success"))
+    result_code = request.data.get("result_code") or ResultCode.INVALID_COMMAND_SCHEMA
+    message = request.data.get("message", "")
+    data = request.data.get("data") if isinstance(request.data.get("data"), dict) else {}
     if not command_id or not request_id:
         return Response(
             {"success": False, "resultCode": "INVALID_COMMAND_SCHEMA", "message": "缺少 command_id 或 request_id"},
@@ -297,6 +290,40 @@ def npc_runtime_summary(request, npc_id):
     return Response({"success": result["success"], "resultCode": result["result_code"], "data": data}, status=status)
 
 
+def _discover_parameter_schema(action):
+    fields = {
+        "MOVE": {"location_code": {"type": "string"}, "point_code": {"type": "string"}},
+        "WAIT": {"duration_minutes": {"type": "integer", "minimum": 1}},
+        "GO_HOME": {},
+        "EAT": {"source": {"type": "string"}, "food_instance_id": {"type": "string"}, "expected_asset_version": {"type": "integer", "minimum": 0}},
+        "REST": {}, "SLEEP": {}, "WORK_PLACEHOLDER": {},
+        "SOCIALIZE": {"target_npc_id": {"type": "string"}, "reservation_id": {"type": "string", "format": "uuid"}},
+        "PLANT": {"plot_code": {"type": "string"}, "crop_code": {"type": "string"}, "expected_asset_version": {"type": "integer", "minimum": 0}},
+        "HARVEST": {"plot_code": {"type": "string"}, "expected_asset_version": {"type": "integer", "minimum": 0}},
+        "HUNT": {"hunt_code": {"type": "string"}}, "COOK": {"recipe_id": {"type": "integer"}},
+        "CREATE_ORDER": {"side": {"type": "string"}, "item_id": {"type": "integer"}, "quantity": {"type": "integer", "minimum": 1}, "limit_price": {"type": "integer", "minimum": 0}},
+        "CANCEL_ORDER": {"order_id": {"type": "string", "format": "uuid"}}, "START_DELIVERY": {"order_id": {"type": "string", "format": "uuid"}},
+        "IMPORT_GOODS": {"item_id": {"type": "integer"}, "amount": {"type": "integer", "minimum": 1}},
+        "EXPORT_GOODS": {"item_id": {"type": "integer"}, "amount": {"type": "integer", "minimum": 1}},
+        "RATE_DISH": {"recipe_id": {"type": "integer"}, "rating": {"type": "integer", "minimum": 1, "maximum": 5}},
+        "PUBLISH_PRICE_INDEX": {"prices": {"type": "object"}}, "AUDIT_PUBLIC_FUND": {},
+        "PROPOSE_TRADE": {"target_npc_id": {"type": "string"}, "item_id": {"type": "integer"}, "quantity": {"type": "integer", "minimum": 1}},
+        "RESPOND_TRADE": {"offer_id": {"type": "string", "format": "uuid"}, "response": {"type": "string"}},
+        "CANCEL_TRADE_OFFER": {"offer_id": {"type": "string", "format": "uuid"}},
+        "LIST_STORE_ITEM": {"item_id": {"type": "integer"}, "quantity": {"type": "integer", "minimum": 1}, "price": {"type": "integer", "minimum": 0}},
+        "UPDATE_STORE_PRICE": {"listing_id": {"type": "string", "format": "uuid"}, "price": {"type": "integer", "minimum": 0}},
+        "DELIST_STORE_ITEM": {"listing_id": {"type": "string", "format": "uuid"}},
+        "BUY_FROM_STORE": {"listing_id": {"type": "string", "format": "uuid"}, "quantity": {"type": "integer", "minimum": 1}},
+        "INSPECT_STORE_INVENTORY": {"store_code": {"type": "string"}}, "INSPECT_SOCIAL_STATE": {},
+        "CREATE_COMMITMENT": {"beneficiary_npc_id": {"type": "string"}, "commitment_type": {"type": "string"}, "target": {}, "due_world_minute": {"type": "integer", "minimum": 0}},
+        "CANCEL_COMMITMENT": {"commitment_id": {"type": "string", "format": "uuid"}}, "PERFORM_COMMITMENT": {"commitment_id": {"type": "string", "format": "uuid"}, "phase": {"type": "string"}},
+        "STORY_VOTE": {"meeting_id": {"type": "string", "format": "uuid"}, "plan_code": {"type": "string"}, "expected_story_version": {"type": "integer", "minimum": 0}},
+        "STORY_ACT": {"action_code": {"type": "string"}, "expected_story_version": {"type": "integer", "minimum": 0}},
+    }
+    properties = fields.get(action, {})
+    return {"$schema": "https://json-schema.org/draft/2020-12/schema", "type": "object", "properties": properties, "additionalProperties": False}
+
+
 @api_view(["GET"])
 @authentication_classes([EnvServerJWTAuthentication])
 @permission_classes([IsAuthenticated])
@@ -304,10 +331,31 @@ def npc_available_actions(request, npc_id):
     """Frozen P4 route: GET /api/village/npcs/{npc_id}/available-actions."""
     result = runtime_summary(npc_id)
     status = 200 if result["success"] else 409
+    available = set(result.get("available_actions", []))
+    actions = [
+        {
+            "name": action,
+            "available": action in available,
+            "reason": "AVAILABLE" if action in available else "RUNTIME_NOT_READY",
+            "state_version": result.get("state_version"),
+            "expires_world_minute": result.get("world_minute", 0) + 30,
+            "parameter_schema": _discover_parameter_schema(action),
+            "result_codes": ["COMMAND_ACCEPTED", "ACTION_NOT_ALLOWED", "NPC_BUSY"],
+        }
+        for action in sorted(CommandService.ALLOWED_ACTIONS)
+    ]
     return Response({
         "success": result["success"], "resultCode": result["result_code"],
-        "data": {"npc_id": result.get("npc_id"), "state_version": result.get("state_version"), "available_actions": result.get("available_actions", [])},
+        "data": {"npc_id": result.get("npc_id"), "state_version": result.get("state_version"), "available_actions": result.get("available_actions", []), "action_specs": actions},
     }, status=status)
+
+
+@api_view(["GET"])
+@authentication_classes([EnvServerJWTAuthentication])
+@permission_classes([IsAuthenticated])
+def npc_discover(request, npc_id):
+    """Complete dynamic Discover projection used by the formal Hub path."""
+    return npc_available_actions(request, npc_id)
 
 
 @api_view(["GET"])
@@ -382,7 +430,19 @@ def commands_start(request, command_id):
             status=400,
         )
 
-    ok, result_code, command = CommandService.start_command(command_id_uuid)
+    # Unity 是时间权威：start_world_minute 是 Unity 本地实际开始分钟，
+    # 用于武装命令区间（与结算区间精确一致），缺失时回退后端本地钟。
+    start_world_minute = request.data.get("start_world_minute") if isinstance(request.data, dict) else None
+    if start_world_minute is not None:
+        try:
+            start_world_minute = int(start_world_minute)
+        except (TypeError, ValueError):
+            return Response(
+                {"success": False, "resultCode": "INVALID_COMMAND_SCHEMA", "message": "无效的 start_world_minute"},
+                status=400,
+            )
+
+    ok, result_code, command = CommandService.start_command(command_id_uuid, start_world_minute)
 
     if not ok:
         return Response({"success": False, "resultCode": result_code}, status=409)
@@ -400,10 +460,39 @@ def commands_start(request, command_id):
 @api_view(["GET"])
 @authentication_classes([EnvServerJWTAuthentication])
 @permission_classes([IsAuthenticated])
+def commands_status(request, command_id):
+    try:
+        command_uuid = uuid.UUID(command_id)
+    except (TypeError, ValueError):
+        return Response({"success": False, "resultCode": ResultCode.INVALID_COMMAND_SCHEMA}, status=400)
+    ok, result_code, data = CommandService.get_status(command_uuid)
+    return Response({"success": ok, "resultCode": result_code, "data": data}, status=200 if ok else 404)
+
+
+@api_view(["POST"])
+@authentication_classes([EnvServerJWTAuthentication])
+@permission_classes([IsAuthenticated])
+def commands_cancel(request, command_id):
+    try:
+        command_uuid = uuid.UUID(command_id)
+    except (TypeError, ValueError):
+        return Response({"success": False, "resultCode": ResultCode.INVALID_COMMAND_SCHEMA}, status=400)
+    ok, result_code, command = CommandService.cancel_command(command_uuid)
+    return Response({
+        "success": ok,
+        "resultCode": result_code,
+        "data": CommandService.serialize_status(command) if command else None,
+    }, status=200 if ok else 409)
+
+
+@api_view(["GET"])
+@authentication_classes([EnvServerJWTAuthentication])
+@permission_classes([IsAuthenticated])
 def deliveries_pending(request):
     """GET /api/village/deliveries/pending"""
     recipient = request.query_params.get("recipient")
     limit = request.query_params.get("limit", 10)
+    after_sequence = request.query_params.get("after_sequence")
 
     if not recipient:
         return Response(
@@ -413,10 +502,12 @@ def deliveries_pending(request):
 
     try:
         limit = int(limit)
+        after_sequence = int(after_sequence) if after_sequence is not None else OutboxService.get_cursor(recipient)
     except ValueError:
         limit = 10
+        after_sequence = OutboxService.get_cursor(recipient)
 
-    entries = OutboxService.claim_pending(recipient=recipient, limit=limit)
+    entries = OutboxService.claim_pending(recipient=recipient, limit=limit, after_sequence=after_sequence)
     return Response({"success": True, "data": entries})
 
 
@@ -433,7 +524,16 @@ def deliveries_ack(request, delivery_id):
             status=400,
         )
 
-    ok, result_code = OutboxService.ack_delivery(delivery_id_uuid)
+    event_sequence = request.data.get("event_sequence")
+    try:
+        event_sequence = int(event_sequence) if event_sequence is not None else None
+    except (TypeError, ValueError):
+        return Response({"success": False, "resultCode": ResultCode.INVALID_COMMAND_SCHEMA}, status=400)
+    ok, result_code = OutboxService.ack_delivery(
+        delivery_id_uuid,
+        event_sequence=event_sequence,
+        recipient=request.data.get("recipient"),
+    )
 
     if not ok:
         return Response({"success": False, "resultCode": result_code}, status=409)
@@ -442,3 +542,13 @@ def deliveries_ack(request, delivery_id):
         "success": True,
         "resultCode": result_code,
     })
+
+
+@api_view(["GET"])
+@authentication_classes([EnvServerJWTAuthentication])
+@permission_classes([IsAuthenticated])
+def deliveries_cursor(request):
+    recipient = request.query_params.get("recipient")
+    if not recipient:
+        return Response({"success": False, "resultCode": ResultCode.INVALID_COMMAND_SCHEMA}, status=400)
+    return Response({"success": True, "data": {"recipient": recipient, "last_event_sequence": OutboxService.get_cursor(recipient)}})
