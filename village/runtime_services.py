@@ -24,7 +24,7 @@ from typing import Any, Dict, List, Optional, Tuple
 
 from django.conf import settings
 from django.db import IntegrityError, models, transaction
-from django.db.models import F, Q
+from django.db.models import Exists, F, OuterRef, Q
 from django.utils import timezone
 
 from .models import (
@@ -41,6 +41,8 @@ from .models import (
 )
 from game_time.models import GlobalGameTimeState
 from inventory.models import NpcDefinition
+
+from .command_catalog import COMMAND_CATALOG
 
 
 def _fast_integration_enabled() -> bool:
@@ -127,8 +129,126 @@ class ResultCode:
     COMMAND_EXPIRED = "COMMAND_EXPIRED"
     COMMAND_NOT_FOUND = "COMMAND_NOT_FOUND"
     COMMAND_NOT_CANCELLABLE = "COMMAND_NOT_CANCELLABLE"
+    SLEEP_INTERRUPTED = "SLEEP_INTERRUPTED"
+    NPC_NOT_SLEEPING = "NPC_NOT_SLEEPING"
+    SLEEP_COMMAND_MISMATCH = "SLEEP_COMMAND_MISMATCH"
     SETTLEMENT_IN_PROGRESS = "SETTLEMENT_IN_PROGRESS"
     HANDSHAKE_REQUIRED = "HANDSHAKE_REQUIRED"
+
+
+_OUTCOME_ACTION_LABELS = {
+    "MOVE": "移动", "WAIT": "等待", "GO_HOME": "回家", "EAT": "进食",
+    "REST": "休息", "SLEEP": "睡眠", "SOCIALIZE": "社交",
+    "WORK_PLACEHOLDER": "工作", "PLANT": "播种", "HARVEST": "收获",
+    "HUNT": "狩猎", "COOK": "烹饪", "CREATE_ORDER": "创建订单",
+    "CANCEL_ORDER": "取消订单", "START_DELIVERY": "配送",
+    "IMPORT_GOODS": "进货", "EXPORT_GOODS": "出货", "RATE_DISH": "菜品评分",
+    "PUBLISH_PRICE_INDEX": "发布价格指数", "AUDIT_PUBLIC_FUND": "公共资金审计",
+    "PROPOSE_TRADE": "发起交易", "RESPOND_TRADE": "响应交易",
+    "CANCEL_TRADE_OFFER": "取消交易报价", "LIST_STORE_ITEM": "商品上架",
+    "UPDATE_STORE_PRICE": "修改商品价格", "DELIST_STORE_ITEM": "商品下架",
+    "BUY_FROM_STORE": "购买商品", "INSPECT_STORE_INVENTORY": "读取商店库存",
+    "OBSERVE": "读取状态", "INSPECT_NEARBY": "读取附近信息", "INSPECT_INVENTORY": "读取背包",
+    "INSPECT_TRADE_OFFERS": "读取交易报价", "INSPECT_STORY_STATE": "读取剧情状态",
+    "INSPECT_RELEVANT_STORIES": "读取相关剧情", "INSPECT_STORY_DETAIL": "读取剧情详情",
+    "INSPECT_ORDERS": "读取订单", "INSPECT_MARKET_STATE": "读取市场状态",
+    "INSPECT_FARM_STATE": "读取农田状态", "INSPECT_RESTAURANT_STATE": "读取餐厅状态",
+    "INSPECT_RATEABLE_DISHES": "读取可评分菜品", "INSPECT_PUBLIC_ECONOMY_STATE": "读取公共经济状态",
+    "INSPECT_SOCIAL_STATE": "读取社交状态",
+    "CREATE_COMMITMENT": "创建承诺", "CANCEL_COMMITMENT": "取消承诺",
+    "PERFORM_COMMITMENT": "履行承诺", "STORY_VOTE": "剧情投票",
+    "STORY_ACT": "剧情行动", "UPDATE_SUBJECTIVE_GOAL": "更新主观目标",
+}
+
+_OUTCOME_REASONS = {
+    "BACKEND_UNAVAILABLE": "Backend 暂不可用，尚未确认最终结果",
+    "INVALID_ENVELOPE": "消息信封格式无效", "INVALID_COMMAND_SCHEMA": "命令字段或参数格式无效",
+    "UNKNOWN_ACTION": "动作名称未知", "ACTION_NOT_ALLOWED": "当前状态不允许执行此动作",
+    "QUEUE_FULL": "命令队列已满", "NPC_BUSY": "NPC 正在执行其他动作",
+    "NPC_NOT_SLEEPING": "NPC 当前没有睡眠", "SLEEP_COMMAND_MISMATCH": "唤醒请求与睡眠命令不匹配",
+    "STALE_STATE_VERSION": "客户端状态版本已过期", "STALE_TIME_REVISION": "时间版本已过期",
+    "WORLD_TIME_REGRESSION": "世界时间不能倒退", "INVALID_LOCATION": "当前位置不满足动作要求",
+    "INVALID_ACTION_LOCATION": "当前位置不满足动作要求", "P3_WRONG_LOCATION": "当前位置不满足动作要求",
+    "TRADE_WRONG_LOCATION": "当前位置不满足交易要求", "TARGET_UNREACHABLE": "目标地点不可达",
+    "ACTION_TIMEOUT": "动作执行超时", "FOOD_NOT_AVAILABLE": "指定食物不存在或数量不足",
+    "FOOD_NOT_ALLOWED": "指定物品不是允许食用的食物", "ENERGY_TOO_LOW": "能量不足",
+    "HEALTH_TOO_LOW": "生命值过低", "LOCATION_CLOSED": "目标地点当前关闭",
+    "P3_FEATURE_DISABLED": "经济功能未启用", "P3_FORBIDDEN_ACTOR": "当前 NPC 无权执行该经济动作",
+    "P3_INVALID_PARAMS": "经济动作参数无效", "P3_INSUFFICIENT_ITEM": "物品或材料不足",
+    "P3_INSUFFICIENT_MONEY": "金币不足", "P3_TOOL_BROKEN": "所需工具已损坏",
+    "P3_PLOT_NOT_READY": "地块尚未准备好", "P3_RECIPE_NOT_ALLOWED": "当前菜谱不允许制作",
+    "P3_ORDER_NOT_OPEN": "订单不存在或已关闭", "P3_DELIVERY_NOT_READY": "配送尚未准备好",
+    "P3_PRICE_UNAVAILABLE": "当前价格不可用", "P3_CARAVAN_COOLDOWN": "商队仍在冷却中",
+    "P3_ASSET_VERSION_CONFLICT": "经济资产版本已变化，请刷新后重试",
+    "P3_REQUEST_CONFLICT": "经济请求冲突，请刷新后重试", "P3_DAY_NOT_READY": "当天经济数据尚未准备好",
+    "TRADE_TARGET_NOT_FOUND": "交易对象不存在", "TRADE_TARGET_REJECTED": "交易对象拒绝了报价",
+    "TRADE_OFFER_NOT_FOUND": "交易报价不存在", "TRADE_OFFER_EXPIRED": "交易报价已过期",
+    "TRADE_OFFER_ALREADY_RESOLVED": "交易报价已经处理过", "TRADE_RESPONSE_FORBIDDEN": "无权响应该交易报价",
+    "TRADE_CANCEL_FORBIDDEN": "无权取消该交易报价", "TRADE_NOT_COLOCATED": "交易双方不在同一地点",
+    "TRADE_STORE_CLOSED": "商店当前关闭", "TRADE_STORE_FORBIDDEN": "无权操作该商店",
+    "TRADE_LISTING_NOT_FOUND": "商品不存在", "TRADE_LISTING_NOT_ACTIVE": "商品未在售",
+    "TRADE_ITEM_NOT_FOR_SALE": "该物品不可出售", "TRADE_INSUFFICIENT_MONEY": "金币不足",
+    "TRADE_INSUFFICIENT_ITEM": "库存物品不足", "TRADE_ASSET_VERSION_CONFLICT": "交易资产版本已变化，请刷新后重试",
+    "TRADE_STORE_VERSION_CONFLICT": "商店库存版本已变化，请刷新后重试", "TRADE_REQUEST_CONFLICT": "交易请求冲突，请刷新后重试",
+    "VILLAGE_SOCIAL_DISABLED": "社交功能未启用", "SOCIAL_INVALID_PARAMS": "社交参数无效",
+    "COMMITMENT_NOT_FOUND": "承诺不存在", "COMMITMENT_ALREADY_RESOLVED": "承诺已经处理过",
+    "COMMITMENT_EXPIRED": "承诺已过期", "SOCIAL_NOT_COLOCATED": "双方不在同一地点",
+    "SOCIAL_PARTICIPANT_UNAVAILABLE": "社交参与者当前不可用", "INSUFFICIENT_MONEY": "金币不足",
+    "INSUFFICIENT_ITEM": "物品不足", "STORY_FEATURE_DISABLED": "剧情功能未启用",
+    "STORY_VERSION_CONFLICT": "剧情版本已变化，请刷新后重试", "STORY_PHASE_INVALID": "当前剧情阶段不允许此操作",
+    "STORY_PLAN_INVALID": "剧情方案无效", "STORY_FACT_NOT_UNLOCKED": "相关剧情事实尚未解锁",
+    "STORY_MEETING_NOT_OPEN": "剧情会议尚未开放", "STORY_MEETING_ALREADY_SETTLED": "剧情会议已经结算",
+    "STORY_NOT_ENOUGH_ATTENDANCE": "出席人数不足", "STORY_VOTE_INVALID": "剧情投票参数无效",
+    "STORY_FORBIDDEN_ACTOR": "当前 NPC 无权执行该剧情操作", "STORY_ACTION_INVALID": "剧情行动不适用于当前计划",
+    "STORY_LOCATION_INVALID": "剧情行动地点不正确", "STORY_RESOURCE_INSUFFICIENT": "剧情资源不足",
+    "STORY_FUND_INSUFFICIENT": "剧情资金不足", "STORY_TRUST_TOO_LOW": "信任度不足",
+    "STORY_NOT_READY": "剧情当前尚未准备好", "STORY_REQUEST_CONFLICT": "剧情请求冲突，请刷新后重试",
+    "STORY_RATION_LIMIT_REACHED": "剧情行动额度已用尽", "GOAL_VERSION_CONFLICT": "目标版本已变化，请刷新后重试",
+    "INVALID_GOAL_SCHEMA": "主观目标格式无效", "HANDSHAKE_REQUIRED": "尚未完成 Hub 会话握手",
+    "COMMAND_EXPIRED": "命令已过期", "COMMAND_NOT_FOUND": "命令不存在",
+    "COMMAND_NOT_CANCELLABLE": "命令当前不可取消", "SETTLEMENT_IN_PROGRESS": "命令正在结算中",
+}
+
+
+def _outcome_message(action: str, result_code: str, success: bool) -> str:
+    action = str(action or "UNKNOWN").upper()
+    label = _OUTCOME_ACTION_LABELS.get(action, action)
+    if result_code == ResultCode.COMMAND_ACCEPTED:
+        return f"已接受「{label}」指令，正在执行。"
+    if result_code == ResultCode.COMMAND_REPLAYED:
+        return "该指令已处理过，返回已保存的结果。"
+    if result_code == ResultCode.SLEEP_INTERRUPTED:
+        return "已提前唤醒 NPC，睡眠被中断。"
+    if success:
+        return f"「{label}」已完成。"
+    reason = _OUTCOME_REASONS.get(result_code)
+    if reason is None:
+        reason = f"服务端返回 {result_code or '未知结果'}"
+    return f"「{label}」失败：{reason}。"
+
+
+def _outcome_next_action(result_code: str) -> Optional[str]:
+    if result_code == ResultCode.BACKEND_UNAVAILABLE:
+        return "RETRY"
+    if result_code in {ResultCode.NPC_BUSY, ResultCode.QUEUE_FULL, ResultCode.SETTLEMENT_IN_PROGRESS}:
+        return "WAIT"
+    if result_code in {"FOOD_NOT_AVAILABLE", "FOOD_NOT_ALLOWED", "P3_INSUFFICIENT_ITEM", "P3_INSUFFICIENT_MONEY", "TRADE_INSUFFICIENT_ITEM", "TRADE_INSUFFICIENT_MONEY"}:
+        return "INSPECT_INVENTORY"
+    if result_code in {"P3_PLOT_NOT_READY"}:
+        return "INSPECT_FARM_STATE"
+    if result_code in {"P3_RECIPE_NOT_ALLOWED", "LOCATION_CLOSED"}:
+        return "INSPECT_RESTAURANT_STATE"
+    if result_code in {"TRADE_LISTING_NOT_FOUND", "TRADE_LISTING_NOT_ACTIVE", "TRADE_STORE_CLOSED", "TRADE_STORE_FORBIDDEN", "TRADE_STORE_VERSION_CONFLICT"}:
+        return "INSPECT_STORE_INVENTORY"
+    if result_code in {"TRADE_OFFER_NOT_FOUND", "TRADE_OFFER_EXPIRED", "TRADE_OFFER_ALREADY_RESOLVED"}:
+        return "INSPECT_TRADE_OFFERS"
+    if result_code in {"P3_WRONG_LOCATION", "INVALID_ACTION_LOCATION", "TRADE_WRONG_LOCATION", "TRADE_NOT_COLOCATED", "SOCIAL_NOT_COLOCATED"}:
+        return "MOVE"
+    if result_code in {"STORY_VERSION_CONFLICT", "STORY_PHASE_INVALID", "STORY_NOT_READY", "STORY_REQUEST_CONFLICT"}:
+        return "INSPECT_STORY_STATE"
+    if result_code in {"INVALID_COMMAND_SCHEMA", "INVALID_ENVELOPE", "P3_INVALID_PARAMS", "SOCIAL_INVALID_PARAMS", "STORY_VOTE_INVALID", "STORY_ACTION_INVALID"}:
+        return "FIX_COMMAND"
+    return None
 
 
 # ============================================================================
@@ -423,6 +543,7 @@ class BootstrapService:
                 "village_economy_enabled": config.village_economy_enabled if config else False,
                 "village_social_enabled": config.village_social_enabled if config else False,
                 "village_story_enabled": config.village_story_enabled if config else False,
+                "village_presentation_enabled": config.village_presentation_enabled if config else False,
                 # action_durations is the unified Phase 1/2/3 timer map.
                 "action_durations": action_durations,
                 "navigation_action_timeout_seconds": navigation_timeouts,
@@ -628,26 +749,77 @@ class CheckpointService:
 class CommandService:
     """命令生命周期服务。"""
 
-    ALLOWED_ACTIONS = {
-        "MOVE", "WAIT", "GO_HOME", "EAT", "REST", "SLEEP", "SOCIALIZE", "WORK_PLACEHOLDER",
-        "STORY_VOTE", "STORY_ACT",
-        "PLANT", "HARVEST", "HUNT", "COOK", "CREATE_ORDER", "CANCEL_ORDER",
-        "START_DELIVERY", "IMPORT_GOODS", "EXPORT_GOODS", "RATE_DISH",
-        "PUBLISH_PRICE_INDEX", "AUDIT_PUBLIC_FUND", "PROPOSE_TRADE", "RESPOND_TRADE",
-        "CANCEL_TRADE_OFFER", "LIST_STORE_ITEM", "UPDATE_STORE_PRICE", "DELIST_STORE_ITEM",
-        "BUY_FROM_STORE", "INSPECT_STORE_INVENTORY", "INSPECT_SOCIAL_STATE",
-        "CREATE_COMMITMENT", "CANCEL_COMMITMENT", "PERFORM_COMMITMENT",
-    }
+    ALLOWED_ACTIONS = frozenset(COMMAND_CATALOG)
+    READ_QUERY_ACTIONS = frozenset({
+        "OBSERVE", "INSPECT_NEARBY", "INSPECT_INVENTORY",
+        "INSPECT_TRADE_OFFERS", "INSPECT_STORY_STATE", "INSPECT_RELEVANT_STORIES",
+        "INSPECT_STORY_DETAIL", "INSPECT_ORDERS",
+        "INSPECT_MARKET_STATE", "INSPECT_FARM_STATE",
+        "INSPECT_RESTAURANT_STATE", "INSPECT_RATEABLE_DISHES",
+        "INSPECT_PUBLIC_ECONOMY_STATE",
+        "INSPECT_STORE_INVENTORY", "INSPECT_SOCIAL_STATE",
+    })
     STORY_ACTIONS = {"STORY_VOTE", "STORY_ACT"}
     MAX_QUEUE_SIZE = 10
     MAX_CLOCK_SKEW_MS = 5 * 60 * 1000
     PHASE2_ACTIONS = {"EAT", "REST", "SLEEP", "SOCIALIZE", "WORK_PLACEHOLDER"}
+    PHASE3_ACTIONS = {
+        "PLANT", "HARVEST", "HUNT", "COOK", "CREATE_ORDER", "CANCEL_ORDER",
+        "START_DELIVERY", "IMPORT_GOODS", "EXPORT_GOODS", "RATE_DISH",
+        "PUBLISH_PRICE_INDEX", "AUDIT_PUBLIC_FUND", "PROPOSE_TRADE",
+        "RESPOND_TRADE", "CANCEL_TRADE_OFFER", "LIST_STORE_ITEM",
+        "UPDATE_STORE_PRICE", "DELIST_STORE_ITEM", "BUY_FROM_STORE",
+        "INSPECT_STORE_INVENTORY",
+    }
+    DIRECT_TRADE_ACTIONS = {
+        "PROPOSE_TRADE", "RESPOND_TRADE", "CANCEL_TRADE_OFFER",
+        "LIST_STORE_ITEM", "UPDATE_STORE_PRICE", "DELIST_STORE_ITEM",
+        "BUY_FROM_STORE", "INSPECT_STORE_INVENTORY",
+    }
+    PHASE4_ACTIONS = {
+        "INSPECT_SOCIAL_STATE", "CREATE_COMMITMENT", "CANCEL_COMMITMENT",
+        "PERFORM_COMMITMENT",
+    }
     NEEDS_FIELDS = {"hunger", "energy", "health", "social", "stress"}
+    WORK_ACTIONS = {
+        "WORK_PLACEHOLDER", "PLANT", "HARVEST", "HUNT", "COOK", "START_DELIVERY",
+    }
+    LOW_HEALTH_ACTIONS = READ_QUERY_ACTIONS | {"MOVE", "GO_HOME", "WAIT", "EAT", "REST", "SLEEP"}
+    VARIABLE_DURATION_ACTIONS = {"REST", "SLEEP", "SOCIALIZE", "WORK_PLACEHOLDER"}
+
+    @staticmethod
+    def allowed_actions_for(npc: NpcDefinition) -> set[str]:
+        """Return the configured command allow-list for one formal NPC."""
+        try:
+            configured = npc.village_profile.capabilities
+        except NpcProfile.DoesNotExist:
+            # Formal village bootstrap requires a profile. Keep isolated legacy
+            # and test NPC definitions compatible outside that runtime.
+            return set(CommandService.ALLOWED_ACTIONS)
+        return {
+            str(action).strip().upper()
+            for action in configured
+            if str(action).strip().upper() in CommandService.ALLOWED_ACTIONS
+        }
+
+    @staticmethod
+    def unavailable_reason(action_name: str, runtime: NpcRuntimeState) -> Optional[str]:
+        action_name = str(action_name).upper()
+        if runtime.health_fp <= 300 and action_name not in CommandService.LOW_HEALTH_ACTIONS:
+            return ResultCode.HEALTH_TOO_LOW
+        if action_name in CommandService.WORK_ACTIONS:
+            if runtime.hunger_fp >= 900:
+                return ResultCode.HUNGER_TOO_HIGH
+            if runtime.energy_fp <= 100:
+                return ResultCode.ENERGY_TOO_LOW
+        return None
 
     @staticmethod
     def apply_admin_duration(action_name: str, content: Dict[str, Any]) -> None:
         """Replace a wire duration with the Backend-managed value for known timers."""
         if action_name not in VillageActionDurationConfig.DEFAULT_DURATIONS:
+            return
+        if action_name in CommandService.VARIABLE_DURATION_ACTIONS and content.get("duration_minutes") is not None:
             return
         duration_minutes = VillageActionDurationConfig.default_durations()[action_name]
         configured = VillageActionDurationConfig.objects.filter(
@@ -719,8 +891,10 @@ class CommandService:
                     uuid.UUID(str(params.get("food_instance_id")))
                 except (ValueError, TypeError):
                     return ResultCode.INVALID_COMMAND_SCHEMA
+                if not {"source", "food_instance_id"}.issubset(params):
+                    return ResultCode.INVALID_COMMAND_SCHEMA
                 version = params.get("expected_asset_version")
-                if set(params) != allowed_params[action_name] or isinstance(version, bool) or not isinstance(version, int) or version < 0:
+                if version is not None and (isinstance(version, bool) or not isinstance(version, int) or version < 0):
                     return ResultCode.INVALID_COMMAND_SCHEMA
             elif source == "COMMUNITY_MEAL":
                 if set(params) != {"source"}:
@@ -753,6 +927,7 @@ class CommandService:
         # 校验 sender
         fast_integration = _fast_integration_enabled()
         content = dict(content or {})
+        server_resolved_intent = content.pop("_server_resolved_intent", False) is True
         content["params"] = dict(content.get("params") or {})
         if fast_integration:
             content["schema_version"] = "village.command.v1"
@@ -808,6 +983,10 @@ class CommandService:
         action_name = content.get("name", "").upper()
         if action_name not in CommandService.ALLOWED_ACTIONS:
             return False, ResultCode.UNKNOWN_ACTION, None
+        if action_name not in CommandService.allowed_actions_for(npc):
+            return False, ResultCode.ACTION_NOT_ALLOWED, None
+        if action_name in CommandService.READ_QUERY_ACTIONS:
+            return False, ResultCode.ACTION_NOT_ALLOWED, None
         phase2_validation = CommandService.validate_phase2_command(action_name, content)
         if phase2_validation:
             return False, phase2_validation, None
@@ -879,10 +1058,7 @@ class CommandService:
         except NpcRuntimeState.DoesNotExist:
             return False, ResultCode.BOOTSTRAP_NPC_SET_MISMATCH, None
         expected_version = content.get("expected_state_version")
-        if fast_integration:
-            expected_version = runtime.state_version
-            content["expected_state_version"] = expected_version
-        elif action_name in CommandService.STORY_ACTIONS and expected_version is None:
+        if fast_integration or server_resolved_intent or expected_version is None:
             expected_version = runtime.state_version
             content["expected_state_version"] = expected_version
         if not isinstance(expected_version, int):
@@ -1174,6 +1350,16 @@ class CommandService:
         ).exists():
             return False, ResultCode.NPC_BUSY, None
 
+        if not fast_integration and command.kind not in CommandService.PHASE2_ACTIONS:
+            unavailable = CommandService.unavailable_reason(command.kind, rt)
+            if unavailable:
+                ActionService.complete_action(
+                    command.command_id, command.request_id, False, unavailable,
+                    message="Action rejected by authoritative need threshold.",
+                    allow_prestart_failure=True,
+                )
+                return False, unavailable, None
+
         # ``time_state`` remains locked from the first lifecycle read through
         # transition to RUNNING; do not re-read an unlocked minute here.
         now_ms = int(timezone.now().timestamp() * 1000)
@@ -1225,16 +1411,13 @@ class CommandService:
                     allow_prestart_failure=True,
                 )
                 return False, ResultCode.INVALID_ACTION_DURATION, None
-            threshold_code = None
-            if command.kind == "WORK_PLACEHOLDER":
-                if rt.hunger_fp >= 900:
-                    threshold_code = ResultCode.HUNGER_TOO_HIGH
-                elif rt.energy_fp <= 100:
-                    threshold_code = ResultCode.ENERGY_TOO_LOW
-                elif rt.health_fp <= 300:
-                    threshold_code = ResultCode.HEALTH_TOO_LOW
-            elif command.kind == "SOCIALIZE" and any(row.health_fp <= 300 for row in gate_runtimes):
-                threshold_code = ResultCode.HEALTH_TOO_LOW
+            threshold_code = CommandService.unavailable_reason(command.kind, rt)
+            if command.kind == "SOCIALIZE" and not threshold_code:
+                threshold_code = next((
+                    CommandService.unavailable_reason(command.kind, row)
+                    for row in gate_runtimes
+                    if CommandService.unavailable_reason(command.kind, row)
+                ), None)
             if threshold_code and not fast_integration:
                 ActionService.complete_action(
                     command.command_id, command.request_id, False,
@@ -1628,6 +1811,23 @@ class OutboxService:
         payload.setdefault("result_code", receipt.result_code)
         payload.setdefault("world_minute", receipt.world_minute)
         payload.setdefault("time_revision", receipt.time_revision)
+        payload.setdefault("action", str(receipt.action_kind or "UNKNOWN").upper())
+        payload.setdefault("phase", "COMPLETED")
+        payload.setdefault("terminal", True)
+        if command:
+            payload_data = dict(payload.get("data") or {})
+            if command.duration_minutes is not None:
+                payload_data.setdefault("duration_minutes", command.duration_minutes)
+            for key in ("target_npc_id", "location_code", "point_code"):
+                value = (command.sanitized_parameters or {}).get(key)
+                if value is not None:
+                    payload_data.setdefault(key, value)
+            payload["data"] = payload_data
+        if not str(payload.get("message") or "").strip():
+            payload["message"] = _outcome_message(
+                payload.get("action"), payload.get("result_code"), bool(payload.get("success")))
+        payload.setdefault("next_action", None if payload.get("success") else
+                           _outcome_next_action(payload.get("result_code")))
         if command:
             payload.setdefault("ref_id", str(command.command_id))
             payload.setdefault("original_message_id", str(command.message_id))
@@ -1654,6 +1854,16 @@ class OutboxService:
             entry.recipient = command.sender_id
             entry.payload = payload
             entry.save(update_fields=["command", "receipt", "recipient", "payload"])
+        else:
+            existing_payload = dict(entry.payload or {})
+            changed = False
+            for key in ("action", "phase", "terminal", "message", "next_action"):
+                if key not in existing_payload or existing_payload[key] in (None, ""):
+                    existing_payload[key] = payload.get(key)
+                    changed = True
+            if changed:
+                entry.payload = existing_payload
+                entry.save(update_fields=["payload"])
         return entry
 
     @staticmethod
@@ -1670,9 +1880,9 @@ class OutboxService:
         lease_until = now + timedelta(minutes=OutboxService.LEASE_DURATION_MINUTES)
 
         limit = max(1, min(int(limit), 100))
-        # 领取 PENDING 或租约过期的 IN_FLIGHT 条目；事件可按接收方游标重放。
-        # 游标过滤必须在 LIMIT 之前完成：否则取出的前 limit 行若全是已过游标的
-        # 旧事件，过滤后为 0 行，新的 OUTCOME/事件会被积压饿死。
+        # The delivery row is the retry authority.  A cursor is only a diagnostic
+        # safe watermark; it must never hide an unacknowledged row, including an
+        # expired lease after an out-of-order ACK.
         qs = VillageDeliveryOutbox.objects.select_for_update(skip_locked=True).filter(
             recipient=recipient,
             status__in=["PENDING", "IN_FLIGHT"],
@@ -1682,12 +1892,7 @@ class OutboxService:
         ).filter(
             Q(next_attempt_at__isnull=True) | Q(next_attempt_at__lte=now)
         )
-        if after_sequence is not None:
-            qs = qs.filter(
-                Q(message_kind="OUTCOME") |
-                Q(event__event_sequence__gt=int(after_sequence))
-            )
-        entries = list(qs.order_by("-priority", "created_at")[:limit])
+        entries = list(qs.order_by("-priority", "created_at", "delivery_id")[:limit])
 
         results = []
         for entry in entries:
@@ -1739,25 +1944,60 @@ class OutboxService:
         if recipient and entry.recipient != recipient:
             return False, ResultCode.SENDER_BINDING_INVALID
 
-        sequence = event_sequence
-        if sequence is None and entry.event_id:
-            sequence = entry.event.event_sequence
-        if sequence is not None:
+        canonical_sequence = (
+            entry.event.event_sequence
+            if entry.message_kind == "EVENT" and entry.event_id
+            else None
+        )
+        if entry.message_kind == "EVENT" and event_sequence is not None:
+            if isinstance(event_sequence, bool):
+                return False, ResultCode.INVALID_COMMAND_SCHEMA
+            try:
+                submitted_sequence = int(event_sequence)
+            except (TypeError, ValueError):
+                return False, ResultCode.INVALID_COMMAND_SCHEMA
+            if canonical_sequence is None or submitted_sequence != canonical_sequence:
+                return False, ResultCode.INVALID_COMMAND_SCHEMA
+
+        cursor = None
+        if canonical_sequence is not None:
             cursor, _ = VillageDeliveryCursor.objects.select_for_update().get_or_create(
                 recipient=entry.recipient
             )
-            if int(sequence) > cursor.last_event_sequence:
-                cursor.last_event_sequence = int(sequence)
-                cursor.save(update_fields=["last_event_sequence", "updated_at"])
 
         if entry.status == "ACKED":
+            if cursor is not None:
+                OutboxService._advance_safe_cursor(entry.recipient, cursor)
             return True, ResultCode.COMMAND_REPLAYED
 
         entry.status = "ACKED"
         entry.acked_at = timezone.now()
-        entry.save()
+        entry.save(update_fields=["status", "acked_at"])
+        if cursor is not None:
+            OutboxService._advance_safe_cursor(entry.recipient, cursor)
 
         return True, ResultCode.COMMAND_ACCEPTED
+
+    @staticmethod
+    def _advance_safe_cursor(recipient: str, cursor: VillageDeliveryCursor) -> None:
+        event_rows = VillageDeliveryOutbox.objects.filter(
+            recipient=recipient,
+            message_kind="EVENT",
+            event__isnull=False,
+        )
+        first_unacked = (
+            event_rows.exclude(status="ACKED")
+            .aggregate(sequence=models.Min("event__event_sequence"))["sequence"]
+        )
+        acknowledged = event_rows.filter(status="ACKED")
+        if first_unacked is not None:
+            acknowledged = acknowledged.filter(event__event_sequence__lt=first_unacked)
+        safe_sequence = acknowledged.aggregate(
+            sequence=models.Max("event__event_sequence")
+        )["sequence"] or 0
+        if safe_sequence > cursor.last_event_sequence:
+            cursor.last_event_sequence = safe_sequence
+            cursor.save(update_fields=["last_event_sequence", "updated_at"])
 
     @staticmethod
     def get_cursor(recipient: str) -> int:
@@ -1768,42 +2008,38 @@ class OutboxService:
 
     @staticmethod
     @transaction.atomic
-    def cleanup(retention_days: int = 7) -> Dict[str, int]:
-        """Summarize and remove only old, acknowledged low-priority events."""
+    def cleanup(retention_days: int = 7, batch_size: int = 1000) -> Dict[str, int]:
+        """Delete one bounded batch of retained, acknowledged deliveries."""
         cutoff = timezone.now() - timedelta(days=max(1, int(retention_days)))
-        old = VillageDeliveryOutbox.objects.select_for_update().filter(
-            message_kind="EVENT", status="ACKED", priority__lt=10, created_at__lt=cutoff
+        batch_size = max(1, min(int(batch_size), 1000))
+        event_is_watermarked = VillageDeliveryCursor.objects.filter(
+            recipient=OuterRef("recipient"),
+            last_event_sequence__gte=OuterRef("event__event_sequence"),
         )
-        grouped: Dict[str, list[VillageDeliveryOutbox]] = {}
-        for entry in old:
-            grouped.setdefault(entry.recipient, []).append(entry)
-        summarized = 0
-        deleted = 0
-        for recipient, entries in grouped.items():
-            key = f"summary:{recipient}:{cutoff.date().isoformat()}"
-            if not VillageDeliveryOutbox.objects.filter(dedupe_key=key).exists():
-                last_sequence = max(
-                    (entry.event.event_sequence for entry in entries if entry.event_id), default=0
-                )
-                VillageDeliveryOutbox.objects.create(
-                    dedupe_key=key,
-                    recipient=recipient,
-                    message_kind="EVENT",
-                    payload={
-                        "schema_version": "village.event.v1",
-                        "event_type": "VILLAGE_EVENT_SUMMARY",
-                        "event_sequence": last_sequence,
-                        "summary": f"{len(entries)} acknowledged village events summarized.",
-                        "count": len(entries),
-                    },
-                    priority=1,
-                    status="PENDING",
-                )
-                summarized += 1
-            deleted += entries and VillageDeliveryOutbox.objects.filter(
+        entries = list(
+            VillageDeliveryOutbox.objects.select_for_update()
+            .filter(
+                message_kind__in=("EVENT", "OUTCOME"),
+                status="ACKED",
+                acked_at__lt=cutoff,
+            )
+            .annotate(event_is_watermarked=Exists(event_is_watermarked))
+            .filter(
+                Q(message_kind="OUTCOME")
+                | Q(event__isnull=True)
+                | Q(event_is_watermarked=True)
+            )
+            .order_by("acked_at", "created_at", "delivery_id")[:batch_size]
+        )
+        counts = {
+            "event_deleted": sum(entry.message_kind == "EVENT" for entry in entries),
+            "outcome_deleted": sum(entry.message_kind == "OUTCOME" for entry in entries),
+        }
+        if entries:
+            VillageDeliveryOutbox.objects.filter(
                 delivery_id__in=[entry.delivery_id for entry in entries]
-            ).delete()[0] or 0
-        return {"summarized": summarized, "deleted": deleted}
+            ).delete()
+        return {"summarized": 0, "deleted": len(entries), **counts}
 
 
 # ============================================================================

@@ -1,5 +1,7 @@
+from django import forms
 from django.contrib import admin
 
+from .command_catalog import command_admin_label, command_admin_sort_key
 from .models import (
     DailyPriceSnapshot,
     EconomicLedgerEntry,
@@ -38,10 +40,34 @@ from .models import (
     VillageStoryTransitionReceipt,
     VillageRouteAttempt,
 )
+from .runtime_services import CommandService
+
+
+class NpcProfileAdminForm(forms.ModelForm):
+    capabilities = forms.MultipleChoiceField(
+        label="允许执行的指令",
+        choices=(),
+        required=False,
+        widget=forms.CheckboxSelectMultiple,
+        help_text="Agent 的 discover 只返回已勾选指令；执行时 Backend 会再次校验。",
+    )
+
+    class Meta:
+        model = NpcProfile
+        fields = "__all__"
+
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.fields["capabilities"].choices = [
+            (action, command_admin_label(action))
+            for action in sorted(CommandService.ALLOWED_ACTIONS, key=command_admin_sort_key)
+        ]
+        self.initial["capabilities"] = self.instance.capabilities or []
 
 
 @admin.register(NpcProfile)
 class NpcProfileAdmin(admin.ModelAdmin):
+    form = NpcProfileAdminForm
     list_display = ("npc", "display_name", "occupation", "is_active")
     search_fields = ("npc__agent_id", "npc__name", "display_name", "occupation")
     list_filter = ("occupation", "is_active")
@@ -58,7 +84,8 @@ class VillageLocationDefinitionAdmin(admin.ModelAdmin):
 class VillageSimulationConfigAdmin(admin.ModelAdmin):
     list_display = (
         "config_key", "village_simulation_enabled", "village_hub_command_adapter_enabled",
-        "village_economy_enabled", "village_social_enabled", "village_story_enabled", "updated_at",
+        "village_economy_enabled", "village_social_enabled", "village_story_enabled",
+        "village_presentation_enabled", "updated_at",
     )
 
     def has_add_permission(self, request):

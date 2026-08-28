@@ -100,6 +100,15 @@ def _result(code=StoryResultCode.OK, **data):
 def _event(*, event_type, request_id, world_minute, time_revision, actor=None,
            participants=None, players=None, location="RECORD_HALL", data=None,
            visibility="PUBLIC", suffix="event"):
+    event_data = dict(data or {})
+    if event_type.startswith("STORY_"):
+        event_data.setdefault("story_id", ARC_CODE)
+        event_data.setdefault(
+            "story_version",
+            VillageStoryArc.objects.filter(arc_code=ARC_CODE).values_list("story_version", flat=True).first(),
+        )
+        event_data.setdefault("change_type", event_type)
+        event_data.setdefault("summary", event_type)
     event = VillageWorldEvent.objects.create(
         dedupe_key=f"phase5:{request_id}:{suffix}"[:128],
         event_type=event_type,
@@ -112,9 +121,9 @@ def _event(*, event_type, request_id, world_minute, time_revision, actor=None,
         request_id=request_id,
         effects={},
         visibility=visibility,
-        public_data=dict(data or {}),
-        hub_summary=str((data or {}).get("hub_summary", event_type))[:256],
-        player_summary=str((data or {}).get("player_summary", event_type))[:256],
+        public_data=event_data,
+        hub_summary=str(event_data.get("hub_summary", event_data.get("summary", event_type)))[:256],
+        player_summary=str(event_data.get("player_summary", event_data.get("summary", event_type)))[:256],
     )
     enqueue_event_deliveries(event)
     return event
@@ -247,7 +256,11 @@ def _get_arc_locked(world_minute, request_id=None):
     rid = request_id or uuid.uuid5(uuid.NAMESPACE_URL, f"phase5:bootstrap:{day}")
     time = GlobalGameTimeState.objects.select_for_update().get(pk=1)
     _event(event_type="STORY_BOOTSTRAPPED", request_id=rid, world_minute=world_minute,
-           time_revision=time.time_revision, data={"arc_code": ARC_CODE}, suffix="bootstrap")
+           time_revision=time.time_revision, data={
+               "story_id": ARC_CODE, "arc_code": ARC_CODE, "story_version": arc.story_version,
+               "change_type": "INITIALIZED", "summary": "断掉的商路主线已开始，旧桥处于损坏状态",
+               "snapshot": _snapshot(arc, fact),
+           }, suffix="bootstrap")
     return arc, fact
 
 
@@ -291,9 +304,15 @@ def _existing_request(request_id, payload_hash):
 
 def _record(request_id, payload_hash, action, result, *, actor=None, players=None,
             world_minute, time_revision, event_type, data=None, ledger=None):
+    event_data = dict(data or result.get("data", {}))
+    if event_type.startswith("STORY_"):
+        event_data.setdefault("story_id", ARC_CODE)
+        event_data.setdefault("story_version", result.get("data", {}).get("story_version"))
+        event_data.setdefault("change_type", event_type)
+        event_data.setdefault("summary", event_type)
     event = _event(event_type=event_type, request_id=request_id, world_minute=world_minute,
                    time_revision=time_revision, actor=actor, participants=[actor.agent_id] if actor else [],
-                   players=players, data=data or result.get("data", {}), suffix=action)
+                   players=players, data=event_data, suffix=action)
     result["event"] = {"event_id": str(event.event_id), "event_sequence": event.event_sequence}
     stored = dict(result)
     stored["request_payload_sha256"] = payload_hash
@@ -334,11 +353,11 @@ def submit_story_vote(payload: Mapping[str, Any], *, player_id=None):
     if not request_id:
         return _result(StoryResultCode.ACTION_INVALID)
     expected = payload.get("expected_story_version", payload.get("params", {}).get("expected_story_version"))
-    if isinstance(expected, bool) or not isinstance(expected, int):
+    if expected is not None and (isinstance(expected, bool) or not isinstance(expected, int)):
         return _result(StoryResultCode.VERSION_CONFLICT)
     params = dict(payload.get("params") or payload)
     allowed = STORY_COMMAND_PARAM_WHITELIST[StoryCommand.VOTE.value]
-    if set(params) - allowed or not {"meeting_id", "plan_code", "expected_story_version"}.issubset(params):
+    if set(params) - allowed or not {"meeting_id", "plan_code"}.issubset(params):
         return _result(StoryResultCode.VOTE_INVALID)
     plan = str(params.get("plan_code", "")).upper()
     meeting_id = _uuid(params.get("meeting_id"))
@@ -353,7 +372,7 @@ def submit_story_vote(payload: Mapping[str, Any], *, player_id=None):
             return replay
         if arc.is_completed:
             return _result(StoryResultCode.ARC_COMPLETED)
-        if arc.story_version != expected:
+        if expected is not None and arc.story_version != expected:
             return _result(StoryResultCode.VERSION_CONFLICT, current_story_version=arc.story_version)
         meeting = VillageStoryMeeting.objects.select_for_update().filter(meeting_id=meeting_id, arc=arc).first()
         if not meeting or meeting.status != "OPEN":
@@ -541,12 +560,12 @@ def complete_story_action(payload: Mapping[str, Any], *, player_id=None):
     params = dict(payload.get("params") or payload)
     action = str(payload.get("action_code", params.get("action_code", ""))).upper()
     expected = payload.get("expected_story_version", params.get("expected_story_version"))
-    if action not in ALL_STORY_ACTIONS or isinstance(expected, bool) or not isinstance(expected, int):
+    if action not in ALL_STORY_ACTIONS or (expected is not None and
+                                           (isinstance(expected, bool) or not isinstance(expected, int))):
         return _result(StoryResultCode.ACTION_INVALID)
     if (
         set(params) - STORY_COMMAND_PARAM_WHITELIST[StoryCommand.ACT.value]
         or "action_code" not in params
-        or "expected_story_version" not in params
     ):
         return _result(StoryResultCode.ACTION_INVALID)
     with transaction.atomic():
@@ -557,7 +576,7 @@ def complete_story_action(payload: Mapping[str, Any], *, player_id=None):
             return replay
         if arc.is_completed:
             return _result(StoryResultCode.ARC_COMPLETED)
-        if arc.story_version != expected:
+        if expected is not None and arc.story_version != expected:
             return _result(StoryResultCode.VERSION_CONFLICT, current_story_version=arc.story_version)
         plan = arc.current_plan
         if plan not in STORY_ACTION_PLANS.get(action, set()):

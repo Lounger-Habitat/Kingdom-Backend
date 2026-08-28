@@ -7,6 +7,7 @@ retry state.
 
 from __future__ import annotations
 
+import re
 from typing import Any, Iterable
 
 from .models import NpcRuntimeState, VillageDeliveryOutbox, VillageWorldEvent
@@ -15,6 +16,7 @@ from .models import NpcRuntimeState, VillageDeliveryOutbox, VillageWorldEvent
 FORMAL_NPC_IDS = ("10011", "10012", "10013", "10014", "10015")
 ENV_CLIENTS = "ENV_CLIENTS"
 VISIBILITIES = {"PUBLIC", "PARTICIPANTS", "PRESENT", "PLAYER_PRIVATE", "SYSTEM"}
+SAFE_PUBLIC_VALUE = re.compile(r"[A-Za-z0-9_-]{1,64}")
 
 
 def _ids(values: Iterable[Any] | None) -> list[str]:
@@ -61,6 +63,27 @@ def _event_content(event: VillageWorldEvent, recipient: str | None = None) -> di
     players = _ids(getattr(event, "player_ids", []))
     is_player_delivery = recipient == ENV_CLIENTS
     data = dict(getattr(event, "public_data", {}) or {})
+
+    if is_player_delivery:
+        content = {
+            "schema_version": "village.event.v1",
+            "event_id": str(event.event_id),
+            "event_sequence": event.event_sequence,
+            "event_type": event.event_type,
+            "world_minute": event.world_minute,
+            "actor_npc_id": str(event.actor_npc.agent_id) if event.actor_npc else None,
+            "participant_npc_ids": participants,
+            "location_code": event.location_code,
+            "visibility": visibility,
+            "summary": event.player_summary,
+            # Routing metadata consumed by Env Server, not ordinary client data.
+            "player_ids": players,
+        }
+        for key in ("category", "public_status_code"):
+            value = data.get(key)
+            if isinstance(value, str) and SAFE_PUBLIC_VALUE.fullmatch(value):
+                content[key] = value
+        return content
 
     # private_data is only ever sent to the immutable NPC participant set.  The
     # player projection is intentionally summary-only.

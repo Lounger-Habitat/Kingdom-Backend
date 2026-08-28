@@ -264,11 +264,12 @@ class Command(BaseCommand):
     def _ensure_phase_two_runtime(npc):
         """Seed only a missing runtime; existing phase-one/phase-two state wins."""
         time_state = GlobalGameTimeState.get_instance()
+        initial_location = npc.village_profile.home_location_code
         runtime, created = NpcRuntimeState.objects.get_or_create(
             npc=npc,
             defaults={
-                "current_location_code": "VILLAGE_SQUARE",
-                "current_point_code": "VILLAGE_SQUARE",
+                "current_location_code": initial_location,
+                "current_point_code": initial_location,
                 "current_goal": "NONE",
                 "current_action": "",
                 "action_status": "IDLE",

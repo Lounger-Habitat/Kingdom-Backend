@@ -86,6 +86,42 @@ class NpcProfile(models.Model):
         return f"{self.display_name} ({self.npc.agent_id})"
 
 
+class NpcSubjectiveGoalState(models.Model):
+    """Agent-authored current goal, separate from profile and action goals."""
+
+    STATUS_CHOICES = [
+        ("ACTIVE", "进行中"),
+        ("COMPLETED", "已完成"),
+        ("ABANDONED", "已放弃"),
+    ]
+
+    npc = models.OneToOneField(
+        "inventory.NpcDefinition",
+        on_delete=models.CASCADE,
+        related_name="subjective_goal_state",
+    )
+    goal_id = models.UUIDField("目标ID", null=True, blank=True)
+    summary = models.CharField("目标摘要", max_length=120, blank=True, default="")
+    status = models.CharField("状态", max_length=16, choices=STATUS_CHOICES, default="ABANDONED")
+    visibility = models.CharField("可见性", max_length=16, default="PUBLIC")
+    goal_version = models.BigIntegerField("目标版本", default=0)
+    updated_world_minute = models.BigIntegerField("更新世界分钟", default=0)
+    updated_at = models.DateTimeField("更新时间", auto_now=True)
+
+    class Meta:
+        verbose_name = "NPC 主观目标"
+        verbose_name_plural = "NPC 主观目标"
+        constraints = [
+            models.CheckConstraint(
+                condition=models.Q(goal_version__gte=0, updated_world_minute__gte=0),
+                name="npc_subjective_goal_versions_non_negative",
+            ),
+        ]
+
+    def __str__(self):
+        return f"{self.npc.agent_id}: {self.status} v{self.goal_version}"
+
+
 class VillageSimulationConfig(models.Model):
     """Phase-gated village configuration. Phase zero seeds every flag as off."""
 
@@ -104,6 +140,7 @@ class VillageSimulationConfig(models.Model):
     village_story_enabled = models.BooleanField(default=False)
     village_hub_command_adapter_enabled = models.BooleanField(default=False)
     village_offline_catchup_enabled = models.BooleanField(default=False)
+    village_presentation_enabled = models.BooleanField(default=False)
     village_debug_overlay_enabled = models.BooleanField(default=False)
     debug_logs_enabled = models.BooleanField(default=False)
     story_fixed_seed = models.CharField(max_length=128, default="village-story-v1")

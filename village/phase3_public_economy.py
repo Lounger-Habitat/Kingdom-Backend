@@ -18,6 +18,7 @@ from typing import Any, Dict, List, Optional
 from django.db import models, transaction
 
 from inventory.models import NpcGlobalInventory, NpcGlobalInventorySlot
+from items.models import Item, ItemType
 
 from .models import (
     DailyPriceSnapshot,
@@ -56,15 +57,18 @@ from .phase3_contract import (
 def _get_eat_whitelist() -> tuple:
     """Return item_ids that NPCs can eat.
 
-    Includes recipe output items + raw edible items.
+    Includes configured food, recipe output items, and raw edible items.
     """
     from recipes.models import Recipe
 
+    configured_food = Item.objects.filter(
+        item_type=ItemType.FOOD, is_deleted=False,
+    ).values_list("item_id", flat=True)
     recipe_outputs = list(
         Recipe.objects.filter(pk__in=RECIPE_WHITELIST).values_list("item_id", flat=True)
     )
     raw_edible = [1030, 1056]  # corn, chicken
-    all_food = set(recipe_outputs) | set(raw_edible)
+    all_food = set(configured_food) | set(recipe_outputs) | set(raw_edible)
     return tuple(all_food)
 
 
@@ -627,10 +631,10 @@ def _eat_personal(
             },
         },
         external_delta=0,
-        # Unity uses this to apply hunger/health changes
+        # Mirrors the authoritative needs mutation committed by the asset service.
         needs_delta={
-            "hunger_fp": 200,   # +20.0 hunger satisfaction
-            "health_fp": 50,    # +5.0 health
+            "hunger_fp": -450,
+            "energy_fp": 50,
         },
     )
 
@@ -702,8 +706,8 @@ def _eat_community(
         },
         external_delta=0,
         needs_delta={
-            "hunger_fp": 200,
-            "health_fp": 50,
+            "hunger_fp": -450,
+            "energy_fp": 50,
         },
     )
 

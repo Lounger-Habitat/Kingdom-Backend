@@ -189,26 +189,45 @@ VILLAGE_FAST_COMMAND_INTEGRATION = (
     in {"1", "true", "yes", "on"}
 )
 
-# Logging: suppress noisy runserver access logs for /game/time/sync
+# Logging: suppress noisy runserver access logs for high-frequency runtime
+# tick endpoints, but only on success (2xx) — errors still print.
 import logging
+import re
 
 
-class _SuppressTimeSyncFilter(logging.Filter):
+class _SuppressRuntimeTickFilter(logging.Filter):
+    _QUIET_PATHS = (
+        "/game/time/sync",
+        "/api/village/runtime/advance-needs",
+        "/api/village/runtime/time",
+        "/api/village/runtime/checkpoint",
+        "/api/village/runtime/bootstrap",
+        "/api/village/deliveries/pending",
+    )
+    # django access-log message: '"METHOD path HTTP/1.1" <code> <size>'
+    _STATUS_RE = re.compile(r'"\s+(\d{3})\b')
+
     def filter(self, record):
-        return "/game/time/sync" not in record.getMessage()
+        msg = record.getMessage()
+        if not any(p in msg for p in self._QUIET_PATHS):
+            return True
+        m = self._STATUS_RE.search(msg)
+        if m and 200 <= int(m.group(1)) < 300:
+            return False  # success on a quiet path: suppress
+        return True  # error (or unparseable): let it through
 
 
 LOGGING = {
     "version": 1,
     "filters": {
-        "suppress_time_sync": {
-            "()": _SuppressTimeSyncFilter,
+        "suppress_runtime_tick": {
+            "()": _SuppressRuntimeTickFilter,
         },
     },
     "loggers": {
         "django.server": {
             "level": "INFO",
-            "filters": ["suppress_time_sync"],
+            "filters": ["suppress_runtime_tick"],
             "propagate": True,
         },
     },

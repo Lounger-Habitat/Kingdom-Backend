@@ -30,7 +30,7 @@ from .models import (
     VillageWorldEvent,
     NpcCommandState,
 )
-from .runtime_services import ResultCode, _fast_integration_enabled
+from .runtime_services import CommandService, ResultCode, _fast_integration_enabled
 
 
 NEEDS_FIELDS = ("hunger", "energy", "health", "social", "stress")
@@ -72,8 +72,40 @@ def need_bands(runtime: NpcRuntimeState) -> Dict[str, str]:
         "hunger": band(runtime.hunger_fp),
         "energy": band(runtime.energy_fp, inverse=True),
         "health": band(runtime.health_fp, inverse=True),
-        "social": band(runtime.social_fp, inverse=True),
+        "social": band(runtime.social_fp),
         "stress": band(runtime.stress_fp),
+    }
+
+
+def needs_rules() -> Dict[str, Any]:
+    """Return the authoritative Agent-facing interpretation of public needs."""
+    return {
+        "scale": {"minimum": 0, "maximum": 100},
+        "directions": {
+            "hunger": "LOWER_IS_BETTER",
+            "energy": "HIGHER_IS_BETTER",
+            "health": "HIGHER_IS_BETTER",
+            "social": "LOWER_IS_BETTER",
+            "stress": "LOWER_IS_BETTER",
+        },
+        "bands": {
+            "higher_is_worse": {"high_at": 70, "critical_at": 90},
+            "lower_is_worse": {"low_at": 30, "critical_at": 10},
+        },
+        "action_gates": {
+            "WORK_PLACEHOLDER": {"hunger_below": 90, "energy_above": 10, "health_above": 30},
+            "SOCIALIZE": {"health_above": 30},
+        },
+        "effects_per_30_minutes": {
+            activity: {name: rate / NEEDS_SCALE for name, rate in rates.items()}
+            for activity, rates in RATES.items()
+        },
+        "eat_completion_effect": {"hunger": -45, "energy": 5},
+        "socialize_daily_effect_percent": [100, 50, 25],
+        "daily_health": {
+            "severe_hunger_all_day": -8,
+            "ate_and_slept_at_least_360_minutes_and_not_injured": 2,
+        },
     }
 
 
@@ -372,9 +404,10 @@ class LifeActionService:
         if action == "EAT":
             source = params.get("source")
             if source == "PERSONAL_INVENTORY":
-                if ((not fast_integration and set(params) != action_params[action]) or
-                        (not fast_integration and (isinstance(params.get("expected_asset_version"), bool) or
-                                                   not isinstance(params.get("expected_asset_version"), int)))):
+                version = params.get("expected_asset_version")
+                if ((not fast_integration and not {"source", "food_instance_id"}.issubset(params)) or
+                        (not fast_integration and version is not None and
+                         (isinstance(version, bool) or not isinstance(version, int)))):
                     return ResultCode.INVALID_COMMAND_SCHEMA
             elif source == "COMMUNITY_MEAL":
                 if not fast_integration and set(params) != {"source"}:
@@ -394,7 +427,7 @@ class LifeActionService:
         return runtimes
 
     @staticmethod
-    def _outbox(runtime: NpcRuntimeState, receipt: VillageActionReceipt, event: VillageWorldEvent, action: str, code: str, effects: Dict[str, Any], time_state: GlobalGameTimeState, command_id: uuid.UUID, *, success: bool = True) -> None:
+    def _outbox(runtime: NpcRuntimeState, receipt: VillageActionReceipt, event: VillageWorldEvent, action: str, code: str, effects: Dict[str, Any], time_state: GlobalGameTimeState, command_id: uuid.UUID, *, success: bool = True, data: Optional[Dict[str, Any]] = None) -> None:
         command = receipt.command
         reason_code = "" if success else code
         payload = {
@@ -404,8 +437,10 @@ class LifeActionService:
             "success": success, "result_code": code, "reason_code": reason_code,
             "world_event_id": str(event.event_id), "world_minute": time_state.world_minute,
             "time_revision": time_state.time_revision, "state_version": runtime.state_version,
+            "current_location_code": runtime.current_location_code,
+            "duration_minutes": command.duration_minutes,
             "public_needs": public_needs(runtime), "public_status": runtime.action_status,
-            "retryable": False, "effects": effects, "data": {},
+            "retryable": False, "effects": effects, "data": data or {},
         }
         VillageDeliveryOutbox.objects.create(
             dedupe_key=f"outcome:{receipt.request_id}", recipient=command.sender_id,
@@ -605,8 +640,9 @@ class LifeActionService:
                 try:
                     food_id = uuid.UUID(str(payload["params"]["food_instance_id"]))
                     inventory = NpcGlobalInventory.objects.select_for_update().get(npc=runtime.npc)
-                    if (not fast_integration and
-                            payload["params"]["expected_asset_version"] != inventory.asset_version):
+                    expected_version = payload["params"].get("expected_asset_version")
+                    if (not fast_integration and expected_version is not None and
+                            expected_version != inventory.asset_version):
                         return terminal(ResultCode.ASSET_VERSION_CONFLICT)
                     slot = NpcGlobalInventorySlot.objects.select_for_update().get(bag=inventory, instance_id=food_id)
                 except (ValueError, TypeError, NpcGlobalInventory.DoesNotExist, NpcGlobalInventorySlot.DoesNotExist):
@@ -778,20 +814,140 @@ class LifeActionService:
         public_response = {key: value for key, value in response_data.items() if key != "request_payload_sha256"}
         return _result(True, ResultCode.LIFE_ACTION_COMPLETED, receipt=receipt, world_event=event, **public_response)
 
+    @classmethod
+    @transaction.atomic
+    def interrupt_sleep(cls, npc_id: str, command_id: str) -> Dict[str, Any]:
+        """Stop one running sleep and settle only the world minutes already slept."""
+        try:
+            command_uuid = uuid.UUID(str(command_id))
+        except (TypeError, ValueError):
+            return _result(False, ResultCode.INVALID_COMMAND_SCHEMA)
+        try:
+            time_state = GlobalGameTimeState.objects.select_for_update().get(pk=1)
+            command = NpcCommandState.objects.select_for_update().select_related("npc").get(
+                command_id=command_uuid,
+            )
+        except GlobalGameTimeState.DoesNotExist:
+            return _result(False, ResultCode.BACKEND_UNAVAILABLE)
+        except NpcCommandState.DoesNotExist:
+            return _result(False, ResultCode.SLEEP_COMMAND_MISMATCH)
+
+        existing = VillageActionReceipt.objects.filter(command=command).first()
+        if existing and existing.result_code == ResultCode.SLEEP_INTERRUPTED:
+            data = dict(existing.response_data or {})
+            data.pop("request_payload_sha256", None)
+            return _result(True, ResultCode.COMMAND_REPLAYED, replayed=True, **data)
+        if str(command.npc.agent_id) != str(npc_id) or command.kind != "SLEEP":
+            return _result(False, ResultCode.SLEEP_COMMAND_MISMATCH)
+        if command.status != "RUNNING":
+            return _result(False, ResultCode.NPC_NOT_SLEEPING)
+
+        runtime = NpcRuntimeState.objects.select_for_update().get(npc=command.npc)
+        if runtime.action_status != "SLEEPING" or runtime.active_command_id != command.command_id:
+            return _result(False, ResultCode.NPC_NOT_SLEEPING)
+
+        start = command.started_world_minute
+        planned_end = runtime.action_ends_world_minute
+        if start is None or planned_end is None:
+            return _result(False, ResultCode.SLEEP_COMMAND_MISMATCH)
+        end = max(start, min(time_state.world_minute, planned_end))
+        before = public_needs(runtime)
+        if runtime.needs_world_minute < end:
+            intervals = cls._intervals(runtime, max(start, runtime.needs_world_minute), end, "SLEEP")
+            error = NeedsService.advance_locked(runtime, end, intervals, finalize_days=False)
+            if error:
+                return _result(False, error)
+        for day_index in range(start // MINUTES_PER_DAY, end // MINUTES_PER_DAY):
+            NeedsService._finalize_day(runtime, day_index)
+
+        after = public_needs(runtime)
+        effects = {
+            "items": [], "money": [], "relationships": [],
+            "needs": {
+                name: round(after[name] - before[name], 1)
+                for name in NEEDS_FIELDS if after[name] != before[name]
+            },
+        }
+        runtime.state_version += 1
+        runtime.time_revision = time_state.time_revision
+        runtime.current_action = ""
+        runtime.action_status = "IDLE"
+        runtime.action_started_world_minute = None
+        runtime.action_ends_world_minute = None
+        runtime.active_command_id = None
+        runtime.save()
+
+        command.status = "CANCELLED"
+        command.result_code = ResultCode.SLEEP_INTERRUPTED
+        command.completed_world_minute = end
+        command.state_version = runtime.state_version
+        command.save()
+        details = {
+            "slept_minutes": end - start,
+            "remaining_minutes": max(0, planned_end - end),
+        }
+        event = VillageWorldEvent.objects.create(
+            dedupe_key=f"sleep-interrupted:{command.request_id}",
+            event_type="npc_action_interrupted", world_minute=time_state.world_minute,
+            time_revision=time_state.time_revision, actor_npc=runtime.npc,
+            participant_npc_ids=[str(runtime.npc.agent_id)],
+            location_code=runtime.current_location_code, command_id=command.command_id,
+            request_id=command.request_id, effects=effects, visibility="PUBLIC",
+            public_data={"public_needs": after, **details},
+        )
+        response_data = {
+            "request_id": str(command.request_id), "command_id": str(command.command_id),
+            "reason_code": ResultCode.SLEEP_INTERRUPTED,
+            "world_event_id": str(event.event_id), "world_minute": time_state.world_minute,
+            "time_revision": time_state.time_revision, "state_version": runtime.state_version,
+            "public_needs": after, "public_status": runtime.action_status,
+            "effects": effects, **details,
+        }
+        receipt = VillageActionReceipt.objects.create(
+            request_id=command.request_id, command=command, npc=runtime.npc, action_kind="SLEEP",
+            success=False, result_code=ResultCode.SLEEP_INTERRUPTED, response_data=response_data,
+            world_minute=time_state.world_minute, time_revision=time_state.time_revision,
+            state_version=runtime.state_version, world_event=event,
+        )
+        cls._outbox(
+            runtime, receipt, event, "SLEEP", ResultCode.SLEEP_INTERRUPTED, effects,
+            time_state, command.command_id, success=False, data=details,
+        )
+        return _result(True, ResultCode.SLEEP_INTERRUPTED, receipt=receipt, **response_data)
+
 
 def runtime_summary(npc_id: str) -> Dict[str, Any]:
     try:
         runtime = NpcRuntimeState.objects.select_related("npc").get(npc__agent_id=str(npc_id), npc__is_test_only=False)
     except NpcRuntimeState.DoesNotExist:
         return _result(False, ResultCode.BOOTSTRAP_NPC_SET_MISMATCH)
+    world_minute = GlobalGameTimeState.objects.filter(pk=1).values_list(
+        "world_minute", flat=True
+    ).first() or 0
+    actions = CommandService.allowed_actions_for(runtime.npc)
+    if not _fast_integration_enabled():
+        config = VillageSimulationConfig.objects.filter(config_key="default").first()
+        if not config or not config.village_needs_enabled:
+            actions -= CommandService.PHASE2_ACTIONS
+        if not config or not config.village_economy_enabled:
+            actions -= CommandService.PHASE3_ACTIONS
+        elif not config.village_direct_trade_enabled:
+            actions -= CommandService.DIRECT_TRADE_ACTIONS
+        if not config or not config.village_social_enabled:
+            actions -= CommandService.PHASE4_ACTIONS
+        if not config or not config.village_story_enabled:
+            actions -= CommandService.STORY_ACTIONS
+    unavailable_reasons = {}
     available = []
-    if (_fast_integration_enabled() or _config_enabled()) and runtime.action_status == "IDLE":
-        actions = set(LifeActionService.ACTIONS)
-        if runtime.hunger_fp >= 900 or runtime.energy_fp <= 100 or runtime.health_fp <= 300:
-            actions.discard("WORK_PLACEHOLDER")
-        if runtime.health_fp <= 300:
-            actions.discard("SOCIALIZE")
-        available = sorted(actions)
+    for action in sorted(actions):
+        if action in CommandService.READ_QUERY_ACTIONS:
+            available.append(action)
+            continue
+        reason = ResultCode.NPC_BUSY if runtime.action_status != "IDLE" else CommandService.unavailable_reason(action, runtime)
+        if reason:
+            unavailable_reasons[action] = reason
+        else:
+            available.append(action)
     active_reservation = (
         NpcActionReservation.objects.filter(
             participants=runtime.npc, status="HELD", active_lock_key__isnull=False,
@@ -816,7 +972,15 @@ def runtime_summary(npc_id: str) -> Dict[str, Any]:
     return _result(
         True, ResultCode.LIFE_ACTION_COMPLETED,
         npc_id=str(runtime.npc.agent_id), state_version=runtime.state_version,
+        world_minute=world_minute,
         needs_world_minute=runtime.needs_world_minute, public_needs=public_needs(runtime),
+        action_status=runtime.action_status,
+        current_action=runtime.current_action or None,
+        action_started_world_minute=runtime.action_started_world_minute,
+        active_command_id=str(runtime.active_command_id) if runtime.active_command_id else None,
+        action_ends_world_minute=runtime.action_ends_world_minute,
+        remaining_minutes=max(0, runtime.action_ends_world_minute - world_minute)
+        if runtime.action_ends_world_minute is not None else None,
         need_bands=need_bands(runtime), active_reservation=reservation_data,
-        available_actions=available,
+        available_actions=available, unavailable_reasons=unavailable_reasons,
     )

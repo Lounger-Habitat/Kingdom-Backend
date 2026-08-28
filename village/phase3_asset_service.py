@@ -19,6 +19,7 @@ from inventory.models import NpcDefinition, NpcGlobalInventory, NpcGlobalInvento
 from .models import (
     EconomicLedgerEntry,
     NpcCommandState,
+    NpcNeedsDaySummary,
     NpcRuntimeState,
     VillageActionReceipt,
     VillageFarmPlot,
@@ -433,12 +434,27 @@ def commit_economy_action(payload: Dict[str, Any]) -> Dict[str, Any]:
                     and runtime.active_command_id != command.command_id
                 ):
                     return _fail(ResultCode.P3_REQUEST_CONFLICT, status="CONFLICT")
+            if runtime is None and command_name in {"EAT", "COMMUNITY_MEAL"}:
+                runtime = NpcRuntimeState.objects.select_for_update().filter(
+                    npc__agent_id=str(npc_id)
+                ).first()
+                if runtime is None:
+                    return _fail(ResultCode.P3_INVALID_PARAMS)
 
             # Dispatch to production handler
             result = handler(npc_id, params, world_minute, request_id)
 
             if result.get("result_code") != ResultCode.OK:
                 return result
+
+            if command_name in {"EAT", "COMMUNITY_MEAL"}:
+                runtime.hunger_fp = max(0, runtime.hunger_fp - 450)
+                runtime.energy_fp = min(1000, runtime.energy_fp + 50)
+                summary, _ = NpcNeedsDaySummary.objects.select_for_update().get_or_create(
+                    npc=runtime.npc, day_index=max(0, world_minute - 1) // 1440,
+                )
+                summary.successful_meals += 1
+                summary.save(update_fields=["successful_meals", "updated_at"])
 
             # 6. Write persistence records
             result["request_id"] = str(request_id)

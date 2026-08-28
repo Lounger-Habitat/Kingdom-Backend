@@ -103,6 +103,10 @@ class PhaseFiveStoryTest(TestCase):
         self.assertEqual(data["arc_code"], "BROKEN_TRADE_ROUTE_V1")
         self.assertEqual(data["phase"], "AFTERMATH")
         self.assertEqual(data["bridge_condition"], "BROKEN")
+        event = VillageWorldEvent.objects.get(event_type="STORY_BOOTSTRAPPED")
+        self.assertEqual(event.public_data["story_id"], "BROKEN_TRADE_ROUTE_V1")
+        self.assertEqual(event.public_data["story_version"], 0)
+        self.assertEqual(event.public_data["snapshot"]["bridge_condition"], "BROKEN")
         self.config.village_story_enabled = False
         self.config.save(update_fields=["village_story_enabled"])
         disabled = get_story_snapshot()

@@ -14,9 +14,11 @@ from inventory.models import (
     NpcGlobalInventory,
     NpcGlobalInventorySlot,
 )
+from items.models import Item, ItemType
 from recipes.models import Recipe, RecipeIngredient
 from village.models import (
     DailyPriceSnapshot,
+    NpcNeedsDaySummary,
     NpcRuntimeState,
     VillageAccount,
     VillageSimulationConfig,
@@ -478,6 +480,26 @@ class AuditPublicFundTest(PublicEconomyTestBase):
 
 
 class EatPersonalTest(PublicEconomyTestBase):
+    def test_eat_item_typed_as_food(self):
+        Item.objects.update_or_create(
+            item_id=1019,
+            defaults={"item_name": "bread", "item_type": ItemType.FOOD, "is_deleted": False},
+        )
+        NpcGlobalInventorySlot.objects.create(
+            bag=self.bill_inv, slot_index=0, item_id=1019, item_amount=1,
+        )
+
+        resp = commit_economy_action(_payload(
+            "EAT", 10011, "VILLAGE_SQUARE",
+            {"source": "PERSONAL_INVENTORY"},
+        ))
+
+        self.assertEqual(resp["result_code"], ResultCode.OK)
+        self.assertEqual(
+            NpcGlobalInventorySlot.objects.get(bag=self.bill_inv, item_id=1019).item_amount,
+            0,
+        )
+
     def test_eat_personal_success(self):
         """NPC eats from personal inventory (FEFO)."""
         NpcGlobalInventorySlot.objects.create(
@@ -497,9 +519,26 @@ class EatPersonalTest(PublicEconomyTestBase):
         )
         self.assertEqual(slot.item_amount, 2)
 
-        # needs_delta present
-        self.assertIn("needs_delta", resp)
-        self.assertGreater(resp["needs_delta"]["hunger_fp"], 0)
+        self.assertEqual(resp["needs_delta"], {"hunger_fp": -450, "energy_fp": 50})
+        self.bill_rt.refresh_from_db()
+        self.assertEqual((self.bill_rt.hunger_fp, self.bill_rt.energy_fp), (0, 850))
+        self.assertEqual(
+            NpcNeedsDaySummary.objects.get(npc=self.bill, day_index=1).successful_meals,
+            1,
+        )
+
+    def test_eat_at_day_boundary_counts_the_completed_day(self):
+        self.time.world_minute = 2880
+        self.time.save(update_fields=["world_minute"])
+        NpcGlobalInventorySlot.objects.create(
+            bag=self.bill_inv, slot_index=0, item_id=1030, item_amount=1,
+        )
+
+        commit_economy_action(_payload(
+            "EAT", 10011, "VILLAGE_SQUARE", {"source": "PERSONAL_INVENTORY"},
+        ))
+
+        self.assertTrue(NpcNeedsDaySummary.objects.filter(npc=self.bill, day_index=1).exists())
 
     def test_eat_fefo_order(self):
         """FEFO: earliest-expiring food consumed first."""

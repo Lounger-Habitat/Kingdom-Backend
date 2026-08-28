@@ -23,8 +23,9 @@ class LifeActionServiceTests(TestCase):
         self.runtime.needs_world_minute = self.other_runtime.needs_world_minute = 0
         self.runtime.state_version = self.other_runtime.state_version = 0
         self.runtime.save(); self.other_runtime.save()
-        NpcProfile.objects.update_or_create(npc=self.npc, defaults={"display_name": "bill", "occupation": "farmer", "home_location_code": "BILL_HOME", "work_location_code": "BILL_WORK", "social_location_code": "BILL_HOME"})
-        NpcProfile.objects.update_or_create(npc=self.other, defaults={"display_name": "jack", "occupation": "hunter", "home_location_code": "JACK_HOME", "work_location_code": "BILL_WORK", "social_location_code": "BILL_HOME"})
+        life_actions = ["EAT", "REST", "SLEEP", "SOCIALIZE", "WORK_PLACEHOLDER"]
+        NpcProfile.objects.update_or_create(npc=self.npc, defaults={"display_name": "bill", "occupation": "farmer", "home_location_code": "BILL_HOME", "work_location_code": "BILL_WORK", "social_location_code": "BILL_HOME", "capabilities": life_actions})
+        NpcProfile.objects.update_or_create(npc=self.other, defaults={"display_name": "jack", "occupation": "hunter", "home_location_code": "JACK_HOME", "work_location_code": "BILL_WORK", "social_location_code": "BILL_HOME", "capabilities": life_actions})
         self.inventory, _ = NpcGlobalInventory.objects.get_or_create(npc=self.npc)
         Item.objects.update_or_create(item_id=29001, defaults={"item_name": "food", "item_type": ItemType.FOOD, "is_deleted": False})
         self.slot, _ = NpcGlobalInventorySlot.objects.update_or_create(bag=self.inventory, slot_index=999, defaults={"item_id": 29001, "item_amount": 1})
@@ -64,6 +65,44 @@ class LifeActionServiceTests(TestCase):
         replay = LifeActionService.execute(payload)
         self.assertEqual(replay["result_code"], ResultCode.COMMAND_REPLAYED)
         self.slot.refresh_from_db(); self.assertEqual(self.slot.item_amount, 0)
+
+    @override_settings(VILLAGE_FAST_COMMAND_INTEGRATION=False)
+    def test_interrupt_sleep_settles_elapsed_minutes_once(self):
+        time_state = GlobalGameTimeState.get_instance()
+        time_state.world_minute = 180
+        time_state.save(update_fields=["world_minute"])
+        self.runtime.energy_fp = 200
+        self.runtime.needs_world_minute = 0
+        self.runtime.save(update_fields=["energy_fp", "needs_world_minute"])
+        payload = self.payload("SLEEP", {})
+        payload["completion_world_minute"] = 480
+        self.arm(payload)
+        self.runtime.action_started_world_minute = 0
+        self.runtime.save(update_fields=["action_started_world_minute"])
+
+        result = LifeActionService.interrupt_sleep("10011", payload["command_id"])
+
+        self.assertTrue(result["success"], result)
+        self.assertEqual(result["result_code"], ResultCode.SLEEP_INTERRUPTED)
+        self.assertEqual((result["slept_minutes"], result["remaining_minutes"]), (180, 300))
+        self.runtime.refresh_from_db()
+        self.assertEqual((self.runtime.action_status, self.runtime.active_command_id), ("IDLE", None))
+        self.assertEqual(NpcNeedsDaySummary.objects.get(npc=self.npc, day_index=0).sleep_minutes, 180)
+        replay = LifeActionService.interrupt_sleep("10011", payload["command_id"])
+        self.assertTrue(replay["success"])
+        self.assertEqual(replay["result_code"], ResultCode.COMMAND_REPLAYED)
+        self.assertEqual(VillageActionReceipt.objects.filter(command__command_id=payload["command_id"]).count(), 1)
+
+    def test_personal_eat_does_not_require_agent_asset_version(self):
+        payload = self.payload("EAT", {
+            "source": "PERSONAL_INVENTORY",
+            "food_instance_id": str(self.slot.instance_id),
+        })
+        self.arm(payload)
+
+        result = LifeActionService.execute(payload)
+
+        self.assertTrue(result["success"], result)
 
     @override_settings(VILLAGE_FAST_COMMAND_INTEGRATION=True)
     def test_fast_integration_skips_location_and_state_version_gates(self):

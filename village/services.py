@@ -11,6 +11,7 @@ FLAG_FIELDS = (
     "village_story_enabled",
     "village_hub_command_adapter_enabled",
     "village_offline_catchup_enabled",
+    "village_presentation_enabled",
     "village_debug_overlay_enabled",
 )
 

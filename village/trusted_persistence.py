@@ -202,6 +202,11 @@ def save_result(payload: Dict[str, Any]) -> Dict[str, Any]:
     response_data = {
         "command_id": str(command.command_id),
         "request_id": str(request_id),
+        "action": action,
+        "phase": "COMPLETED",
+        "terminal": True,
+        "message": str(payload.get("message") or "")[:512],
+        "next_action": payload.get("next_action"),
         "world_event_id": str(event.event_id),
         "world_minute": world_minute,
         "time_revision": time_revision,

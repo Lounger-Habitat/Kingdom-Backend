@@ -12,6 +12,7 @@ from inventory.models import NpcDefinition
 from village.models import (
     NpcCommandState,
     NpcActionReservation,
+    NpcProfile,
     NpcRuntimeState,
     VillageActionDurationConfig,
     VillageActionReceipt,
@@ -171,7 +172,7 @@ class BootstrapServiceTest(TestCase):
         self.assertEqual(data["config"]["navigation_action_timeout_seconds"]["MOVE"], 45)
         self.assertEqual(data["config"]["economy_action_durations"]["PLANT"], 5)
 
-    def test_command_duration_is_replaced_by_admin_configuration(self):
+    def test_variable_command_duration_is_preserved(self):
         VillageActionDurationConfig.objects.update_or_create(
             action_name="REST", defaults={"duration_minutes": 60},
         )
@@ -179,7 +180,7 @@ class BootstrapServiceTest(TestCase):
 
         CommandService.apply_admin_duration("REST", content)
 
-        self.assertEqual(content["duration_minutes"], 60)
+        self.assertEqual(content["duration_minutes"], 30)
 
     def test_bootstrap_exposes_need_bands_and_shared_active_reservation(self):
         npcs = []
@@ -217,7 +218,6 @@ class CheckpointServiceTest(TestCase):
             action_status="IDLE",
             state_version=10,
         )
-
     def test_checkpoint_success(self):
         """正常检查点提交"""
         results = CheckpointService.submit_checkpoint([{
@@ -306,6 +306,11 @@ class CommandServiceTest(TestCase):
             action_status="IDLE",
             state_version=10,
         )
+        NpcProfile.objects.create(
+            npc=self.npc, display_name="Bill", occupation="farmer",
+            home_location_code="VILLAGE_SQUARE", work_location_code="VILLAGE_SQUARE",
+            social_location_code="VILLAGE_SQUARE", capabilities=["MOVE"],
+        )
         self.time_state = GlobalGameTimeState.get_instance()
         self.time_state.world_minute = 1000
         self.time_state.time_revision = 5
@@ -357,6 +362,27 @@ class CommandServiceTest(TestCase):
         )
         self.assertFalse(ok)
         self.assertEqual(code, ResultCode.UNKNOWN_ACTION)
+
+    def test_accept_command_rejects_unconfigured_action(self):
+        content = {
+            "schema_version": "village.command.v1",
+            "id": str(uuid.uuid4()),
+            "request_id": str(uuid.uuid4()),
+            "name": "WAIT",
+            "params": {},
+            "queue_mode": "STRICT",
+            "expected_state_version": 10,
+            "ttl_ms": 30000,
+        }
+
+        ok, code, cmd = CommandService.accept_command(
+            envelope_id=str(uuid.uuid4()), sender="10011", recipient="env-001",
+            content=content, timestamp_ms=int(time.time() * 1000),
+        )
+
+        self.assertFalse(ok)
+        self.assertEqual(code, ResultCode.ACTION_NOT_ALLOWED)
+        self.assertIsNone(cmd)
 
     def test_accept_command_sender_binding(self):
         """非正式 sender 应拒绝"""

@@ -248,15 +248,13 @@ def _do_hunt(
         if expected_version is not None and inventory.asset_version != expected_version:
             return _fail(ResultCode.P3_ASSET_VERSION_CONFLICT)
 
-        # Health gate (use runtime state)
+        # Direct settlement calls retain the original defensive health gate;
+        # the formal Hub path also rejects this before the action starts.
         from .models import NpcRuntimeState
-
         try:
             runtime = NpcRuntimeState.objects.get(npc__agent_id=str(npc_id))
         except NpcRuntimeState.DoesNotExist:
             return _fail(ResultCode.P3_INVALID_PARAMS)
-
-        # Minimum health threshold: health_fp <= 300 means too unhealthy
         if runtime.health_fp <= 300:
             return _fail(ResultCode.P3_FORBIDDEN_ACTOR)
 

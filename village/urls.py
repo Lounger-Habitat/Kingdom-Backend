@@ -4,15 +4,21 @@ from . import views
 from . import phase3_views
 from . import phase4_views
 from . import phase5_views
+from . import phase7_views
 
 
 urlpatterns = [
+    path("api/village/public/journal", phase7_views.journal, name="village-public-journal"),
+    path("api/village/public/overview", phase7_views.overview, name="village-public-overview"),
+    path("api/village/public/npcs/<str:npc_id>/observation", phase7_views.npc_observation, name="village-public-npc-observation"),
+    path("api/village/operations/snapshot", phase7_views.operations, name="village-operations-snapshot"),
     # 阶段零 API
     path("api/village/config", views.village_config, name="village-config"),
     path("api/village/npcs", views.village_npcs, name="village-npcs"),
     path("api/village/npcs/<str:npc_id>/runtime-summary", views.npc_runtime_summary, name="village-npc-runtime-summary"),
     path("api/village/npcs/<str:npc_id>/available-actions", views.npc_available_actions, name="village-npc-available-actions"),
     path("api/village/npcs/<str:npc_id>/discover", views.npc_discover, name="village-npc-discover"),
+    path("api/village/npcs/<str:npc_id>/query/<str:query_name>", views.npc_agent_query, name="village-npc-agent-query"),
     path("api/village/locations", views.village_locations, name="village-locations"),
     path(
         "api/village/bootstrap-validation",
@@ -22,6 +28,7 @@ urlpatterns = [
     # 阶段一 Runtime API
     path("api/village/runtime/bootstrap", views.runtime_bootstrap, name="village-runtime-bootstrap"),
     path("api/village/runtime/checkpoint", views.runtime_checkpoint, name="village-runtime-checkpoint"),
+    path("api/village/runtime/subjective-goal", views.subjective_goal_update, name="village-subjective-goal-update"),
     path("api/village/runtime/summary", views.runtime_summary_view, name="village-runtime-summary"),
     path("api/village/runtime/time", views.runtime_time, name="village-runtime-time"),
     path("api/village/runtime/advance-needs", views.runtime_advance_needs, name="village-runtime-advance-needs"),
@@ -37,6 +44,7 @@ urlpatterns = [
     path("api/village/commands/<str:command_id>/start", views.commands_start, name="village-commands-start"),
     path("api/village/commands/<str:command_id>/status", views.commands_status, name="village-commands-status"),
     path("api/village/commands/<str:command_id>/cancel", views.commands_cancel, name="village-commands-cancel"),
+    path("api/village/commands/<str:command_id>/wake", views.interrupt_sleep, name="village-sleep-interrupt"),
     # Phase 4 social read APIs
     path("api/village/social/npcs/<str:npc_id>", phase4_views.social_npc, name="village-social-npc"),
     path("api/village/social/player/facts", phase4_views.player_facts, name="village-social-player-facts"),

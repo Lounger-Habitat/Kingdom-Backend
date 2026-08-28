@@ -482,6 +482,20 @@ class StartDeliverySuccessTest(TradeTestBase):
         self.assertEqual(sell_order.status, "FILLED")
         self.assertEqual(buy_order.status, "FILLED")
 
+    def test_start_delivery_only_requires_delivery_id(self):
+        NpcGlobalInventorySlot.objects.create(
+            bag=self.bill_inv, slot_index=0, item_id=1030, item_amount=10,
+        )
+        self._create_order(10011, "MARKET_STREET", "SELL", 1030, 5, 8)
+        buy_resp = self._create_order(10012, "MARKET_STREET", "BUY", 1030, 5, 10)
+
+        resp = commit_economy_action(_payload(
+            "START_DELIVERY", 10011, "MARKET_STREET",
+            {"delivery_id": buy_resp["effects"]["delivery"]["delivery_id"]},
+        ))
+
+        self.assertEqual(resp["result_code"], ResultCode.OK)
+
 
 class StartDeliveryWrongLocationTest(TradeTestBase):
     def test_wrong_location_fails(self):

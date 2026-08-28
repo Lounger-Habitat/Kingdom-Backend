@@ -390,14 +390,10 @@ def _do_start_delivery(
     request_id: uuid.UUID,
 ) -> Dict[str, Any]:
     """START_DELIVERY: physical delivery when buyer+seller at same point."""
-    delivery_id = params.get("delivery_id")
-    buyer_npc_id = params.get("buyer_npc_id")
-    seller_npc_id = params.get("seller_npc_id")
-    delivery_point_code = params.get("delivery_point_code")
-
-    # Actor must be the seller
-    if str(npc_id) != str(seller_npc_id):
-        return _fail(ResultCode.P3_FORBIDDEN_ACTOR)
+    try:
+        delivery_id = uuid.UUID(str(params.get("delivery_id")))
+    except (TypeError, ValueError, AttributeError):
+        return _fail(ResultCode.P3_INVALID_PARAMS)
 
     with transaction.atomic():
         # Lock delivery
@@ -408,16 +404,17 @@ def _do_start_delivery(
         except NpcTradeDelivery.DoesNotExist:
             return _fail(ResultCode.P3_INVALID_PARAMS)
 
+        buyer_npc_id = str(delivery.buyer_order.npc.agent_id)
+        seller_npc_id = str(delivery.seller_order.npc.agent_id)
+        delivery_point_code = delivery.delivery_point_code
+
+        # Participant identities and location come from the locked delivery,
+        # not from duplicate Agent-supplied fields.
+        if str(npc_id) != seller_npc_id:
+            return _fail(ResultCode.P3_FORBIDDEN_ACTOR)
+
         if delivery.status != "ACTIVE":
             return _fail(ResultCode.P3_DELIVERY_NOT_READY)
-
-        # Validate participant and point match delivery record
-        if str(delivery.buyer_order.npc.agent_id) != str(buyer_npc_id):
-            return _fail(ResultCode.P3_INVALID_PARAMS)
-        if str(delivery.seller_order.npc.agent_id) != str(seller_npc_id):
-            return _fail(ResultCode.P3_INVALID_PARAMS)
-        if delivery.delivery_point_code != delivery_point_code:
-            return _fail(ResultCode.P3_INVALID_PARAMS)
 
         # Both NPCs must be at the delivery point
         try:

@@ -1,0 +1,927 @@
+﻿{
+  "actions": [
+    {
+      "name": "MOVE",
+      "phase": "阶段一",
+      "label": "移动",
+      "description": "前往指定地点；以寻路到达为准，仅“导航超时（秒）”生效。",
+      "parameters": {
+        "type": "object",
+        "properties": {
+          "location_code": {
+            "type": "string",
+            "description": "目标地点代码"
+          }
+        },
+        "required": [
+          "location_code"
+        ]
+      }
+    },
+    {
+      "name": "WAIT",
+      "phase": "阶段一",
+      "label": "等待",
+      "description": "原地等待；使用“时长（世界分钟）”。",
+      "parameters": {
+        "type": "object",
+        "properties": {},
+        "required": []
+      }
+    },
+    {
+      "name": "GO_HOME",
+      "phase": "阶段一",
+      "label": "回家",
+      "description": "返回 NPC 住所；以寻路到达为准，仅“导航超时（秒）”生效。",
+      "parameters": {
+        "type": "object",
+        "properties": {},
+        "required": []
+      }
+    },
+    {
+      "name": "EAT",
+      "phase": "阶段二",
+      "label": "进食",
+      "description": "进食并结算饥饿值；时长固定为 30 个世界分钟。",
+      "parameters": {
+        "type": "object",
+        "properties": {
+          "source": {
+            "type": "string",
+            "description": "食物来源",
+            "enum": [
+              "PERSONAL_INVENTORY",
+              "COMMUNITY_MEAL"
+            ]
+          },
+          "food_instance_id": {
+            "type": "string",
+            "description": "食物实例ID；选择公共餐食时不传",
+            "format": "uuid"
+          }
+        },
+        "required": [
+          "source"
+        ]
+      }
+    },
+    {
+      "name": "REST",
+      "phase": "阶段二",
+      "label": "休息",
+      "description": "在家或餐厅休息；30–120 个世界分钟，且必须为 30 的倍数。",
+      "parameters": {
+        "type": "object",
+        "properties": {
+          "duration_minutes": {
+            "type": "integer",
+            "description": "休息时长（世界分钟）",
+            "minimum": 30,
+            "maximum": 120,
+            "multipleOf": 30
+          }
+        },
+        "required": ["duration_minutes"]
+      }
+    },
+    {
+      "name": "SLEEP",
+      "phase": "阶段二",
+      "label": "睡眠",
+      "description": "在家睡眠；30–600 个世界分钟，且必须为 30 的倍数。",
+      "parameters": {
+        "type": "object",
+        "properties": {
+          "duration_minutes": {
+            "type": "integer",
+            "description": "睡眠时长（世界分钟）",
+            "minimum": 30,
+            "maximum": 600,
+            "multipleOf": 30
+          }
+        },
+        "required": ["duration_minutes"]
+      }
+    },
+    {
+      "name": "SOCIALIZE",
+      "phase": "阶段二",
+      "label": "社交",
+      "description": "与另一名 NPC 社交；30–120 个世界分钟，且必须为 30 的倍数。",
+      "parameters": {
+        "type": "object",
+        "properties": {
+          "target_npc_id": {
+            "type": "string",
+            "description": "目标NPC ID"
+          },
+          "duration_minutes": {
+            "type": "integer",
+            "description": "社交时长（世界分钟）",
+            "minimum": 30,
+            "maximum": 120,
+            "multipleOf": 30
+          }
+        },
+        "required": [
+          "target_npc_id",
+          "duration_minutes"
+        ]
+      }
+    },
+    {
+      "name": "WORK_PLACEHOLDER",
+      "phase": "阶段二",
+      "label": "工作",
+      "description": "在工作地点执行工作；30–240 个世界分钟，且必须为 30 的倍数。",
+      "parameters": {
+        "type": "object",
+        "properties": {
+          "duration_minutes": {
+            "type": "integer",
+            "description": "工作时长（世界分钟）",
+            "minimum": 30,
+            "maximum": 240,
+            "multipleOf": 30
+          }
+        },
+        "required": ["duration_minutes"]
+      }
+    },
+    {
+      "name": "PLANT",
+      "phase": "阶段三",
+      "label": "播种",
+      "description": "在 Bill 农田播种；使用“时长（世界分钟）”。",
+      "parameters": {
+        "type": "object",
+        "properties": {
+          "plot_code": {
+            "type": "string",
+            "description": "农田地块代码"
+          },
+          "crop_code": {
+            "type": "string",
+            "description": "作物代码"
+          }
+        },
+        "required": [
+          "plot_code",
+          "crop_code"
+        ]
+      }
+    },
+    {
+      "name": "HARVEST",
+      "phase": "阶段三",
+      "label": "收获",
+      "description": "在 Bill 农田收获；使用“时长（世界分钟）”。",
+      "parameters": {
+        "type": "object",
+        "properties": {
+          "plot_code": {
+            "type": "string",
+            "description": "农田地块代码"
+          }
+        },
+        "required": [
+          "plot_code"
+        ]
+      }
+    },
+    {
+      "name": "HUNT",
+      "phase": "阶段三",
+      "label": "狩猎",
+      "description": "在狩猎入口狩猎；使用“时长（世界分钟）”。",
+      "parameters": {
+        "type": "object",
+        "properties": {
+          "hunt_code": {
+            "type": "string",
+            "description": "狩猎项目代码",
+            "enum": ["HUNT_CHICKEN"]
+          }
+        },
+        "required": [
+          "hunt_code"
+        ]
+      }
+    },
+    {
+      "name": "COOK",
+      "phase": "阶段三",
+      "label": "烹饪",
+      "description": "在餐厅烹饪；使用“时长（世界分钟）”。",
+      "parameters": {
+        "type": "object",
+        "properties": {
+          "recipe_id": {
+            "type": "integer",
+            "description": "菜谱ID",
+            "minimum": 1
+          }
+        },
+        "required": [
+          "recipe_id"
+        ]
+      }
+    },
+    {
+      "name": "CREATE_ORDER",
+      "phase": "阶段三",
+      "label": "创建订单",
+      "description": "创建交易订单；使用“时长（世界分钟）”。",
+      "parameters": {
+        "type": "object",
+        "properties": {
+          "side": {
+            "type": "string",
+            "description": "订单方向",
+            "enum": [
+              "BUY",
+              "SELL"
+            ]
+          },
+          "item_id": {
+            "type": "integer",
+            "description": "物品ID",
+            "minimum": 1
+          },
+          "amount": {
+            "type": "integer",
+            "description": "数量",
+            "minimum": 1
+          },
+          "unit_price": {
+            "type": "integer",
+            "description": "单价",
+            "minimum": 1
+          },
+          "delivery_point_code": {
+            "type": "string",
+            "description": "交付地点代码"
+          }
+        },
+        "required": [
+          "side",
+          "item_id",
+          "amount",
+          "unit_price",
+          "delivery_point_code"
+        ]
+      }
+    },
+    {
+      "name": "CANCEL_ORDER",
+      "phase": "阶段三",
+      "label": "取消订单",
+      "description": "取消自己的开放订单；使用“时长（世界分钟）”。",
+      "parameters": {
+        "type": "object",
+        "properties": {
+          "order_id": {
+            "type": "string",
+            "description": "订单ID",
+            "format": "uuid"
+          }
+        },
+        "required": [
+          "order_id"
+        ]
+      }
+    },
+    {
+      "name": "START_DELIVERY",
+      "phase": "阶段三",
+      "label": "开始配送",
+      "description": "开始已匹配订单的配送；使用“时长（世界分钟）”。",
+      "parameters": {
+        "type": "object",
+        "properties": {
+          "delivery_id": {
+            "type": "string",
+            "description": "配送单ID",
+            "format": "uuid"
+          }
+        },
+        "required": [
+          "delivery_id"
+        ]
+      }
+    },
+    {
+      "name": "IMPORT_GOODS",
+      "phase": "阶段三",
+      "label": "外部进货",
+      "description": "在贸易道路向商队进货；使用“时长（世界分钟）”。",
+      "parameters": {
+        "type": "object",
+        "properties": {
+          "item_id": {
+            "type": "integer",
+            "description": "物品ID",
+            "minimum": 1
+          },
+          "amount": {
+            "type": "integer",
+            "description": "数量",
+            "minimum": 1
+          }
+        },
+        "required": [
+          "item_id",
+          "amount"
+        ]
+      }
+    },
+    {
+      "name": "EXPORT_GOODS",
+      "phase": "阶段三",
+      "label": "外部出货",
+      "description": "在贸易道路向商队出货；使用“时长（世界分钟）”。",
+      "parameters": {
+        "type": "object",
+        "properties": {
+          "item_id": {
+            "type": "integer",
+            "description": "物品ID",
+            "minimum": 1
+          },
+          "amount": {
+            "type": "integer",
+            "description": "数量",
+            "minimum": 1
+          }
+        },
+        "required": [
+          "item_id",
+          "amount"
+        ]
+      }
+    },
+    {
+      "name": "RATE_DISH",
+      "phase": "阶段三",
+      "label": "菜品评分",
+      "description": "在档案馆为菜品评分；使用“时长（世界分钟）”。",
+      "parameters": {
+        "type": "object",
+        "properties": {
+          "owner_npc_id": {
+            "type": "string",
+            "description": "菜品所属NPC ID"
+          },
+          "food_instance_id": {
+            "type": "string",
+            "description": "食物实例ID；选择公共餐食时不传",
+            "format": "uuid"
+          },
+          "score": {
+            "type": "integer",
+            "description": "评分",
+            "minimum": 1,
+            "maximum": 5
+          }
+        },
+        "required": [
+          "owner_npc_id",
+          "food_instance_id",
+          "score"
+        ]
+      }
+    },
+    {
+      "name": "PUBLISH_PRICE_INDEX",
+      "phase": "阶段三",
+      "label": "发布价格指数",
+      "description": "在档案馆发布当日价格指数；使用“时长（世界分钟）”。",
+      "parameters": {
+        "type": "object",
+        "properties": {},
+        "required": []
+      }
+    },
+    {
+      "name": "AUDIT_PUBLIC_FUND",
+      "phase": "阶段三",
+      "label": "审计公款",
+      "description": "在档案馆审计公共资金；使用“时长（世界分钟）”。",
+      "parameters": {
+        "type": "object",
+        "properties": {},
+        "required": []
+      }
+    },
+    {
+      "name": "PROPOSE_TRADE",
+      "phase": "阶段三",
+      "label": "发起交易报价",
+      "description": "向指定 NPC 发起结构化定向报价；使用“时长（世界分钟）”。",
+      "parameters": {
+        "type": "object",
+        "properties": {
+          "target_npc_id": {
+            "type": "string",
+            "description": "目标NPC ID"
+          },
+          "item_id": {
+            "type": "integer",
+            "description": "物品ID",
+            "minimum": 1
+          },
+          "amount": {
+            "type": "integer",
+            "description": "数量",
+            "minimum": 1
+          },
+          "gold_amount": {
+            "type": "integer",
+            "description": "金币数量",
+            "minimum": 1
+          }
+        },
+        "required": [
+          "target_npc_id",
+          "item_id",
+          "amount",
+          "gold_amount"
+        ]
+      }
+    },
+    {
+      "name": "RESPOND_TRADE",
+      "phase": "阶段三",
+      "label": "响应交易报价",
+      "description": "接受或拒绝交易报价；使用“时长（世界分钟）”。",
+      "parameters": {
+        "type": "object",
+        "properties": {
+          "offer_id": {
+            "type": "string",
+            "description": "交易报价ID",
+            "format": "uuid"
+          },
+          "decision": {
+            "type": "string",
+            "description": "处理决定",
+            "enum": [
+              "ACCEPT",
+              "REJECT"
+            ]
+          }
+        },
+        "required": [
+          "offer_id",
+          "decision"
+        ]
+      }
+    },
+    {
+      "name": "CANCEL_TRADE_OFFER",
+      "phase": "阶段三",
+      "label": "取消交易报价",
+      "description": "发起方取消待处理报价；使用“时长（世界分钟）”。",
+      "parameters": {
+        "type": "object",
+        "properties": {
+          "offer_id": {
+            "type": "string",
+            "description": "交易报价ID",
+            "format": "uuid"
+          }
+        },
+        "required": [
+          "offer_id"
+        ]
+      }
+    },
+    {
+      "name": "LIST_STORE_ITEM",
+      "phase": "阶段三",
+      "label": "上架商品",
+      "description": "经营 NPC 将个人物品转入商店并上架；使用“时长（世界分钟）”。",
+      "parameters": {
+        "type": "object",
+        "properties": {
+          "store_code": {
+            "type": "string",
+            "description": "商店代码"
+          },
+          "item_id": {
+            "type": "integer",
+            "description": "物品ID",
+            "minimum": 1
+          },
+          "amount": {
+            "type": "integer",
+            "description": "数量",
+            "minimum": 1
+          },
+          "price_mode": {
+            "type": "string",
+            "description": "定价方式",
+            "enum": [
+              "ORIGINAL",
+              "CUSTOM"
+            ]
+          },
+          "custom_unit_price": {
+            "type": "integer",
+            "description": "自定义单价；自定义定价时必填",
+            "minimum": 1
+          }
+        },
+        "required": [
+          "store_code",
+          "item_id",
+          "amount",
+          "price_mode"
+        ]
+      }
+    },
+    {
+      "name": "UPDATE_STORE_PRICE",
+      "phase": "阶段三",
+      "label": "修改商品价格",
+      "description": "经营 NPC 修改上架商品单价；使用“时长（世界分钟）”。",
+      "parameters": {
+        "type": "object",
+        "properties": {
+          "listing_id": {
+            "type": "string",
+            "description": "商品上架记录ID",
+            "format": "uuid"
+          },
+          "price_mode": {
+            "type": "string",
+            "description": "定价方式",
+            "enum": [
+              "ORIGINAL",
+              "CUSTOM"
+            ]
+          },
+          "custom_unit_price": {
+            "type": "integer",
+            "description": "自定义单价；自定义定价时必填",
+            "minimum": 1
+          }
+        },
+        "required": [
+          "listing_id",
+          "price_mode"
+        ]
+      }
+    },
+    {
+      "name": "DELIST_STORE_ITEM",
+      "phase": "阶段三",
+      "label": "下架商品",
+      "description": "经营 NPC 下架商品并取回库存；使用“时长（世界分钟）”。",
+      "parameters": {
+        "type": "object",
+        "properties": {
+          "listing_id": {
+            "type": "string",
+            "description": "商品上架记录ID",
+            "format": "uuid"
+          }
+        },
+        "required": [
+          "listing_id"
+        ]
+      }
+    },
+    {
+      "name": "BUY_FROM_STORE",
+      "phase": "阶段三",
+      "label": "商店购买",
+      "description": "其他 NPC 按上架记录价格购买商品；使用“时长（世界分钟）”。",
+      "parameters": {
+        "type": "object",
+        "properties": {
+          "listing_id": {
+            "type": "string",
+            "description": "商品上架记录ID",
+            "format": "uuid"
+          },
+          "amount": {
+            "type": "integer",
+            "description": "数量",
+            "minimum": 1
+          }
+        },
+        "required": [
+          "listing_id",
+          "amount"
+        ]
+      }
+    },
+    {
+      "name": "INSPECT_STORE_INVENTORY",
+      "phase": "阶段三",
+      "label": "查看商店库存",
+      "description": "只读查询，不进入经济结算。",
+      "parameters": {
+        "type": "object",
+        "properties": {
+          "store_code": {
+            "type": "string",
+            "description": "商店代码"
+          }
+        },
+        "required": [
+          "store_code"
+        ]
+      }
+    },
+    {
+      "name": "INSPECT_SOCIAL_STATE",
+      "phase": "阶段四",
+      "label": "查看社交状态",
+      "description": "查看关系、承诺及当前可用的社交信息。",
+      "parameters": {
+        "type": "object",
+        "properties": {},
+        "required": []
+      }
+    },
+    {
+      "name": "CREATE_COMMITMENT",
+      "phase": "阶段四",
+      "label": "创建承诺",
+      "description": "创建结构化 NPC 承诺；使用 1 个世界分钟。",
+      "parameters": {
+        "type": "object",
+        "properties": {
+          "beneficiary_npc_id": {
+            "type": "string",
+            "description": "承诺受益NPC ID"
+          },
+          "commitment_type": {
+            "type": "string",
+            "description": "承诺类型",
+            "enum": [
+              "DELIVERY",
+              "REPAYMENT",
+              "DONATION",
+              "JOINT_WORK",
+              "MEETING"
+            ]
+          },
+          "target": {
+            "type": "object",
+            "description": "承诺的结构化目标"
+          },
+          "due_world_minute": {
+            "type": "integer",
+            "description": "承诺截止世界分钟",
+            "minimum": 0
+          }
+        },
+        "required": [
+          "beneficiary_npc_id",
+          "commitment_type",
+          "target",
+          "due_world_minute"
+        ]
+      }
+    },
+    {
+      "name": "CANCEL_COMMITMENT",
+      "phase": "阶段四",
+      "label": "取消承诺",
+      "description": "取消仍开放的 NPC 承诺；使用 1 个世界分钟。",
+      "parameters": {
+        "type": "object",
+        "properties": {
+          "commitment_id": {
+            "type": "string",
+            "description": "承诺ID",
+            "format": "uuid"
+          }
+        },
+        "required": [
+          "commitment_id"
+        ]
+      }
+    },
+    {
+      "name": "PERFORM_COMMITMENT",
+      "phase": "阶段四",
+      "label": "履行承诺",
+      "description": "履行短时承诺；共同工作和见面使用各自固定时长。",
+      "parameters": {
+        "type": "object",
+        "properties": {
+          "commitment_id": {
+            "type": "string",
+            "description": "承诺ID",
+            "format": "uuid"
+          }
+        },
+        "required": [
+          "commitment_id"
+        ]
+      }
+    },
+    {
+      "name": "STORY_VOTE",
+      "phase": "阶段五",
+      "label": "剧情投票",
+      "description": "在开放的村庄议事中提交方案选择。",
+      "parameters": {
+        "type": "object",
+        "properties": {
+          "meeting_id": {
+            "type": "string",
+            "description": "议事会议ID",
+            "format": "uuid"
+          },
+          "plan_code": {
+            "type": "string",
+            "description": "选择的方案代码"
+          }
+        },
+        "required": [
+          "meeting_id",
+          "plan_code"
+        ]
+      }
+    },
+    {
+      "name": "STORY_ACT",
+      "phase": "阶段五",
+      "label": "剧情行动",
+      "description": "执行当前剧情阶段允许的村庄行动。",
+      "parameters": {
+        "type": "object",
+        "properties": {
+          "action_code": {
+            "type": "string",
+            "description": "剧情行动代码"
+          },
+          "item_id": {
+            "type": "integer",
+            "description": "物品ID",
+            "minimum": 1
+          },
+          "amount": {
+            "type": "integer",
+            "description": "数量",
+            "minimum": 1
+          },
+          "gold_amount": {
+            "type": "integer",
+            "description": "金币数量",
+            "minimum": 1
+          },
+          "labor_hours": {
+            "type": "integer",
+            "description": "投入工时",
+            "minimum": 1
+          },
+          "route_attempt_id": {
+            "type": "string",
+            "description": "路线尝试ID",
+            "format": "uuid"
+          },
+          "segment_code": {
+            "type": "string",
+            "description": "路线分段代码"
+          },
+          "companion_npc_id": {
+            "type": "string",
+            "description": "同行NPC ID"
+          },
+          "supply_item_id": {
+            "type": "integer",
+            "description": "补给物品ID",
+            "minimum": 1
+          },
+          "supply_amount": {
+            "type": "integer",
+            "description": "补给数量",
+            "minimum": 1
+          },
+          "limit_item_id": {
+            "type": "integer",
+            "description": "限购物品ID",
+            "minimum": 1
+          },
+          "daily_limit": {
+            "type": "integer",
+            "description": "每日限购数量",
+            "minimum": 1
+          },
+          "meal_item_id": {
+            "type": "integer",
+            "description": "公共餐食物品ID",
+            "minimum": 1
+          },
+          "meal_amount": {
+            "type": "integer",
+            "description": "公共餐食数量",
+            "minimum": 1
+          }
+        },
+        "required": [
+          "action_code"
+        ]
+      }
+    },
+    {
+      "name": "OBSERVE",
+      "phase": "查询",
+      "label": "观察自身状态",
+      "description": "查看当前时间、地点、动作和生活需求。",
+      "parameters": {"type": "object", "properties": {}, "required": []}
+    },
+    {
+      "name": "INSPECT_NEARBY",
+      "phase": "查询",
+      "label": "观察附近",
+      "description": "查看当前位置附近的NPC和地点。",
+      "parameters": {"type": "object", "properties": {}, "required": []}
+    },
+    {
+      "name": "INSPECT_INVENTORY",
+      "phase": "查询",
+      "label": "查看背包",
+      "description": "查看自己的金币、物品数量和物品实例ID。",
+      "parameters": {"type": "object", "properties": {}, "required": []}
+    },
+    {
+      "name": "INSPECT_TRADE_OFFERS",
+      "phase": "查询",
+      "label": "查看交易报价",
+      "description": "查看自己收到和发出的待处理交易报价。",
+      "parameters": {"type": "object", "properties": {}, "required": []}
+    },
+    {
+      "name": "INSPECT_STORY_STATE",
+      "phase": "查询",
+      "label": "查看剧情状态",
+      "description": "查看当前剧情、开放会议、候选方案和可执行剧情行动。",
+      "parameters": {"type": "object", "properties": {}, "required": []}
+    },
+    {
+      "name": "INSPECT_RELEVANT_STORIES",
+      "phase": "查询",
+      "label": "查看相关剧情",
+      "description": "查看与自己有关的剧情目录和摘要。",
+      "parameters": {"type": "object", "properties": {}, "required": []}
+    },
+    {
+      "name": "INSPECT_STORY_DETAIL",
+      "phase": "查询",
+      "label": "查看剧情详情",
+      "description": "按剧情唯一ID查看自己有权限看到的剧情详情。",
+      "parameters": {"type": "object", "properties": {"story_id": {"type": "string"}}, "required": ["story_id"]}
+    },
+    {
+      "name": "INSPECT_ORDERS",
+      "phase": "查询",
+      "label": "查看订单",
+      "description": "查看自己的交易订单和相关配送任务。",
+      "parameters": {"type": "object", "properties": {}, "required": []}
+    },
+    {
+      "name": "INSPECT_MARKET_STATE",
+      "phase": "查询",
+      "label": "查看市场状态",
+      "description": "查看市场价格、可交易物品、交付地点和商队状态。",
+      "parameters": {"type": "object", "properties": {}, "required": []}
+    },
+    {
+      "name": "INSPECT_FARM_STATE",
+      "phase": "查询",
+      "label": "查看农田状态",
+      "description": "查看农田地块、作物成熟状态和可播种作物。",
+      "parameters": {"type": "object", "properties": {}, "required": []}
+    },
+    {
+      "name": "INSPECT_RESTAURANT_STATE",
+      "phase": "查询",
+      "label": "查看饭店状态",
+      "description": "查看饭店营业状态、可用菜谱、材料需求和材料是否充足。",
+      "parameters": {"type": "object", "properties": {}, "required": []}
+    },
+    {
+      "name": "INSPECT_RATEABLE_DISHES",
+      "phase": "查询",
+      "label": "查看待评分菜品",
+      "description": "查看可以评分的菜品、所属NPC和食物实例ID。",
+      "parameters": {"type": "object", "properties": {}, "required": []}
+    },
+    {
+      "name": "INSPECT_PUBLIC_ECONOMY_STATE",
+      "phase": "查询",
+      "label": "查看公共经济",
+      "description": "查看当日价格指数、公款余额和审计状态。",
+      "parameters": {"type": "object", "properties": {}, "required": []}
+    }
+  ]
+}
