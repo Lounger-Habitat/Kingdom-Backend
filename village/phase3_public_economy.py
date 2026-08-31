@@ -584,9 +584,9 @@ def handle_eat(
     world_minute: int,
     request_id: uuid.UUID,
 ) -> Dict[str, Any]:
-    """EAT with FEFO when economy enabled.
+    """EAT when economy is enabled.
 
-    - source=PERSONAL_INVENTORY: FEFO consume 1 food from NPC's whitelist
+    - source=PERSONAL_INVENTORY: consume the requested food instance
     - source=COMMUNITY_MEAL: FEFO consume 1 Lucy dish, PUBLIC_FUND pays Lucy
     - Return needs_delta for Unity to apply
     """
@@ -596,26 +596,40 @@ def handle_eat(
         return _fail(ResultCode.P3_INVALID_PARAMS)
 
     if source == "PERSONAL_INVENTORY":
-        return _eat_personal(npc_id, world_minute, request_id)
+        try:
+            food_instance_id = uuid.UUID(str(params["food_instance_id"]))
+        except (KeyError, TypeError, ValueError, AttributeError):
+            return _fail(ResultCode.P3_INVALID_PARAMS)
+        return _eat_personal(npc_id, food_instance_id, world_minute, request_id)
     else:
         return _eat_community(npc_id, world_minute, request_id)
 
 
 def _eat_personal(
     npc_id: int,
+    food_instance_id: uuid.UUID,
     world_minute: int,
     request_id: uuid.UUID,
 ) -> Dict[str, Any]:
-    """FEFO consume 1 food from NPC's personal inventory."""
-    food_whitelist = _get_eat_whitelist()
-
+    """Consume the requested food instance from the NPC's inventory."""
     try:
-        consumed = consume_fefo(npc_id, food_whitelist, 1)
-    except ValueError:
+        inventory = NpcGlobalInventory.objects.select_for_update().get(
+            npc__agent_id=str(npc_id)
+        )
+        slot = NpcGlobalInventorySlot.objects.select_for_update().get(
+            bag=inventory,
+            instance_id=food_instance_id,
+        )
+    except (NpcGlobalInventory.DoesNotExist, NpcGlobalInventorySlot.DoesNotExist):
         return _fail(ResultCode.P3_INSUFFICIENT_ITEM)
 
-    # Increment asset version
-    inventory = NpcGlobalInventory.objects.get(npc__agent_id=str(npc_id))
+    if slot.item_id not in _get_eat_whitelist():
+        return _fail(ResultCode.P3_INVALID_PARAMS)
+    if get_available_slot_amount(slot) < 1:
+        return _fail(ResultCode.P3_INSUFFICIENT_ITEM)
+
+    slot.item_amount -= 1
+    slot.save(update_fields=["item_amount"])
     inventory.asset_version += 1
     inventory.save(update_fields=["asset_version", "updated_at"])
 
@@ -624,10 +638,8 @@ def _eat_personal(
         effects={
             "eat": {
                 "source": "PERSONAL_INVENTORY",
-                "items_consumed": [
-                    {"item_id": slot.item_id, "amount": amt}
-                    for slot, amt in consumed
-                ],
+                "food_instance_id": str(food_instance_id),
+                "items_consumed": [{"item_id": slot.item_id, "amount": 1}],
             },
         },
         external_delta=0,

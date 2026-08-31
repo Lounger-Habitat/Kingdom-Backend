@@ -14,6 +14,7 @@ from recipes.models import Recipe
 from .models import (
     DailyPriceSnapshot,
     NpcProfile,
+    NpcDialogueSession,
     NpcRuntimeState,
     NpcStoryFactAccess,
     NpcTradeDelivery,
@@ -37,6 +38,11 @@ from .phase3_catalog import (
     RECIPE_WHITELIST,
 )
 from .phase3_contract import CROP_CODES, DELIVERY_POINTS, FarmPlotStatus
+from .phase3_marketplace import (
+    browse_marketplace_query,
+    marketplace_history_query,
+    my_marketplace_listings_query,
+)
 from .phase5_contract import FORMAL_NPC_IDS, STORY_ACTION_ACTORS, STORY_FACT_CODES
 from .phase5_story import ARC_CODE, STORY_ACTION_PLANS, _snapshot
 
@@ -55,8 +61,11 @@ QUERY_NAMES = frozenset({
     "INSPECT_RESTAURANT_STATE",
     "INSPECT_RATEABLE_DISHES",
     "INSPECT_PUBLIC_ECONOMY_STATE",
+    "BROWSE_MARKETPLACE",
     "INSPECT_STORE_INVENTORY",
     "INSPECT_SOCIAL_STATE",
+    "CHECK_MY_MARKETPLACE_LISTINGS",
+    "CHECK_MARKETPLACE_HISTORY",
 })
 
 
@@ -71,14 +80,17 @@ def _item_names(item_ids) -> dict[int, str]:
 def _observe(npc: NpcDefinition) -> dict:
     runtime = NpcRuntimeState.objects.get(npc=npc)
     world_minute = _world_minute()
-    action_end = runtime.action_ends_world_minute
+    dialogue = NpcDialogueSession.objects.filter(
+        Q(initiator=npc) | Q(target=npc), status="ACTIVE"
+    ).first()
+    action_end = dialogue.expires_world_minute if dialogue else runtime.action_ends_world_minute
     return {
         "world_minute": world_minute,
         "current_location": runtime.current_location_code,
-        "current_action": runtime.current_action or None,
-        "action_status": runtime.action_status,
-        "action_started_world_minute": runtime.action_started_world_minute,
-        "action_ends_world_minute": runtime.action_ends_world_minute,
+        "current_action": "DIALOGUE" if dialogue else runtime.current_action or None,
+        "action_status": "DIALOGUING" if dialogue else runtime.action_status,
+        "action_started_world_minute": dialogue.started_world_minute if dialogue else runtime.action_started_world_minute,
+        "action_ends_world_minute": action_end,
         "remaining_minutes": max(0, action_end - world_minute) if action_end is not None else None,
         "active_command_id": str(runtime.active_command_id) if runtime.active_command_id else None,
         "interruptible": runtime.action_status == "SLEEPING" and runtime.current_action == "SLEEP",
@@ -112,6 +124,13 @@ def _nearby(npc: NpcDefinition) -> dict:
         .exclude(npc=npc)
         .order_by("npc__agent_id")
     ]
+    npc_names = {
+        str(agent_id): display_name
+        for agent_id, display_name in NpcProfile.objects.filter(
+            is_active=True, npc__is_test_only=False,
+        )
+        .values_list("npc__agent_id", "display_name")
+    }
     visible_codes = {
         profile.home_location_code,
         profile.work_location_code,
@@ -135,6 +154,7 @@ def _nearby(npc: NpcDefinition) -> dict:
     locations.sort(key=lambda row: (row["distance"] is None, row["distance"] or 0, row["location_code"]))
     return {
         "current_location": runtime.current_location_code,
+        "npc_names": npc_names,
         "nearby_npcs": nearby_npcs,
         "nearby_locations": locations[:5],
     }
@@ -414,6 +434,18 @@ def _public_economy(_npc: NpcDefinition) -> dict:
     }
 
 
+def _browse_marketplace(npc: NpcDefinition, query_params=None) -> dict:
+    return browse_marketplace_query(npc, query_params)
+
+
+def _my_marketplace_listings(npc: NpcDefinition, query_params=None) -> dict:
+    return my_marketplace_listings_query(npc, query_params)
+
+
+def _marketplace_history(npc: NpcDefinition, query_params=None) -> dict:
+    return marketplace_history_query(npc, query_params)
+
+
 def _authorized(_npc: NpcDefinition) -> dict:
     """Capability gate for parameterized legacy query endpoints."""
     return {"authorized": True}
@@ -432,6 +464,9 @@ _HANDLERS = {
     "INSPECT_RESTAURANT_STATE": _restaurant_state,
     "INSPECT_RATEABLE_DISHES": _rateable_dishes,
     "INSPECT_PUBLIC_ECONOMY_STATE": _public_economy,
+    "BROWSE_MARKETPLACE": _browse_marketplace,
+    "CHECK_MY_MARKETPLACE_LISTINGS": _my_marketplace_listings,
+    "CHECK_MARKETPLACE_HISTORY": _marketplace_history,
     "INSPECT_STORE_INVENTORY": _authorized,
     "INSPECT_SOCIAL_STATE": _authorized,
 }
@@ -455,6 +490,8 @@ def execute_agent_query(npc_id: str, query_name: str, query_params=None) -> tupl
             story_id = str((query_params or {}).get("story_id", "")).strip()
             data = _story_detail(npc, story_id)
             return (True, "OK", data) if data is not None else (False, "STORY_NOT_VISIBLE", None)
+        if query_name in {"BROWSE_MARKETPLACE", "CHECK_MY_MARKETPLACE_LISTINGS", "CHECK_MARKETPLACE_HISTORY"}:
+            return True, "OK", _HANDLERS[query_name](npc, query_params)
         return True, "OK", _HANDLERS[query_name](npc)
     except (NpcRuntimeState.DoesNotExist, NpcGlobalInventory.DoesNotExist, NpcProfile.DoesNotExist):
         return False, "NPC_NOT_READY", None

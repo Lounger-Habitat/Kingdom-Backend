@@ -191,6 +191,12 @@ class VillageActionDurationConfig(models.Model):
         "UPDATE_STORE_PRICE": ("阶段三", "修改商品价格", "经营 NPC 修改上架商品单价；使用“时长（世界分钟）”。"),
         "DELIST_STORE_ITEM": ("阶段三", "下架商品", "经营 NPC 下架商品并取回库存；使用“时长（世界分钟）”。"),
         "BUY_FROM_STORE": ("阶段三", "商店购买", "其他 NPC 按上架记录价格购买商品；使用“时长（世界分钟）”。"),
+        "BUY_FROM_MARKETPLACE": ("阶段三", "购买全服商品", "在市场街购买全服 Marketplace 挂单；使用“时长（世界分钟）”。"),
+        "SELL_ON_MARKETPLACE": ("阶段三", "上架全服商品", "在市场街将个人库存上架到全服 Marketplace；使用“时长（世界分钟）”。"),
+        "DELIST_FROM_MARKETPLACE": ("阶段三", "下架全服商品", "在市场街下架自己的全服 Marketplace 挂单；使用“时长（世界分钟）”。"),
+        "BROWSE_MARKETPLACE": ("查询", "浏览全服市场", "只读查询，不进入经济结算。"),
+        "CHECK_MY_MARKETPLACE_LISTINGS": ("查询", "查看我的全服挂单", "只读查询，不进入经济结算。"),
+        "CHECK_MARKETPLACE_HISTORY": ("查询", "查看全服成交历史", "只读查询，不进入经济结算。"),
         "INSPECT_STORE_INVENTORY": ("阶段三", "查看商店库存", "只读查询，不进入经济结算。"),
         "JOINT_WORK": ("阶段四", "共同工作", "与另一名 NPC 在指定地点共同工作；固定使用 120 个世界分钟。"),
         "MEETING": ("阶段四", "见面", "与另一名 NPC 在指定地点会面；固定使用 30 个世界分钟。"),
@@ -230,6 +236,12 @@ class VillageActionDurationConfig(models.Model):
         "UPDATE_STORE_PRICE": 1,
         "DELIST_STORE_ITEM": 1,
         "BUY_FROM_STORE": 1,
+        "BUY_FROM_MARKETPLACE": 1,
+        "SELL_ON_MARKETPLACE": 1,
+        "DELIST_FROM_MARKETPLACE": 1,
+        "BROWSE_MARKETPLACE": 5,
+        "CHECK_MY_MARKETPLACE_LISTINGS": 5,
+        "CHECK_MARKETPLACE_HISTORY": 5,
         "INSPECT_STORE_INVENTORY": 5,
         "JOINT_WORK": 120,
         "MEETING": 30,
@@ -719,6 +731,46 @@ class NpcActionReservation(models.Model):
 
     def __str__(self):
         return f"{self.reservation_id} - {self.action_kind} - {self.status}"
+
+
+class NpcDialogueSession(models.Model):
+    """Authoritative transcript and settlement anchor for one NPC dialogue."""
+
+    STATUS_CHOICES = [
+        ("ACTIVE", "进行中"),
+        ("COMPLETED", "已完成"),
+        ("EXPIRED", "已过期"),
+    ]
+
+    conversation_id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
+    initiator = models.ForeignKey(
+        "inventory.NpcDefinition", on_delete=models.CASCADE, related_name="initiated_dialogues"
+    )
+    target = models.ForeignKey(
+        "inventory.NpcDefinition", on_delete=models.CASCADE, related_name="received_dialogues"
+    )
+    reservation = models.OneToOneField(
+        NpcActionReservation, on_delete=models.PROTECT, related_name="dialogue_session"
+    )
+    status = models.CharField(max_length=16, choices=STATUS_CHOICES, default="ACTIVE")
+    topic = models.CharField(max_length=120, blank=True, default="")
+    messages = models.JSONField(default=list, blank=True)
+    end_requests = models.JSONField(default=list, blank=True)
+    started_world_minute = models.BigIntegerField()
+    expires_world_minute = models.BigIntegerField()
+    ended_world_minute = models.BigIntegerField(null=True, blank=True)
+    end_reason = models.CharField(max_length=64, blank=True, default="")
+    valid_for_social_needs = models.BooleanField(null=True, blank=True)
+    social_multiplier_percent = models.PositiveSmallIntegerField(null=True, blank=True)
+    created_at = models.DateTimeField(auto_now_add=True)
+    updated_at = models.DateTimeField(auto_now=True)
+
+    class Meta:
+        verbose_name = "NPC 对话会话"
+        verbose_name_plural = "NPC 对话会话"
+
+    def __str__(self):
+        return f"{self.conversation_id} - {self.status}"
 
 
 class VillageDeliveryOutbox(models.Model):

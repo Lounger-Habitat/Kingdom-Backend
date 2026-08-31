@@ -44,10 +44,10 @@ class SchemaVersionTest(TestCase):
 
 
 class ActionNameTest(TestCase):
-    """All 21 action names must be present and stable."""
+    """All 24 action names must be present and stable."""
 
     def test_all_action_names_count(self):
-        self.assertEqual(len(ActionName), 21)
+        self.assertEqual(len(ActionName), 24)
 
     def test_action_name_values(self):
         expected = {
@@ -58,7 +58,8 @@ class ActionNameTest(TestCase):
             "EAT", "COMMUNITY_MEAL",
             "PROPOSE_TRADE", "RESPOND_TRADE", "CANCEL_TRADE_OFFER",
             "LIST_STORE_ITEM", "UPDATE_STORE_PRICE", "DELIST_STORE_ITEM",
-            "BUY_FROM_STORE",
+            "BUY_FROM_STORE", "BUY_FROM_MARKETPLACE",
+            "SELL_ON_MARKETPLACE", "DELIST_FROM_MARKETPLACE",
         }
         self.assertEqual(ALL_ACTION_NAMES, expected)
 
@@ -342,7 +343,7 @@ class EnumStabilityTest(TestCase):
 
 
 class Phase3TradeActionContractTest(TestCase):
-    """The 7 Phase 3 direct-trade commands must be fully frozen."""
+    """The 10 Phase 3 direct-trade commands must be fully frozen."""
 
     def test_propose_trade_contract(self):
         self.assertEqual(ACTOR_WHITELIST[ActionName.PROPOSE_TRADE], set())
@@ -419,6 +420,33 @@ class Phase3TradeActionContractTest(TestCase):
             }),
         )
 
+    def test_buy_from_marketplace_contract(self):
+        self.assertEqual(ACTOR_WHITELIST[ActionName.BUY_FROM_MARKETPLACE], set())
+        self.assertEqual(LOCATION_REQUIREMENTS[ActionName.BUY_FROM_MARKETPLACE], "MARKET_STREET")
+        self.assertEqual(ACTION_DURATION[ActionName.BUY_FROM_MARKETPLACE], 1)
+        self.assertEqual(
+            PARAM_WHITELIST[ActionName.BUY_FROM_MARKETPLACE],
+            frozenset({"listing_id", "amount", "expected_buyer_asset_version"}),
+        )
+
+    def test_sell_on_marketplace_contract(self):
+        self.assertEqual(ACTOR_WHITELIST[ActionName.SELL_ON_MARKETPLACE], set())
+        self.assertEqual(LOCATION_REQUIREMENTS[ActionName.SELL_ON_MARKETPLACE], "MARKET_STREET")
+        self.assertEqual(ACTION_DURATION[ActionName.SELL_ON_MARKETPLACE], 1)
+        self.assertEqual(
+            PARAM_WHITELIST[ActionName.SELL_ON_MARKETPLACE],
+            frozenset({"instance_id", "amount", "price", "expected_asset_version"}),
+        )
+
+    def test_delist_from_marketplace_contract(self):
+        self.assertEqual(ACTOR_WHITELIST[ActionName.DELIST_FROM_MARKETPLACE], set())
+        self.assertEqual(LOCATION_REQUIREMENTS[ActionName.DELIST_FROM_MARKETPLACE], "MARKET_STREET")
+        self.assertEqual(ACTION_DURATION[ActionName.DELIST_FROM_MARKETPLACE], 1)
+        self.assertEqual(
+            PARAM_WHITELIST[ActionName.DELIST_FROM_MARKETPLACE],
+            frozenset({"listing_id", "expected_asset_version"}),
+        )
+
     def test_all_trade_actions_have_full_contract_entries(self):
         for action in (
             ActionName.PROPOSE_TRADE,
@@ -428,6 +456,9 @@ class Phase3TradeActionContractTest(TestCase):
             ActionName.UPDATE_STORE_PRICE,
             ActionName.DELIST_STORE_ITEM,
             ActionName.BUY_FROM_STORE,
+            ActionName.BUY_FROM_MARKETPLACE,
+            ActionName.SELL_ON_MARKETPLACE,
+            ActionName.DELIST_FROM_MARKETPLACE,
         ):
             self.assertIn(action, ACTOR_WHITELIST)
             self.assertIn(action, LOCATION_REQUIREMENTS)

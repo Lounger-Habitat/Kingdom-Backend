@@ -35,6 +35,9 @@ class ActionName(str, Enum):
     UPDATE_STORE_PRICE = "UPDATE_STORE_PRICE"
     DELIST_STORE_ITEM = "DELIST_STORE_ITEM"
     BUY_FROM_STORE = "BUY_FROM_STORE"
+    BUY_FROM_MARKETPLACE = "BUY_FROM_MARKETPLACE"
+    SELL_ON_MARKETPLACE = "SELL_ON_MARKETPLACE"
+    DELIST_FROM_MARKETPLACE = "DELIST_FROM_MARKETPLACE"
 
 
 # ── Read-only query names ─────────────────────────────────────────
@@ -210,6 +213,9 @@ ACTOR_WHITELIST = {
     ActionName.UPDATE_STORE_PRICE: {"10014", "10015"},
     ActionName.DELIST_STORE_ITEM: {"10014", "10015"},
     ActionName.BUY_FROM_STORE: set(),  # any non-operator NPC
+    ActionName.BUY_FROM_MARKETPLACE: set(),
+    ActionName.SELL_ON_MARKETPLACE: set(),
+    ActionName.DELIST_FROM_MARKETPLACE: set(),
 }
 
 # ── Location requirements per action ───────────────────────────────
@@ -235,6 +241,9 @@ LOCATION_REQUIREMENTS = {
     ActionName.UPDATE_STORE_PRICE: None,  # runtime-validated: operator at own store
     ActionName.DELIST_STORE_ITEM: None,  # runtime-validated: operator at own store
     ActionName.BUY_FROM_STORE: None,  # runtime-validated: buyer at target store
+    ActionName.BUY_FROM_MARKETPLACE: "MARKET_STREET",
+    ActionName.SELL_ON_MARKETPLACE: "MARKET_STREET",
+    ActionName.DELIST_FROM_MARKETPLACE: "MARKET_STREET",
 }
 
 # ── Duration per action (world minutes) ────────────────────────────
@@ -260,6 +269,9 @@ ACTION_DURATION = {
     ActionName.UPDATE_STORE_PRICE: 1,
     ActionName.DELIST_STORE_ITEM: 1,
     ActionName.BUY_FROM_STORE: 1,
+    ActionName.BUY_FROM_MARKETPLACE: 1,
+    ActionName.SELL_ON_MARKETPLACE: 1,
+    ActionName.DELIST_FROM_MARKETPLACE: 1,
 }
 
 # ── Param whitelists per action ────────────────────────────────────
@@ -304,6 +316,15 @@ PARAM_WHITELIST = {
     }),
     ActionName.BUY_FROM_STORE: frozenset({
         "listing_id", "amount", "expected_store_inventory_version", "expected_buyer_asset_version",
+    }),
+    ActionName.BUY_FROM_MARKETPLACE: frozenset({
+        "listing_id", "amount", "expected_buyer_asset_version",
+    }),
+    ActionName.SELL_ON_MARKETPLACE: frozenset({
+        "instance_id", "amount", "price", "expected_asset_version",
+    }),
+    ActionName.DELIST_FROM_MARKETPLACE: frozenset({
+        "listing_id", "expected_asset_version",
     }),
 }
 

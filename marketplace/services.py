@@ -7,8 +7,13 @@ from django.db.models import Max, Q
 from django.utils import timezone
 
 from account.models import GameAccount
-from inventory.models import InventoryBag, InventorySlot
-from inventory.serializers import serialize_bag
+from inventory.models import (
+    InventoryBag,
+    InventorySlot,
+    NpcDefinition,
+    NpcGlobalInventory,
+    NpcGlobalInventorySlot,
+)
 from items.models import Item
 
 from .models import MarketListing, MarketListingSource, MarketListingStatus, MarketTransaction
@@ -17,12 +22,88 @@ from .models import MarketListing, MarketListingSource, MarketListingStatus, Mar
 MARKETPLACE_LISTING_DURATION_HOURS = 168  # 7 days
 
 
-# ──────────────────────────────────────────────────────────────
-#  Helpers (reused / adapted from inventory app)
-# ──────────────────────────────────────────────────────────────
-
 def get_player_main_bag(player):
     return InventoryBag.objects.get_or_create(player=player, character_id=player.username)
+
+
+def get_npc_main_bag(npc):
+    return NpcGlobalInventory.objects.get_or_create(npc=npc)
+
+
+def _lock_player_bag(bag):
+    return InventoryBag.objects.select_for_update().get(pk=bag.pk)
+
+
+def _lock_npc_bag(bag):
+    return NpcGlobalInventory.objects.select_for_update().get(pk=bag.pk)
+
+
+def _save_money_change(bag, source):
+    if isinstance(bag, InventoryBag):
+        bag._money_change_source = source
+        bag.save()
+    else:
+        bag.save(update_fields=["money", "updated_at"])
+
+
+def _bump_npc_asset_version(bag):
+    if isinstance(bag, NpcGlobalInventory):
+        bag.asset_version += 1
+        bag.save(update_fields=["asset_version", "updated_at"])
+
+
+def _owner_sort_key(owner):
+    owner_type = "npc" if owner["kind"] == "npc" else "player"
+    return (owner_type, owner["id"])
+
+
+def _resolve_owner(actor):
+    if isinstance(actor, GameAccount):
+        bag, _ = get_player_main_bag(actor)
+        return {
+            "kind": "player",
+            "id": str(actor.id),
+            "account": actor,
+            "npc": None,
+            "bag": bag,
+            "slot_model": InventorySlot,
+            "source_type": MarketListingSource.PLAYER,
+            "money_source_buy": "marketplace_buy",
+            "money_source_sell": "marketplace_sell",
+            "money_source_admin_buy": "admin_marketplace_buy",
+            "money_source_admin_sell": "admin_marketplace_sell",
+        }
+    if isinstance(actor, NpcDefinition):
+        bag, _ = get_npc_main_bag(actor)
+        return {
+            "kind": "npc",
+            "id": actor.agent_id,
+            "account": None,
+            "npc": actor,
+            "bag": bag,
+            "slot_model": NpcGlobalInventorySlot,
+            "source_type": MarketListingSource.NPC,
+            "money_source_buy": "marketplace_buy_npc",
+            "money_source_sell": "marketplace_sell_npc",
+            "money_source_admin_buy": "admin_marketplace_buy_npc",
+            "money_source_admin_sell": "admin_marketplace_sell_npc",
+        }
+    raise TypeError("Unsupported marketplace actor")
+
+
+def _lock_owner(owner):
+    if owner["kind"] == "player":
+        owner["bag"] = _lock_player_bag(owner["bag"])
+    else:
+        owner["bag"] = _lock_npc_bag(owner["bag"])
+    return owner
+
+
+def _lock_owners(*owners):
+    locked = []
+    for owner in sorted(owners, key=_owner_sort_key):
+        locked.append(_lock_owner(owner))
+    return locked
 
 
 def find_slot_by_instance(bag, instance_id):
@@ -35,7 +116,8 @@ def find_empty_slot(bag):
         return empty
     max_index = bag.slots.aggregate(Max("slot_index"))["slot_index__max"]
     next_index = (max_index + 1) if max_index is not None else 0
-    return InventorySlot(bag=bag, slot_index=next_index)
+    slot_model = NpcGlobalInventorySlot if isinstance(bag, NpcGlobalInventory) else InventorySlot
+    return slot_model(bag=bag, slot_index=next_index)
 
 
 def clear_slot_if_empty(slot):
@@ -53,11 +135,25 @@ def clear_slot_if_empty(slot):
         slot.hide_in_shop = False
         slot.remaining_uses = None
         slot.review_comment = ""
-        slot.save()
+        update_fields = [
+            "item_id",
+            "item_amount",
+            "instance_id",
+            "rated",
+            "rating_price",
+            "overall_score",
+            "ingredient",
+            "item_bag_name",
+            "cook_time",
+            "dish_quality",
+            "hide_in_shop",
+            "remaining_uses",
+            "review_comment",
+        ]
+        slot.save(update_fields=update_fields)
 
 
 def snapshot_slot(slot):
-    """Build item_snapshot JSON from an InventorySlot."""
     return {
         "instanceID": str(slot.instance_id),
         "itemID": slot.item_id,
@@ -76,7 +172,6 @@ def snapshot_slot(slot):
 
 
 def build_default_item_snapshot(item, amount):
-    """Build a default item_snapshot from an Item model (for system listings)."""
     remaining_uses = item.max_use_count if item.item_type == "Usable" else None
     return {
         "instanceID": str(uuid.uuid4()),
@@ -96,24 +191,18 @@ def build_default_item_snapshot(item, amount):
 
 
 def is_special_instance(snap):
-    """Check if a snapshot represents a special instance (should not be stacked)."""
-    if snap.get("rated"):
-        return True
-    if snap.get("ratingPrice", -1) >= 0:
-        return True
-    if snap.get("overallScore", 0) > 0:
-        return True
-    if snap.get("ingredient"):
-        return True
-    if snap.get("cookTime", 0) > 0:
-        return True
-    if snap.get("dishQuality", 3) != 3:
-        return True
-    if snap.get("remainingUses") is not None:
-        return True
-    if snap.get("reviewComment"):
-        return True
-    return False
+    return any(
+        [
+            snap.get("rated"),
+            snap.get("ratingPrice", -1) >= 0,
+            snap.get("overallScore", 0) > 0,
+            bool(snap.get("ingredient")),
+            snap.get("cookTime", 0) > 0,
+            snap.get("dishQuality", 3) != 3,
+            snap.get("remainingUses") is not None,
+            bool(snap.get("reviewComment")),
+        ]
+    )
 
 
 def calculate_commission(total_price):
@@ -138,259 +227,62 @@ def calculate_settlement(listing, amount):
     }
 
 
-# ──────────────────────────────────────────────────────────────
-#  Core business logic
-# ──────────────────────────────────────────────────────────────
-
-@transaction.atomic
-def create_listing(player, instance_id, amount, price):
-    """List a player's inventory item on the marketplace."""
-    bag, _ = get_player_main_bag(player)
-    slot = find_slot_by_instance(bag, instance_id)
-    if not slot:
-        return None, "物品未找到"
-    if slot.item_amount < amount:
-        return None, "物品数量不足"
-    if amount <= 0:
-        return None, "数量必须大于0"
-    if price <= 0:
-        return None, "价格必须大于0"
-
-    # Ensure seller earns at least 1 after commission
-    commission = calculate_commission(price * amount)
-    if price * amount - commission <= 0:
-        return None, "价格过低，手续费后收入为0"
-
-    # Get item info for snapshots
-    item_name = ""
-    item_type = ""
-    icon_url = ""
-    try:
-        item = Item.objects.get(item_id=slot.item_id)
-        item_name = item.item_name
-        item_type = item.item_type
-        icon_url = item.icon_url or ""
-    except Item.DoesNotExist:
-        pass
-
-    snap = snapshot_slot(slot)
-    snap["itemAmount"] = amount  # snapshot the listed amount
-
-    now = timezone.now()
-    listing = MarketListing.objects.create(
-        source_type=MarketListingSource.PLAYER,
-        seller=player,
-        source_instance_id=slot.instance_id,
-        item_id=slot.item_id,
-        item_name_snapshot=item_name,
-        item_type_snapshot=item_type,
-        icon_url_snapshot=icon_url,
-        total_amount=amount,
-        remaining_amount=amount,
-        price=price,
-        status=MarketListingStatus.ACTIVE,
-        item_snapshot=snap,
-        rated=slot.rated,
-        rating_price=slot.rating_price,
-        overall_score=slot.overall_score,
-        ingredient=slot.ingredient,
-        item_bag_name=slot.item_bag_name,
-        cook_time=slot.cook_time,
-        dish_quality=slot.dish_quality,
-        remaining_uses=slot.remaining_uses,
-        review_comment=slot.review_comment,
-        expires_at=now + timedelta(hours=MARKETPLACE_LISTING_DURATION_HOURS),
-    )
-
-    # Deduct from inventory
-    slot.item_amount -= amount
-    slot.save()
-    clear_slot_if_empty(slot)
-
-    return listing, None
-
-
-@transaction.atomic
-def delist_listing(player, listing_id):
-    """Delist a player's active listing and return items to inventory."""
-    try:
-        listing = MarketListing.objects.select_for_update().get(pk=listing_id)
-    except MarketListing.DoesNotExist:
-        return None, "挂单不存在"
-
-    if listing.seller_id != player.id:
-        return None, "无权操作此挂单"
-    if listing.status != MarketListingStatus.ACTIVE:
-        return None, "挂单不在出售中状态"
-
-    bag, _ = get_player_main_bag(player)
-
-    if listing.remaining_amount > 0:
-        _return_items_to_bag(bag, listing, listing.remaining_amount)
-
-    listing.remaining_amount = 0
-    listing.status = MarketListingStatus.DELISTED
-    listing.save()
-
-    return bag, None
-
-
-@transaction.atomic
-def delist_system_listing(listing_id):
-    """Admin delist a system listing (no item return)."""
-    try:
-        listing = MarketListing.objects.select_for_update().get(pk=listing_id)
-    except MarketListing.DoesNotExist:
-        return None, "挂单不存在"
-
-    if listing.source_type != MarketListingSource.SYSTEM:
-        return None, "非系统挂单"
-
-    listing.remaining_amount = 0
-    listing.status = MarketListingStatus.DELISTED
-    listing.save()
-    return listing, None
-
-
-@transaction.atomic
-def buy_listing(buyer, listing_id, amount):
-    """Buy items from a marketplace listing."""
-    if amount <= 0:
-        return None, "数量必须大于0"
-
-    try:
-        listing = MarketListing.objects.select_for_update().get(pk=listing_id)
-    except MarketListing.DoesNotExist:
-        return None, "挂单不存在"
-
-    if listing.status != MarketListingStatus.ACTIVE:
-        return None, "挂单不在出售中状态"
-
-    if listing.expires_at and listing.expires_at <= timezone.now():
-        # Expire it inline
-        _expire_single_listing(listing)
-        return None, "挂单已过期"
-
-    if listing.source_type == MarketListingSource.PLAYER and listing.seller_id == buyer.id:
-        return None, "不能购买自己的挂单"
-
-    if amount > listing.remaining_amount:
-        return None, "购买数量超过剩余数量"
-
-    settlement = calculate_settlement(listing, amount)
-    total_price = settlement["total_price"]
-
-    # Get buyer bag
-    buyer_bag, _ = get_player_main_bag(buyer)
-    if buyer_bag.money < total_price:
-        return None, "金币不足"
-
-    # Lock bags in pk order to prevent deadlock
-    if listing.source_type == MarketListingSource.PLAYER and listing.seller:
-        seller_bag, _ = get_player_main_bag(listing.seller)
-        bags = sorted([buyer_bag, seller_bag], key=lambda b: b.pk)
-        for b in bags:
-            InventoryBag.objects.select_for_update().get(pk=b.pk)
-        # Re-fetch after locking
-        buyer_bag.refresh_from_db()
-        seller_bag.refresh_from_db()
-    else:
-        InventoryBag.objects.select_for_update().get(pk=buyer_bag.pk)
-        buyer_bag.refresh_from_db()
-        seller_bag = None
-
-    # Re-check money after lock
-    if buyer_bag.money < total_price:
-        return None, "金币不足"
-
-    # Deduct buyer money
-    buyer_bag.money -= total_price
-    buyer_bag._money_change_source = "marketplace_buy"
-    buyer_bag.save()
-
-    # Add money to seller (player listings only)
-    if seller_bag and listing.source_type == MarketListingSource.PLAYER:
-        seller_bag.money += settlement["seller_earnings"]
-        seller_bag._money_change_source = "marketplace_sell"
-        seller_bag.save()
-
-    # Add items to buyer bag
-    _add_snapshot_item_to_bag(buyer_bag, listing.item_snapshot, amount)
-
-    # Update listing
-    listing.remaining_amount -= amount
-    if listing.remaining_amount <= 0:
-        listing.status = MarketListingStatus.SOLD_OUT
-    listing.save()
-
-    # Create transaction record
-    tx = MarketTransaction.objects.create(
-        listing=listing,
-        source_type=listing.source_type,
-        seller=listing.seller,
-        buyer=buyer,
-        item_id=listing.item_id,
-        item_name_snapshot=listing.item_name_snapshot,
-        amount=amount,
-        unit_price=listing.price,
-        total_price=total_price,
-        commission=settlement["commission"],
-        seller_earnings=settlement["seller_earnings"],
-        system_income=settlement["system_income"],
-    )
-
+def _get_item_snapshot_fields(source_slot, amount):
+    snap = snapshot_slot(source_slot)
+    snap["itemAmount"] = amount
     return {
-        "bag": buyer_bag,
-        "transaction": tx,
-        "listing": listing,
-    }, None
+        "source_instance_id": source_slot.instance_id,
+        "item_id": source_slot.item_id,
+        "item_snapshot": snap,
+        "rated": source_slot.rated,
+        "rating_price": source_slot.rating_price,
+        "overall_score": source_slot.overall_score,
+        "ingredient": source_slot.ingredient,
+        "item_bag_name": source_slot.item_bag_name,
+        "cook_time": source_slot.cook_time,
+        "dish_quality": source_slot.dish_quality,
+        "remaining_uses": source_slot.remaining_uses,
+        "review_comment": source_slot.review_comment,
+    }
 
 
-def expire_due_listings(limit=100):
-    """Expire active listings that have passed their expires_at. Returns items to sellers."""
-    now = timezone.now()
-    qs = MarketListing.objects.select_for_update().filter(
-        status=MarketListingStatus.ACTIVE,
-        expires_at__lte=now,
-    )[:limit]
-
-    expired_ids = []
-    for listing in qs:
-        if listing.remaining_amount > 0 and listing.source_type == MarketListingSource.PLAYER and listing.seller:
-            bag, _ = get_player_main_bag(listing.seller)
-            _return_items_to_bag(bag, listing, listing.remaining_amount)
-        listing.remaining_amount = 0
-        listing.status = MarketListingStatus.EXPIRED
-        listing.save()
-        expired_ids.append(listing.pk)
-
-    return expired_ids
+def _listing_identity_fields(owner):
+    if owner["kind"] == "player":
+        return {"source_type": MarketListingSource.PLAYER, "seller": owner["account"], "seller_npc": None}
+    if owner["kind"] == "npc":
+        return {"source_type": MarketListingSource.NPC, "seller": None, "seller_npc": owner["npc"]}
+    return {"source_type": MarketListingSource.SYSTEM, "seller": None, "seller_npc": None}
 
 
-def _expire_single_listing(listing):
-    """Expire a single listing (caller must hold lock)."""
-    if listing.remaining_amount > 0 and listing.source_type == MarketListingSource.PLAYER and listing.seller:
-        bag, _ = get_player_main_bag(listing.seller)
-        _return_items_to_bag(bag, listing, listing.remaining_amount)
-    listing.remaining_amount = 0
-    listing.status = MarketListingStatus.EXPIRED
-    listing.save()
+def _transaction_identity_fields(listing, buyer_owner):
+    return {
+        "source_type": listing.source_type,
+        "seller": listing.seller,
+        "seller_npc": listing.seller_npc,
+        "buyer": buyer_owner["account"],
+        "buyer_npc": buyer_owner["npc"],
+    }
+
+
+def _listing_seller_owner(listing):
+    if listing.source_type == MarketListingSource.PLAYER and listing.seller:
+        return _resolve_owner(listing.seller)
+    if listing.source_type == MarketListingSource.NPC and listing.seller_npc:
+        return _resolve_owner(listing.seller_npc)
+    return None
 
 
 def _return_items_to_bag(bag, listing, amount):
-    """Return items from a listing back to a player's bag."""
     snap = listing.item_snapshot
     special = is_special_instance(snap)
 
     if not special:
-        # Try to stack on existing slot
         existing = bag.slots.filter(item_id=listing.item_id, item_amount__gt=0).first()
         if existing:
             existing.item_amount += amount
-            existing.save()
-            return
+            existing.save(update_fields=["item_amount"])
+            return existing
 
-    # Create new slot
     slot = find_empty_slot(bag)
     slot.item_id = listing.item_id
     slot.item_amount = amount
@@ -404,21 +296,19 @@ def _return_items_to_bag(bag, listing, amount):
     slot.remaining_uses = listing.remaining_uses
     slot.review_comment = listing.review_comment
     slot.save()
+    return slot
 
 
 def _add_snapshot_item_to_bag(bag, snap, amount):
-    """Add items from a snapshot to a player's bag."""
     special = is_special_instance(snap)
 
     if not special:
-        # Try to stack
         existing = bag.slots.filter(item_id=snap.get("itemID", 0), item_amount__gt=0).first()
         if existing:
             existing.item_amount += amount
-            existing.save()
-            return
+            existing.save(update_fields=["item_amount"])
+            return existing
 
-    # Create new slot with new instance_id
     slot = find_empty_slot(bag)
     slot.item_id = snap.get("itemID", 0)
     slot.item_amount = amount
@@ -426,20 +316,194 @@ def _add_snapshot_item_to_bag(bag, snap, amount):
     slot.rating_price = snap.get("ratingPrice", -1)
     slot.overall_score = snap.get("overallScore", 0)
     slot.ingredient = snap.get("ingredient", "")
-    # 用实际槽位索引生成，避免与买家背包中已有物品重名
     item = Item.objects.filter(item_id=slot.item_id).first()
     item_name = item.item_name if item else f"物品#{slot.item_id}"
     slot.item_bag_name = f"{item_name}_{slot.slot_index}"
     slot.cook_time = snap.get("cookTime", 0)
     slot.dish_quality = snap.get("dishQuality", 3)
+    slot.hide_in_shop = False
     slot.remaining_uses = snap.get("remainingUses")
     slot.review_comment = snap.get("reviewComment", "")
     slot.save()
+    return slot
+
+
+def _expire_single_listing(listing):
+    seller_owner = _listing_seller_owner(listing)
+    if listing.remaining_amount > 0 and seller_owner is not None:
+        _lock_owner(seller_owner)
+        _return_items_to_bag(seller_owner["bag"], listing, listing.remaining_amount)
+        _bump_npc_asset_version(seller_owner["bag"])
+    listing.remaining_amount = 0
+    listing.status = MarketListingStatus.EXPIRED
+    listing.save(update_fields=["remaining_amount", "status", "updated_at"])
+
+
+def browse_listings(
+    *,
+    keyword="",
+    item_type="",
+    item_id=None,
+    min_price=None,
+    max_price=None,
+    sort_by="newest",
+    status=MarketListingStatus.ACTIVE,
+):
+    expire_due_listings()
+    qs = MarketListing.objects.all()
+    if status:
+        qs = qs.filter(status=status)
+    if keyword:
+        qs = qs.filter(
+            Q(item_name_snapshot__icontains=keyword)
+            | Q(seller__username__icontains=keyword)
+            | Q(seller_npc__name__icontains=keyword)
+        )
+    if item_type:
+        qs = qs.filter(item_type_snapshot=item_type)
+    if item_id is not None:
+        qs = qs.filter(item_id=int(item_id))
+    if min_price is not None:
+        qs = qs.filter(price__gte=int(min_price))
+    if max_price is not None:
+        qs = qs.filter(price__lte=int(max_price))
+    sort_map = {
+        "price_asc": "price",
+        "price_desc": "-price",
+        "newest": "-created_at",
+        "oldest": "created_at",
+        "amount_desc": "-remaining_amount",
+    }
+    return qs.select_related("seller", "seller_npc").order_by(sort_map.get(sort_by, "-created_at"))
+
+
+def get_npc_listings(npc, status=""):
+    expire_due_listings()
+    qs = MarketListing.objects.filter(seller_npc=npc)
+    if status:
+        qs = qs.filter(status=status)
+    return qs.select_related("seller_npc").order_by("-created_at")
+
+
+def get_npc_history(npc, role="all"):
+    qs = MarketTransaction.objects.select_related("seller", "seller_npc", "buyer", "buyer_npc")
+    if role == "buyer":
+        return qs.filter(buyer_npc=npc).order_by("-created_at")
+    if role == "seller":
+        return qs.filter(seller_npc=npc).order_by("-created_at")
+    return qs.filter(Q(buyer_npc=npc) | Q(seller_npc=npc)).order_by("-created_at")
 
 
 @transaction.atomic
-def admin_buy_listing(buyer, listing_id, amount):
-    """Admin purchase: buy items from a listing on behalf of a player."""
+def _create_listing_for_owner(owner, instance_id, amount, price, *, expected_asset_version=None):
+    owner = _lock_owner(owner)
+    if owner["kind"] == "npc" and expected_asset_version is not None and owner["bag"].asset_version != expected_asset_version:
+        return None, "资产版本不匹配"
+
+    slot = find_slot_by_instance(owner["bag"], instance_id)
+    if not slot:
+        return None, "物品未找到"
+    if amount <= 0:
+        return None, "数量必须大于0"
+    if price <= 0:
+        return None, "价格必须大于0"
+    if slot.item_amount < amount:
+        return None, "物品数量不足"
+
+    commission = calculate_commission(price * amount)
+    if price * amount - commission <= 0 and owner["kind"] != "system":
+        return None, "价格过低，手续费后收入为0"
+
+    item = Item.objects.filter(item_id=slot.item_id).first()
+    listing = MarketListing.objects.create(
+        **_listing_identity_fields(owner),
+        **_get_item_snapshot_fields(slot, amount),
+        item_name_snapshot=item.item_name if item else "",
+        item_type_snapshot=item.item_type if item else "",
+        icon_url_snapshot=(item.icon_url or "") if item else "",
+        total_amount=amount,
+        remaining_amount=amount,
+        price=price,
+        status=MarketListingStatus.ACTIVE,
+        expires_at=timezone.now() + timedelta(hours=MARKETPLACE_LISTING_DURATION_HOURS),
+    )
+
+    slot.item_amount -= amount
+    slot.save(update_fields=["item_amount"])
+    clear_slot_if_empty(slot)
+    _bump_npc_asset_version(owner["bag"])
+    return listing, None
+
+
+@transaction.atomic
+def create_listing(player, instance_id, amount, price):
+    return _create_listing_for_owner(_resolve_owner(player), instance_id, amount, price)
+
+
+@transaction.atomic
+def create_npc_listing(npc, instance_id, amount, price, expected_asset_version=None):
+    return _create_listing_for_owner(
+        _resolve_owner(npc), instance_id, amount, price, expected_asset_version=expected_asset_version
+    )
+
+
+@transaction.atomic
+def _delist_listing_for_owner(owner, listing_id, *, expected_asset_version=None):
+    try:
+        listing = MarketListing.objects.select_for_update().get(pk=listing_id)
+    except MarketListing.DoesNotExist:
+        return None, "挂单不存在"
+
+    owner = _lock_owner(owner)
+    if owner["kind"] == "npc" and expected_asset_version is not None and owner["bag"].asset_version != expected_asset_version:
+        return None, "资产版本不匹配"
+    if owner["kind"] == "player" and listing.seller_id != owner["account"].id:
+        return None, "无权操作此挂单"
+    if owner["kind"] == "npc" and listing.seller_npc_id != owner["npc"].id:
+        return None, "无权操作此挂单"
+    if listing.status != MarketListingStatus.ACTIVE:
+        return None, "挂单不在出售中状态"
+
+    if listing.remaining_amount > 0:
+        _return_items_to_bag(owner["bag"], listing, listing.remaining_amount)
+
+    listing.remaining_amount = 0
+    listing.status = MarketListingStatus.DELISTED
+    listing.save(update_fields=["remaining_amount", "status", "updated_at"])
+    _bump_npc_asset_version(owner["bag"])
+    return owner["bag"], None
+
+
+@transaction.atomic
+def delist_listing(player, listing_id):
+    return _delist_listing_for_owner(_resolve_owner(player), listing_id)
+
+
+@transaction.atomic
+def delist_npc_listing(npc, listing_id, expected_asset_version=None):
+    return _delist_listing_for_owner(
+        _resolve_owner(npc), listing_id, expected_asset_version=expected_asset_version
+    )
+
+
+@transaction.atomic
+def delist_system_listing(listing_id):
+    try:
+        listing = MarketListing.objects.select_for_update().get(pk=listing_id)
+    except MarketListing.DoesNotExist:
+        return None, "挂单不存在"
+
+    if listing.source_type != MarketListingSource.SYSTEM:
+        return None, "非系统挂单"
+
+    listing.remaining_amount = 0
+    listing.status = MarketListingStatus.DELISTED
+    listing.save(update_fields=["remaining_amount", "status", "updated_at"])
+    return listing, None
+
+
+@transaction.atomic
+def _buy_listing_for_owner(buyer_owner, listing_id, amount, *, expected_asset_version=None, admin_purchase=False):
     if amount <= 0:
         return None, "数量必须大于0"
 
@@ -450,58 +514,54 @@ def admin_buy_listing(buyer, listing_id, amount):
 
     if listing.status != MarketListingStatus.ACTIVE:
         return None, "挂单不在出售中状态"
-
     if listing.expires_at and listing.expires_at <= timezone.now():
         _expire_single_listing(listing)
         return None, "挂单已过期"
 
+    seller_owner = _listing_seller_owner(listing)
+    if seller_owner is not None and seller_owner["kind"] == buyer_owner["kind"] and seller_owner["id"] == buyer_owner["id"]:
+        return None, "不能购买自己的挂单"
     if amount > listing.remaining_amount:
         return None, "购买数量超过剩余数量"
 
+    if seller_owner is None:
+        _lock_owner(buyer_owner)
+    else:
+        _lock_owners(buyer_owner, seller_owner)
+    if buyer_owner["kind"] == "npc" and expected_asset_version is not None and buyer_owner["bag"].asset_version != expected_asset_version:
+        return None, "资产版本不匹配"
+
     settlement = calculate_settlement(listing, amount)
     total_price = settlement["total_price"]
-
-    buyer_bag, _ = get_player_main_bag(buyer)
-    if buyer_bag.money < total_price:
+    if buyer_owner["bag"].money < total_price:
         return None, "金币不足"
 
-    # Lock bags
-    if listing.source_type == MarketListingSource.PLAYER and listing.seller:
-        seller_bag, _ = get_player_main_bag(listing.seller)
-        bags = sorted([buyer_bag, seller_bag], key=lambda b: b.pk)
-        for b in bags:
-            InventoryBag.objects.select_for_update().get(pk=b.pk)
-        buyer_bag.refresh_from_db()
-        seller_bag.refresh_from_db()
-    else:
-        InventoryBag.objects.select_for_update().get(pk=buyer_bag.pk)
-        buyer_bag.refresh_from_db()
-        seller_bag = None
+    buyer_owner["bag"].money -= total_price
+    _save_money_change(
+        buyer_owner["bag"],
+        buyer_owner["money_source_admin_buy"] if admin_purchase else buyer_owner["money_source_buy"],
+    )
 
-    if buyer_bag.money < total_price:
-        return None, "金币不足"
+    if seller_owner is not None and listing.source_type != MarketListingSource.SYSTEM:
+        seller_owner["bag"].money += settlement["seller_earnings"]
+        _save_money_change(
+            seller_owner["bag"],
+            seller_owner["money_source_admin_sell"] if admin_purchase else seller_owner["money_source_sell"],
+        )
 
-    buyer_bag.money -= total_price
-    buyer_bag._money_change_source = "admin_marketplace_buy"
-    buyer_bag.save()
-
-    if seller_bag and listing.source_type == MarketListingSource.PLAYER:
-        seller_bag.money += settlement["seller_earnings"]
-        seller_bag._money_change_source = "admin_marketplace_sell"
-        seller_bag.save()
-
-    _add_snapshot_item_to_bag(buyer_bag, listing.item_snapshot, amount)
-
+    _add_snapshot_item_to_bag(buyer_owner["bag"], listing.item_snapshot, amount)
     listing.remaining_amount -= amount
     if listing.remaining_amount <= 0:
         listing.status = MarketListingStatus.SOLD_OUT
-    listing.save()
+    listing.save(update_fields=["remaining_amount", "status", "updated_at"])
+
+    _bump_npc_asset_version(buyer_owner["bag"])
+    if seller_owner is not None:
+        _bump_npc_asset_version(seller_owner["bag"])
 
     tx = MarketTransaction.objects.create(
         listing=listing,
-        source_type=listing.source_type,
-        seller=listing.seller,
-        buyer=buyer,
+        **_transaction_identity_fields(listing, buyer_owner),
         item_id=listing.item_id,
         item_name_snapshot=listing.item_name_snapshot,
         amount=amount,
@@ -512,15 +572,42 @@ def admin_buy_listing(buyer, listing_id, amount):
         system_income=settlement["system_income"],
     )
 
-    return {
-        "bag": buyer_bag,
-        "transaction": tx,
-        "listing": listing,
-    }, None
+    return {"bag": buyer_owner["bag"], "transaction": tx, "listing": listing}, None
+
+
+@transaction.atomic
+def buy_listing(buyer, listing_id, amount):
+    return _buy_listing_for_owner(_resolve_owner(buyer), listing_id, amount)
+
+
+@transaction.atomic
+def buy_listing_for_npc(npc, listing_id, amount, expected_asset_version=None):
+    return _buy_listing_for_owner(
+        _resolve_owner(npc), listing_id, amount, expected_asset_version=expected_asset_version
+    )
+
+
+@transaction.atomic
+def expire_due_listings(limit=100):
+    now = timezone.now()
+    qs = list(
+        MarketListing.objects.select_for_update()
+        .filter(status=MarketListingStatus.ACTIVE, expires_at__lte=now)
+        .order_by("pk")[:limit]
+    )
+    expired_ids = []
+    for listing in qs:
+        _expire_single_listing(listing)
+        expired_ids.append(listing.pk)
+    return expired_ids
+
+
+@transaction.atomic
+def admin_buy_listing(buyer, listing_id, amount):
+    return _buy_listing_for_owner(_resolve_owner(buyer), listing_id, amount, admin_purchase=True)
 
 
 def create_system_listing(item_id, amount, price, expires_at=None, snapshot_overrides=None):
-    """Create a system listing from admin."""
     if amount <= 0 or price <= 0:
         return None, "数量和价格必须大于0"
 
@@ -536,6 +623,7 @@ def create_system_listing(item_id, amount, price, expires_at=None, snapshot_over
     listing = MarketListing.objects.create(
         source_type=MarketListingSource.SYSTEM,
         seller=None,
+        seller_npc=None,
         item_id=item_id,
         item_name_snapshot=item.item_name,
         item_type_snapshot=item.item_type,

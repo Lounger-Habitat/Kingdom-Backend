@@ -30,6 +30,7 @@ from django.utils import timezone
 from .models import (
     NpcActionReservation,
     NpcCommandState,
+    NpcDialogueSession,
     NpcProfile,
     NpcRuntimeState,
     VillageActionDurationConfig,
@@ -62,6 +63,9 @@ class ResultCode:
     GO_HOME_COMPLETED = "GO_HOME_COMPLETED"
     COMMAND_CANCELLED_ON_RECOVERY = "COMMAND_CANCELLED_ON_RECOVERY"
     LIFE_ACTION_COMPLETED = "LIFE_ACTION_COMPLETED"
+    DIALOGUE_STARTED = "DIALOGUE_STARTED"
+    DIALOGUE_SPOKEN = "DIALOGUE_SPOKEN"
+    DIALOGUE_COMPLETED = "DIALOGUE_COMPLETED"
 
     # 失败码 - 协议和身份
     PROTOCOL_VERSION_UNSUPPORTED = "PROTOCOL_VERSION_UNSUPPORTED"
@@ -119,6 +123,12 @@ class ResultCode:
     ASSET_VERSION_CONFLICT = "ASSET_VERSION_CONFLICT"
     SOCIAL_TARGET_BUSY = "SOCIAL_TARGET_BUSY"
     SOCIAL_TARGET_INVALID = "SOCIAL_TARGET_INVALID"
+    DIALOGUE_NOT_FOUND = "DIALOGUE_NOT_FOUND"
+    DIALOGUE_NOT_ACTIVE = "DIALOGUE_NOT_ACTIVE"
+    DIALOGUE_PARTICIPANT_INVALID = "DIALOGUE_PARTICIPANT_INVALID"
+    DIALOGUE_TEXT_INVALID = "DIALOGUE_TEXT_INVALID"
+    DIALOGUE_NOT_COLOCATED = "DIALOGUE_NOT_COLOCATED"
+    DIALOGUE_ALREADY_ENDED_SELF = "DIALOGUE_ALREADY_ENDED_SELF"
 
     # 阶段边界
     ASSET_EFFECT_NOT_ALLOWED = "ASSET_EFFECT_NOT_ALLOWED"
@@ -147,7 +157,14 @@ _OUTCOME_ACTION_LABELS = {
     "PROPOSE_TRADE": "发起交易", "RESPOND_TRADE": "响应交易",
     "CANCEL_TRADE_OFFER": "取消交易报价", "LIST_STORE_ITEM": "商品上架",
     "UPDATE_STORE_PRICE": "修改商品价格", "DELIST_STORE_ITEM": "商品下架",
-    "BUY_FROM_STORE": "购买商品", "INSPECT_STORE_INVENTORY": "读取商店库存",
+    "BUY_FROM_STORE": "购买商品",
+    "BUY_FROM_MARKETPLACE": "购买全服商品",
+    "SELL_ON_MARKETPLACE": "上架全服商品",
+    "DELIST_FROM_MARKETPLACE": "下架全服商品",
+    "BROWSE_MARKETPLACE": "浏览全服市场",
+    "CHECK_MY_MARKETPLACE_LISTINGS": "读取我的全服挂单",
+    "CHECK_MARKETPLACE_HISTORY": "读取全服成交历史",
+    "INSPECT_STORE_INVENTORY": "读取商店库存",
     "OBSERVE": "读取状态", "INSPECT_NEARBY": "读取附近信息", "INSPECT_INVENTORY": "读取背包",
     "INSPECT_TRADE_OFFERS": "读取交易报价", "INSPECT_STORY_STATE": "读取剧情状态",
     "INSPECT_RELEVANT_STORIES": "读取相关剧情", "INSPECT_STORY_DETAIL": "读取剧情详情",
@@ -190,6 +207,12 @@ _OUTCOME_REASONS = {
     "TRADE_ITEM_NOT_FOR_SALE": "该物品不可出售", "TRADE_INSUFFICIENT_MONEY": "金币不足",
     "TRADE_INSUFFICIENT_ITEM": "库存物品不足", "TRADE_ASSET_VERSION_CONFLICT": "交易资产版本已变化，请刷新后重试",
     "TRADE_STORE_VERSION_CONFLICT": "商店库存版本已变化，请刷新后重试", "TRADE_REQUEST_CONFLICT": "交易请求冲突，请刷新后重试",
+    "MARKETPLACE_LISTING_NOT_FOUND": "全服挂单不存在",
+    "MARKETPLACE_LISTING_NOT_ACTIVE": "全服挂单未在售",
+    "MARKETPLACE_FORBIDDEN": "无权操作该全服挂单",
+    "MARKETPLACE_INSUFFICIENT_MONEY": "金币不足",
+    "MARKETPLACE_INSUFFICIENT_ITEM": "库存物品不足",
+    "MARKETPLACE_ASSET_VERSION_CONFLICT": "资产版本已变化，请刷新后重试",
     "VILLAGE_SOCIAL_DISABLED": "社交功能未启用", "SOCIAL_INVALID_PARAMS": "社交参数无效",
     "COMMITMENT_NOT_FOUND": "承诺不存在", "COMMITMENT_ALREADY_RESOLVED": "承诺已经处理过",
     "COMMITMENT_EXPIRED": "承诺已过期", "SOCIAL_NOT_COLOCATED": "双方不在同一地点",
@@ -240,6 +263,8 @@ def _outcome_next_action(result_code: str) -> Optional[str]:
         return "INSPECT_RESTAURANT_STATE"
     if result_code in {"TRADE_LISTING_NOT_FOUND", "TRADE_LISTING_NOT_ACTIVE", "TRADE_STORE_CLOSED", "TRADE_STORE_FORBIDDEN", "TRADE_STORE_VERSION_CONFLICT"}:
         return "INSPECT_STORE_INVENTORY"
+    if result_code in {"MARKETPLACE_LISTING_NOT_FOUND", "MARKETPLACE_LISTING_NOT_ACTIVE", "MARKETPLACE_FORBIDDEN"}:
+        return "BROWSE_MARKETPLACE"
     if result_code in {"TRADE_OFFER_NOT_FOUND", "TRADE_OFFER_EXPIRED", "TRADE_OFFER_ALREADY_RESOLVED"}:
         return "INSPECT_TRADE_OFFERS"
     if result_code in {"P3_WRONG_LOCATION", "INVALID_ACTION_LOCATION", "TRADE_WRONG_LOCATION", "TRADE_NOT_COLOCATED", "SOCIAL_NOT_COLOCATED"}:
@@ -323,6 +348,8 @@ class TimeService:
         state.game_minute = minute_of_day % 60
 
         state.save()
+        from .dialogue_service import DialogueService
+        DialogueService.expire_active(state.world_minute)
 
         # 创建 Receipt
         receipt = VillageActionReceipt.objects.create(
@@ -364,6 +391,8 @@ class TimeService:
             state.apply_world_minute(world_minute)
             state.time_revision = time_revision
             state.save()
+            from .dialogue_service import DialogueService
+            DialogueService.expire_active(state.world_minute)
         return True, ResultCode.COMMAND_ACCEPTED, state
 
 
@@ -389,6 +418,10 @@ class BootstrapService:
         # has the same lock order as TimeService.advance_time (time first).
         GlobalGameTimeState.get_instance()
         time_state = GlobalGameTimeState.objects.select_for_update().get(pk=1)
+        from .dialogue_service import DialogueService
+        DialogueService.expire_active(
+            time_state.world_minute, include_unexpired=True, force_invalid=True
+        )
 
         # Lock the formal ownership set before validating or serializing it.
         # Test-only NPCs are intentionally absent from this recovery boundary.
@@ -757,24 +790,31 @@ class CommandService:
         "INSPECT_MARKET_STATE", "INSPECT_FARM_STATE",
         "INSPECT_RESTAURANT_STATE", "INSPECT_RATEABLE_DISHES",
         "INSPECT_PUBLIC_ECONOMY_STATE",
+        "BROWSE_MARKETPLACE", "CHECK_MY_MARKETPLACE_LISTINGS",
+        "CHECK_MARKETPLACE_HISTORY",
         "INSPECT_STORE_INVENTORY", "INSPECT_SOCIAL_STATE",
     })
     STORY_ACTIONS = {"STORY_VOTE", "STORY_ACT"}
     MAX_QUEUE_SIZE = 10
     MAX_CLOCK_SKEW_MS = 5 * 60 * 1000
     PHASE2_ACTIONS = {"EAT", "REST", "SLEEP", "SOCIALIZE", "WORK_PLACEHOLDER"}
+    DIALOGUE_ACTIONS = {"START_DIALOGUE", "SPEAK"}
     PHASE3_ACTIONS = {
         "PLANT", "HARVEST", "HUNT", "COOK", "CREATE_ORDER", "CANCEL_ORDER",
         "START_DELIVERY", "IMPORT_GOODS", "EXPORT_GOODS", "RATE_DISH",
         "PUBLISH_PRICE_INDEX", "AUDIT_PUBLIC_FUND", "PROPOSE_TRADE",
         "RESPOND_TRADE", "CANCEL_TRADE_OFFER", "LIST_STORE_ITEM",
         "UPDATE_STORE_PRICE", "DELIST_STORE_ITEM", "BUY_FROM_STORE",
+        "BUY_FROM_MARKETPLACE", "SELL_ON_MARKETPLACE", "DELIST_FROM_MARKETPLACE",
         "INSPECT_STORE_INVENTORY",
     }
     DIRECT_TRADE_ACTIONS = {
         "PROPOSE_TRADE", "RESPOND_TRADE", "CANCEL_TRADE_OFFER",
         "LIST_STORE_ITEM", "UPDATE_STORE_PRICE", "DELIST_STORE_ITEM",
-        "BUY_FROM_STORE", "INSPECT_STORE_INVENTORY",
+        "BUY_FROM_STORE", "BUY_FROM_MARKETPLACE", "SELL_ON_MARKETPLACE",
+        "DELIST_FROM_MARKETPLACE", "BROWSE_MARKETPLACE",
+        "CHECK_MY_MARKETPLACE_LISTINGS", "CHECK_MARKETPLACE_HISTORY",
+        "INSPECT_STORE_INVENTORY",
     }
     PHASE4_ACTIONS = {
         "INSPECT_SOCIAL_STATE", "CREATE_COMMITMENT", "CANCEL_COMMITMENT",
@@ -987,9 +1027,23 @@ class CommandService:
             return False, ResultCode.ACTION_NOT_ALLOWED, None
         if action_name in CommandService.READ_QUERY_ACTIONS:
             return False, ResultCode.ACTION_NOT_ALLOWED, None
+        if action_name in CommandService.DIALOGUE_ACTIONS:
+            return False, ResultCode.ACTION_NOT_ALLOWED, None
         phase2_validation = CommandService.validate_phase2_command(action_name, content)
         if phase2_validation:
             return False, phase2_validation, None
+        if action_name == "MOVE":
+            params = content.get("params")
+            if (not isinstance(params, dict) or set(params) not in (
+                {"location_code"}, {"target_npc_id"}
+            )):
+                return False, ResultCode.INVALID_COMMAND_SCHEMA, None
+            if "target_npc_id" in params and not NpcDefinition.objects.filter(
+                agent_id=str(params["target_npc_id"]), is_test_only=False
+            ).exists():
+                return False, ResultCode.SOCIAL_TARGET_INVALID, None
+            if str(params.get("target_npc_id", "")) == str(sender):
+                return False, ResultCode.SOCIAL_TARGET_INVALID, None
         # Preserve protocol validation of the caller-provided value first, then
         # make normal commands use the Backend-administered duration.  Fast
         # integration intentionally keeps its caller duration for harnesses.
@@ -1545,6 +1599,19 @@ class ActionService:
         ):
             return False, ResultCode.NPC_BUSY, None
 
+        if success:
+            from .phase2_services import settle_action_needs_locked
+            started = command.started_world_minute
+            ended = (
+                min(time_state.world_minute, started + command.duration_minutes)
+                if started is not None and command.duration_minutes else None
+            )
+            error = settle_action_needs_locked(
+                rt, command.kind, started, ended, base_until=time_state.world_minute
+            )
+            if error:
+                return False, error, None
+
         command.status = "SETTLING"
         command.save(update_fields=["status", "updated_at"])
 
@@ -1614,6 +1681,7 @@ class ActionService:
             "original_message_id": str(command.message_id),
             "request_id": str(request_id),
             "npc_id": str(command.npc.agent_id),
+            "action": command.kind,
             "success": success,
             "result_code": result_code,
             "message": message,
@@ -1705,7 +1773,7 @@ class ReservationService:
     ) -> Tuple[bool, str, Optional[NpcActionReservation]]:
         normalized_ids = sorted({str(npc_id) for npc_id in participant_ids})
         if (not normalized_ids or expires_world_minute < world_minute or
-                action_kind not in CommandService.ALLOWED_ACTIONS):
+                action_kind not in CommandService.ALLOWED_ACTIONS | {"DIALOGUE"}):
             return False, ResultCode.INVALID_COMMAND_SCHEMA, None
 
         # This query intentionally materializes locks in a stable total order.

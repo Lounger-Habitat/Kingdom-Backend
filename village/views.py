@@ -24,9 +24,10 @@ from .runtime_services import (
     ResultCode,
     TimeService,
 )
-from .phase2_services import LifeActionService, NeedsService, needs_rules, runtime_summary
+from .phase2_services import LifeActionService, NeedsService, TickService, needs_rules, runtime_summary
 from .goal_services import update_subjective_goal
 from .agent_queries import execute_agent_query
+from .dialogue_service import DialogueService
 from .services import validate_bootstrap
 
 
@@ -307,6 +308,65 @@ def life_actions_execute(request):
     return Response({"success": result["success"], "resultCode": result["result_code"], "data": data}, status=status)
 
 
+@api_view(["POST"])
+@authentication_classes([EnvServerJWTAuthentication])
+@permission_classes([IsAuthenticated])
+def runtime_tick(request):
+    """Persist Unity's authoritative time and catch Backend projections up."""
+    if not isinstance(request.data, dict):
+        return Response({"success": False, "resultCode": ResultCode.INVALID_COMMAND_SCHEMA}, status=400)
+    result = TickService.advance(dict(request.data))
+    status = 200 if result["success"] else 409
+    data = {key: value for key, value in result.items()
+            if key not in {"receipt", "success", "result_code"}}
+    return Response({"success": result["success"], "resultCode": result["result_code"], "data": data}, status=status)
+
+
+def _dialogue_response(result):
+    code = result["result_code"]
+    status = 200 if result["success"] else 404 if code == ResultCode.DIALOGUE_NOT_FOUND else 409
+    data = {key: value for key, value in result.items() if key not in {"success", "result_code"}}
+    return Response({"success": result["success"], "resultCode": code, "data": data}, status=status)
+
+
+@api_view(["POST"])
+@authentication_classes([EnvServerJWTAuthentication])
+@permission_classes([IsAuthenticated])
+def dialogue_start(request):
+    if not isinstance(request.data, dict) or not set(request.data).issubset({
+        "npc_id", "target_npc_id", "topic"
+    }):
+        return _dialogue_response({"success": False, "result_code": ResultCode.INVALID_COMMAND_SCHEMA})
+    return _dialogue_response(DialogueService.start(
+        request.data.get("npc_id"), request.data.get("target_npc_id"), request.data.get("topic", "")
+    ))
+
+
+@api_view(["POST"])
+@authentication_classes([EnvServerJWTAuthentication])
+@permission_classes([IsAuthenticated])
+def dialogue_speak(request, conversation_id):
+    if not isinstance(request.data, dict) or not set(request.data).issubset({
+        "npc_id", "text", "end_turn"
+    }):
+        return _dialogue_response({"success": False, "result_code": ResultCode.INVALID_COMMAND_SCHEMA})
+    return _dialogue_response(DialogueService.speak(
+        conversation_id, request.data.get("npc_id"), request.data.get("text"),
+        request.data.get("end_turn", False),
+    ))
+
+
+@api_view(["POST"])
+@authentication_classes([EnvServerJWTAuthentication])
+@permission_classes([IsAuthenticated])
+def dialogue_complete(request, conversation_id):
+    if not isinstance(request.data, dict) or not set(request.data).issubset({"npc_id", "reason"}):
+        return _dialogue_response({"success": False, "result_code": ResultCode.INVALID_COMMAND_SCHEMA})
+    return _dialogue_response(DialogueService.complete(
+        conversation_id, request.data.get("npc_id"), request.data.get("reason", "COMPLETED")
+    ))
+
+
 @api_view(["GET"])
 @authentication_classes([EnvServerJWTAuthentication])
 @permission_classes([IsAuthenticated])
@@ -350,6 +410,7 @@ def npc_available_actions(request, npc_id):
         is_active=True,
     ).first()
     configured = CommandService.allowed_actions_for(profile.npc) if profile else set()
+    configured.discard("SOCIALIZE")
     available = set(result.get("available_actions", []))
     unavailable_reasons = result.get("unavailable_reasons", {})
     sleeping = result.get("action_status") == "SLEEPING" and result.get("active_command_id")

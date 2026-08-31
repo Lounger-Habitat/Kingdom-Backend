@@ -9,8 +9,8 @@ from account.models import GameAccount
 from game_time.models import GlobalGameTimeState
 from inventory.models import NpcDefinition
 from village.command_catalog import COMMAND_CATALOG, agent_tool, load_command_catalog
-from village.models import NpcNeedsDaySummary, NpcProfile, NpcRuntimeState, VillageLocationDefinition, VillageSimulationConfig
-from village.phase2_services import NeedsService, need_bands, runtime_summary
+from village.models import NpcActionReservation, NpcNeedsDaySummary, NpcProfile, NpcRuntimeState, VillageActionReceipt, VillageLocationDefinition, VillageSimulationConfig
+from village.phase2_services import NeedsService, TickService, need_bands, runtime_summary, settle_action_needs_locked
 from village.runtime_services import CommandService, ResultCode
 from village.views import npc_available_actions, npc_runtime_summary
 
@@ -24,7 +24,7 @@ class NeedsServiceTests(TestCase):
             npc=npc, display_name="Bill", occupation="farmer",
             home_location_code="BILL_HOME", work_location_code="BILL_HOME",
             social_location_code="BILL_HOME",
-            capabilities=["EAT", "REST", "SLEEP", "SOCIALIZE", "WORK_PLACEHOLDER"],
+            capabilities=["EAT", "REST", "SLEEP", "START_DIALOGUE", "SPEAK", "WORK_PLACEHOLDER"],
         )
         self.runtime = NpcRuntimeState.objects.create(npc=npc, needs_world_minute=0)
         time_state = GlobalGameTimeState.get_instance()
@@ -99,6 +99,121 @@ class NeedsServiceTests(TestCase):
         self.assertEqual(self.runtime.needs_world_minute, 0)
         self.assertFalse(NpcNeedsDaySummary.objects.filter(npc=self.runtime.npc).exists())
 
+    def test_tick_rolls_back_time_and_all_needs_when_one_npc_fails(self):
+        other_npc = NpcDefinition.objects.get(agent_id="10012")
+        other, _ = NpcRuntimeState.objects.get_or_create(npc=other_npc)
+        other.needs_world_minute = 1500
+        other.save(update_fields=["needs_world_minute"])
+        self.runtime.needs_world_minute = 1500
+        self.runtime.save(update_fields=["needs_world_minute"])
+        time_state = GlobalGameTimeState.get_instance()
+        tick_id = uuid.uuid4()
+        requests = []
+        for npc_id, version in (("10011", 0), ("10012", 99)):
+            requests.append({
+                "npc_id": npc_id, "advance_to_world_minute": 1501,
+                "expected_state_version": version, "tick_id": str(uuid.uuid4()),
+                "activity_intervals": [{
+                    "interval_id": str(uuid.uuid4()), "start_world_minute": 1500,
+                    "end_world_minute": 1501, "activity": "IDLE",
+                }],
+            })
+
+        result = TickService.advance({
+            "world_minute": 1501, "time_revision": 8,
+            "request_id": str(tick_id), "needs_requests": requests,
+        })
+
+        self.assertFalse(result["success"])
+        time_state.refresh_from_db(); self.runtime.refresh_from_db(); other.refresh_from_db()
+        self.assertEqual((time_state.world_minute, time_state.time_revision), (1500, 7))
+        self.assertEqual((self.runtime.needs_world_minute, other.needs_world_minute), (1500, 1500))
+        self.assertFalse(VillageActionReceipt.objects.filter(request_id=tick_id).exists())
+
+    def test_tick_commits_and_replays_as_one_idempotent_unit(self):
+        self.runtime.needs_world_minute = 1500
+        self.runtime.save(update_fields=["needs_world_minute"])
+        payload = {
+            "world_minute": 1501, "time_revision": 8,
+            "request_id": str(uuid.uuid4()),
+            "needs_requests": [{
+                "npc_id": "10011", "advance_to_world_minute": 1501,
+                "expected_state_version": 0, "tick_id": str(uuid.uuid4()),
+                "activity_intervals": [{
+                    "interval_id": str(uuid.uuid4()), "start_world_minute": 1500,
+                    "end_world_minute": 1501, "activity": "IDLE",
+                }],
+            }],
+        }
+
+        result = TickService.advance(payload)
+        replay = TickService.advance(payload)
+
+        self.assertTrue(result["success"])
+        self.assertEqual(replay["result_code"], ResultCode.COMMAND_REPLAYED)
+        self.runtime.refresh_from_db()
+        time_state = GlobalGameTimeState.get_instance()
+        self.assertEqual((time_state.world_minute, time_state.time_revision), (1501, 8))
+        self.assertEqual(self.runtime.needs_world_minute, 1501)
+
+    def test_tick_applies_base_to_busy_npc_without_client_needs_batch(self):
+        self.runtime.needs_world_minute = 1500
+        self.runtime.action_status = "ACTING"
+        self.runtime.save(update_fields=["needs_world_minute", "action_status"])
+        reservation = NpcActionReservation.objects.create(
+            action_kind="DIALOGUE", active_lock_key="test:tick:busy",
+            acquired_world_minute=1500, expires_world_minute=1600,
+        )
+        reservation.participants.set([self.runtime.npc])
+        result = TickService.advance({
+            "world_minute": 1501, "time_revision": 8,
+            "request_id": str(uuid.uuid4()),
+        })
+        self.assertTrue(result["success"], result)
+        self.runtime.refresh_from_db()
+        self.assertEqual(self.runtime.needs_world_minute, 1501)
+        self.assertEqual((self.runtime.hunger_remainder, self.runtime.social_remainder), (20, 10))
+
+    def test_tick_accepts_jump_and_replays_same_minute_without_reapplying(self):
+        self.runtime.needs_world_minute = 1500
+        self.runtime.save(update_fields=["needs_world_minute"])
+        payload = {"world_minute": 1560, "time_revision": 8, "request_id": str(uuid.uuid4())}
+        result = TickService.advance(payload)
+        self.assertTrue(result["success"], result)
+        self.runtime.refresh_from_db()
+        hunger = self.runtime.hunger_fp
+        replay = TickService.advance({**payload, "request_id": str(uuid.uuid4())})
+        self.assertEqual(replay["result_code"], ResultCode.COMMAND_REPLAYED)
+        self.runtime.refresh_from_db()
+        self.assertEqual((self.runtime.needs_world_minute, self.runtime.hunger_fp), (1560, hunger))
+        old = TickService.advance({"world_minute": 1559, "time_revision": 9, "request_id": str(uuid.uuid4())})
+        self.assertFalse(old["success"])
+        self.assertEqual(GlobalGameTimeState.get_instance().world_minute, 1560)
+
+    def test_action_delta_maps_move_and_economy_work_on_top_of_base(self):
+        self.assertIsNone(settle_action_needs_locked(self.runtime, "MOVE", 0, 30, base_until=30))
+        self.runtime.save()
+        self.runtime.refresh_from_db()
+        self.assertEqual(
+            (self.runtime.hunger_fp, self.runtime.energy_fp,
+             self.runtime.social_fp, self.runtime.stress_fp),
+            (220, 790, 210, 105),
+        )
+        self.runtime.hunger_fp, self.runtime.energy_fp = 200, 800
+        self.runtime.social_fp, self.runtime.stress_fp = 200, 100
+        self.runtime.needs_world_minute = 0
+        self.runtime.save(update_fields=[
+            "hunger_fp", "energy_fp", "social_fp", "stress_fp", "needs_world_minute",
+        ])
+        self.assertIsNone(settle_action_needs_locked(self.runtime, "HUNT", 0, 30, base_until=30))
+        self.runtime.save()
+        self.runtime.refresh_from_db()
+        self.assertEqual(
+            (self.runtime.hunger_fp, self.runtime.energy_fp,
+             self.runtime.social_fp, self.runtime.stress_fp),
+            (230, 760, 210, 120),
+        )
+
     def test_frozen_runtime_summary_and_available_actions_http_routes(self):
         user = GameAccount.objects.create(username="phase2-env", password="unused")
         factory = APIRequestFactory()
@@ -139,7 +254,7 @@ class NeedsServiceTests(TestCase):
         )
         for tool in response.data["data"]["tools"]:
             self.assertEqual(set(tool), {"name", "description", "parameters"})
-            self.assertEqual(set(tool["parameters"]), {"type", "properties", "required"})
+            self.assertTrue({"type", "properties", "required"}.issubset(tool["parameters"]))
 
     def test_sleeping_discover_exposes_clock_remaining_time_and_wake_up(self):
         command_id = uuid.uuid4()
@@ -163,7 +278,7 @@ class NeedsServiceTests(TestCase):
 
     def test_command_catalog_is_the_allowed_action_source(self):
         self.assertEqual(CommandService.ALLOWED_ACTIONS, frozenset(COMMAND_CATALOG))
-        self.assertEqual(len(COMMAND_CATALOG), 45)
+        self.assertEqual(len(COMMAND_CATALOG), 55)
         for action in COMMAND_CATALOG:
             self.assertEqual(set(agent_tool(action)), {"name", "description", "parameters"})
 
@@ -179,7 +294,8 @@ class NeedsServiceTests(TestCase):
         self.runtime.save(update_fields=["hunger_fp"])
         result = runtime_summary("10011")
         self.assertNotIn("WORK_PLACEHOLDER", result["available_actions"])
-        self.assertIn("SOCIALIZE", result["available_actions"])
+        self.assertIn("START_DIALOGUE", result["available_actions"])
+        self.assertNotIn("SPEAK", result["available_actions"])
 
         self.runtime.hunger_fp = 200
         self.runtime.energy_fp = 100
@@ -192,7 +308,7 @@ class NeedsServiceTests(TestCase):
         self.runtime.save(update_fields=["energy_fp", "health_fp"])
         result = runtime_summary("10011")
         self.assertNotIn("WORK_PLACEHOLDER", result["available_actions"])
-        self.assertNotIn("SOCIALIZE", result["available_actions"])
+        self.assertNotIn("START_DIALOGUE", result["available_actions"])
         self.assertTrue({"EAT", "REST", "SLEEP"}.issubset(result["available_actions"]))
 
     def test_low_health_hides_production_with_stable_reason(self):

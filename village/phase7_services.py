@@ -15,6 +15,7 @@ from .models import (
     NpcActionReservation,
     NpcCommandState,
     NpcCommitment,
+    NpcDialogueSession,
     NpcProfile,
     NpcRelationship,
     NpcRuntimeState,
@@ -392,6 +393,9 @@ def public_npc_observation(npc_id: str) -> dict | None:
             npc=profile.npc, status__in=("SUCCEEDED", "FAILED")
         ).order_by("-completed_world_minute", "-updated_at")[:3]
     ]
+    dialogue = NpcDialogueSession.objects.filter(
+        Q(initiator=profile.npc) | Q(target=profile.npc), status="ACTIVE"
+    ).first()
     return {
         "npc_id": npc_id,
         "display_name": profile.display_name,
@@ -403,8 +407,8 @@ def public_npc_observation(npc_id: str) -> dict | None:
             "stress": runtime.stress_fp / 10,
         },
         "public_status": {
-            "action": runtime.current_action or "IDLE",
-            "action_status": runtime.action_status,
+            "action": "SOCIALIZING" if dialogue else runtime.current_action or "IDLE",
+            "action_status": "SOCIAL" if dialogue else runtime.action_status,
         },
         "subjective_goal": ({
             "goal_id": str(goal.goal_id),
@@ -439,6 +443,11 @@ def operations_snapshot() -> dict:
             npc__agent_id__in=FORMAL_NPC_IDS
         ).order_by("npc__agent_id")[:100]
     )
+    dialogue_npc_ids = set()
+    for dialogue in NpcDialogueSession.objects.filter(status="ACTIVE").values_list(
+        "initiator__agent_id", "target__agent_id"
+    ):
+        dialogue_npc_ids.update(str(npc_id) for npc_id in dialogue)
     recent = {
         str(runtime.npc.agent_id): [
             {
@@ -455,9 +464,9 @@ def operations_snapshot() -> dict:
     npcs = [{
         "npc_id": str(row.npc.agent_id),
         "location_code": row.current_location_code,
-        "action_status": row.action_status,
+        "action_status": "DIALOGUING" if str(row.npc.agent_id) in dialogue_npc_ids else row.action_status,
         "current_goal": row.current_goal,
-        "current_action": row.current_action,
+        "current_action": "DIALOGUE" if str(row.npc.agent_id) in dialogue_npc_ids else row.current_action,
         "action_started_world_minute": row.action_started_world_minute,
         "action_ends_world_minute": row.action_ends_world_minute,
         "active_command_id": str(row.active_command_id) if row.active_command_id else None,

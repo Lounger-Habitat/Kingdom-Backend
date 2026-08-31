@@ -61,7 +61,7 @@ class LifeActionServiceTests(TestCase):
         self.assertTrue(result["success"])
         self.slot.refresh_from_db(); self.inventory.refresh_from_db(); self.runtime.refresh_from_db()
         self.assertEqual((self.slot.item_amount, self.inventory.asset_version), (0, 1))
-        self.assertEqual(self.runtime.hunger_fp, 0)
+        self.assertEqual(self.runtime.hunger_fp, 60)
         replay = LifeActionService.execute(payload)
         self.assertEqual(replay["result_code"], ResultCode.COMMAND_REPLAYED)
         self.slot.refresh_from_db(); self.assertEqual(self.slot.item_amount, 0)
@@ -124,7 +124,17 @@ class LifeActionServiceTests(TestCase):
         self.assertTrue(result["success"])
         self.assertEqual(result["effects"]["relationships"], [])
         self.other_runtime.refresh_from_db()
-        self.assertEqual(self.other_runtime.needs_world_minute, 30)
+        self.assertEqual(self.other_runtime.needs_world_minute, 120)
+
+    def test_late_settlement_catches_needs_up_to_authoritative_time(self):
+        payload = self.payload("SLEEP", {})
+        self.arm(payload)
+
+        result = LifeActionService.execute(payload)
+
+        self.assertTrue(result["success"], result)
+        self.runtime.refresh_from_db()
+        self.assertEqual(self.runtime.needs_world_minute, 120)
 
     def test_socialize_diminishing_return_clamps_once_and_cannot_cross_day(self):
         self.runtime.social_fp = self.runtime.stress_fp = 10
@@ -143,8 +153,8 @@ class LifeActionServiceTests(TestCase):
         result = LifeActionService.execute(payload)
         self.assertTrue(result["success"])
         self.runtime.refresh_from_db(); self.other_runtime.refresh_from_db()
-        self.assertEqual((self.runtime.social_fp, self.runtime.stress_fp), (0, 0))
-        self.assertEqual((self.other_runtime.social_fp, self.other_runtime.stress_fp), (0, 0))
+        self.assertEqual((self.runtime.social_fp, self.runtime.stress_fp), (30, 0))
+        self.assertEqual((self.other_runtime.social_fp, self.other_runtime.stress_fp), (30, 0))
 
         cross_day = self.payload(
             "SOCIALIZE",
@@ -180,7 +190,7 @@ class LifeActionServiceTests(TestCase):
         result = LifeActionService.execute(payload)
         self.assertTrue(result["success"])
         self.runtime.refresh_from_db(); self.other_runtime.refresh_from_db()
-        self.assertEqual((self.runtime.stress_fp, self.other_runtime.stress_fp), (490, 490))
+        self.assertEqual((self.runtime.stress_fp, self.other_runtime.stress_fp), (550, 550))
 
     def test_work_has_no_assets_and_stale_asset_version_has_no_food_benefit(self):
         stale = self.payload("EAT", {"source": "PERSONAL_INVENTORY", "food_instance_id": str(self.slot.instance_id), "expected_asset_version": 1})
@@ -485,8 +495,8 @@ class LifeActionServiceTests(TestCase):
         self.runtime.refresh_from_db()
         self.other_runtime.refresh_from_db()
         self.assertEqual(self.runtime.action_status, "IDLE")
-        self.assertEqual(self.runtime.needs_world_minute, 30)
-        self.assertEqual(self.other_runtime.needs_world_minute, 30)
+        self.assertEqual(self.runtime.needs_world_minute, 120)
+        self.assertEqual(self.other_runtime.needs_world_minute, 120)
 
     def test_settlement_interval_mismatch_terminalizes_npc_busy_with_outcome(self):
         """结算区间与武装区间不一致是终态拒绝：落 FAILED 并投递失败 OUTCOME，

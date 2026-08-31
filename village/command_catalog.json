@@ -11,10 +11,16 @@
           "location_code": {
             "type": "string",
             "description": "目标地点代码"
+          },
+          "target_npc_id": {
+            "type": "string",
+            "description": "要靠近的目标NPC ID"
           }
         },
-        "required": [
-          "location_code"
+        "required": [],
+        "oneOf": [
+          {"required": ["location_code"]},
+          {"required": ["target_npc_id"]}
         ]
       }
     },
@@ -22,7 +28,7 @@
       "name": "WAIT",
       "phase": "阶段一",
       "label": "等待",
-      "description": "原地等待；使用“时长（世界分钟）”。",
+      "description": "原地等待；耗时由系统决定（单位：世界分钟），无需传参；执行结果在 duration_minutes 字段返回实际消耗。",
       "parameters": {
         "type": "object",
         "properties": {},
@@ -154,7 +160,7 @@
       "name": "PLANT",
       "phase": "阶段三",
       "label": "播种",
-      "description": "在 Bill 农田播种；使用“时长（世界分钟）”。",
+      "description": "在 Bill 农田播种；耗时由系统决定（单位：世界分钟），无需传参；执行结果在 duration_minutes 字段返回实际消耗。",
       "parameters": {
         "type": "object",
         "properties": {
@@ -177,7 +183,7 @@
       "name": "HARVEST",
       "phase": "阶段三",
       "label": "收获",
-      "description": "在 Bill 农田收获；使用“时长（世界分钟）”。",
+      "description": "在 Bill 农田收获；耗时由系统决定（单位：世界分钟），无需传参；执行结果在 duration_minutes 字段返回实际消耗。",
       "parameters": {
         "type": "object",
         "properties": {
@@ -195,7 +201,7 @@
       "name": "HUNT",
       "phase": "阶段三",
       "label": "狩猎",
-      "description": "在狩猎入口狩猎；使用“时长（世界分钟）”。",
+      "description": "在狩猎入口狩猎；耗时由系统决定（单位：世界分钟），无需传参；执行结果在 duration_minutes 字段返回实际消耗。",
       "parameters": {
         "type": "object",
         "properties": {
@@ -214,7 +220,7 @@
       "name": "COOK",
       "phase": "阶段三",
       "label": "烹饪",
-      "description": "在餐厅烹饪；使用“时长（世界分钟）”。",
+      "description": "在餐厅烹饪；耗时由系统决定（单位：世界分钟），无需传参；执行结果在 duration_minutes 字段返回实际消耗。",
       "parameters": {
         "type": "object",
         "properties": {
@@ -233,7 +239,7 @@
       "name": "CREATE_ORDER",
       "phase": "阶段三",
       "label": "创建订单",
-      "description": "创建交易订单；使用“时长（世界分钟）”。",
+      "description": "创建交易订单；耗时由系统决定（单位：世界分钟），无需传参；执行结果在 duration_minutes 字段返回实际消耗。",
       "parameters": {
         "type": "object",
         "properties": {
@@ -278,7 +284,7 @@
       "name": "CANCEL_ORDER",
       "phase": "阶段三",
       "label": "取消订单",
-      "description": "取消自己的开放订单；使用“时长（世界分钟）”。",
+      "description": "取消自己的开放订单；耗时由系统决定（单位：世界分钟），无需传参；执行结果在 duration_minutes 字段返回实际消耗。",
       "parameters": {
         "type": "object",
         "properties": {
@@ -297,7 +303,7 @@
       "name": "START_DELIVERY",
       "phase": "阶段三",
       "label": "开始配送",
-      "description": "开始已匹配订单的配送；使用“时长（世界分钟）”。",
+      "description": "开始已匹配订单的配送；耗时由系统决定（单位：世界分钟），无需传参；执行结果在 duration_minutes 字段返回实际消耗。",
       "parameters": {
         "type": "object",
         "properties": {
@@ -316,7 +322,7 @@
       "name": "IMPORT_GOODS",
       "phase": "阶段三",
       "label": "外部进货",
-      "description": "在贸易道路向商队进货；使用“时长（世界分钟）”。",
+      "description": "在贸易道路向商队进货；耗时由系统决定（单位：世界分钟），无需传参；执行结果在 duration_minutes 字段返回实际消耗。",
       "parameters": {
         "type": "object",
         "properties": {
@@ -341,7 +347,7 @@
       "name": "EXPORT_GOODS",
       "phase": "阶段三",
       "label": "外部出货",
-      "description": "在贸易道路向商队出货；使用“时长（世界分钟）”。",
+      "description": "在贸易道路向商队出货；耗时由系统决定（单位：世界分钟），无需传参；执行结果在 duration_minutes 字段返回实际消耗。",
       "parameters": {
         "type": "object",
         "properties": {
@@ -366,7 +372,7 @@
       "name": "RATE_DISH",
       "phase": "阶段三",
       "label": "菜品评分",
-      "description": "在档案馆为菜品评分；使用“时长（世界分钟）”。",
+      "description": "在档案馆为菜品评分；耗时由系统决定（单位：世界分钟），无需传参；执行结果在 duration_minutes 字段返回实际消耗。",
       "parameters": {
         "type": "object",
         "properties": {
@@ -397,7 +403,7 @@
       "name": "PUBLISH_PRICE_INDEX",
       "phase": "阶段三",
       "label": "发布价格指数",
-      "description": "在档案馆发布当日价格指数；使用“时长（世界分钟）”。",
+      "description": "在档案馆发布当日价格指数；耗时由系统决定（单位：世界分钟），无需传参；执行结果在 duration_minutes 字段返回实际消耗。",
       "parameters": {
         "type": "object",
         "properties": {},
@@ -408,7 +414,7 @@
       "name": "AUDIT_PUBLIC_FUND",
       "phase": "阶段三",
       "label": "审计公款",
-      "description": "在档案馆审计公共资金；使用“时长（世界分钟）”。",
+      "description": "在档案馆审计公共资金；耗时由系统决定（单位：世界分钟），无需传参；执行结果在 duration_minutes 字段返回实际消耗。",
       "parameters": {
         "type": "object",
         "properties": {},
@@ -419,7 +425,7 @@
       "name": "PROPOSE_TRADE",
       "phase": "阶段三",
       "label": "发起交易报价",
-      "description": "向指定 NPC 发起结构化定向报价；使用“时长（世界分钟）”。",
+      "description": "向指定 NPC 发起结构化定向报价；耗时由系统决定（单位：世界分钟），无需传参；执行结果在 duration_minutes 字段返回实际消耗。",
       "parameters": {
         "type": "object",
         "properties": {
@@ -455,7 +461,7 @@
       "name": "RESPOND_TRADE",
       "phase": "阶段三",
       "label": "响应交易报价",
-      "description": "接受或拒绝交易报价；使用“时长（世界分钟）”。",
+      "description": "接受或拒绝交易报价；耗时由系统决定（单位：世界分钟），无需传参；执行结果在 duration_minutes 字段返回实际消耗。",
       "parameters": {
         "type": "object",
         "properties": {
@@ -483,7 +489,7 @@
       "name": "CANCEL_TRADE_OFFER",
       "phase": "阶段三",
       "label": "取消交易报价",
-      "description": "发起方取消待处理报价；使用“时长（世界分钟）”。",
+      "description": "发起方取消待处理报价；耗时由系统决定（单位：世界分钟），无需传参；执行结果在 duration_minutes 字段返回实际消耗。",
       "parameters": {
         "type": "object",
         "properties": {
@@ -502,13 +508,14 @@
       "name": "LIST_STORE_ITEM",
       "phase": "阶段三",
       "label": "上架商品",
-      "description": "经营 NPC 将个人物品转入商店并上架；使用“时长（世界分钟）”。",
+      "description": "经营 NPC 将个人物品转入自己经营的商店并上架。Nora杂货铺使用GENERAL_STORE，地点为GENERAL_STORE；Lucy饭店使用RESTAURANT_STORE，地点为RESTAURANT。",
       "parameters": {
         "type": "object",
         "properties": {
           "store_code": {
             "type": "string",
-            "description": "商店代码"
+            "description": "商店唯一代码，不是地点代码",
+            "enum": ["GENERAL_STORE", "RESTAURANT_STORE"]
           },
           "item_id": {
             "type": "integer",
@@ -546,7 +553,7 @@
       "name": "UPDATE_STORE_PRICE",
       "phase": "阶段三",
       "label": "修改商品价格",
-      "description": "经营 NPC 修改上架商品单价；使用“时长（世界分钟）”。",
+      "description": "经营 NPC 修改上架商品单价；耗时由系统决定（单位：世界分钟），无需传参；执行结果在 duration_minutes 字段返回实际消耗。",
       "parameters": {
         "type": "object",
         "properties": {
@@ -579,7 +586,7 @@
       "name": "DELIST_STORE_ITEM",
       "phase": "阶段三",
       "label": "下架商品",
-      "description": "经营 NPC 下架商品并取回库存；使用“时长（世界分钟）”。",
+      "description": "经营 NPC 下架商品并取回库存；耗时由系统决定（单位：世界分钟），无需传参；执行结果在 duration_minutes 字段返回实际消耗。",
       "parameters": {
         "type": "object",
         "properties": {
@@ -598,7 +605,7 @@
       "name": "BUY_FROM_STORE",
       "phase": "阶段三",
       "label": "商店购买",
-      "description": "其他 NPC 按上架记录价格购买商品；使用“时长（世界分钟）”。",
+      "description": "其他 NPC 按上架记录价格购买商品；耗时由系统决定（单位：世界分钟），无需传参；执行结果在 duration_minutes 字段返回实际消耗。",
       "parameters": {
         "type": "object",
         "properties": {
@@ -620,16 +627,92 @@
       }
     },
     {
+      "name": "SELL_ON_MARKETPLACE",
+      "phase": "阶段三",
+      "label": "上架全服商品",
+      "description": "在市场街将个人库存上架到全服 Marketplace；耗时由系统决定（单位：世界分钟），无需传参；执行结果在 duration_minutes 字段返回实际消耗。",
+      "parameters": {
+        "type": "object",
+        "properties": {
+          "instance_id": {
+            "type": "string",
+            "description": "物品实例ID",
+            "format": "uuid"
+          },
+          "amount": {
+            "type": "integer",
+            "description": "数量",
+            "minimum": 1
+          },
+          "price": {
+            "type": "integer",
+            "description": "单价",
+            "minimum": 1
+          }
+        },
+        "required": [
+          "instance_id",
+          "amount",
+          "price"
+        ]
+      }
+    },
+    {
+      "name": "BUY_FROM_MARKETPLACE",
+      "phase": "阶段三",
+      "label": "购买全服商品",
+      "description": "在市场街购买全服 Marketplace 挂单；耗时由系统决定（单位：世界分钟），无需传参；执行结果在 duration_minutes 字段返回实际消耗。",
+      "parameters": {
+        "type": "object",
+        "properties": {
+          "listing_id": {
+            "type": "integer",
+            "description": "全服挂单ID",
+            "minimum": 1
+          },
+          "amount": {
+            "type": "integer",
+            "description": "数量",
+            "minimum": 1
+          }
+        },
+        "required": [
+          "listing_id",
+          "amount"
+        ]
+      }
+    },
+    {
+      "name": "DELIST_FROM_MARKETPLACE",
+      "phase": "阶段三",
+      "label": "下架全服商品",
+      "description": "在市场街下架自己的全服 Marketplace 挂单；耗时由系统决定（单位：世界分钟），无需传参；执行结果在 duration_minutes 字段返回实际消耗。",
+      "parameters": {
+        "type": "object",
+        "properties": {
+          "listing_id": {
+            "type": "integer",
+            "description": "全服挂单ID",
+            "minimum": 1
+          }
+        },
+        "required": [
+          "listing_id"
+        ]
+      }
+    },
+    {
       "name": "INSPECT_STORE_INVENTORY",
       "phase": "阶段三",
       "label": "查看商店库存",
-      "description": "只读查询，不进入经济结算。",
+      "description": "查看指定商店库存，调用前必须先移动到商店所在地点。Nora杂货铺使用GENERAL_STORE，地点为GENERAL_STORE；Lucy饭店使用RESTAURANT_STORE，地点为RESTAURANT。只读查询，不进入经济结算。",
       "parameters": {
         "type": "object",
         "properties": {
           "store_code": {
             "type": "string",
-            "description": "商店代码"
+            "description": "商店唯一代码，不是地点代码",
+            "enum": ["GENERAL_STORE", "RESTAURANT_STORE"]
           }
         },
         "required": [
@@ -833,6 +916,55 @@
       }
     },
     {
+      "name": "START_DIALOGUE",
+      "phase": "阶段二",
+      "label": "发起对话",
+      "description": "尝试与距离自己4米以内的NPC开始对话。成功时立即建立或复用对话，并返回conversation_id；失败时返回不能开始对话的原因。",
+      "parameters": {
+        "type": "object",
+        "properties": {
+          "target_npc_id": {
+            "type": "string",
+            "description": "目标NPC的ID。目标必须距离自己4米以内，不能填写自己的ID。"
+          },
+          "topic": {
+            "type": "string",
+            "description": "可选的对话主题，说明想与对方讨论什么。",
+            "maxLength": 120
+          }
+        },
+        "required": ["target_npc_id"]
+      }
+    },
+    {
+      "name": "SPEAK",
+      "phase": "阶段二",
+      "label": "对话发言",
+      "description": "在已经建立的对话中发言；允许同一NPC连续发言。双方必须仍在4米以内，超过范围时对话会结束并返回失败原因。",
+      "parameters": {
+        "type": "object",
+        "properties": {
+          "conversation_id": {
+            "type": "string",
+            "format": "uuid",
+            "description": "START_DIALOGUE成功后返回的对话ID。"
+          },
+          "text": {
+            "type": "string",
+            "description": "要对对方说的话。",
+            "minLength": 1,
+            "maxLength": 100
+          },
+          "end_turn": {
+            "type": "boolean",
+            "description": "是否在本次发言后表示自己希望结束对话。设置为true后自己不能继续发言；双方都表示结束后，对话才会完成。",
+            "default": false
+          }
+        },
+        "required": ["conversation_id", "text"]
+      }
+    },
+    {
       "name": "OBSERVE",
       "phase": "查询",
       "label": "观察自身状态",
@@ -843,7 +975,7 @@
       "name": "INSPECT_NEARBY",
       "phase": "查询",
       "label": "观察附近",
-      "description": "查看当前位置附近的NPC和地点。",
+      "description": "查看自身周围20米内的NPC和地点，返回它们的名称、ID、状态和距离。",
       "parameters": {"type": "object", "properties": {}, "required": []}
     },
     {
@@ -921,6 +1053,34 @@
       "phase": "查询",
       "label": "查看公共经济",
       "description": "查看当日价格指数、公款余额和审计状态。",
+      "parameters": {"type": "object", "properties": {}, "required": []}
+    },
+    {
+      "name": "BROWSE_MARKETPLACE",
+      "phase": "查询",
+      "label": "浏览全服市场",
+      "description": "查看全服 Marketplace 在售挂单，可按物品筛选并限制返回数量。",
+      "parameters": {
+        "type": "object",
+        "properties": {
+          "item_id": {"type": "integer", "minimum": 1, "description": "可选，按物品ID筛选"},
+          "limit": {"type": "integer", "minimum": 1, "description": "可选，返回数量，默认20"}
+        },
+        "required": []
+      }
+    },
+    {
+      "name": "CHECK_MY_MARKETPLACE_LISTINGS",
+      "phase": "查询",
+      "label": "查看我的全服挂单",
+      "description": "查看自己当前在全服 Marketplace 的挂单。",
+      "parameters": {"type": "object", "properties": {}, "required": []}
+    },
+    {
+      "name": "CHECK_MARKETPLACE_HISTORY",
+      "phase": "查询",
+      "label": "查看全服成交历史",
+      "description": "查看自己相关的全服 Marketplace 成交历史。",
       "parameters": {"type": "object", "properties": {}, "required": []}
     }
   ]

@@ -485,13 +485,13 @@ class EatPersonalTest(PublicEconomyTestBase):
             item_id=1019,
             defaults={"item_name": "bread", "item_type": ItemType.FOOD, "is_deleted": False},
         )
-        NpcGlobalInventorySlot.objects.create(
+        slot = NpcGlobalInventorySlot.objects.create(
             bag=self.bill_inv, slot_index=0, item_id=1019, item_amount=1,
         )
 
         resp = commit_economy_action(_payload(
             "EAT", 10011, "VILLAGE_SQUARE",
-            {"source": "PERSONAL_INVENTORY"},
+            {"source": "PERSONAL_INVENTORY", "food_instance_id": str(slot.instance_id)},
         ))
 
         self.assertEqual(resp["result_code"], ResultCode.OK)
@@ -501,15 +501,15 @@ class EatPersonalTest(PublicEconomyTestBase):
         )
 
     def test_eat_personal_success(self):
-        """NPC eats from personal inventory (FEFO)."""
-        NpcGlobalInventorySlot.objects.create(
+        """NPC eats the requested item from personal inventory."""
+        slot = NpcGlobalInventorySlot.objects.create(
             bag=self.bill_inv, slot_index=0, item_id=1030, item_amount=3,
             produced_world_minute=1000, expires_world_minute=4000,
         )
 
         resp = commit_economy_action(_payload(
             "EAT", 10011, "VILLAGE_SQUARE",
-            {"source": "PERSONAL_INVENTORY"},
+            {"source": "PERSONAL_INVENTORY", "food_instance_id": str(slot.instance_id)},
         ))
         self.assertEqual(resp["result_code"], ResultCode.OK)
 
@@ -530,53 +530,60 @@ class EatPersonalTest(PublicEconomyTestBase):
     def test_eat_at_day_boundary_counts_the_completed_day(self):
         self.time.world_minute = 2880
         self.time.save(update_fields=["world_minute"])
-        NpcGlobalInventorySlot.objects.create(
+        slot = NpcGlobalInventorySlot.objects.create(
             bag=self.bill_inv, slot_index=0, item_id=1030, item_amount=1,
         )
 
         commit_economy_action(_payload(
-            "EAT", 10011, "VILLAGE_SQUARE", {"source": "PERSONAL_INVENTORY"},
+            "EAT", 10011, "VILLAGE_SQUARE",
+            {"source": "PERSONAL_INVENTORY", "food_instance_id": str(slot.instance_id)},
         ))
 
         self.assertTrue(NpcNeedsDaySummary.objects.filter(npc=self.bill, day_index=1).exists())
 
-    def test_eat_fefo_order(self):
-        """FEFO: earliest-expiring food consumed first."""
-        # Later expiry
-        NpcGlobalInventorySlot.objects.create(
-            bag=self.bill_inv, slot_index=0, item_id=1030, item_amount=1,
-            produced_world_minute=1000, expires_world_minute=5000,
+    def test_eat_consumes_requested_instance(self):
+        """The requested bread is consumed even when chicken expires first."""
+        Item.objects.update_or_create(
+            item_id=1019,
+            defaults={"item_name": "bread", "item_type": ItemType.FOOD, "is_deleted": False},
         )
-        # Earlier expiry
-        NpcGlobalInventorySlot.objects.create(
-            bag=self.bill_inv, slot_index=1, item_id=1030, item_amount=1,
+        bread = NpcGlobalInventorySlot.objects.create(
+            bag=self.bill_inv, slot_index=0, item_id=1019, item_amount=4,
+        )
+        chicken = NpcGlobalInventorySlot.objects.create(
+            bag=self.bill_inv, slot_index=1, item_id=1056, item_amount=1,
             produced_world_minute=800, expires_world_minute=3000,
         )
 
         resp = commit_economy_action(_payload(
             "EAT", 10011, "VILLAGE_SQUARE",
-            {"source": "PERSONAL_INVENTORY"},
+            {"source": "PERSONAL_INVENTORY", "food_instance_id": str(bread.instance_id)},
         ))
         self.assertEqual(resp["result_code"], ResultCode.OK)
 
-        # Earlier expiry slot should be consumed
-        slots = list(NpcGlobalInventorySlot.objects.filter(
-            bag=self.bill_inv, item_id=1030,
-        ).order_by("slot_index"))
-        self.assertEqual(slots[0].item_amount, 1)  # later expiry preserved
-        self.assertEqual(slots[1].item_amount, 0)  # earlier expiry consumed
+        bread.refresh_from_db()
+        chicken.refresh_from_db()
+        self.assertEqual(bread.item_amount, 3)
+        self.assertEqual(chicken.item_amount, 1)
+        self.assertEqual(resp["effects"]["eat"]["food_instance_id"], str(bread.instance_id))
 
     def test_eat_no_food_fails(self):
         """EAT fails when NPC has no food."""
         resp = commit_economy_action(_payload(
             "EAT", 10011, "VILLAGE_SQUARE",
-            {"source": "PERSONAL_INVENTORY"},
+            {"source": "PERSONAL_INVENTORY", "food_instance_id": str(uuid.uuid4())},
         ))
         self.assertEqual(resp["result_code"], ResultCode.P3_INSUFFICIENT_ITEM)
 
+    def test_eat_requires_food_instance_id(self):
+        resp = commit_economy_action(_payload(
+            "EAT", 10011, "VILLAGE_SQUARE", {"source": "PERSONAL_INVENTORY"},
+        ))
+        self.assertEqual(resp["result_code"], ResultCode.P3_INVALID_PARAMS)
+
     def test_eat_cooked_dish(self):
         """NPC can eat cooked dishes from personal inventory."""
-        NpcGlobalInventorySlot.objects.create(
+        slot = NpcGlobalInventorySlot.objects.create(
             bag=self.bill_inv, slot_index=0, item_id=1053, item_amount=1,
             produced_world_minute=1000, expires_world_minute=4000,
             dish_quality=3, rated=False,
@@ -584,7 +591,7 @@ class EatPersonalTest(PublicEconomyTestBase):
 
         resp = commit_economy_action(_payload(
             "EAT", 10011, "VILLAGE_SQUARE",
-            {"source": "PERSONAL_INVENTORY"},
+            {"source": "PERSONAL_INVENTORY", "food_instance_id": str(slot.instance_id)},
         ))
         self.assertEqual(resp["result_code"], ResultCode.OK)
 

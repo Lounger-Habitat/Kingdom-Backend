@@ -31,8 +31,12 @@ urlpatterns = [
     path("api/village/runtime/subjective-goal", views.subjective_goal_update, name="village-subjective-goal-update"),
     path("api/village/runtime/summary", views.runtime_summary_view, name="village-runtime-summary"),
     path("api/village/runtime/time", views.runtime_time, name="village-runtime-time"),
+    path("api/village/runtime/tick", views.runtime_tick, name="village-runtime-tick"),
     path("api/village/runtime/advance-needs", views.runtime_advance_needs, name="village-runtime-advance-needs"),
     path("api/village/life-actions/execute", views.life_actions_execute, name="village-life-actions-execute"),
+    path("api/village/dialogues/start", views.dialogue_start, name="village-dialogue-start"),
+    path("api/village/dialogues/<uuid:conversation_id>/speak", views.dialogue_speak, name="village-dialogue-speak"),
+    path("api/village/dialogues/<uuid:conversation_id>/complete", views.dialogue_complete, name="village-dialogue-complete"),
     path("api/village/actions/complete", views.actions_complete, name="village-actions-complete"),
     path("api/village/events", views.events_list, name="village-events"),
     # 阶段一 Command API

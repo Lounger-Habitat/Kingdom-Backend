@@ -1,8 +1,11 @@
 BASE_ACTIONS = [
     "MOVE", "WAIT", "GO_HOME",
-    "EAT", "REST", "SLEEP", "SOCIALIZE", "WORK_PLACEHOLDER",
+    "EAT", "REST", "SLEEP", "START_DIALOGUE", "SPEAK", "WORK_PLACEHOLDER",
     "PROPOSE_TRADE", "RESPOND_TRADE", "CANCEL_TRADE_OFFER",
-    "BUY_FROM_STORE", "INSPECT_STORE_INVENTORY",
+    "BUY_FROM_STORE", "BUY_FROM_MARKETPLACE", "SELL_ON_MARKETPLACE",
+    "DELIST_FROM_MARKETPLACE", "BROWSE_MARKETPLACE",
+    "CHECK_MY_MARKETPLACE_LISTINGS", "CHECK_MARKETPLACE_HISTORY",
+    "INSPECT_STORE_INVENTORY",
     "INSPECT_SOCIAL_STATE", "CREATE_COMMITMENT", "CANCEL_COMMITMENT",
     "PERFORM_COMMITMENT", "STORY_VOTE", "STORY_ACT",
     "OBSERVE", "INSPECT_NEARBY", "INSPECT_INVENTORY",
@@ -11,6 +14,9 @@ BASE_ACTIONS = [
 ]
 
 
+# 订单流动作（CREATE_ORDER/CANCEL_ORDER/START_DELIVERY）在指令目录中有定义，
+# 但刻意不授予任何 NPC：保持与线上 NpcProfile.capabilities 一致，重置/重播种
+# 不得新增指令。如要启用，先在线上 DB 授权再同步到这里。
 NPC_SEEDS = [
     {
         "agent_id": "10011",
@@ -23,8 +29,8 @@ NPC_SEEDS = [
         "personality_traits": ["practical", "reserved", "responsible"],
         "personal_goal": "维持三块农田生产并保住家庭储备",
         "capabilities": BASE_ACTIONS + [
-            "PLANT", "HARVEST", "CREATE_ORDER", "CANCEL_ORDER", "START_DELIVERY",
-            "INSPECT_ORDERS", "INSPECT_MARKET_STATE", "INSPECT_FARM_STATE",
+            "PLANT", "HARVEST",
+            "INSPECT_MARKET_STATE", "INSPECT_FARM_STATE",
         ],
         "money": 200,
         "items": [(1003, 12), (1051, 18), (1019, 4), (1023, 3)],
@@ -40,8 +46,8 @@ NPC_SEEDS = [
         "personality_traits": ["independent", "wry", "cautious"],
         "personal_goal": "稳定肉类供应并确认森林旧路风险",
         "capabilities": BASE_ACTIONS + [
-            "HUNT", "CREATE_ORDER", "CANCEL_ORDER", "START_DELIVERY",
-            "INSPECT_ORDERS", "INSPECT_MARKET_STATE",
+            "HUNT",
+            "INSPECT_MARKET_STATE",
         ],
         "money": 240,
         "items": [(1009, 4), (1034, 3), (1056, 6), (1019, 4)],
@@ -74,9 +80,9 @@ NPC_SEEDS = [
         "personality_traits": ["creative", "ambitious", "warm", "stubborn"],
         "personal_goal": "让饭店在商路中断期间持续供应村民",
         "capabilities": BASE_ACTIONS + [
-            "COOK", "CREATE_ORDER", "CANCEL_ORDER", "START_DELIVERY",
+            "COOK",
             "LIST_STORE_ITEM", "UPDATE_STORE_PRICE", "DELIST_STORE_ITEM",
-            "INSPECT_ORDERS", "INSPECT_MARKET_STATE", "INSPECT_RESTAURANT_STATE",
+            "INSPECT_MARKET_STATE", "INSPECT_RESTAURANT_STATE",
         ],
         "money": 300,
         "items": [(1025, 10), (1042, 10), (1056, 8), (1057, 6), (1049, 8), (1058, 6)],
@@ -93,9 +99,8 @@ NPC_SEEDS = [
         "personal_goal": "恢复商路并建立可信的村庄供货网络",
         "capabilities": BASE_ACTIONS + [
             "IMPORT_GOODS", "EXPORT_GOODS",
-            "CREATE_ORDER", "CANCEL_ORDER", "START_DELIVERY",
             "LIST_STORE_ITEM", "UPDATE_STORE_PRICE", "DELIST_STORE_ITEM",
-            "INSPECT_ORDERS", "INSPECT_MARKET_STATE",
+            "INSPECT_MARKET_STATE",
         ],
         "money": 450,
         "items": [(1003, 30), (1051, 36), (1049, 12), (1050, 8), (1058, 8), (1076, 6), (1002, 10)],

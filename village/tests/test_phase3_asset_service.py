@@ -4,7 +4,9 @@ Covers feature flag, actor/location validation, idempotency, version
 conflict, replay, request conflict, and transaction rollback.
 """
 
+import json
 import uuid
+from unittest.mock import patch
 
 from django.test import TestCase, override_settings
 
@@ -14,6 +16,7 @@ from inventory.models import (
     NpcGlobalInventory,
     NpcGlobalInventorySlot,
 )
+from items.models import Item, ItemType
 from village.models import (
     EconomicLedgerEntry,
     NpcCommandState,
@@ -59,7 +62,7 @@ class Phase3AssetServiceBase(TestCase):
 
     def setUp(self):
         self.config = VillageSimulationConfig.objects.create(
-            config_key="default", village_economy_enabled=True,
+            config_key="default", village_economy_enabled=True, village_direct_trade_enabled=True,
         )
         self.time = GlobalGameTimeState.get_instance()
         self.time.world_minute = 700
@@ -210,6 +213,87 @@ class PersistenceTest(Phase3AssetServiceBase):
         self.assertTrue(VillageActionReceipt.objects.filter(request_id=request_id).exists())
         self.assertTrue(EconomicLedgerEntry.objects.filter(request_id=request_id).exists())
         self.assertTrue(VillageWorldEvent.objects.filter(request_id=request_id).exists())
+
+    @patch("village.phase3_marketplace._call_service")
+    def test_marketplace_sell_action_dispatches_and_persists(self, call_service_mock):
+        call_service_mock.return_value = {
+            "status": "SUCCEEDED",
+            "result_code": ResultCode.OK,
+            "data": {
+                "listing": {"listingId": "market-1", "price": 9},
+                "bag": {"money": 200, "items": []},
+                "asset_version": 1,
+            },
+            "asset_versions": {},
+            "effects": {},
+            "event": {},
+            "external_delta": 0,
+        }
+        payload = _base_payload(
+            command_name="SELL_ON_MARKETPLACE",
+            current_location_code="MARKET_STREET",
+            npc_id=10011,
+        )
+        payload["params"] = {
+            "instance_id": str(uuid.uuid4()),
+            "amount": 2,
+            "price": 9,
+            "expected_asset_version": 0,
+        }
+
+        resp = commit_economy_action(payload)
+
+        self.assertEqual(resp["result_code"], ResultCode.OK)
+        self.assertEqual(resp["data"]["listing"]["listingId"], "market-1")
+        self.assertTrue(
+            EconomicLedgerEntry.objects.filter(
+                request_id=uuid.UUID(payload["request_id"]),
+                entry_type="SELL_ON_MARKETPLACE",
+            ).exists()
+        )
+
+    def test_marketplace_sell_action_real_service_persists_json_safe_payload(self):
+        Item.objects.create(item_id=1051, item_name="玉米", item_type=ItemType.INGREDIENT)
+        slot = NpcGlobalInventorySlot.objects.get(bag=self.bill_inv, slot_index=0)
+        payload = _base_payload(
+            command_name="SELL_ON_MARKETPLACE",
+            current_location_code="MARKET_STREET",
+            npc_id=10011,
+        )
+        payload["params"] = {
+            "instance_id": str(slot.instance_id),
+            "amount": 2,
+            "price": 9,
+            "expected_asset_version": self.bill_inv.asset_version,
+        }
+
+        resp = commit_economy_action(payload)
+
+        self.assertEqual(resp["result_code"], ResultCode.OK)
+        self.assertIn("listing", resp["data"])
+        self.assertIn("bag", resp["data"])
+        receipt = VillageActionReceipt.objects.get(request_id=uuid.UUID(payload["request_id"]))
+        json.dumps(receipt.response_data, ensure_ascii=False)
+        self.assertEqual(receipt.response_data["data"]["listing"]["price"], 9)
+        self.assertEqual(receipt.response_data["data"]["asset_version"], 1)
+
+    @patch("village.phase3_marketplace._service")
+    def test_marketplace_missing_service_fails_closed(self, service_mock):
+        service_mock.return_value = None
+        payload = _base_payload(
+            command_name="BUY_FROM_MARKETPLACE",
+            current_location_code="MARKET_STREET",
+            npc_id=10012,
+        )
+        payload["params"] = {
+            "listing_id": str(uuid.uuid4()),
+            "amount": 1,
+            "expected_buyer_asset_version": 0,
+        }
+
+        resp = commit_economy_action(payload)
+
+        self.assertEqual(resp["result_code"], ResultCode.P3_FEATURE_DISABLED)
 
     def test_success_reuses_running_command_and_releases_runtime(self):
         payload = _base_payload()

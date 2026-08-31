@@ -95,6 +95,9 @@ _DIRECT_TRADE_COMMANDS = frozenset({
     "UPDATE_STORE_PRICE",
     "DELIST_STORE_ITEM",
     "BUY_FROM_STORE",
+    "BUY_FROM_MARKETPLACE",
+    "SELL_ON_MARKETPLACE",
+    "DELIST_FROM_MARKETPLACE",
 })
 _PARTICIPANT_TRADE_EVENTS = frozenset({
     "PROPOSE_TRADE", "RESPOND_TRADE", "CANCEL_TRADE_OFFER",
@@ -299,6 +302,11 @@ def _ensure_handlers() -> None:
         _do_respond_trade,
         _do_update_store_price,
     )
+    from .phase3_marketplace import (
+        _do_buy_from_marketplace,
+        _do_delist_from_marketplace,
+        _do_sell_on_marketplace,
+    )
     _ACTION_HANDLERS.update({
         "PLANT": _do_plant,
         "HARVEST": _do_harvest,
@@ -321,6 +329,9 @@ def _ensure_handlers() -> None:
         "UPDATE_STORE_PRICE": _do_update_store_price,
         "DELIST_STORE_ITEM": _do_delist_store_item,
         "BUY_FROM_STORE": _do_buy_from_store,
+        "BUY_FROM_MARKETPLACE": _do_buy_from_marketplace,
+        "SELL_ON_MARKETPLACE": _do_sell_on_marketplace,
+        "DELIST_FROM_MARKETPLACE": _do_delist_from_marketplace,
     })
 
 
@@ -455,6 +466,19 @@ def commit_economy_action(payload: Dict[str, Any]) -> Dict[str, Any]:
                 )
                 summary.successful_meals += 1
                 summary.save(update_fields=["successful_meals", "updated_at"])
+
+            if runtime is not None and command is not None:
+                from .phase2_services import settle_action_needs_locked
+                started = command.started_world_minute
+                ended = (
+                    min(world_minute, started + command.duration_minutes)
+                    if started is not None and command.duration_minutes else None
+                )
+                error = settle_action_needs_locked(
+                    runtime, command_name, started, ended, base_until=world_minute
+                )
+                if error:
+                    return _fail(error)
 
             # 6. Write persistence records
             result["request_id"] = str(request_id)

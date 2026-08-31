@@ -81,7 +81,8 @@ def marketplace_browse(request):
     if keyword:
         qs = qs.filter(
             Q(item_name_snapshot__icontains=keyword) |
-            Q(seller__username__icontains=keyword)
+            Q(seller__username__icontains=keyword) |
+            Q(seller_npc__name__icontains=keyword)
         )
     if item_type:
         qs = qs.filter(item_type_snapshot=item_type)

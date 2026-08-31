@@ -9,11 +9,15 @@ def serialize_listing(listing, viewer=None):
         seller_name = "系统"
     elif listing.seller:
         seller_name = listing.seller.username
+    elif listing.seller_npc:
+        seller_name = listing.seller_npc.name
 
     is_own = (
         viewer is not None
-        and listing.seller_id is not None
-        and listing.seller_id == viewer.id
+        and (
+            (hasattr(viewer, "id") and listing.seller_id is not None and listing.seller_id == viewer.id)
+            or (hasattr(viewer, "agent_id") and listing.seller_npc_id is not None and listing.seller_npc_id == viewer.id)
+        )
     )
 
     data = {
@@ -51,8 +55,10 @@ def serialize_transaction(tx):
         seller_name = "系统"
     elif tx.seller:
         seller_name = tx.seller.username
+    elif tx.seller_npc:
+        seller_name = tx.seller_npc.name
 
-    buyer_name = tx.buyer.username if tx.buyer else ""
+    buyer_name = tx.buyer.username if tx.buyer else (tx.buyer_npc.name if tx.buyer_npc else "")
 
     return {
         "transactionId": tx.pk,

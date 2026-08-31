@@ -2,6 +2,7 @@ import time
 import uuid
 from unittest.mock import patch
 
+from django.http import QueryDict
 from django.test import TestCase
 from rest_framework.test import APIRequestFactory, force_authenticate
 
@@ -9,6 +10,7 @@ from account.models import GameAccount
 from game_time.models import GlobalGameTimeState
 from inventory.models import NpcDefinition, NpcGlobalInventory, NpcGlobalInventorySlot
 from items.models import Item, ItemType
+from marketplace.services import buy_listing_for_npc, create_npc_listing
 from village.agent_queries import QUERY_NAMES, execute_agent_query
 from village.command_catalog import COMMAND_CATALOG
 from village.models import (
@@ -72,6 +74,7 @@ class AgentQueryTests(TestCase):
         success, code, data = execute_agent_query("10011", "INSPECT_NEARBY")
         self.assertTrue(success)
         self.assertEqual(data["nearby_npcs"][0]["npc_id"], "90012")
+        self.assertEqual(data["npc_names"]["90012"], "Jack")
         self.assertEqual([row["location_code"] for row in data["nearby_locations"]], ["MARKET_STREET"])
         success, code, data = execute_agent_query("90012", "INSPECT_INVENTORY")
         self.assertFalse(success)
@@ -166,3 +169,80 @@ class AgentQueryTests(TestCase):
             COMMAND_CATALOG["HUNT"]["parameters"]["properties"]["hunt_code"]["enum"],
             ["HUNT_CHICKEN"],
         )
+        self.assertEqual(
+            set(COMMAND_CATALOG["BROWSE_MARKETPLACE"]["parameters"]["properties"]),
+            {"item_id", "limit"},
+        )
+        for action in ("LIST_STORE_ITEM", "INSPECT_STORE_INVENTORY"):
+            self.assertEqual(
+                COMMAND_CATALOG[action]["parameters"]["properties"]["store_code"]["enum"],
+                ["GENERAL_STORE", "RESTAURANT_STORE"],
+            )
+        self.assertIn("20米", COMMAND_CATALOG["INSPECT_NEARBY"]["description"])
+        self.assertIn("4米", COMMAND_CATALOG["START_DIALOGUE"]["description"])
+        self.assertIn("conversation_id", COMMAND_CATALOG["START_DIALOGUE"]["description"])
+        self.assertIn("4米", COMMAND_CATALOG["SPEAK"]["description"])
+        self.assertIn(
+            "双方都表示结束",
+            COMMAND_CATALOG["SPEAK"]["parameters"]["properties"]["end_turn"]["description"],
+        )
+
+    def test_browse_marketplace_accepts_django_query_params(self):
+        success, code, data = execute_agent_query(
+            "10011", "BROWSE_MARKETPLACE", QueryDict("item_id=1030&limit=20")
+        )
+        self.assertTrue(success, code)
+        self.assertEqual(code, "OK")
+        self.assertEqual(data["page_size"], 20)
+
+    @patch("village.agent_queries.browse_marketplace_query", return_value={"listings": [{"listing_id": "1"}]})
+    def test_browse_marketplace_query_is_exposed(self, browse_marketplace_query):
+        success, code, data = execute_agent_query("10011", "BROWSE_MARKETPLACE")
+        self.assertTrue(success)
+        self.assertEqual(code, "OK")
+        self.assertEqual(data["listings"][0]["listing_id"], "1")
+        browse_marketplace_query.assert_called_once()
+
+    @patch("village.agent_queries.my_marketplace_listings_query", return_value={"listings": [{"listing_id": "2"}]})
+    def test_my_marketplace_listings_query_is_exposed(self, my_marketplace_listings_query):
+        success, code, data = execute_agent_query("10011", "CHECK_MY_MARKETPLACE_LISTINGS")
+        self.assertTrue(success)
+        self.assertEqual(code, "OK")
+        self.assertEqual(data["listings"][0]["listing_id"], "2")
+        my_marketplace_listings_query.assert_called_once()
+
+    @patch("village.agent_queries.marketplace_history_query", return_value={"transactions": [{"transaction_id": "3"}]})
+    def test_marketplace_history_query_is_exposed(self, marketplace_history_query):
+        success, code, data = execute_agent_query("10011", "CHECK_MARKETPLACE_HISTORY")
+        self.assertTrue(success)
+        self.assertEqual(code, "OK")
+        self.assertEqual(data["transactions"][0]["transaction_id"], "3")
+        marketplace_history_query.assert_called_once()
+
+    def test_marketplace_queries_serialize_real_service_results(self):
+        listing, err = create_npc_listing(
+            self.bill,
+            self.food.instance_id,
+            2,
+            15,
+            expected_asset_version=self.inventory.asset_version,
+        )
+        self.assertIsNone(err)
+        buy_result, err = buy_listing_for_npc(other := NpcDefinition.objects.get(agent_id="90012"), listing.pk, 1)
+        self.assertIsNone(err)
+        self.assertIsNotNone(buy_result["transaction"])
+
+        success, code, data = execute_agent_query("10011", "BROWSE_MARKETPLACE")
+        self.assertTrue(success, code)
+        self.assertEqual(data["listings"][0]["listingId"], listing.pk)
+        self.assertIn("sellerName", data["listings"][0])
+
+        success, code, data = execute_agent_query("10011", "CHECK_MY_MARKETPLACE_LISTINGS")
+        self.assertTrue(success, code)
+        self.assertEqual(data["listings"][0]["listingId"], listing.pk)
+        self.assertIn("remainingAmount", data["listings"][0])
+
+        success, code, data = execute_agent_query("10011", "CHECK_MARKETPLACE_HISTORY")
+        self.assertTrue(success, code)
+        self.assertEqual(data["transactions"][0]["listingId"], listing.pk)
+        self.assertEqual(data["transactions"][0]["buyerName"], "jack")

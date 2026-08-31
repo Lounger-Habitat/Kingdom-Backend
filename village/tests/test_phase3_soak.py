@@ -139,7 +139,7 @@ class Phase3SoakTest(TestCase):
         NpcGlobalInventorySlot.objects.create(
             bag=bill_inv, slot_index=1, item_id=1051, item_amount=30,
         )
-        NpcGlobalInventorySlot.objects.create(
+        bill_food = NpcGlobalInventorySlot.objects.create(
             bag=bill_inv, slot_index=2, item_id=1030, item_amount=20,
             produced_world_minute=600,
         )
@@ -257,7 +257,8 @@ class Phase3SoakTest(TestCase):
                 bill_inv.refresh_from_db()
                 _track(commit_economy_action(_payload(
                     "EAT", 10011, "BILL_FARM",
-                    {"source": "PERSONAL_INVENTORY"},
+                    {"source": "PERSONAL_INVENTORY",
+                     "food_instance_id": str(bill_food.instance_id)},
                     wm=current_wm,
                 )))
 

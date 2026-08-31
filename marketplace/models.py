@@ -2,10 +2,12 @@ import uuid
 from django.conf import settings
 from django.db import models
 from account.models import GameAccount
+from inventory.models import NpcDefinition
 
 
 class MarketListingSource(models.TextChoices):
     PLAYER = "player", "玩家"
+    NPC = "npc", "NPC"
     SYSTEM = "system", "系统"
 
 
@@ -22,6 +24,10 @@ class MarketListing(models.Model):
     )
     seller = models.ForeignKey(
         GameAccount, on_delete=models.CASCADE,
+        null=True, blank=True, related_name="market_listings",
+    )
+    seller_npc = models.ForeignKey(
+        NpcDefinition, on_delete=models.CASCADE,
         null=True, blank=True, related_name="market_listings",
     )
     created_by_admin = models.ForeignKey(
@@ -67,13 +73,41 @@ class MarketListing(models.Model):
             models.Index(fields=["source_type", "status"]),
             models.Index(fields=["status", "item_id"]),
             models.Index(fields=["seller", "status"]),
+            models.Index(fields=["seller_npc", "status"]),
             models.Index(fields=["status", "price"]),
             models.Index(fields=["expires_at"]),
             models.Index(fields=["created_at"]),
         ]
+        constraints = [
+            models.CheckConstraint(
+                name="market_listing_source_owner_valid",
+                condition=(
+                    (
+                        models.Q(source_type=MarketListingSource.PLAYER)
+                        & models.Q(seller__isnull=False)
+                        & models.Q(seller_npc__isnull=True)
+                    )
+                    | (
+                        models.Q(source_type=MarketListingSource.NPC)
+                        & models.Q(seller__isnull=True)
+                        & models.Q(seller_npc__isnull=False)
+                    )
+                    | (
+                        models.Q(source_type=MarketListingSource.SYSTEM)
+                        & models.Q(seller__isnull=True)
+                        & models.Q(seller_npc__isnull=True)
+                    )
+                ),
+            ),
+        ]
 
     def __str__(self):
-        seller_name = self.seller.username if self.seller else "系统"
+        if self.seller:
+            seller_name = self.seller.username
+        elif self.seller_npc:
+            seller_name = self.seller_npc.name
+        else:
+            seller_name = "系统"
         return f"Listing #{self.pk} [{seller_name}] item={self.item_id} x{self.remaining_amount}/{self.total_amount} @{self.price}"
 
 
@@ -84,7 +118,18 @@ class MarketTransaction(models.Model):
         GameAccount, on_delete=models.SET_NULL,
         null=True, blank=True, related_name="market_sales",
     )
-    buyer = models.ForeignKey(GameAccount, on_delete=models.CASCADE, related_name="market_purchases")
+    seller_npc = models.ForeignKey(
+        NpcDefinition, on_delete=models.SET_NULL,
+        null=True, blank=True, related_name="market_sales",
+    )
+    buyer = models.ForeignKey(
+        GameAccount, on_delete=models.CASCADE,
+        null=True, blank=True, related_name="market_purchases",
+    )
+    buyer_npc = models.ForeignKey(
+        NpcDefinition, on_delete=models.CASCADE,
+        null=True, blank=True, related_name="market_purchases",
+    )
     item_id = models.IntegerField()
     item_name_snapshot = models.CharField(max_length=100, default="", blank=True)
     amount = models.IntegerField()
@@ -102,10 +147,42 @@ class MarketTransaction(models.Model):
         indexes = [
             models.Index(fields=["listing"]),
             models.Index(fields=["seller", "created_at"]),
+            models.Index(fields=["seller_npc", "created_at"]),
             models.Index(fields=["buyer", "created_at"]),
+            models.Index(fields=["buyer_npc", "created_at"]),
             models.Index(fields=["source_type", "created_at"]),
             models.Index(fields=["item_id", "created_at"]),
         ]
+        constraints = [
+            models.CheckConstraint(
+                name="market_transaction_source_owner_valid",
+                condition=(
+                    (
+                        models.Q(source_type=MarketListingSource.PLAYER)
+                        & models.Q(seller__isnull=False)
+                        & models.Q(seller_npc__isnull=True)
+                    )
+                    | (
+                        models.Q(source_type=MarketListingSource.NPC)
+                        & models.Q(seller__isnull=True)
+                        & models.Q(seller_npc__isnull=False)
+                    )
+                    | (
+                        models.Q(source_type=MarketListingSource.SYSTEM)
+                        & models.Q(seller__isnull=True)
+                        & models.Q(seller_npc__isnull=True)
+                    )
+                ),
+            ),
+            models.CheckConstraint(
+                name="market_transaction_buyer_identity_valid",
+                condition=(
+                    (models.Q(buyer__isnull=False) & models.Q(buyer_npc__isnull=True))
+                    | (models.Q(buyer__isnull=True) & models.Q(buyer_npc__isnull=False))
+                ),
+            ),
+        ]
 
     def __str__(self):
-        return f"Tx #{self.pk} listing={self.listing_id} {self.amount}x @{self.unit_price} -> {self.buyer_id}"
+        buyer_id = self.buyer_id or self.buyer_npc_id
+        return f"Tx #{self.pk} listing={self.listing_id} {self.amount}x @{self.unit_price} -> {buyer_id}"

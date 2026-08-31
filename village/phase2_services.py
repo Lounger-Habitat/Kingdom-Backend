@@ -11,6 +11,7 @@ from dataclasses import dataclass
 from typing import Any, Dict, Iterable, Optional, Sequence
 
 from django.db import IntegrityError, transaction
+from django.db.models import Q
 
 from game_time.models import GlobalGameTimeState
 from inventory.models import NpcGlobalInventory, NpcGlobalInventorySlot
@@ -18,6 +19,7 @@ from items.models import Item, ItemType
 
 from .models import (
     NpcActionReservation,
+    NpcDialogueSession,
     NpcNeedsDaySummary,
     NpcProfile,
     NpcRuntimeState,
@@ -30,7 +32,7 @@ from .models import (
     VillageWorldEvent,
     NpcCommandState,
 )
-from .runtime_services import CommandService, ResultCode, _fast_integration_enabled
+from .runtime_services import CommandService, ResultCode, TimeService, _fast_integration_enabled
 
 
 NEEDS_FIELDS = ("hunger", "energy", "health", "social", "stress")
@@ -49,6 +51,39 @@ RATES = {
     "REST": {"hunger": 20, "energy": 60, "social": 10, "stress": -40},
     "SLEEP": {"hunger": 10, "energy": 100, "social": 0, "stress": -20},
 }
+
+# RATES is the legacy total effect for an activity.  The authoritative split
+# is a fixed IDLE-like base applied by the world Tick plus an action delta
+# applied once when the action settles.
+BASE_RATES = dict(RATES["IDLE"])
+ACTION_DELTAS = {
+    activity: {
+        name: rate - BASE_RATES.get(name, 0)
+        for name, rate in rates.items()
+        if rate - BASE_RATES.get(name, 0)
+    }
+    for activity, rates in RATES.items()
+}
+ACTION_DELTA_ACTIVITIES = {
+    "MOVE": "MOVE", "GO_HOME": "MOVE",
+    "WORK_PLACEHOLDER": "WORK",
+    "PLANT": "WORK", "HARVEST": "WORK", "HUNT": "WORK", "COOK": "WORK",
+}
+
+
+def settle_action_needs_locked(
+    runtime: NpcRuntimeState, action: str, started: Optional[int], ended: Optional[int],
+    *, base_until: Optional[int] = None,
+) -> Optional[str]:
+    """Catch up fixed base and append one action delta for a settled action."""
+    activity = ACTION_DELTA_ACTIVITIES.get(action)
+    if not activity or started is None or ended is None or ended <= started:
+        return None
+    if base_until is not None and runtime.needs_world_minute < base_until:
+        error = NeedsService.advance_base_locked(runtime, base_until, finalize_days=False)
+        if error:
+            return error
+    return NeedsService.apply_behavior_delta_locked(runtime, started, ended, activity)
 
 
 def _hash(payload: Dict[str, Any]) -> str:
@@ -99,6 +134,13 @@ def needs_rules() -> Dict[str, Any]:
         "effects_per_30_minutes": {
             activity: {name: rate / NEEDS_SCALE for name, rate in rates.items()}
             for activity, rates in RATES.items()
+        },
+        "base_effects_per_30_minutes": {
+            name: rate / NEEDS_SCALE for name, rate in BASE_RATES.items()
+        },
+        "behavior_delta_effects_per_30_minutes": {
+            activity: {name: rate / NEEDS_SCALE for name, rate in rates.items()}
+            for activity, rates in ACTION_DELTAS.items()
         },
         "eat_completion_effect": {"hunger": -45, "energy": 5},
         "socialize_daily_effect_percent": [100, 50, 25],
@@ -237,6 +279,71 @@ class NeedsService:
         summary.save(update_fields=["sleep_minutes", "severe_hunger_minutes", "updated_at"])
 
     @classmethod
+    def _apply_base_segment(cls, runtime: NpcRuntimeState, start: int, end: int) -> None:
+        """Apply only the fixed world-time Needs base for one day segment."""
+        summary = cls._summary(runtime, start // MINUTES_PER_DAY)
+        for _minute in range(start, end):
+            severe = runtime.hunger_fp >= 900
+            if severe:
+                summary.severe_hunger_minutes += 1
+                cls._apply_rate(runtime, "stress", 20, 1)
+            for name, rate in BASE_RATES.items():
+                cls._apply_rate(runtime, name, rate, 1)
+        summary.save(update_fields=["severe_hunger_minutes", "updated_at"])
+
+    @classmethod
+    def advance_base_locked(
+        cls, runtime: NpcRuntimeState, target: int, *, finalize_days: bool = True,
+    ) -> Optional[str]:
+        """Advance a runtime to target using only the fixed base rates."""
+        if target < runtime.needs_world_minute:
+            return ResultCode.STALE_NEEDS_MINUTE
+        if target == runtime.needs_world_minute:
+            return None
+        cursor = runtime.needs_world_minute
+        while cursor < target:
+            next_day = ((cursor // MINUTES_PER_DAY) + 1) * MINUTES_PER_DAY
+            segment_end = min(target, next_day)
+            cls._apply_base_segment(runtime, cursor, segment_end)
+            if finalize_days and segment_end == next_day:
+                cls._finalize_day(runtime, cursor // MINUTES_PER_DAY)
+            cursor = segment_end
+        runtime.needs_world_minute = target
+        return None
+
+    @classmethod
+    def _apply_extra_segment(
+        cls, runtime: NpcRuntimeState, activity: str, start: int, end: int,
+        multiplier_percent: int = 100,
+    ) -> None:
+        summary = cls._summary(runtime, start // MINUTES_PER_DAY)
+        deltas = ACTION_DELTAS[activity]
+        for _minute in range(start, end):
+            if activity == "SLEEP":
+                summary.sleep_minutes += 1
+            for name, rate in deltas.items():
+                if multiplier_percent == 100:
+                    cls._apply_rate(runtime, name, rate, 1)
+                else:
+                    cls._apply_scaled_rate(runtime, name, rate, 1, multiplier_percent)
+        summary.save(update_fields=["sleep_minutes", "updated_at"])
+
+    @classmethod
+    def apply_behavior_delta_locked(
+        cls, runtime: NpcRuntimeState, start: int, end: int, activity: str,
+        multiplier_percent: int = 100,
+    ) -> Optional[str]:
+        """Apply one action's incremental effect without moving the Needs cursor."""
+        if activity not in ACTION_DELTAS or end <= start:
+            return ResultCode.INVALID_ACTIVITY_INTERVAL if end <= start else ResultCode.UNKNOWN_ACTION
+        cursor = start
+        while cursor < end:
+            segment_end = min(end, ((cursor // MINUTES_PER_DAY) + 1) * MINUTES_PER_DAY)
+            cls._apply_extra_segment(runtime, activity, cursor, segment_end, multiplier_percent)
+            cursor = segment_end
+        return None
+
+    @classmethod
     def _finalize_day(cls, runtime: NpcRuntimeState, day_index: int) -> None:
         summary = cls._summary(runtime, day_index)
         if summary.finalized:
@@ -319,10 +426,6 @@ class NeedsService:
             )
         except NpcRuntimeState.DoesNotExist:
             return _result(False, ResultCode.BACKEND_UNAVAILABLE)
-        if NpcActionReservation.objects.filter(
-            participants=runtime.npc, action_kind="SOCIALIZE", status="HELD", active_lock_key__isnull=False
-        ).exists():
-            return _result(False, ResultCode.RESERVATION_CONFLICT)
         if payload["advance_to_world_minute"] > time_state.world_minute:
             return _result(False, ResultCode.STALE_NEEDS_MINUTE)
         if runtime.state_version != payload["expected_state_version"]:
@@ -348,6 +451,141 @@ class NeedsService:
         )
         public_response = {key: value for key, value in data.items() if key != "request_payload_sha256"}
         return _result(True, ResultCode.LIFE_ACTION_COMPLETED, receipt=receipt, **public_response)
+
+
+class _TickRejected(Exception):
+    def __init__(self, result: Dict[str, Any]):
+        self.result = result
+
+
+class TickService:
+    """Persist Unity's clock and apply elapsed-time Needs for formal NPCs."""
+
+    @classmethod
+    def advance(cls, payload: Dict[str, Any]) -> Dict[str, Any]:
+        allowed = {"world_minute", "time_revision", "request_id"}
+        legacy_allowed = {"world_minute", "expected_time_revision", "request_id"}
+        if not any(set(payload) == candidate for candidate in (
+                allowed, allowed | {"needs_requests"}, legacy_allowed,
+                legacy_allowed | {"needs_requests"})):
+            return _result(False, ResultCode.INVALID_COMMAND_SCHEMA)
+        try:
+            request_id = uuid.UUID(str(payload["request_id"]))
+        except (ValueError, TypeError):
+            return _result(False, ResultCode.INVALID_COMMAND_SCHEMA)
+        if (isinstance(payload["world_minute"], bool)
+                or isinstance(payload.get("time_revision", payload.get("expected_time_revision")), bool)
+                or not isinstance(payload["world_minute"], int)
+                or not isinstance(payload.get("time_revision", payload.get("expected_time_revision")), int)):
+            return _result(False, ResultCode.INVALID_COMMAND_SCHEMA)
+        if "time_revision" not in payload:
+            # Legacy field was the pre-Unity CAS revision; Unity's resulting
+            # revision is one greater.  New callers must send time_revision.
+            payload["time_revision"] = payload.pop("expected_time_revision") + 1
+        # Accept the old envelope during rollout, but never trust its activity
+        # intervals: the Tick has one authoritative base rate for every NPC.
+        legacy_requests = payload.get("needs_requests")
+        if legacy_requests is not None:
+            if not isinstance(legacy_requests, list):
+                return _result(False, ResultCode.INVALID_COMMAND_SCHEMA)
+            if any(not isinstance(item, dict) or "npc_id" not in item for item in legacy_requests):
+                return _result(False, ResultCode.INVALID_COMMAND_SCHEMA)
+            npc_ids = [str(item["npc_id"]) for item in legacy_requests]
+            if len(npc_ids) != len(legacy_requests) or len(npc_ids) != len(set(npc_ids)):
+                return _result(False, ResultCode.INVALID_COMMAND_SCHEMA)
+            if any(item.get("advance_to_world_minute") != payload["world_minute"] for item in legacy_requests):
+                return _result(False, ResultCode.INVALID_COMMAND_SCHEMA)
+
+        payload_hash = _hash(payload)
+        existing = VillageActionReceipt.objects.filter(request_id=request_id).first()
+        if existing:
+            if (existing.action_kind == "VILLAGE_TICK"
+                    and existing.response_data.get("request_payload_sha256") == payload_hash):
+                data = {key: value for key, value in existing.response_data.items()
+                        if key != "request_payload_sha256"}
+                return _result(True, ResultCode.COMMAND_REPLAYED, receipt=existing, **data)
+            return _result(False, ResultCode.REQUEST_ID_CONFLICT)
+        # A second delivery of the same Unity clock observation is a replay
+        # even if transport assigned a new request id.
+        existing_tick = VillageActionReceipt.objects.filter(
+            action_kind="VILLAGE_TICK", world_minute=payload["world_minute"]
+        ).first()
+        if existing_tick:
+            data = {key: value for key, value in existing_tick.response_data.items()
+                    if key != "request_payload_sha256"}
+            return _result(True, ResultCode.COMMAND_REPLAYED, receipt=existing_tick, **data)
+        try:
+            return cls._advance_atomic(payload, request_id, payload_hash)
+        except _TickRejected as rejected:
+            return rejected.result
+
+    @staticmethod
+    @transaction.atomic
+    def _advance_atomic(payload: Dict[str, Any], request_id: uuid.UUID, payload_hash: str) -> Dict[str, Any]:
+        # Unity already advanced its authoritative clock.  Backend only
+        # accepts the monotonic observation, then applies elapsed-time
+        # projections atomically with the NPC updates.
+        success, code, state = TimeService.receive_time(payload["world_minute"], payload["time_revision"])
+        if not success:
+            raise _TickRejected(_result(False, code))
+
+        receipt = VillageActionReceipt.objects.create(
+            request_id=request_id,
+            action_kind="VILLAGE_TICK",
+            success=True,
+            result_code=ResultCode.COMMAND_ACCEPTED,
+            world_minute=state.world_minute,
+            time_revision=state.time_revision,
+        )
+
+        legacy_versions = {
+            str(item["npc_id"]): item.get("expected_state_version")
+            for item in payload.get("needs_requests", [])
+        }
+        runtimes = list(
+            NpcRuntimeState.objects.select_for_update().select_related("npc")
+            .filter(npc__is_test_only=False)
+            .order_by("npc__agent_id")
+        )
+        npc_results = {}
+        for runtime in runtimes:
+            npc_id = str(runtime.npc.agent_id)
+            if npc_id in legacy_versions and runtime.state_version != legacy_versions[npc_id]:
+                raise _TickRejected(_result(
+                    False, ResultCode.STALE_STATE_VERSION, npc_id=npc_id,
+                    state_version=runtime.state_version,
+                ))
+            if runtime.needs_world_minute >= payload["world_minute"]:
+                npc_results[npc_id] = {
+                    "public_needs": public_needs(runtime),
+                    "needs_world_minute": runtime.needs_world_minute,
+                    "state_version": runtime.state_version,
+                }
+                continue
+            error = NeedsService.advance_base_locked(runtime, payload["world_minute"])
+            if error:
+                raise _TickRejected(_result(False, error, npc_id=npc_id))
+            runtime.state_version += 1
+            runtime.time_revision = state.time_revision
+            runtime.save()
+            npc_results[npc_id] = {
+                "public_needs": public_needs(runtime),
+                "needs_world_minute": runtime.needs_world_minute,
+                "state_version": runtime.state_version,
+            }
+
+        data = {
+            "request_payload_sha256": payload_hash,
+            "world_minute": receipt.world_minute,
+            "time_revision": receipt.time_revision,
+            "npc_results": npc_results,
+        }
+        receipt.action_kind = "VILLAGE_TICK"
+        receipt.response_data = data
+        receipt.save(update_fields=["action_kind", "response_data"])
+        return _result(True, ResultCode.COMMAND_ACCEPTED, receipt=receipt,
+                       world_minute=receipt.world_minute, time_revision=receipt.time_revision,
+                       npc_results=npc_results)
 
 
 class LifeActionService:
@@ -434,6 +672,7 @@ class LifeActionService:
             "schema_version": "village.outcome.v1", "ref_id": str(command_id),
             "original_message_id": str(command.message_id),
             "request_id": str(receipt.request_id), "npc_id": str(runtime.npc.agent_id),
+            "action": action,
             "success": success, "result_code": code, "reason_code": reason_code,
             "world_event_id": str(event.event_id), "world_minute": time_state.world_minute,
             "time_revision": time_state.time_revision, "state_version": runtime.state_version,
@@ -578,13 +817,16 @@ class LifeActionService:
         if runtime.action_status not in {"ACTING", "SLEEPING"}:
             return terminal(ResultCode.NPC_BUSY)
 
-        if not fast_integration and runtime.state_version != payload["expected_state_version"]:
+        # A world Tick may advance this row while the action is running.  The
+        # command identity checks above remain authoritative; its start-time
+        # state_version is only a snapshot, not a settlement lock.
+        if not fast_integration and runtime.state_version < payload["expected_state_version"]:
             return terminal(ResultCode.STALE_STATE_VERSION)
         profile = NpcProfile.objects.filter(npc=runtime.npc, is_active=True).first()
         if not fast_integration and not profile:
             return terminal(ResultCode.INVALID_ACTION_LOCATION)
         location = payload["location_code"]
-        if not fast_integration and (start < runtime.needs_world_minute or start > time_state.world_minute):
+        if not fast_integration and start > time_state.world_minute:
             return terminal(ResultCode.STALE_NEEDS_MINUTE)
         if not fast_integration and runtime.current_location_code != location:
             return terminal(ResultCode.INVALID_ACTION_LOCATION)
@@ -613,8 +855,6 @@ class LifeActionService:
                     (other.action_status != "IDLE" or other.current_location_code != runtime.current_location_code or
                      location != runtime.current_location_code)):
                 return terminal(ResultCode.SOCIAL_TARGET_BUSY)
-            if not fast_integration and start < other.needs_world_minute:
-                return terminal(ResultCode.STALE_NEEDS_MINUTE)
         elif not fast_integration and action != "EAT" and not cls._location_open(location):
             return terminal(ResultCode.LOCATION_CLOSED)
 
@@ -664,11 +904,7 @@ class LifeActionService:
         # prevents a stale cursor from bypassing hunger/energy/health limits.
         actor_needs_start = runtime.needs_world_minute
         if runtime.needs_world_minute < start:
-            error = NeedsService.advance_locked(
-                runtime, start,
-                [{"interval_id": str(uuid.uuid4()), "start_world_minute": runtime.needs_world_minute,
-                  "end_world_minute": start, "activity": "IDLE"}],
-            )
+            error = NeedsService.advance_base_locked(runtime, start)
             if error:
                 return terminal(error)
         if action == "WORK_PLACEHOLDER" and not fast_integration:
@@ -689,45 +925,41 @@ class LifeActionService:
         # EAT has no separate interval rate in the frozen activity vocabulary;
         # its only special needs effect is the committed completion effect.
         activity = "WORK" if action == "WORK_PLACEHOLDER" else "IDLE" if action == "EAT" else action
+        if action != "SOCIALIZE" and runtime.needs_world_minute < end:
+            error = NeedsService.advance_base_locked(runtime, end, finalize_days=False)
+            if error:
+                return terminal(error)
         if action != "SOCIALIZE":
-            # fast 模式下 needs 游标会被实时推进，可能已越过动作开始时间；
-            # 区间起点取两者较大值，避免 validate_intervals 因起点滞后而拒绝结算。
-            interval_start = max(start, runtime.needs_world_minute) if fast_integration else start
-            if interval_start < end:
-                error = NeedsService.advance_locked(
-                    runtime, end,
-                    [{"interval_id": str(uuid.uuid4()), "start_world_minute": interval_start,
-                      "end_world_minute": end, "activity": activity}],
-                    finalize_days=False,
-                )
-                if error:
-                    return terminal(error)
+            error = NeedsService.apply_behavior_delta_locked(runtime, start, end, activity)
+            if error:
+                return terminal(error)
         effects: Dict[str, Any] = {}
         if action == "SOCIALIZE":
             other = runtime_by_id[target_id]
             other_needs_start = other.needs_world_minute
             if other.needs_world_minute < start:
-                other_error = NeedsService.advance_locked(
-                    other, start,
-                    [{"interval_id": str(uuid.uuid4()), "start_world_minute": other.needs_world_minute,
-                      "end_world_minute": start, "activity": "IDLE"}],
-                )
+                other_error = NeedsService.advance_base_locked(other, start)
                 if other_error:
                     return terminal(other_error)
             if not fast_integration and other.health_fp <= 300:
                 return terminal(ResultCode.HEALTH_TOO_LOW)
+            if runtime.needs_world_minute < end:
+                actor_error = NeedsService.advance_base_locked(runtime, end, finalize_days=False)
+            else:
+                actor_error = None
+            if other.needs_world_minute < end:
+                other_error = NeedsService.advance_base_locked(other, end, finalize_days=False)
+            else:
+                other_error = None
+            if actor_error or other_error:
+                return terminal(actor_error or other_error)
             low, high = sorted((runtime, other), key=lambda rt: str(rt.npc.agent_id))
             day_index = (end - 1) // MINUTES_PER_DAY
             counter, _ = NpcSocialDailyCounter.objects.select_for_update().get_or_create(low_npc=low.npc, high_npc=high.npc, day_index=day_index)
             multiplier = 100 if counter.socialize_count == 0 else 50 if counter.socialize_count == 1 else 25
             counter.socialize_count += 1; counter.save(update_fields=["socialize_count", "updated_at"])
-            # fast 模式下 checkpoint 会把 needs 游标实时推到动作起点之后（与
-            # line 656 非社交动作的宽容一致）：结算区间起点取 max(start, 游标)，
-            # 避免 advance_social_scaled_locked 因游标超前而拒绝结算。
-            actor_span_start = max(start, runtime.needs_world_minute) if fast_integration else start
-            other_span_start = max(start, other.needs_world_minute) if fast_integration else start
-            actor_error = NeedsService.advance_social_scaled_locked(runtime, actor_span_start, end, multiplier)
-            other_error = NeedsService.advance_social_scaled_locked(other, other_span_start, end, multiplier)
+            actor_error = NeedsService.apply_behavior_delta_locked(runtime, start, end, "SOCIALIZE", multiplier)
+            other_error = NeedsService.apply_behavior_delta_locked(other, start, end, "SOCIALIZE", multiplier)
             if actor_error or other_error:
                 return terminal(actor_error or other_error)
             reservation = prepared["reservation"]
@@ -763,6 +995,7 @@ class LifeActionService:
             effects = {"items": [], "money": [], "needs": {}, "relationships": []}
         else:
             effects = {"items": [], "money": [], "needs": {}, "relationships": []}
+        action_end_needs = public_needs(runtime)
 
         # A life action applies its committed completion effect before any day
         # boundary health correction, exactly once for every crossed absolute
@@ -771,8 +1004,14 @@ class LifeActionService:
         if action == "SOCIALIZE":
             participant_starts[other.pk] = other_needs_start
         for participant in runtimes:
+            if participant.needs_world_minute < time_state.world_minute:
+                error = NeedsService.advance_base_locked(
+                    participant, time_state.world_minute, finalize_days=False
+                )
+                if error:
+                    return terminal(error)
             first_day = participant_starts.get(participant.pk, participant.needs_world_minute) // MINUTES_PER_DAY
-            for day_index in range(first_day, end // MINUTES_PER_DAY):
+            for day_index in range(first_day, time_state.world_minute // MINUTES_PER_DAY):
                 NeedsService._finalize_day(participant, day_index)
             participant.state_version += 1
             participant.time_revision = time_state.time_revision
@@ -783,7 +1022,7 @@ class LifeActionService:
                 participant.action_ends_world_minute = None
                 participant.active_command_id = None
             participant.save()
-        actor_end_needs = public_needs(runtime)
+        actor_end_needs = action_end_needs
         if action == "EAT":
             effects["needs"] = {"hunger": -45.0, "energy": 5.0}
         else:
@@ -853,10 +1092,12 @@ class LifeActionService:
         end = max(start, min(time_state.world_minute, planned_end))
         before = public_needs(runtime)
         if runtime.needs_world_minute < end:
-            intervals = cls._intervals(runtime, max(start, runtime.needs_world_minute), end, "SLEEP")
-            error = NeedsService.advance_locked(runtime, end, intervals, finalize_days=False)
+            error = NeedsService.advance_base_locked(runtime, end, finalize_days=False)
             if error:
                 return _result(False, error)
+        error = NeedsService.apply_behavior_delta_locked(runtime, start, end, "SLEEP")
+        if error:
+            return _result(False, error)
         for day_index in range(start // MINUTES_PER_DAY, end // MINUTES_PER_DAY):
             NeedsService._finalize_day(runtime, day_index)
 
@@ -925,10 +1166,11 @@ def runtime_summary(npc_id: str) -> Dict[str, Any]:
         "world_minute", flat=True
     ).first() or 0
     actions = CommandService.allowed_actions_for(runtime.npc)
+    actions.discard("SOCIALIZE")
     if not _fast_integration_enabled():
         config = VillageSimulationConfig.objects.filter(config_key="default").first()
         if not config or not config.village_needs_enabled:
-            actions -= CommandService.PHASE2_ACTIONS
+            actions -= CommandService.PHASE2_ACTIONS | CommandService.DIALOGUE_ACTIONS
         if not config or not config.village_economy_enabled:
             actions -= CommandService.PHASE3_ACTIONS
         elif not config.village_direct_trade_enabled:
@@ -937,13 +1179,21 @@ def runtime_summary(npc_id: str) -> Dict[str, Any]:
             actions -= CommandService.PHASE4_ACTIONS
         if not config or not config.village_story_enabled:
             actions -= CommandService.STORY_ACTIONS
+    active_dialogue = NpcDialogueSession.objects.filter(
+        Q(initiator=runtime.npc) | Q(target=runtime.npc), status="ACTIVE"
+    ).first()
     unavailable_reasons = {}
     available = []
     for action in sorted(actions):
         if action in CommandService.READ_QUERY_ACTIONS:
             available.append(action)
             continue
-        reason = ResultCode.NPC_BUSY if runtime.action_status != "IDLE" else CommandService.unavailable_reason(action, runtime)
+        if active_dialogue:
+            reason = None if action == "SPEAK" else ResultCode.NPC_BUSY
+        elif action == "SPEAK":
+            reason = ResultCode.DIALOGUE_NOT_ACTIVE
+        else:
+            reason = ResultCode.NPC_BUSY if runtime.action_status != "IDLE" else CommandService.unavailable_reason(action, runtime)
         if reason:
             unavailable_reasons[action] = reason
         else:
@@ -974,13 +1224,14 @@ def runtime_summary(npc_id: str) -> Dict[str, Any]:
         npc_id=str(runtime.npc.agent_id), state_version=runtime.state_version,
         world_minute=world_minute,
         needs_world_minute=runtime.needs_world_minute, public_needs=public_needs(runtime),
-        action_status=runtime.action_status,
-        current_action=runtime.current_action or None,
-        action_started_world_minute=runtime.action_started_world_minute,
+        action_status="DIALOGUING" if active_dialogue else runtime.action_status,
+        current_action="DIALOGUE" if active_dialogue else runtime.current_action or None,
+        action_started_world_minute=active_dialogue.started_world_minute if active_dialogue else runtime.action_started_world_minute,
         active_command_id=str(runtime.active_command_id) if runtime.active_command_id else None,
-        action_ends_world_minute=runtime.action_ends_world_minute,
-        remaining_minutes=max(0, runtime.action_ends_world_minute - world_minute)
-        if runtime.action_ends_world_minute is not None else None,
+        action_ends_world_minute=active_dialogue.expires_world_minute if active_dialogue else runtime.action_ends_world_minute,
+        remaining_minutes=max(0, active_dialogue.expires_world_minute - world_minute) if active_dialogue else
+        (max(0, runtime.action_ends_world_minute - world_minute)
+         if runtime.action_ends_world_minute is not None else None),
         need_bands=need_bands(runtime), active_reservation=reservation_data,
         available_actions=available, unavailable_reasons=unavailable_reasons,
     )
