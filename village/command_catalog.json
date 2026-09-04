@@ -508,7 +508,7 @@
       "name": "LIST_STORE_ITEM",
       "phase": "阶段三",
       "label": "上架商品",
-      "description": "经营 NPC 将个人物品转入自己经营的商店并上架。Nora杂货铺使用GENERAL_STORE，地点为GENERAL_STORE；Lucy饭店使用RESTAURANT_STORE，地点为RESTAURANT。",
+      "description": "经营 NPC 将个人库存中的任意真实物品转入自己经营的商店并上架。先查看 INSPECT_INVENTORY 和 INSPECT_MARKET_STATE，由 Agent 自主选择物品、数量和价格；上架必须使用 CUSTOM 并填写正整数 custom_unit_price。Nora杂货铺使用GENERAL_STORE，地点为GENERAL_STORE；Lucy饭店使用RESTAURANT_STORE，地点为RESTAURANT。",
       "parameters": {
         "type": "object",
         "properties": {
@@ -530,14 +530,11 @@
           "price_mode": {
             "type": "string",
             "description": "定价方式",
-            "enum": [
-              "ORIGINAL",
-              "CUSTOM"
-            ]
+            "enum": ["CUSTOM"]
           },
           "custom_unit_price": {
             "type": "integer",
-            "description": "自定义单价；自定义定价时必填",
+            "description": "Agent 根据库存、需求、参考价格和风险自主决定的单价，必须为正整数",
             "minimum": 1
           }
         },
@@ -545,7 +542,8 @@
           "store_code",
           "item_id",
           "amount",
-          "price_mode"
+          "price_mode",
+          "custom_unit_price"
         ]
       }
     },

@@ -8,9 +8,10 @@ from rest_framework.response import Response
 
 from account.env_auth import EnvServerJWTAuthentication
 
-from .command_catalog import COMMAND_CATALOG, agent_tool
+from .command_catalog import AGENT_INSTRUCTION_ACTIONS, COMMAND_CATALOG, agent_tool
 from .models import (
     NpcProfile,
+    VillageActionReceipt,
     VillageLocationDefinition,
     VillageSimulationConfig,
 )
@@ -507,6 +508,60 @@ def npc_agent_query(request, npc_id, query_name):
     success, result_code, data = execute_agent_query(npc_id, query_name, request.query_params)
     status = 200 if success else 404 if result_code in {"NPC_NOT_FOUND", "UNKNOWN_QUERY"} else 409
     return Response({"success": success, "resultCode": result_code, "data": data}, status=status)
+
+
+@api_view(["POST"])
+@authentication_classes([EnvServerJWTAuthentication])
+@permission_classes([IsAuthenticated])
+def instruction_outcome_record(request):
+    """Persist terminal outcomes for Agent instructions that bypass command lifecycle."""
+    data = request.data
+    action = str(data.get("action", "")).upper()
+    npc_id = str(data.get("npc_id", ""))
+    raw_request_id = str(
+        data.get("request_id") or data.get("ref_id") or data.get("original_message_id") or ""
+    )
+    try:
+        world_minute = int(data.get("world_minute"))
+        time_revision = int(data.get("time_revision"))
+        state_version = data.get("state_version")
+        state_version = int(state_version) if state_version is not None else None
+    except (TypeError, ValueError):
+        return Response({"success": False, "resultCode": "INVALID_COMMAND_SCHEMA"}, status=400)
+    try:
+        request_id = uuid.UUID(raw_request_id)
+    except (TypeError, ValueError, AttributeError):
+        request_id = uuid.uuid5(
+            uuid.NAMESPACE_URL, f"kingdom:village:agent-instruction:{npc_id}:{action}:{raw_request_id}"
+        )
+    success = data.get("success")
+    result_code = str(data.get("result_code", ""))
+    parameters = data.get("params", {})
+    profile = NpcProfile.objects.select_related("npc").filter(
+        npc__agent_id=npc_id, npc__is_test_only=False, is_active=True
+    ).first()
+    if (not raw_request_id or len(raw_request_id) > 128 or action not in AGENT_INSTRUCTION_ACTIONS
+            or profile is None or not isinstance(success, bool)
+            or not isinstance(parameters, dict) or world_minute < 0 or time_revision < 0
+            or (state_version is not None and state_version < 0)
+            or len(result_code) > 64):
+        return Response({"success": False, "resultCode": "INVALID_COMMAND_SCHEMA"}, status=400)
+    receipt, created = VillageActionReceipt.objects.get_or_create(
+        request_id=request_id,
+        defaults={
+            "npc": profile.npc,
+            "action_kind": action,
+            "success": success,
+            "result_code": result_code,
+            "response_data": {"parameters": parameters},
+            "world_minute": world_minute,
+            "time_revision": time_revision,
+            "state_version": state_version,
+        },
+    )
+    if receipt.npc_id != profile.npc_id or receipt.action_kind != action:
+        return Response({"success": False, "resultCode": "REQUEST_CONFLICT"}, status=409)
+    return Response({"success": True, "resultCode": "RECORDED" if created else "REPLAYED"})
 
 
 @api_view(["GET"])

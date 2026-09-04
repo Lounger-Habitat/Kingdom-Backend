@@ -37,10 +37,10 @@ from .phase3_catalog import (
     CORN_YIELD_MIN,
     DISH_SPOILAGE_MINUTES,
     FARM_TOOL_ITEM_ID,
-    HUNT_CHICKEN_OUTPUT_ITEM_ID,
-    HUNT_CHICKEN_SPOILAGE_MINUTES,
-    HUNT_CHICKEN_YIELD_MAX,
-    HUNT_CHICKEN_YIELD_MIN,
+    HUNT_MEAT_ITEM_IDS,
+    HUNT_MEAT_SPOILAGE_MINUTES,
+    HUNT_MEAT_YIELD_MAX,
+    HUNT_MEAT_YIELD_MIN,
     HUNT_TOOL_ITEM_ID,
     RECIPE_WHITELIST,
 )
@@ -267,15 +267,16 @@ def _do_hunt(
         # Deterministic yield
         day_index = world_minute // 1440
         rng = deterministic_rng(request_id, "HUNT", day_index)
-        chicken_amount = rng.randint(HUNT_CHICKEN_YIELD_MIN, HUNT_CHICKEN_YIELD_MAX)
+        meat_item_id = rng.choice(HUNT_MEAT_ITEM_IDS)
+        meat_amount = rng.randint(HUNT_MEAT_YIELD_MIN, HUNT_MEAT_YIELD_MAX)
 
-        # Add chicken with expiry
+        # Add one randomly selected meat type with expiry
         add_batch(
             inventory,
-            HUNT_CHICKEN_OUTPUT_ITEM_ID,
-            chicken_amount,
+            meat_item_id,
+            meat_amount,
             world_minute,
-            world_minute + HUNT_CHICKEN_SPOILAGE_MINUTES,
+            world_minute + HUNT_MEAT_SPOILAGE_MINUTES,
             request_id,
         )
 
@@ -288,9 +289,9 @@ def _do_hunt(
         effects={
             "items_added": [
                 {
-                    "item_id": HUNT_CHICKEN_OUTPUT_ITEM_ID,
-                    "amount": chicken_amount,
-                    "expires_world_minute": world_minute + HUNT_CHICKEN_SPOILAGE_MINUTES,
+                    "item_id": meat_item_id,
+                    "amount": meat_amount,
+                    "expires_world_minute": world_minute + HUNT_MEAT_SPOILAGE_MINUTES,
                 }
             ],
             "tool_used": {"item_id": HUNT_TOOL_ITEM_ID, "uses": 1},

@@ -21,6 +21,7 @@ from village.models import (
     VillageSimulationConfig,
 )
 from village.phase3_asset_service import commit_economy_action
+from village.phase3_catalog import HUNT_MEAT_ITEM_IDS
 from village.phase3_contract import (
     VILLAGE_ECONOMY_ACTION_V1,
     ResultCode,
@@ -174,6 +175,7 @@ class PlantSuccessTest(ProductionTestBase):
     def test_plant_success(self):
         resp = self._plant()
         self.assertEqual(resp["result_code"], ResultCode.OK)
+        self.assertIn("public_needs", resp["data"])
 
         # Seed consumed
         self.bill_seeds.refresh_from_db()
@@ -318,17 +320,17 @@ class HuntSuccessTest(ProductionTestBase):
         resp = self._hunt()
         self.assertEqual(resp["result_code"], ResultCode.OK)
 
-        # Chicken added
-        chicken_slots = NpcGlobalInventorySlot.objects.filter(
-            bag=self.jack_inv, item_id=1056,
+        # One current meat type added
+        meat_slots = NpcGlobalInventorySlot.objects.filter(
+            bag=self.jack_inv, item_id__in=HUNT_MEAT_ITEM_IDS,
         )
-        total_chicken = sum(s.item_amount for s in chicken_slots)
-        self.assertGreaterEqual(total_chicken, 3)
-        self.assertLessEqual(total_chicken, 5)
+        self.assertEqual(len(meat_slots), 1)
+        self.assertIn(meat_slots[0].item_id, HUNT_MEAT_ITEM_IDS)
+        self.assertGreaterEqual(meat_slots[0].item_amount, 3)
+        self.assertLessEqual(meat_slots[0].item_amount, 5)
 
         # Expiry set
-        for slot in chicken_slots:
-            self.assertEqual(slot.expires_world_minute, 700 + 2880)
+        self.assertEqual(meat_slots[0].expires_world_minute, 700 + 2880)
 
         # Tool durability decreased
         self.jack_hunt_tool.refresh_from_db()

@@ -113,6 +113,12 @@ class BootstrapServiceTest(TestCase):
         data = BootstrapService.get_bootstrap()
         self.assertNotIn("error", data)
         self.assertEqual(len(data["npcs"]), 5)
+        runtime = NpcRuntimeState.objects.get(npc__agent_id=10011)
+        runtime.world_position = {"x": 1.25, "y": 2.5, "z": -3.75}
+        runtime.save(update_fields=["world_position"])
+        data = BootstrapService.get_bootstrap()
+        npc = next(row for row in data["npcs"] if row["npc_id"] == "10011")
+        self.assertEqual(npc["world_position"], {"x": 1.25, "y": 2.5, "z": -3.75})
 
     def test_bootstrap_exposes_economy_feature_flag(self):
         for i, name in enumerate(["bill", "jack", "mark", "lucy", "nora"], start=10011):
@@ -224,12 +230,14 @@ class CheckpointServiceTest(TestCase):
             "npc_id": "10011",
             "expected_state_version": 10,
             "current_location_code": "IRONSMITH",
+            "world_position": {"x": 1.25, "y": 2.5, "z": -3.75},
         }])
         self.assertEqual(len(results), 1)
         self.assertTrue(results[0]["success"])
 
         self.rt.refresh_from_db()
         self.assertEqual(self.rt.current_location_code, "IRONSMITH")
+        self.assertEqual(self.rt.world_position, {"x": 1.25, "y": 2.5, "z": -3.75})
         self.assertEqual(self.rt.state_version, 11)
 
         # The same expected version must not be able to overwrite the first
@@ -266,6 +274,21 @@ class CheckpointServiceTest(TestCase):
         self.assertEqual(len(results), 1)
         self.assertFalse(results[0]["success"])
         self.assertEqual(results[0]["result_code"], ResultCode.CHECKPOINT_FIELD_NOT_ALLOWED)
+
+    def test_checkpoint_rejects_malformed_world_position(self):
+        for position in (
+            {"x": 1, "y": 2},
+            {"x": 1, "y": 2, "z": True},
+            {"x": 1, "y": 2, "z": float("inf")},
+        ):
+            with self.subTest(position=position):
+                result = CheckpointService.submit_checkpoint([{
+                    "npc_id": "10011",
+                    "expected_state_version": 10,
+                    "world_position": position,
+                }])[0]
+                self.assertFalse(result["success"])
+                self.assertEqual(result["result_code"], ResultCode.INVALID_COMMAND_SCHEMA)
 
     def test_checkpoint_cannot_mutate_lifecycle_or_authority_fields(self):
         """Checkpoint is restricted to recovery-safe location/goal state."""

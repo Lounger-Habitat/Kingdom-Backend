@@ -45,7 +45,12 @@ class AgentQueryTests(TestCase):
         )
         NpcRuntimeState.objects.create(npc=self.bill, current_location_code="BILL_HOME")
         self.inventory = NpcGlobalInventory.objects.create(npc=self.bill, money=20, asset_version=9)
-        Item.objects.create(item_id=1030, item_name="玉米", item_type=ItemType.FOOD)
+        Item.objects.create(
+            item_id=1030, item_name="玉米", item_type=ItemType.FOOD, item_price=8
+        )
+        Item.objects.create(
+            item_id=1049, item_name="盐", item_type=ItemType.SEASONING, item_price=2
+        )
         self.food = NpcGlobalInventorySlot.objects.create(
             bag=self.inventory, slot_index=0, item_id=1030, item_amount=3,
         )
@@ -68,7 +73,16 @@ class AgentQueryTests(TestCase):
         self.assertEqual(code, "OK")
         self.assertNotIn("asset_version", data)
         self.assertEqual(data["items"][0]["food_instance_id"], str(self.food.instance_id))
+        self.assertTrue(data["items"][0]["can_list_in_store"])
+        self.assertEqual(data["items"][0]["reference_unit_price"], 8)
         self.assertNotIn(str(self.other_food.instance_id), str(data))
+
+    def test_market_state_exposes_all_real_items_as_listing_candidates(self):
+        success, code, data = execute_agent_query("10011", "INSPECT_MARKET_STATE")
+        self.assertTrue(success, code)
+        salt = next(row for row in data["items"] if row["item_id"] == 1049)
+        self.assertTrue(salt["can_list_in_store"])
+        self.assertEqual(salt["reference_unit_price"], 2)
 
     def test_capability_gate_and_nearby_projection(self):
         success, code, data = execute_agent_query("10011", "INSPECT_NEARBY")

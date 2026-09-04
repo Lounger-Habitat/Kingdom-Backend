@@ -345,6 +345,7 @@ class NpcRuntimeState(models.Model):
     )
     current_location_code = models.CharField("当前地点", max_length=64, default="VILLAGE_SQUARE")
     current_point_code = models.CharField("当前点位", max_length=64, default="VILLAGE_SQUARE")
+    world_position = models.JSONField("世界坐标", default=dict, blank=True)
     current_goal = models.CharField("当前目标", max_length=32, choices=GOAL_CHOICES, default="NONE")
     current_action = models.CharField("当前动作", max_length=32, choices=ACTION_CHOICES, default="", blank=True)
     action_status = models.CharField("动作状态", max_length=16, choices=ACTION_STATUS_CHOICES, default="IDLE")

@@ -163,6 +163,12 @@ def _nearby(npc: NpcDefinition) -> dict:
 def _inventory(npc: NpcDefinition) -> dict:
     inventory = NpcGlobalInventory.objects.get(npc=npc)
     slots = list(inventory.slots.filter(item_amount__gt=0).order_by("slot_index"))
+    item_details = {
+        row["item_id"]: row
+        for row in Item.objects.filter(
+            item_id__in={slot.item_id for slot in slots}, is_deleted=False
+        ).values("item_id", "item_price", "item_type")
+    }
     names = _item_names(row.item_id for row in slots)
     edible_item_ids = set(Item.objects.filter(
         item_type=ItemType.FOOD, is_deleted=False,
@@ -176,6 +182,15 @@ def _inventory(npc: NpcDefinition) -> dict:
             "name": names.get(row.item_id, ""),
             "quantity": row.item_amount,
             "available_quantity": get_available_slot_amount(row),
+            "can_list_in_store": row.item_id in item_details,
+            "reference_unit_price": (
+                item_details[row.item_id]["item_price"]
+                if row.item_id in item_details else None
+            ),
+            "item_type": (
+                item_details[row.item_id]["item_type"]
+                if row.item_id in item_details else None
+            ),
             "expires_world_minute": row.expires_world_minute,
             "rated": row.rated,
         } for row in slots],
@@ -327,8 +342,18 @@ def _market_state(_npc: NpcDefinition) -> dict:
     world_minute = _world_minute()
     snapshot = DailyPriceSnapshot.objects.filter(status="PUBLISHED").order_by("-day_index").first()
     prices = dict(snapshot.prices or {}) if snapshot else {str(key): value for key, value in BASE_PRICES.items()}
-    item_ids = {int(value) for value in prices} | set(IMPORT_WHITELIST) | set(EXPORT_WHITELIST)
-    names = _item_names(item_ids)
+    item_details = {
+        row["item_id"]: row
+        for row in Item.objects.filter(is_deleted=False).values(
+            "item_id", "item_name", "item_price", "item_type"
+        )
+    }
+    item_ids = (
+        set(item_details)
+        | {int(value) for value in prices}
+        | set(IMPORT_WHITELIST)
+        | set(EXPORT_WHITELIST)
+    )
     account = VillageAccount.objects.filter(account_code="PUBLIC_FUND").first()
     last_caravan_day = account.last_caravan_day if account else None
     current_day = world_minute // 1440
@@ -337,8 +362,17 @@ def _market_state(_npc: NpcDefinition) -> dict:
         "price_day_index": snapshot.day_index if snapshot else None,
         "items": [{
             "item_id": item_id,
-            "name": names.get(item_id, ""),
-            "unit_price": prices.get(str(item_id), BASE_PRICES.get(item_id)),
+            "name": item_details.get(item_id, {}).get("item_name", ""),
+            "unit_price": prices.get(
+                str(item_id),
+                BASE_PRICES.get(
+                    item_id, item_details.get(item_id, {}).get("item_price")
+                ),
+            ),
+            "reference_unit_price": BASE_PRICES.get(
+                item_id, item_details.get(item_id, {}).get("item_price")
+            ),
+            "can_list_in_store": item_id in item_details,
             "can_import": item_id in IMPORT_WHITELIST,
             "can_export": item_id in EXPORT_WHITELIST,
         } for item_id in sorted(item_ids)],

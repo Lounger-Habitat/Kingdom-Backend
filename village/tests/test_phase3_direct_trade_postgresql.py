@@ -13,6 +13,7 @@ from django.test import TransactionTestCase
 
 from game_time.models import GlobalGameTimeState
 from inventory.models import NpcDefinition, NpcGlobalInventory, NpcGlobalInventorySlot
+from items.models import Item
 from village.models import (
     NpcRuntimeState,
     VillageAccount,
@@ -99,6 +100,11 @@ class PostgreSQLPhaseThreeDirectTradeConcurrencyTests(TransactionTestCase):
 
         self.public_fund, _ = VillageAccount.objects.get_or_create(
             account_code="PUBLIC_FUND", defaults={"balance": 500},
+        )
+
+        Item.objects.update_or_create(
+            item_id=1030,
+            defaults={"item_name": "玉米", "item_price": 8, "is_deleted": False},
         )
 
         self.store, _ = VillageStore.objects.get_or_create(

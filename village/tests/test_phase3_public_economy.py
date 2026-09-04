@@ -223,6 +223,19 @@ class ImportGoodsTest(PublicEconomyTestBase):
         ))
         self.assertEqual(resp["result_code"], ResultCode.P3_INVALID_PARAMS)
 
+    def test_import_tools_seasonings_and_seeds(self):
+        """Tools, current seasonings, and current seeds can be imported."""
+        for item_id in (4001, 4002, 1003, 1022, 1051, 1049, 1058, 1076, 1099):
+            with self.subTest(item_id=item_id):
+                self.account.last_caravan_day = None
+                self.account.balance = 500
+                self.account.save(update_fields=["last_caravan_day", "balance"])
+                resp = commit_economy_action(_payload(
+                    "IMPORT_GOODS", 10015, "TRADE_ROAD",
+                    {"item_id": item_id, "amount": 1},
+                ))
+                self.assertEqual(resp["result_code"], ResultCode.OK)
+
     def test_import_wrong_actor(self):
         """Only Nora can import."""
         resp = commit_economy_action(_payload(
@@ -520,6 +533,11 @@ class EatPersonalTest(PublicEconomyTestBase):
         self.assertEqual(slot.item_amount, 2)
 
         self.assertEqual(resp["needs_delta"], {"hunger_fp": -450, "energy_fp": 50})
+        self.assertEqual(
+            resp["data"]["public_needs"],
+            {"hunger": 0.0, "energy": 85.0, "health": 100.0, "social": 20.0, "stress": 10.0},
+        )
+        self.assertEqual(resp["data"]["needs_delta"], {"hunger": -20.0, "energy": 5.0})
         self.bill_rt.refresh_from_db()
         self.assertEqual((self.bill_rt.hunger_fp, self.bill_rt.energy_fp), (0, 850))
         self.assertEqual(

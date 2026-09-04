@@ -2,13 +2,19 @@
 
 from __future__ import annotations
 
+import uuid
+
 from django.db import connection
 from django.db.models import Count, Max, Min, Q, Sum
 from django.utils import timezone
 
 from game_time.models import GlobalGameTimeState
 from inventory.models import NpcGlobalInventory, NpcGlobalInventorySlot
+from items.models import Item
+from marketplace.models import MarketListing
+from recipes.models import Recipe
 
+from .command_catalog import AGENT_INSTRUCTION_ACTIONS, COMMAND_CATALOG
 from .models import (
     DailyPriceSnapshot,
     EconomicLedgerEntry,
@@ -31,6 +37,8 @@ from .models import (
     VillageStoryArc,
     VillageStoryFact,
     VillageStoryTransitionReceipt,
+    VillageStoreListing,
+    VillageTradeOffer,
     VillageWorldEvent,
 )
 from .phase3_catalog import TOOL_ITEM_IDS
@@ -42,6 +50,218 @@ PRICE_ITEM_IDS = (1030, 1056, 1053, 1067)
 FOOD_ITEM_IDS = (*PRICE_ITEM_IDS, 29001)
 SCAN_BATCH_SIZE = 200
 SCAN_EVENT_BUDGET = 1000
+
+
+def _display_code(value: object) -> str:
+    return str(value or "").replace("_", " ")
+
+
+def _public_command_summary(action: str, params: dict, duration: int | None,
+                            npc_names: dict[str, str],
+                            location_names: dict[str, str], item_names: dict[int, str],
+                            marketplace_item_names: dict[str, str],
+                            home_location_code: str = "", details: dict | None = None) -> str:
+    """Build a bounded public description without exposing raw command parameters."""
+    action = str(action or "").upper()
+    label = COMMAND_CATALOG.get(action, {}).get("label", {
+        "WAKE_UP": "唤醒",
+        "UPDATE_SUBJECTIVE_GOAL": "更新主观目标",
+    }.get(action, action or "未知指令"))
+    params = params if isinstance(params, dict) else {}
+    details = details or {}
+
+    def location(*keys: str) -> str:
+        for key in keys:
+            code = params.get(key)
+            if code:
+                return location_names.get(str(code), _display_code(code))
+        return ""
+
+    def npc(*keys: str) -> str:
+        for key in keys:
+            npc_id = params.get(key)
+            if npc_id:
+                return npc_names.get(str(npc_id), f"NPC {npc_id}")
+        return ""
+
+    def item(*keys: str) -> str:
+        for key in keys:
+            item_id = params.get(key)
+            try:
+                if item_id is not None:
+                    return item_names.get(int(item_id), f"物品#{item_id}")
+            except (TypeError, ValueError):
+                return f"物品#{item_id}"
+        return ""
+
+    def resolved(kind: str, key: str) -> dict:
+        return details.get(kind, {}).get(str(params.get(key)), {})
+
+    def named_item(item_id: object) -> str:
+        try:
+            return item_names.get(int(item_id), f"物品#{item_id}")
+        except (TypeError, ValueError):
+            return ""
+
+    duration = params.get("duration_minutes", duration)
+    if action == "MOVE":
+        destination = location("location_code")
+        target = npc("target_npc_id")
+        return f"移动至{destination}" if destination else f"移动至{target}身边" if target else label
+    if action == "GO_HOME":
+        home = location_names.get(home_location_code, _display_code(home_location_code))
+        return f"回家（{home}）" if home else label
+    if action == "EAT":
+        source = {"COMMUNITY_MEAL": "公共餐食", "PERSONAL_INVENTORY": "个人背包"}.get(
+            str(params.get("source", "")).upper(), "")
+        goods = item("item_id")
+        if not goods:
+            goods = named_item(resolved("instances", "food_instance_id").get("item_id"))
+        return f"进食{goods}（{source}）" if goods and source else f"进食（{source}）" if source else label
+    if action in {"REST", "SLEEP", "WAIT", "WORK_PLACEHOLDER"}:
+        return f"{label} {duration} 分钟" if duration is not None else label
+    if action == "SOCIALIZE":
+        target = npc("target_npc_id")
+        detail = f"与{target}交流" if target else label
+        return f"{detail} {duration} 分钟" if duration is not None else detail
+    if action == "START_DIALOGUE":
+        target = npc("target_npc_id")
+        topic = str(params.get("topic", "")).strip()
+        detail = f"与{target}开始对话" if target else label
+        return f"{detail}：{topic}" if topic else detail
+    if action == "SPEAK":
+        speech = str(params.get("text", "")).strip()
+        return f"对话发言：“{speech}”" if speech else label
+    if action == "PLANT":
+        plot, crop = _display_code(params.get("plot_code")), _display_code(params.get("crop_code"))
+        return f"在{plot}播种{crop}" if plot and crop else label
+    if action == "HARVEST":
+        plot = _display_code(params.get("plot_code"))
+        return f"收获{plot}" if plot else label
+    if action == "HUNT":
+        hunt = {"HUNT_CHICKEN": "肉类"}.get(str(params.get("hunt_code", "")).upper(), "")
+        return f"狩猎{hunt}" if hunt else label
+    if action == "COOK":
+        recipe = params.get("recipe_id")
+        recipe_name = details.get("recipes", {}).get(str(recipe), "")
+        return f"烹饪{recipe_name}" if recipe_name else f"烹饪菜谱#{recipe}" if recipe is not None else label
+    if action == "CREATE_ORDER":
+        side = {"BUY": "收购", "SELL": "出售"}.get(str(params.get("side", "")).upper(), label)
+        goods = item("item_id")
+        amount, price = params.get("amount"), params.get("unit_price")
+        detail = f"{side}{goods}" if goods else side
+        if amount is not None:
+            detail += f" ×{amount}"
+        if price is not None:
+            detail += f"（单价 {price} 金币）"
+        destination = location("delivery_point_code")
+        return f"{detail}，交付至{destination}" if destination else detail
+    if action == "CANCEL_ORDER":
+        order = resolved("orders", "order_id")
+        goods = named_item(order.get("item_id"))
+        side = {"BUY": "收购", "SELL": "出售"}.get(order.get("side"), "订单")
+        return f"取消{side}{goods} ×{order.get('amount')}" if goods else label
+    if action == "START_DELIVERY":
+        delivery = resolved("deliveries", "delivery_id")
+        goods = named_item(delivery.get("item_id"))
+        destination = location_names.get(
+            str(delivery.get("delivery_point_code", "")), _display_code(delivery.get("delivery_point_code")))
+        detail = f"配送{goods} ×{delivery.get('amount')}" if goods else label
+        return f"{detail}至{destination}" if destination else detail
+    if action in {"IMPORT_GOODS", "EXPORT_GOODS"}:
+        goods, amount = item("item_id"), params.get("amount")
+        return f"{label}{goods} ×{amount}" if goods and amount is not None else label
+    if action == "RATE_DISH":
+        owner, score = npc("owner_npc_id"), params.get("score")
+        goods = named_item(resolved("instances", "food_instance_id").get("item_id"))
+        dish = goods or "菜品"
+        return f"为{owner}的{dish}评分 {score} 星" if owner and score is not None else label
+    if action == "PROPOSE_TRADE":
+        target, goods = npc("target_npc_id"), item("item_id")
+        amount, gold = params.get("amount"), params.get("gold_amount")
+        detail = f"向{target}发起交易" if target else label
+        if goods and amount is not None:
+            detail += f"：{goods} ×{amount}"
+        if gold is not None:
+            detail += f"，{gold} 金币"
+        return detail
+    if action == "RESPOND_TRADE":
+        decision = {"ACCEPT": "接受", "REJECT": "拒绝"}.get(
+            str(params.get("decision", "")).upper(), "响应")
+        offer = resolved("offers", "offer_id")
+        goods = named_item(offer.get("item_id"))
+        return f"{decision}{goods} ×{offer.get('amount')}的交易报价" if goods else f"{decision}交易报价"
+    if action == "CANCEL_TRADE_OFFER":
+        offer = resolved("offers", "offer_id")
+        goods = named_item(offer.get("item_id"))
+        return f"取消{goods} ×{offer.get('amount')}的交易报价" if goods else label
+    if action == "LIST_STORE_ITEM":
+        goods, amount = item("item_id"), params.get("amount")
+        detail = f"{label}{goods}" if goods else label
+        if amount is not None:
+            detail += f" ×{amount}"
+        price = params.get("custom_unit_price", params.get("price"))
+        return f"{detail}（单价 {price} 金币）" if price is not None else detail
+    if action == "SELL_ON_MARKETPLACE":
+        goods = named_item(resolved("instances", "instance_id").get("item_id"))
+        amount, price = params.get("amount"), params.get("price")
+        detail = f"上架全服商品{goods} ×{amount}" if goods else label
+        return f"{detail}（单价 {price} 金币）" if price is not None else detail
+    if action == "BUY_FROM_MARKETPLACE":
+        goods = marketplace_item_names.get(str(params.get("listing_id")), "未知物品")
+        amount = params.get("amount")
+        return f"购买{goods} ×{amount}" if amount is not None else f"购买{goods}"
+    if action == "BUY_FROM_STORE":
+        listing = resolved("store_listings", "listing_id")
+        goods = named_item(listing.get("item_id"))
+        amount = params.get("amount")
+        return f"购买{goods} ×{amount}" if goods and amount is not None else f"{label} ×{amount}" if amount is not None else label
+    if action in {"UPDATE_STORE_PRICE", "DELIST_STORE_ITEM"}:
+        listing = resolved("store_listings", "listing_id")
+        goods = named_item(listing.get("item_id"))
+        if action == "UPDATE_STORE_PRICE":
+            price = params.get("custom_unit_price")
+            return f"修改{goods}价格为 {price} 金币" if goods and price is not None else label
+        return f"下架{goods}" if goods else label
+    if action == "DELIST_FROM_MARKETPLACE":
+        goods = marketplace_item_names.get(str(params.get("listing_id")), "")
+        return f"下架全服商品{goods}" if goods else label
+    if action == "BROWSE_MARKETPLACE":
+        goods = item("item_id")
+        return f"浏览{goods}市场" if goods else label
+    if action == "INSPECT_STORE_INVENTORY":
+        store = {"GENERAL_STORE": "杂货铺", "RESTAURANT_STORE": "饭店"}.get(
+            str(params.get("store_code", "")).upper(), "")
+        return f"查看{store}库存" if store else label
+    if action == "CREATE_COMMITMENT":
+        target = npc("beneficiary_npc_id")
+        kind = {
+            "DELIVERY": "交货", "REPAYMENT": "还款", "DONATION": "捐赠",
+            "JOINT_WORK": "共同工作", "MEETING": "见面",
+        }.get(str(params.get("commitment_type", "")).upper(), "事项")
+        return f"向{target}承诺{kind}" if target else label
+    if action in {"CANCEL_COMMITMENT", "PERFORM_COMMITMENT"}:
+        commitment = resolved("commitments", "commitment_id")
+        target = npc_names.get(str(commitment.get("beneficiary_npc_id")), "")
+        kind = {
+            "DELIVERY": "交货", "REPAYMENT": "还款", "DONATION": "捐赠",
+            "JOINT_WORK": "共同工作", "MEETING": "见面",
+        }.get(commitment.get("commitment_type"), "承诺")
+        verb = "取消" if action == "CANCEL_COMMITMENT" else "履行"
+        return f"{verb}对{target}的{kind}承诺" if target else label
+    if action == "STORY_VOTE":
+        plan = _display_code(params.get("plan_code"))
+        return f"剧情投票：{plan}" if plan else label
+    if action == "STORY_ACT":
+        story_action = _display_code(params.get("action_code"))
+        goods = item("item_id", "supply_item_id", "limit_item_id", "meal_item_id")
+        amount = params.get("amount", params.get("supply_amount", params.get("meal_amount")))
+        detail = f"剧情行动：{story_action}" if story_action else label
+        return f"{detail}，使用{goods} ×{amount}" if goods and amount is not None else detail
+    if action == "UPDATE_SUBJECTIVE_GOAL":
+        goal = str(params.get("summary", "")).strip()
+        return f"更新主观目标：{goal}" if goal else label
+    return label
 
 
 def presentation_enabled() -> bool:
@@ -365,6 +585,9 @@ def public_npc_observation(npc_id: str) -> dict | None:
         str(row.npc.agent_id): row.display_name
         for row in NpcProfile.objects.select_related("npc").filter(is_active=True)
     }
+    location_names = dict(VillageLocationDefinition.objects.filter(
+        is_active=True, is_public=True
+    ).values_list("location_code", "display_name"))
     open_commitments = NpcCommitment.objects.filter(status="OPEN").filter(
         Q(promisor_npc=profile.npc) | Q(beneficiary_npc=profile.npc)
     ).select_related("promisor_npc", "beneficiary_npc").order_by("due_world_minute")[:20]
@@ -382,23 +605,183 @@ def public_npc_observation(npc_id: str) -> dict | None:
             "label": relationship_label(relationship_snapshot(row), has_open),
             "has_open_commitment": has_open,
         })
+    recent_receipts = list(
+        VillageActionReceipt.objects.filter(npc=profile.npc).filter(
+            Q(action_kind__in=AGENT_INSTRUCTION_ACTIONS)
+            | Q(command__kind__in=AGENT_INSTRUCTION_ACTIONS)
+        ).select_related("command").order_by("-world_minute", "-created_at")
+    )
+    history_rows = []
+    for receipt in recent_receipts:
+        command = receipt.command
+        action_kind = (
+            command.kind if command and command.kind in AGENT_INSTRUCTION_ACTIONS
+            else receipt.action_kind
+        )
+        raw_parameters = (command.sanitized_parameters if command else
+                          (receipt.response_data or {}).get("parameters", {}))
+        parameters = dict(raw_parameters) if isinstance(raw_parameters, dict) else {}
+        response_data = receipt.response_data or {}
+        if action_kind == "EAT" and parameters.get("item_id") is None:
+            effects = response_data.get("effects", {})
+            eaten = effects.get("eat", {}).get("items_consumed", []) if isinstance(effects, dict) else []
+            eaten = eaten or (effects.get("items", []) if isinstance(effects, dict) else [])
+            if eaten and isinstance(eaten[0], dict):
+                parameters["item_id"] = eaten[0].get("item_id")
+        if action_kind == "UPDATE_SUBJECTIVE_GOAL":
+            goal_data = response_data.get("subjective_goal")
+            if isinstance(goal_data, dict) and goal_data.get("summary"):
+                parameters["summary"] = goal_data["summary"]
+        history_rows.append((receipt, action_kind, parameters, command.duration_minutes if command else None))
+    active_command = NpcCommandState.objects.filter(
+        npc=profile.npc, command_id=runtime.active_command_id
+    ).first() if runtime.active_command_id else None
+    item_ids = set()
+    marketplace_listing_ids = set()
+    instance_ids, store_listing_ids = set(), set()
+    recipe_ids, order_ids, delivery_ids = set(), set(), set()
+    offer_ids, commitment_ids = set(), set()
+
+    def add_uuid(target: set, value: object) -> None:
+        try:
+            if value:
+                target.add(uuid.UUID(str(value)))
+        except (TypeError, ValueError, AttributeError):
+            pass
+
+    parameter_rows = [(parameters, action_kind) for _, action_kind, parameters, _ in history_rows]
+    if active_command:
+        parameter_rows.append((active_command.sanitized_parameters, active_command.kind))
+    for params, action in parameter_rows:
+        params = params if isinstance(params, dict) else {}
+        for key in ("item_id", "supply_item_id", "limit_item_id", "meal_item_id"):
+            try:
+                if params.get(key) is not None:
+                    item_ids.add(int(params[key]))
+            except (TypeError, ValueError):
+                pass
+        if action == "BUY_FROM_MARKETPLACE":
+            try:
+                marketplace_listing_ids.add(int(params.get("listing_id")))
+            except (TypeError, ValueError):
+                pass
+        if action == "DELIST_FROM_MARKETPLACE":
+            try:
+                marketplace_listing_ids.add(int(params.get("listing_id")))
+            except (TypeError, ValueError):
+                pass
+        add_uuid(instance_ids, params.get("food_instance_id"))
+        add_uuid(instance_ids, params.get("instance_id"))
+        if action in {"UPDATE_STORE_PRICE", "DELIST_STORE_ITEM", "BUY_FROM_STORE"}:
+            add_uuid(store_listing_ids, params.get("listing_id"))
+        if action == "COOK":
+            try:
+                recipe_ids.add(int(params.get("recipe_id")))
+            except (TypeError, ValueError):
+                pass
+        add_uuid(order_ids, params.get("order_id"))
+        add_uuid(delivery_ids, params.get("delivery_id"))
+        add_uuid(offer_ids, params.get("offer_id"))
+        add_uuid(commitment_ids, params.get("commitment_id"))
+
+    instance_rows = list(NpcGlobalInventorySlot.objects.filter(
+        instance_id__in=instance_ids
+    ).values("instance_id", "item_id"))
+    store_listing_rows = list(VillageStoreListing.objects.filter(
+        listing_id__in=store_listing_ids
+    ).values("listing_id", "item_id"))
+    recipe_rows = list(Recipe.objects.filter(pk__in=recipe_ids).values("id", "recipe_name", "item_id"))
+    order_rows = list(NpcTradeOrder.objects.filter(order_id__in=order_ids).values(
+        "order_id", "side", "item_id", "amount"))
+    delivery_rows = list(NpcTradeDelivery.objects.filter(delivery_id__in=delivery_ids).values(
+        "delivery_id", "buyer_order__item_id", "reserved_amount", "delivery_point_code"))
+    offer_rows = list(VillageTradeOffer.objects.filter(offer_id__in=offer_ids).values(
+        "offer_id", "item_id", "amount"))
+    commitment_detail_rows = list(NpcCommitment.objects.filter(
+        commitment_id__in=commitment_ids
+    ).values("commitment_id", "commitment_type", "beneficiary_npc__agent_id"))
+    item_ids.update(row["item_id"] for row in instance_rows)
+    item_ids.update(row["item_id"] for row in store_listing_rows)
+    item_ids.update(row["item_id"] for row in order_rows)
+    item_ids.update(row["buyer_order__item_id"] for row in delivery_rows)
+    item_ids.update(row["item_id"] for row in offer_rows)
+    marketplace_listings = list(MarketListing.objects.filter(
+        pk__in=marketplace_listing_ids
+    ).values("id", "item_id", "item_name_snapshot"))
+    item_ids.update(row["item_id"] for row in marketplace_listings)
+    item_names = dict(Item.objects.filter(item_id__in=item_ids).values_list("item_id", "item_name"))
+    marketplace_item_names = {
+        str(row["id"]): row["item_name_snapshot"] or item_names.get(row["item_id"], f"物品#{row['item_id']}")
+        for row in marketplace_listings
+    }
+    details = {
+        "instances": {str(row["instance_id"]): row for row in instance_rows},
+        "store_listings": {str(row["listing_id"]): row for row in store_listing_rows},
+        "recipes": {str(row["id"]): row["recipe_name"] for row in recipe_rows},
+        "orders": {str(row["order_id"]): row for row in order_rows},
+        "deliveries": {
+            str(row["delivery_id"]): {
+                "item_id": row["buyer_order__item_id"], "amount": row["reserved_amount"],
+                "delivery_point_code": row["delivery_point_code"],
+            }
+            for row in delivery_rows
+        },
+        "offers": {str(row["offer_id"]): row for row in offer_rows},
+        "commitments": {
+            str(row["commitment_id"]): {
+                "commitment_type": row["commitment_type"],
+                "beneficiary_npc_id": row["beneficiary_npc__agent_id"],
+            }
+            for row in commitment_detail_rows
+        },
+    }
     recent_commands = [
         {
-            "name": row.kind,
-            "status": row.status,
-            "result_code": row.result_code,
-            "completed_world_minute": row.completed_world_minute,
+            "name": action_kind,
+            "summary": _public_command_summary(
+                action_kind, parameters, duration,
+                names, location_names, item_names, marketplace_item_names,
+                profile.home_location_code, details
+            ),
+            "status": "SUCCEEDED" if receipt.success else "FAILED",
+            "result_code": receipt.result_code,
+            "completed_world_minute": receipt.world_minute,
         }
-        for row in NpcCommandState.objects.filter(
-            npc=profile.npc, status__in=("SUCCEEDED", "FAILED")
-        ).order_by("-completed_world_minute", "-updated_at")[:3]
+        for receipt, action_kind, parameters, duration in history_rows
     ]
+    if active_command:
+        recent_commands.insert(0, {
+            "name": active_command.kind,
+            "summary": _public_command_summary(
+                active_command.kind, active_command.sanitized_parameters, active_command.duration_minutes,
+                names, location_names, item_names, marketplace_item_names,
+                profile.home_location_code, details
+            ),
+            "status": "RUNNING",
+            "result_code": "",
+            "started_world_minute": active_command.started_world_minute,
+            "completed_world_minute": None,
+        })
     dialogue = NpcDialogueSession.objects.filter(
         Q(initiator=profile.npc) | Q(target=profile.npc), status="ACTIVE"
-    ).first()
+    ).select_related("initiator", "target").first()
+    if dialogue:
+        other = dialogue.target if dialogue.initiator_id == profile.npc_id else dialogue.initiator
+        action_summary = f"与{names.get(str(other.agent_id), other.name)}交流"
+    elif active_command:
+        action_summary = _public_command_summary(
+            active_command.kind, active_command.sanitized_parameters, active_command.duration_minutes,
+            names, location_names, item_names, marketplace_item_names,
+            profile.home_location_code, details
+        )
+    else:
+        action = runtime.current_action or "IDLE"
+        action_summary = COMMAND_CATALOG.get(action, {}).get("label", "空闲")
+    time_state = GlobalGameTimeState.objects.filter(pk=1).first()
     return {
         "npc_id": npc_id,
         "display_name": profile.display_name,
+        "world_minute": time_state.world_minute if time_state else 0,
         "public_needs": {
             "hunger": runtime.hunger_fp / 10,
             "energy": runtime.energy_fp / 10,
@@ -409,6 +792,7 @@ def public_npc_observation(npc_id: str) -> dict | None:
         "public_status": {
             "action": "SOCIALIZING" if dialogue else runtime.current_action or "IDLE",
             "action_status": "SOCIAL" if dialogue else runtime.action_status,
+            "summary": action_summary,
         },
         "subjective_goal": ({
             "goal_id": str(goal.goal_id),

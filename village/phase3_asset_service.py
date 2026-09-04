@@ -445,7 +445,9 @@ def commit_economy_action(payload: Dict[str, Any]) -> Dict[str, Any]:
                     and runtime.active_command_id != command.command_id
                 ):
                     return _fail(ResultCode.P3_REQUEST_CONFLICT, status="CONFLICT")
-            if runtime is None and command_name in {"EAT", "COMMUNITY_MEAL"}:
+            if runtime is None and command_name in {
+                "EAT", "COMMUNITY_MEAL", "PLANT", "HARVEST", "HUNT", "COOK",
+            }:
                 runtime = NpcRuntimeState.objects.select_for_update().filter(
                     npc__agent_id=str(npc_id)
                 ).first()
@@ -458,9 +460,16 @@ def commit_economy_action(payload: Dict[str, Any]) -> Dict[str, Any]:
             if result.get("result_code") != ResultCode.OK:
                 return result
 
+            eat_needs_delta = None
             if command_name in {"EAT", "COMMUNITY_MEAL"}:
+                hunger_before = runtime.hunger_fp
+                energy_before = runtime.energy_fp
                 runtime.hunger_fp = max(0, runtime.hunger_fp - 450)
                 runtime.energy_fp = min(1000, runtime.energy_fp + 50)
+                eat_needs_delta = {
+                    "hunger": (runtime.hunger_fp - hunger_before) / 10,
+                    "energy": (runtime.energy_fp - energy_before) / 10,
+                }
                 summary, _ = NpcNeedsDaySummary.objects.select_for_update().get_or_create(
                     npc=runtime.npc, day_index=max(0, world_minute - 1) // 1440,
                 )
@@ -479,6 +488,18 @@ def commit_economy_action(payload: Dict[str, Any]) -> Dict[str, Any]:
                 )
                 if error:
                     return _fail(error)
+
+            # Production actions also settle an authoritative needs effect via
+            # settle_action_needs_locked above.  Include the post-settlement
+            # public snapshot so the outbox formatter can put it in message.
+            if runtime is not None and command_name in {
+                "EAT", "COMMUNITY_MEAL", "PLANT", "HARVEST", "HUNT", "COOK",
+            }:
+                from .phase2_services import public_needs
+                result_data = result.setdefault("data", {})
+                result_data["public_needs"] = public_needs(runtime)
+                if eat_needs_delta is not None:
+                    result_data["needs_delta"] = eat_needs_delta
 
             # 6. Write persistence records
             result["request_id"] = str(request_id)

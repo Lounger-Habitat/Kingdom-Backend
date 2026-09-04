@@ -46,6 +46,7 @@ def load_command_catalog(path=CATALOG_PATH):
 
 
 COMMAND_CATALOG = load_command_catalog()
+AGENT_INSTRUCTION_ACTIONS = frozenset(COMMAND_CATALOG) | {"WAKE_UP", "UPDATE_SUBJECTIVE_GOAL"}
 
 
 def agent_tool(action):

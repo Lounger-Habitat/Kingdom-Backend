@@ -29,6 +29,7 @@ urlpatterns = [
     path("api/village/runtime/bootstrap", views.runtime_bootstrap, name="village-runtime-bootstrap"),
     path("api/village/runtime/checkpoint", views.runtime_checkpoint, name="village-runtime-checkpoint"),
     path("api/village/runtime/subjective-goal", views.subjective_goal_update, name="village-subjective-goal-update"),
+    path("api/village/runtime/instruction-outcome", views.instruction_outcome_record, name="village-instruction-outcome"),
     path("api/village/runtime/summary", views.runtime_summary_view, name="village-runtime-summary"),
     path("api/village/runtime/time", views.runtime_time, name="village-runtime-time"),
     path("api/village/runtime/tick", views.runtime_tick, name="village-runtime-tick"),

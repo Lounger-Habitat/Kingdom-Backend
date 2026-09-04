@@ -17,6 +17,7 @@
 
 import hashlib
 import json
+import math
 import time
 import uuid
 from datetime import datetime, timedelta
@@ -526,6 +527,7 @@ class BootstrapService:
                 "name": rt.npc.name,
                 "current_location_code": rt.current_location_code,
                 "current_point_code": rt.current_point_code,
+                "world_position": rt.world_position or None,
                 "current_goal": "NONE",
                 "current_action": active.kind if active else rt.current_action,
                 "action_status": rt.action_status if active else "IDLE",
@@ -605,6 +607,7 @@ class CheckpointService:
     ALLOWED_FIELDS = (
         "current_location_code",
         "current_point_code",
+        "world_position",
         "current_goal",
         "last_simulated_world_minute",
     )
@@ -665,6 +668,18 @@ class CheckpointService:
                 return cls._invalid_checkpoint(npc_id)
         if "current_goal" in checkpoint and checkpoint["current_goal"] not in cls._GOALS:
             return cls._invalid_checkpoint(npc_id)
+        if "world_position" in checkpoint:
+            position = checkpoint["world_position"]
+            if not isinstance(position, dict) or set(position) != {"x", "y", "z"}:
+                return cls._invalid_checkpoint(npc_id)
+            if any(
+                isinstance(value, bool)
+                or not isinstance(value, (int, float))
+                or abs(value) > 1_000_000
+                or not math.isfinite(value)
+                for value in position.values()
+            ):
+                return cls._invalid_checkpoint(npc_id)
         if "last_simulated_world_minute" in checkpoint and (
             isinstance(checkpoint["last_simulated_world_minute"], bool)
             or not isinstance(checkpoint["last_simulated_world_minute"], int)

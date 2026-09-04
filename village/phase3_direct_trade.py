@@ -52,6 +52,7 @@ from typing import Any, Dict, List, Optional, Tuple
 from django.db import models, transaction
 
 from inventory.models import NpcDefinition, NpcGlobalInventory, NpcGlobalInventorySlot
+from items.models import Item
 
 from .models import (
     EconomicLedgerEntry,
@@ -96,16 +97,6 @@ DIRECT_TRADE_COMMANDS = frozenset({
 
 # Store operational status that permits trading.
 _TRADABLE_STORE_STATUSES = frozenset({StoreOperationalStatus.OPEN.value})
-
-# Authoritative catalog items that may be listed in a store (design 7.1).
-# This is the phase-3 catalog (BASE_PRICES) minus the phase-3 tools, which are
-# personal equipment and must never be sold through a store.  v1 does not
-# differentiate GENERAL_STORE vs RESTAURANT_STORE merchandise; operators may
-# list any saleable catalog item, and the operator-capability split remains the
-# Unity/contract concern (ACTOR_WHITELIST already scopes LIST_STORE_ITEM to the
-# two operators).
-STORE_SALEABLE_ITEMS = frozenset(BASE_PRICES.keys()) - {4001, 4002}
-
 
 # ── Small helpers ────────────────────────────────────────────────────────────
 
@@ -290,7 +281,14 @@ def _resolve_final_unit_price(
     if price_mode == PriceMode.ORIGINAL:
         if custom_unit_price is not None:
             return None
+        # Keep ORIGINAL compatible for catalog items, while allowing a valid
+        # inventory item outside that catalog to use its item configuration as
+        # a reference price. Agents should use CUSTOM when deciding prices.
         base = BASE_PRICES.get(item_id)
+        if base is None:
+            base = Item.objects.filter(
+                item_id=item_id, is_deleted=False
+            ).values_list("item_price", flat=True).first()
         if base is None or not isinstance(base, int) or base <= 0:
             return None
         return base
@@ -673,9 +671,9 @@ def _do_list_store_item(
     if not _is_positive_int(amount):
         return _fail(ResultCode.P3_INVALID_PARAMS)
 
-    # Saleable-whitelist check (design 7.1): both ORIGINAL and CUSTOM must be
-    # within the authoritative catalog minus tools.  Runs before any mutation.
-    if item_id not in STORE_SALEABLE_ITEMS:
+    # Every real, non-deleted item is eligible. The agent decides whether to
+    # list it and at what CUSTOM price; this guard only rejects stale/fake IDs.
+    if not Item.objects.filter(item_id=item_id, is_deleted=False).exists():
         return _fail(ResultCode.TRADE_ITEM_NOT_FOR_SALE)
 
     unit_price = _resolve_final_unit_price(price_mode, custom_unit_price, item_id)

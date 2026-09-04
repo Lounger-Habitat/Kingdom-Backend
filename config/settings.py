@@ -202,6 +202,7 @@ class _SuppressRuntimeTickFilter(logging.Filter):
         "/api/village/runtime/time",
         "/api/village/runtime/checkpoint",
         "/api/village/runtime/bootstrap",
+        "/api/village/runtime/tick",
         "/api/village/deliveries/pending",
     )
     # django access-log message: '"METHOD path HTTP/1.1" <code> <size>'

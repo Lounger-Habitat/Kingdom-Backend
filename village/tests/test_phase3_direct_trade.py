@@ -20,6 +20,7 @@ from inventory.models import (
     NpcGlobalInventory,
     NpcGlobalInventorySlot,
 )
+from items.models import Item
 from village.models import (
     DailyPriceSnapshot,
     EconomicLedgerEntry,
@@ -169,6 +170,21 @@ class DirectTradeTestBase(TestCase):
         self.store_account.balance = 0
         self.store_account.account_version = 0
         self.store_account.save(update_fields=["balance", "account_version"])
+
+        for item_id, item_name, item_price in (
+            (1030, "玉米", 8),
+            (1056, "鸡肉", 12),
+            (1049, "盐", 2),
+            (4001, "阶段三农具", 50),
+        ):
+            Item.objects.update_or_create(
+                item_id=item_id,
+                defaults={
+                    "item_name": item_name,
+                    "item_price": item_price,
+                    "is_deleted": False,
+                },
+            )
 
         self.rest_store, _ = VillageStore.objects.get_or_create(
             store_code="RESTAURANT_STORE",
@@ -440,25 +456,27 @@ class CustomPriceTest(DirectTradeTestBase):
         )
 
 
-class SaleableWhitelistTest(DirectTradeTestBase):
-    def test_tool_not_saleable(self):
-        # 4001 is a phase-3 tool, present in BASE_PRICES but not for sale.
+class StoreItemEligibilityTest(DirectTradeTestBase):
+    def test_any_existing_item_can_be_listed_with_custom_price(self):
+        self._set_location(10015, "GENERAL_STORE")
+        self._give_item(self.nora_inv, 1049, 12)
+        resp = self._list(
+            10015, "GENERAL_STORE", 1049, 12, PriceMode.CUSTOM, custom=7
+        )
+        self.assertEqual(resp["result_code"], ResultCode.OK)
+        self.assertEqual(resp["data"]["item_id"], 1049)
+        self.assertEqual(resp["data"]["unit_price"], 7)
+
+    def test_existing_tool_can_also_be_listed(self):
         self._set_location(10015, "GENERAL_STORE")
         self._give_item(self.nora_inv, 4001, 1)
-        nora_before = sum(
-            s.item_amount for s in
-            NpcGlobalInventorySlot.objects.filter(bag=self.nora_inv, item_id=4001)
+        resp = self._list(
+            10015, "GENERAL_STORE", 4001, 1, PriceMode.CUSTOM, custom=60
         )
-        resp = self._list(10015, "GENERAL_STORE", 4001, 1, PriceMode.ORIGINAL)
-        self.assertEqual(resp["result_code"], ResultCode.TRADE_ITEM_NOT_FOR_SALE)
-        nora_after = sum(
-            s.item_amount for s in
-            NpcGlobalInventorySlot.objects.filter(bag=self.nora_inv, item_id=4001)
-        )
-        self.assertEqual(nora_before, nora_after)
-        self.assertFalse(VillageStoreListing.objects.filter(store=self.store, item_id=4001).exists())
+        self.assertEqual(resp["result_code"], ResultCode.OK)
+        self.assertEqual(resp["data"]["unit_price"], 60)
 
-    def test_non_catalog_item_not_saleable(self):
+    def test_unknown_item_id_is_not_listable(self):
         self._set_location(10015, "GENERAL_STORE")
         self._give_item(self.nora_inv, 9999, 5)
         nora_before = sum(
