@@ -20,7 +20,7 @@ from django.db import models, transaction
 
 from inventory.models import NpcGlobalInventory, NpcGlobalInventorySlot
 
-from .models import NpcRuntimeState, NpcTradeDelivery, NpcTradeOrder
+from .models import NpcTradeDelivery, NpcTradeOrder
 from .phase3_asset_service import (
     _fail,
     _ok,
@@ -406,26 +406,12 @@ def _do_start_delivery(
 
         buyer_npc_id = str(delivery.buyer_order.npc.agent_id)
         seller_npc_id = str(delivery.seller_order.npc.agent_id)
-        delivery_point_code = delivery.delivery_point_code
-
-        # Participant identities and location come from the locked delivery,
-        # not from duplicate Agent-supplied fields.
+        # Participant identities come from the locked delivery, not from
+        # duplicate Agent-supplied fields. Unity owns the live position check.
         if str(npc_id) != seller_npc_id:
             return _fail(ResultCode.P3_FORBIDDEN_ACTOR)
 
         if delivery.status != "ACTIVE":
-            return _fail(ResultCode.P3_DELIVERY_NOT_READY)
-
-        # Both NPCs must be at the delivery point
-        try:
-            buyer_rt = NpcRuntimeState.objects.get(npc__agent_id=str(buyer_npc_id))
-            seller_rt = NpcRuntimeState.objects.get(npc__agent_id=str(seller_npc_id))
-        except NpcRuntimeState.DoesNotExist:
-            return _fail(ResultCode.P3_DELIVERY_NOT_READY)
-
-        if buyer_rt.current_location_code != delivery_point_code:
-            return _fail(ResultCode.P3_DELIVERY_NOT_READY)
-        if seller_rt.current_location_code != delivery_point_code:
             return _fail(ResultCode.P3_DELIVERY_NOT_READY)
 
         # Lock orders in stable order
@@ -487,6 +473,7 @@ def _do_start_delivery(
             seller_slot.produced_world_minute or world_minute,
             seller_slot.expires_world_minute,
             request_id,
+            remaining_uses=seller_slot.remaining_uses,
         )
 
         # Money transfer: buyer pays seller

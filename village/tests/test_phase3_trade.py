@@ -498,8 +498,8 @@ class StartDeliverySuccessTest(TradeTestBase):
 
 
 class StartDeliveryWrongLocationTest(TradeTestBase):
-    def test_wrong_location_fails(self):
-        """NPCs not at delivery point → P3_DELIVERY_NOT_READY."""
+    def test_wrong_location_is_deferred_to_unity(self):
+        """Unity checks delivery location; Backend settles the request."""
         NpcGlobalInventorySlot.objects.create(
             bag=self.bill_inv, slot_index=0, item_id=1030, item_amount=10,
         )
@@ -513,7 +513,7 @@ class StartDeliveryWrongLocationTest(TradeTestBase):
 
         # NPCs are at MARKET_STREET, delivery is at RESTAURANT
         resp = self._start_delivery(10011, delivery_id, 10012, "RESTAURANT")
-        self.assertEqual(resp["result_code"], ResultCode.P3_DELIVERY_NOT_READY)
+        self.assertEqual(resp["result_code"], ResultCode.OK)
 
 
 class StartDeliveryForbiddenActorTest(TradeTestBase):

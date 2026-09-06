@@ -16,6 +16,7 @@ from village.command_catalog import COMMAND_CATALOG
 from village.models import (
     NpcProfile, NpcRuntimeState, NpcStoryFactAccess, VillageLocationDefinition,
     VillageStoryArc, VillageStoryFact,
+    VillageActionDurationConfig,
 )
 from village.runtime_services import CommandService, ResultCode
 from village.views import npc_available_actions
@@ -162,6 +163,113 @@ class AgentQueryTests(TestCase):
         self.assertNotIn("state_version", data["npc_profile"])
         for tool in data["tools"]:
             self.assertEqual(set(tool), {"name", "description", "parameters"})
+
+    def test_context_contains_only_rules_and_follows_capabilities_and_configuration(self):
+        user = GameAccount.objects.create(username="context-env", password="unused")
+        request = APIRequestFactory().get("/api/village/npcs/10011/discover")
+        force_authenticate(request, user=user)
+        profile = NpcProfile.objects.get(npc=self.bill)
+        profile.capabilities = ["OBSERVE", "PLANT", "SOCIALIZE"]
+        profile.save(update_fields=["capabilities"])
+        VillageActionDurationConfig.objects.update_or_create(
+            action_name="PLANT", defaults={"duration_minutes": 7}
+        )
+
+        data = npc_available_actions(request, "10011").data["data"]
+        context = data["agent_context"]
+        self.assertEqual(set(context), {"common_rules", "npc_rules"})
+        self.assertIn("对话是环境规则", "\n".join(context["common_rules"]))
+        self.assertNotIn("对话是环境规则", "\n".join(context["npc_rules"]))
+        text = "\n".join(context["common_rules"] + context["npc_rules"])
+        self.assertIn("7世界分钟", text)
+        self.assertIn("玉米", text)
+        self.assertNotIn("HUNT", text)
+        self.assertNotIn("SOCIALIZE", text)
+        self.assertNotIn("Bill", text)
+        self.assertNotIn("10011", text)
+        self.assertNotIn("BILL_HOME", text)
+        self.assertEqual({tool["name"] for tool in data["tools"]}, {"OBSERVE", "PLANT"})
+
+        NpcRuntimeState.objects.filter(npc=self.bill).update(
+            action_status="RUNNING", hunger_fp=990, current_location_code="MARKET_STREET"
+        )
+        self.assertEqual(npc_available_actions(request, "10011").data["data"]["agent_context"], context)
+
+        profile.capabilities = ["OBSERVE", "HUNT"]
+        profile.save(update_fields=["capabilities"])
+        data = npc_available_actions(request, "10011").data["data"]
+        text = "\n".join(data["agent_context"]["npc_rules"])
+        self.assertIn("对话是环境规则", "\n".join(data["agent_context"]["common_rules"]))
+        self.assertNotIn("对话是环境规则", text)
+        self.assertIn("HUNT", text)
+        self.assertNotIn("玉米", text)
+        self.assertNotIn("PLANT", text)
+        self.assertEqual({tool["name"] for tool in data["tools"]}, {"OBSERVE", "HUNT"})
+
+        with patch.dict(CommandService.NEED_GATE_LIMITS, {"hunger": 800}):
+            data = npc_available_actions(request, "10011").data["data"]
+            self.assertIn("饥饿必须低于80", "\n".join(data["agent_context"]["npc_rules"]))
+            runtime = NpcRuntimeState.objects.get(npc=self.bill)
+            runtime.hunger_fp = 800
+            self.assertEqual(CommandService.unavailable_reason("HUNT", runtime), ResultCode.HUNGER_TOO_HIGH)
+
+    def test_get_rule_returns_per_npc_environment_rules(self):
+        user = GameAccount.objects.create(username="get-rule-env", password="unused")
+        request = APIRequestFactory().get("/api/village/npcs/10011/discover")
+        force_authenticate(request, user=user)
+        profile = NpcProfile.objects.get(npc=self.bill)
+        profile.capabilities = ["GET_RULE", "OBSERVE", "PLANT", "SOCIALIZE"]
+        profile.save(update_fields=["capabilities"])
+        VillageActionDurationConfig.objects.update_or_create(
+            action_name="PLANT", defaults={"duration_minutes": 7}
+        )
+
+        discover_context = npc_available_actions(request, "10011").data["data"]["agent_context"]
+        success, code, data = execute_agent_query("10011", "GET_RULE")
+        self.assertTrue(success)
+        self.assertEqual(code, "OK")
+        self.assertEqual(discover_context, data)
+        self.assertEqual(set(data), {"common_rules", "npc_rules"})
+        text = "\n".join(data["common_rules"] + data["npc_rules"])
+        self.assertIn("7世界分钟", text)
+        self.assertIn("玉米", text)
+        self.assertNotIn("HUNT", text)
+        self.assertNotIn("Bill", text)
+        self.assertNotIn("10011", text)
+
+        profile.capabilities = ["GET_RULE", "OBSERVE", "HUNT"]
+        profile.save(update_fields=["capabilities"])
+        success, code, data = execute_agent_query("10011", "GET_RULE")
+        self.assertTrue(success)
+        text = "\n".join(data["npc_rules"])
+        self.assertIn("HUNT", text)
+        self.assertNotIn("玉米", text)
+        self.assertNotIn("PLANT", text)
+
+    def test_get_rule_denied_without_capability(self):
+        profile = NpcProfile.objects.get(npc__agent_id="90012")
+        self.assertEqual(profile.capabilities, [])
+        success, code, data = execute_agent_query("90012", "GET_RULE")
+        self.assertFalse(success)
+        self.assertEqual(code, ResultCode.ACTION_NOT_ALLOWED)
+
+    def test_dialogue_capability_repair_preserves_other_permissions(self):
+        from importlib import import_module
+        from django.apps import apps
+        from django.db import connection
+        from village.seed_data import BASE_ACTIONS
+
+        profile = NpcProfile.objects.get(npc=self.bill)
+        profile.capabilities = ["PLANT", "SOCIALIZE"]
+        profile.save(update_fields=["capabilities"])
+        migrate = import_module("village.migrations.0028_restore_dialogue_capabilities").restore_dialogue_capabilities
+        migrate(apps, connection.schema_editor())
+        migrate(apps, connection.schema_editor())
+        profile.refresh_from_db()
+        self.assertEqual(profile.capabilities, ["PLANT", "START_DIALOGUE", "SPEAK"])
+        self.assertEqual(NpcProfile.objects.get(npc__agent_id="90012").capabilities, [])
+        self.assertTrue({"START_DIALOGUE", "SPEAK"}.issubset(BASE_ACTIONS))
+        self.assertNotIn("SOCIALIZE", BASE_ACTIONS)
 
     @patch("village.runtime_services._fast_integration_enabled", return_value=True)
     def test_all_read_queries_are_rejected_by_command_lifecycle(self, _fast):

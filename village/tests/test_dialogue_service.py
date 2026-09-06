@@ -4,6 +4,7 @@ from game_time.models import GlobalGameTimeState
 from inventory.models import NpcDefinition
 from village.dialogue_service import DialogueService
 from village.models import (
+    NpcActionReservation,
     NpcDialogueSession,
     NpcProfile,
     NpcRuntimeState,
@@ -46,10 +47,14 @@ class DialogueServiceTests(TestCase):
         self.time.save(update_fields=["world_minute", "time_revision"])
 
     def test_consecutive_speech_projection_and_social_settlement(self):
-        started = DialogueService.start("10011", "10012", "harvest")
+        started = DialogueService.start(
+            "10011", "10012", "harvest", conversation_id="cid-dialogue-test-1"
+        )
         self.assertTrue(started["success"], started)
         conversation_id = started["conversation_id"]
-        replay = DialogueService.start("10012", "10011")
+        replay = DialogueService.start(
+            "10012", "10011", conversation_id="cid-dialogue-test-1"
+        )
         self.assertEqual((replay["conversation_id"], replay["reused"]), (conversation_id, True))
         self.assertEqual(runtime_summary("10012")["action_status"], "DIALOGUING")
         self.assertEqual(runtime_summary("10011")["available_actions"], ["SPEAK"])
@@ -70,14 +75,14 @@ class DialogueServiceTests(TestCase):
     def test_start_does_not_use_logical_location_as_distance(self):
         NpcRuntimeState.objects.filter(npc=self.npcs[1]).update(current_location_code="OTHER")
 
-        started = DialogueService.start("10011", "10012")
+        started = DialogueService.start("10011", "10012", conversation_id="cid-dialogue-test")
 
         self.assertTrue(started["success"], started)
         self.assertEqual(started["result_code"], ResultCode.DIALOGUE_STARTED)
         self.assertTrue(started["conversation_id"])
 
     def test_dialogue_settlement_adds_delta_after_tick_base_once(self):
-        started = DialogueService.start("10011", "10012")
+        started = DialogueService.start("10011", "10012", conversation_id="cid-dialogue-test")
         conversation_id = started["conversation_id"]
         DialogueService.speak(conversation_id, "10011", "hello")
         DialogueService.speak(conversation_id, "10012", "hi")
@@ -96,7 +101,7 @@ class DialogueServiceTests(TestCase):
             self.assertEqual(runtime.social_fp, 120)
 
     def test_expired_one_sided_dialogue_fills_idle_without_reward(self):
-        started = DialogueService.start("10011", "10012")
+        started = DialogueService.start("10011", "10012", conversation_id="cid-dialogue-test")
         DialogueService.speak(started["conversation_id"], "10011", "hello", end_turn=True)
         rejected = DialogueService.speak(started["conversation_id"], "10011", "too late")
         self.assertEqual(rejected["result_code"], ResultCode.DIALOGUE_ALREADY_ENDED_SELF)
@@ -112,7 +117,7 @@ class DialogueServiceTests(TestCase):
             self.assertEqual((runtime.needs_world_minute, runtime.social_fp), (120, 240))
 
     def test_recovery_expires_unfinished_dialogue_immediately(self):
-        started = DialogueService.start("10011", "10012")
+        started = DialogueService.start("10011", "10012", conversation_id="cid-dialogue-test")
         self.time.world_minute = 30
         self.time.save(update_fields=["world_minute"])
 
@@ -126,7 +131,7 @@ class DialogueServiceTests(TestCase):
             self.assertEqual(runtime.needs_world_minute, 30)
 
     def test_natural_expiry_rewards_a_dialogue_when_both_participants_spoke(self):
-        started = DialogueService.start("10011", "10012")
+        started = DialogueService.start("10011", "10012", conversation_id="cid-dialogue-test")
         DialogueService.speak(started["conversation_id"], "10011", "hello")
         DialogueService.speak(started["conversation_id"], "10012", "hi")
         self.time.world_minute = 120
@@ -139,7 +144,7 @@ class DialogueServiceTests(TestCase):
         self.assertEqual(session.social_multiplier_percent, 100)
 
     def test_late_expiry_catches_needs_up_to_authoritative_time(self):
-        DialogueService.start("10011", "10012")
+        DialogueService.start("10011", "10012", conversation_id="cid-dialogue-test-late")
         self.time.world_minute = 125
         self.time.save(update_fields=["world_minute"])
 
@@ -147,3 +152,40 @@ class DialogueServiceTests(TestCase):
 
         for npc in self.npcs:
             self.assertEqual(NpcRuntimeState.objects.get(npc=npc).needs_world_minute, 125)
+
+    def test_start_requires_caller_supplied_conversation_id(self):
+        missing = DialogueService.start("10011", "10012")
+        self.assertEqual(missing["result_code"], ResultCode.INVALID_COMMAND_SCHEMA)
+        too_long = DialogueService.start("10011", "10012", conversation_id="x" * 129)
+        self.assertEqual(too_long["result_code"], ResultCode.INVALID_COMMAND_SCHEMA)
+        self.assertFalse(NpcDialogueSession.objects.exists())
+
+    def test_dialogue_allows_npc_busy_with_daily_action(self):
+        NpcRuntimeState.objects.filter(npc=self.npcs[0]).update(
+            action_status="ACTING", current_action="COOK", health_fp=50
+        )
+        started = DialogueService.start("10011", "10012", conversation_id="cid-dialogue-acting")
+        self.assertTrue(started["success"], started)
+
+    def test_dialogue_coexists_with_held_daily_reservation(self):
+        res = NpcActionReservation.objects.create(
+            action_kind="HUNT", location_code="SQUARE",
+            active_lock_key="participants:10011", status="HELD",
+            acquired_world_minute=0, expires_world_minute=500,
+        )
+        res.participants.set([self.npcs[0]])
+        started = DialogueService.start("10011", "10012", conversation_id="cid-dialogue-held-reservation")
+        self.assertTrue(started["success"], started)
+
+    def test_dialogue_rejects_sleeping_npc(self):
+        NpcRuntimeState.objects.filter(npc=self.npcs[0]).update(action_status="SLEEPING")
+        started = DialogueService.start("10011", "10012", conversation_id="cid-dialogue-sleeping")
+        self.assertEqual(started["result_code"], ResultCode.SOCIAL_TARGET_BUSY)
+        self.assertFalse(NpcDialogueSession.objects.exists())
+
+    def test_dialogue_busy_while_participant_already_in_dialogue(self):
+        started = DialogueService.start("10011", "10012", conversation_id="cid-dialogue-first")
+        self.assertTrue(started["success"], started)
+        second = DialogueService.start("10011", "10012", conversation_id="cid-dialogue-second")
+        self.assertEqual(second["result_code"], ResultCode.SOCIAL_TARGET_BUSY)
+        self.assertEqual(NpcDialogueSession.objects.count(), 1)

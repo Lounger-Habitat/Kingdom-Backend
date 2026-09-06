@@ -1,4 +1,4 @@
-﻿{
+{
   "actions": [
     {
       "name": "MOVE",
@@ -50,7 +50,7 @@
       "name": "EAT",
       "phase": "阶段二",
       "label": "进食",
-      "description": "进食并结算饥饿值；时长固定为 30 个世界分钟。",
+      "description": "进食并结算饥饿值；时长使用后端配置（世界分钟）。",
       "parameters": {
         "type": "object",
         "properties": {
@@ -77,45 +77,41 @@
       "name": "REST",
       "phase": "阶段二",
       "label": "休息",
-      "description": "在家或餐厅休息；30–120 个世界分钟，且必须为 30 的倍数。",
+      "description": "在家或餐厅休息；可指定正整数世界分钟时长，省略时使用后端配置。",
       "parameters": {
         "type": "object",
         "properties": {
           "duration_minutes": {
             "type": "integer",
             "description": "休息时长（世界分钟）",
-            "minimum": 30,
-            "maximum": 120,
-            "multipleOf": 30
+            "minimum": 1
           }
         },
-        "required": ["duration_minutes"]
+        "required": []
       }
     },
     {
       "name": "SLEEP",
       "phase": "阶段二",
       "label": "睡眠",
-      "description": "在家睡眠；30–600 个世界分钟，且必须为 30 的倍数。",
+      "description": "在家睡眠；可指定正整数世界分钟时长，省略时使用后端配置。",
       "parameters": {
         "type": "object",
         "properties": {
           "duration_minutes": {
             "type": "integer",
             "description": "睡眠时长（世界分钟）",
-            "minimum": 30,
-            "maximum": 600,
-            "multipleOf": 30
+            "minimum": 1
           }
         },
-        "required": ["duration_minutes"]
+        "required": []
       }
     },
     {
       "name": "SOCIALIZE",
       "phase": "阶段二",
       "label": "社交",
-      "description": "与另一名 NPC 社交；30–120 个世界分钟，且必须为 30 的倍数。",
+      "description": "与另一名 NPC 社交；可指定正整数世界分钟时长，省略时使用后端配置。",
       "parameters": {
         "type": "object",
         "properties": {
@@ -126,14 +122,11 @@
           "duration_minutes": {
             "type": "integer",
             "description": "社交时长（世界分钟）",
-            "minimum": 30,
-            "maximum": 120,
-            "multipleOf": 30
+            "minimum": 1
           }
         },
         "required": [
-          "target_npc_id",
-          "duration_minutes"
+          "target_npc_id"
         ]
       }
     },
@@ -141,19 +134,17 @@
       "name": "WORK_PLACEHOLDER",
       "phase": "阶段二",
       "label": "工作",
-      "description": "在工作地点执行工作；30–240 个世界分钟，且必须为 30 的倍数。",
+      "description": "在工作地点执行工作；可指定正整数世界分钟时长，省略时使用后端配置。",
       "parameters": {
         "type": "object",
         "properties": {
           "duration_minutes": {
             "type": "integer",
             "description": "工作时长（世界分钟）",
-            "minimum": 30,
-            "maximum": 240,
-            "multipleOf": 30
+            "minimum": 1
           }
         },
-        "required": ["duration_minutes"]
+        "required": []
       }
     },
     {
@@ -733,7 +724,7 @@
       "name": "CREATE_COMMITMENT",
       "phase": "阶段四",
       "label": "创建承诺",
-      "description": "创建结构化 NPC 承诺；使用 1 个世界分钟。",
+      "description": "创建结构化 NPC 承诺；时长使用后端配置（世界分钟）。",
       "parameters": {
         "type": "object",
         "properties": {
@@ -774,7 +765,7 @@
       "name": "CANCEL_COMMITMENT",
       "phase": "阶段四",
       "label": "取消承诺",
-      "description": "取消仍开放的 NPC 承诺；使用 1 个世界分钟。",
+      "description": "取消仍开放的 NPC 承诺；时长使用后端配置（世界分钟）。",
       "parameters": {
         "type": "object",
         "properties": {
@@ -793,7 +784,7 @@
       "name": "PERFORM_COMMITMENT",
       "phase": "阶段四",
       "label": "履行承诺",
-      "description": "履行短时承诺；共同工作和见面使用各自固定时长。",
+      "description": "履行承诺；时长使用后端配置，共同工作和见面使用各自配置。",
       "parameters": {
         "type": "object",
         "properties": {
@@ -961,6 +952,13 @@
         },
         "required": ["conversation_id", "text"]
       }
+    },
+    {
+      "name": "GET_RULE",
+      "phase": "查询",
+      "label": "获取村庄规则",
+      "description": "获取当前适用于你自己的村庄环境规则（需求数值、行动耗时、各指令前提等；不同村民可执行的规则不同）。连接后、规则可能变化时或不确定时调用。",
+      "parameters": {"type": "object", "properties": {}, "required": []}
     },
     {
       "name": "OBSERVE",

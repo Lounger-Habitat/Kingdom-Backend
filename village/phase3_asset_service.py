@@ -28,7 +28,6 @@ from .models import (
 )
 from .phase3_contract import (
     ACTOR_WHITELIST,
-    LOCATION_REQUIREMENTS,
     PARAM_WHITELIST,
     VILLAGE_ECONOMY_ACTION_V1,
     VILLAGE_ECONOMY_RESULT_V1,
@@ -210,6 +209,7 @@ def add_batch(
     produced_world_minute: int,
     expires_world_minute: Optional[int],
     source_request_id: uuid.UUID,
+    remaining_uses: Optional[int] = None,
 ) -> NpcGlobalInventorySlot:
     """Add a new inventory batch. Never merges with existing slots."""
     max_idx = (
@@ -224,6 +224,7 @@ def add_batch(
         slot_index=next_index,
         item_id=item_id,
         item_amount=amount,
+        remaining_uses=remaining_uses,
         produced_world_minute=produced_world_minute,
         expires_world_minute=expires_world_minute,
         source_request_id=source_request_id,
@@ -373,7 +374,8 @@ def commit_economy_action(payload: Dict[str, Any]) -> Dict[str, Any]:
             return response_data
         return _fail(ResultCode.P3_REQUEST_CONFLICT, status="CONFLICT")
 
-    # 4. Validate actor/location/params against contract
+    # 4. Validate actor/params against contract. Unity owns NPC location
+    # validation; current_location_code is retained below as reported state.
     command_name = str(payload.get("command_name", "")).upper()
     npc_id = int(payload["npc_id"])
     location = str(payload.get("current_location_code", ""))
@@ -391,10 +393,6 @@ def commit_economy_action(payload: Dict[str, Any]) -> Dict[str, Any]:
     allowed_actors = ACTOR_WHITELIST.get(action_enum, set())
     if allowed_actors and str(npc_id) not in allowed_actors:
         return _fail(ResultCode.P3_FORBIDDEN_ACTOR)
-
-    required_location = LOCATION_REQUIREMENTS.get(action_enum)
-    if required_location and location != required_location:
-        return _fail(ResultCode.P3_WRONG_LOCATION)
 
     allowed_params = PARAM_WHITELIST.get(action_enum, frozenset())
     # 线缆兼容隧道键：部署的 Hub 只转发 action id/name/params，命令元数据经 params

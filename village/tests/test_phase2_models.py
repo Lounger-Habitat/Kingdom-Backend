@@ -52,7 +52,7 @@ class PhaseTwoModelConstraintTests(TestCase):
         with self.assertRaises(IntegrityError), transaction.atomic():
             NpcRuntimeState.objects.filter(pk=self.runtime.pk).update(hunger_fp=1001)
         with self.assertRaises(IntegrityError), transaction.atomic():
-            NpcRuntimeState.objects.filter(pk=self.runtime.pk).update(stress_remainder=-30)
+            NpcRuntimeState.objects.filter(pk=self.runtime.pk).update(stress_remainder=-3000)
         with self.assertRaises(IntegrityError), transaction.atomic():
             NpcRuntimeState.objects.filter(pk=self.runtime.pk).update(needs_world_minute=-1)
 

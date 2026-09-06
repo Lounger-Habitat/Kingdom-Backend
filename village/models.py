@@ -167,11 +167,11 @@ class VillageActionDurationConfig(models.Model):
         "MOVE": ("阶段一", "移动", "前往指定地点；以寻路到达为准，仅“导航超时（秒）”生效。"),
         "WAIT": ("阶段一", "等待", "原地等待；使用“时长（世界分钟）”。"),
         "GO_HOME": ("阶段一", "回家", "返回 NPC 住所；以寻路到达为准，仅“导航超时（秒）”生效。"),
-        "EAT": ("阶段二", "进食", "进食并结算饥饿值；时长固定为 30 个世界分钟。"),
-        "REST": ("阶段二", "休息", "在家或餐厅休息；30–120 个世界分钟，且必须为 30 的倍数。"),
-        "SLEEP": ("阶段二", "睡眠", "在家睡眠；30–600 个世界分钟，且必须为 30 的倍数。"),
-        "SOCIALIZE": ("阶段二", "社交", "与另一名 NPC 社交；30–120 个世界分钟，且必须为 30 的倍数。"),
-        "WORK_PLACEHOLDER": ("阶段二", "工作", "在工作地点执行工作；30–240 个世界分钟，且必须为 30 的倍数。"),
+        "EAT": ("阶段二", "进食", "进食并结算饥饿值；使用配置的世界分钟时长。"),
+        "REST": ("阶段二", "休息", "在家或餐厅休息；Agent 可指定正整数时长，省略时使用此配置。"),
+        "SLEEP": ("阶段二", "睡眠", "在家睡眠；Agent 可指定正整数时长，省略时使用此配置。"),
+        "SOCIALIZE": ("阶段二", "社交", "与另一名 NPC 社交；Agent 可指定正整数时长，省略时使用此配置。"),
+        "WORK_PLACEHOLDER": ("阶段二", "工作", "在工作地点执行工作；Agent 可指定正整数时长，省略时使用此配置。"),
         "PLANT": ("阶段三", "播种", "在 Bill 农田播种；使用“时长（世界分钟）”。"),
         "HARVEST": ("阶段三", "收获", "在 Bill 农田收获；使用“时长（世界分钟）”。"),
         "HUNT": ("阶段三", "狩猎", "在狩猎入口狩猎；使用“时长（世界分钟）”。"),
@@ -198,18 +198,14 @@ class VillageActionDurationConfig(models.Model):
         "CHECK_MY_MARKETPLACE_LISTINGS": ("查询", "查看我的全服挂单", "只读查询，不进入经济结算。"),
         "CHECK_MARKETPLACE_HISTORY": ("查询", "查看全服成交历史", "只读查询，不进入经济结算。"),
         "INSPECT_STORE_INVENTORY": ("阶段三", "查看商店库存", "只读查询，不进入经济结算。"),
-        "JOINT_WORK": ("阶段四", "共同工作", "与另一名 NPC 在指定地点共同工作；固定使用 120 个世界分钟。"),
-        "MEETING": ("阶段四", "见面", "与另一名 NPC 在指定地点会面；固定使用 30 个世界分钟。"),
-        "CREATE_COMMITMENT": ("阶段四", "创建承诺", "创建结构化 NPC 承诺；使用 1 个世界分钟。"),
-        "CANCEL_COMMITMENT": ("阶段四", "取消承诺", "取消仍开放的 NPC 承诺；使用 1 个世界分钟。"),
-        "PERFORM_COMMITMENT": ("阶段四", "履行承诺", "履行短时承诺；共同工作和见面使用各自固定时长。"),
+        "JOINT_WORK": ("阶段四", "共同工作", "共同工作承诺使用的世界分钟时长。"),
+        "MEETING": ("阶段四", "见面", "见面承诺使用的世界分钟时长。"),
+        "CREATE_COMMITMENT": ("阶段四", "创建承诺", "创建结构化 NPC 承诺；使用配置的世界分钟时长。"),
+        "CANCEL_COMMITMENT": ("阶段四", "取消承诺", "取消仍开放的 NPC 承诺；使用配置的世界分钟时长。"),
+        "PERFORM_COMMITMENT": ("阶段四", "履行承诺", "普通履约时长；共同工作和见面使用各自配置。"),
     }
     ACTION_CHOICES = [(action, f"{label}（{action}）") for action, (_, label, _) in ACTION_METADATA.items()]
     NAVIGATION_ACTIONS = frozenset({"MOVE", "GO_HOME"})
-    PHASE2_DURATION_LIMITS = {
-        "EAT": (30, 30), "REST": (30, 120), "SLEEP": (30, 600),
-        "SOCIALIZE": (30, 120), "WORK_PLACEHOLDER": (30, 240),
-    }
     DEFAULT_DURATIONS = {
         "WAIT": 1,
         "EAT": 30,
@@ -279,6 +275,11 @@ class VillageActionDurationConfig(models.Model):
         return dict(cls.DEFAULT_DURATIONS)
 
     @classmethod
+    def configured_duration(cls, action_name):
+        value = cls.objects.filter(action_name=action_name).values_list("duration_minutes", flat=True).first()
+        return value if value is not None else cls.DEFAULT_DURATIONS[action_name]
+
+    @classmethod
     def default_navigation_timeouts(cls):
         return dict(cls.DEFAULT_NAVIGATION_TIMEOUT_SECONDS)
 
@@ -294,11 +295,6 @@ class VillageActionDurationConfig(models.Model):
             return
         if not self.duration_minutes:
             raise ValidationError({"duration_minutes": "此动作必须设置大于 0 的世界分钟时长。"})
-        limits = self.PHASE2_DURATION_LIMITS.get(self.action_name)
-        if limits and (self.duration_minutes % 30 or not limits[0] <= self.duration_minutes <= limits[1]):
-            raise ValidationError({
-                "duration_minutes": f"{self.action_name} 必须在 {limits[0]}–{limits[1]} 之间，且为 30 的倍数。"
-            })
 
     def __str__(self):
         value = self.navigation_timeout_seconds if self.action_name in self.NAVIGATION_ACTIONS else self.duration_minutes
@@ -399,11 +395,11 @@ class NpcRuntimeState(models.Model):
             models.CheckConstraint(
                 name="npc_runtime_needs_remainder_in_range",
                 condition=(
-                    models.Q(hunger_remainder__gte=-29, hunger_remainder__lte=29)
-                    & models.Q(energy_remainder__gte=-29, energy_remainder__lte=29)
-                    & models.Q(health_remainder__gte=-29, health_remainder__lte=29)
-                    & models.Q(social_remainder__gte=-29, social_remainder__lte=29)
-                    & models.Q(stress_remainder__gte=-29, stress_remainder__lte=29)
+                    models.Q(hunger_remainder__gte=-2999, hunger_remainder__lte=2999)
+                    & models.Q(energy_remainder__gte=-2999, energy_remainder__lte=2999)
+                    & models.Q(health_remainder__gte=-2999, health_remainder__lte=2999)
+                    & models.Q(social_remainder__gte=-2999, social_remainder__lte=2999)
+                    & models.Q(stress_remainder__gte=-2999, stress_remainder__lte=2999)
                 ),
             ),
             models.CheckConstraint(
@@ -743,7 +739,7 @@ class NpcDialogueSession(models.Model):
         ("EXPIRED", "已过期"),
     ]
 
-    conversation_id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
+    conversation_id = models.CharField("会话ID", max_length=128, primary_key=True, editable=False)
     initiator = models.ForeignKey(
         "inventory.NpcDefinition", on_delete=models.CASCADE, related_name="initiated_dialogues"
     )
@@ -1198,6 +1194,7 @@ class VillageStoreInventorySlot(models.Model):
     )
     item_id = models.IntegerField("物品ID")
     item_amount = models.IntegerField("数量", default=0)
+    remaining_uses = models.IntegerField("剩余使用次数", null=True, blank=True)
     produced_world_minute = models.BigIntegerField("生产世界分钟", null=True, blank=True)
     expires_world_minute = models.BigIntegerField("过期世界分钟", null=True, blank=True)
     source_npc = models.ForeignKey(

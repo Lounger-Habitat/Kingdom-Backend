@@ -213,19 +213,14 @@ def economy_actions_complete(request):
 def economy_store_inventory(request, store_code):
     """Read-only public store inventory query (INSPECT_STORE_INVENTORY).
 
-    Never writes a receipt, ledger or world event.
+    Never writes a receipt, ledger or world event. Unity performs the NPC
+    location check before requesting this public projection.
     """
     try:
-        npc_id_raw = request.query_params.get("npc_id")
-        try:
-            npc_id = int(npc_id_raw)
-        except (TypeError, ValueError):
-            return _error_response(ResultCode.P3_INVALID_PARAMS)
-
         time_state = GlobalGameTimeState.objects.filter(pk=1).first()
         world_minute = time_state.world_minute if time_state else 0
 
-        result_code, data = query_store_inventory(store_code, npc_id, world_minute)
+        result_code, data = query_store_inventory(store_code, world_minute)
         if result_code is not None:
             return _error_response(result_code, status=200)
         return Response(

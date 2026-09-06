@@ -1,7 +1,7 @@
 """Tests for Phase 3 public economy actions: IMPORT_GOODS, EXPORT_GOODS,
 RATE_DISH, PUBLISH_PRICE_INDEX, AUDIT_PUBLIC_FUND, EAT, COMMUNITY_MEAL.
 
-Covers success, cooldown, FEFO, salary, fund payment, insufficient resources.
+Covers success, cooldown, FEFO, salary, owner payment, insufficient resources.
 """
 
 import uuid
@@ -168,9 +168,12 @@ class ImportGoodsTest(PublicEconomyTestBase):
         total = sum(s.item_amount for s in pepper_slots)
         self.assertEqual(total, 6)
 
-        # PUBLIC_FUND deducted
+        # Nora pays for her own stock; PUBLIC_FUND is unchanged.
+        self.nora_inv.refresh_from_db()
+        self.assertEqual(self.nora_inv.money, 450 - 8 * 6)
         self.account.refresh_from_db()
-        self.assertEqual(self.account.balance, 500 - 8 * 6)  # 8 is published price
+        self.assertEqual(self.account.balance, 500)
+        self.assertEqual(resp["effects"]["nora_balance"], 450 - 8 * 6)
 
         # external_delta negative
         self.assertEqual(resp["external_delta"], -48)
@@ -204,8 +207,8 @@ class ImportGoodsTest(PublicEconomyTestBase):
         self.assertEqual(resp["result_code"], ResultCode.OK)
         self.assertEqual(resp["effects"]["import"]["amount"], 3)
 
-    def test_import_public_fund_payment(self):
-        """Import costs come from PUBLIC_FUND."""
+    def test_import_owner_payment(self):
+        """Import costs come from Nora, not PUBLIC_FUND."""
         self.account.balance = 10
         self.account.save(update_fields=["balance"])
 
@@ -213,7 +216,24 @@ class ImportGoodsTest(PublicEconomyTestBase):
             "IMPORT_GOODS", 10015, "TRADE_ROAD",
             {"item_id": 1050, "amount": 3},  # sugar: 4 * 3 = 12
         ))
+        self.assertEqual(resp["result_code"], ResultCode.OK)
+        self.nora_inv.refresh_from_db()
+        self.account.refresh_from_db()
+        self.assertEqual(self.nora_inv.money, 450 - 12)
+        self.assertEqual(self.account.balance, 10)
+
+    def test_import_fails_when_nora_cannot_pay(self):
+        """A full PUBLIC_FUND cannot cover Nora's insufficient balance."""
+        self.nora_inv.money = 10
+        self.nora_inv.save(update_fields=["money"])
+
+        resp = commit_economy_action(_payload(
+            "IMPORT_GOODS", 10015, "TRADE_ROAD",
+            {"item_id": 1050, "amount": 3},
+        ))
         self.assertEqual(resp["result_code"], ResultCode.P3_INSUFFICIENT_MONEY)
+        self.account.refresh_from_db()
+        self.assertEqual(self.account.balance, 500)
 
     def test_import_wrong_item(self):
         """Only import whitelist items allowed."""

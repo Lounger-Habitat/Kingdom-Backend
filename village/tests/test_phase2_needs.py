@@ -172,7 +172,7 @@ class NeedsServiceTests(TestCase):
         self.assertTrue(result["success"], result)
         self.runtime.refresh_from_db()
         self.assertEqual(self.runtime.needs_world_minute, 1501)
-        self.assertEqual((self.runtime.hunger_remainder, self.runtime.social_remainder), (20, 10))
+        self.assertEqual((self.runtime.hunger_remainder, self.runtime.social_remainder), (2000, 1000))
 
     def test_tick_accepts_jump_and_replays_same_minute_without_reapplying(self):
         self.runtime.needs_world_minute = 1500
@@ -278,7 +278,7 @@ class NeedsServiceTests(TestCase):
 
     def test_command_catalog_is_the_allowed_action_source(self):
         self.assertEqual(CommandService.ALLOWED_ACTIONS, frozenset(COMMAND_CATALOG))
-        self.assertEqual(len(COMMAND_CATALOG), 55)
+        self.assertEqual(len(COMMAND_CATALOG), 56)
         for action in COMMAND_CATALOG:
             self.assertEqual(set(agent_tool(action)), {"name", "description", "parameters"})
 

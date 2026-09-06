@@ -114,11 +114,6 @@ def _is_positive_int(value: Any) -> bool:
     return isinstance(value, int) and not isinstance(value, bool) and value > 0
 
 
-def _get_runtime_location(npc_id: int) -> Optional[str]:
-    rt = NpcRuntimeState.objects.filter(npc__agent_id=str(npc_id)).first()
-    return rt.current_location_code if rt else None
-
-
 def _get_buyer_available_money(inventory: NpcGlobalInventory) -> int:
     """Buyer-side available money (money minus ACTIVE-delivery reservations)."""
     reserved = (
@@ -340,11 +335,8 @@ def _do_propose_trade(
         return _fail(ResultCode.TRADE_TARGET_NOT_FOUND)
 
     buyer_rt = NpcRuntimeState.objects.filter(npc=buyer).first()
-    seller_rt = NpcRuntimeState.objects.filter(npc=seller).first()
-    if buyer_rt is None or seller_rt is None:
+    if buyer_rt is None:
         return _fail(ResultCode.TRADE_TARGET_NOT_FOUND)
-    if buyer_rt.current_location_code != seller_rt.current_location_code:
-        return _fail(ResultCode.TRADE_NOT_COLOCATED)
 
     commitment = None
     if commitment_id is not None:
@@ -377,6 +369,8 @@ def _do_propose_trade(
         amount=amount,
         gold_amount=gold_amount,
         conversation_id=conversation_id,
+        # Keep the Unity-synchronised location as offer metadata; do not use it
+        # as a Backend-side authorization check.
         location_code=buyer_rt.current_location_code,
         status=TradeOfferStatus.PENDING.value,
         expected_seller_asset_version=expected_seller_asset_version,
@@ -504,17 +498,6 @@ def _do_respond_trade(
         buyer_id = str(offer.buyer_npc.agent_id)
         seller_id = str(offer.seller_npc.agent_id)
 
-        # Re-verify colocation at settlement time.
-        buyer_rt = NpcRuntimeState.objects.filter(npc=offer.buyer_npc).first()
-        seller_rt = NpcRuntimeState.objects.filter(npc=offer.seller_npc).first()
-        if buyer_rt is None or seller_rt is None:
-            return _fail(ResultCode.TRADE_NOT_COLOCATED)
-        if (
-            buyer_rt.current_location_code != offer.location_code
-            or seller_rt.current_location_code != offer.location_code
-        ):
-            return _fail(ResultCode.TRADE_NOT_COLOCATED)
-
         # Lock both inventories in stable order.
         nid_a, nid_b = sorted([buyer_id, seller_id])
         inv_a = NpcGlobalInventory.objects.select_for_update().get(npc__agent_id=nid_a)
@@ -561,6 +544,7 @@ def _do_respond_trade(
                 slot.produced_world_minute or world_minute,
                 slot.expires_world_minute,
                 request_id,
+                remaining_uses=slot.remaining_uses,
             )
 
         buyer_inv.money -= gold_amount
@@ -690,9 +674,6 @@ def _do_list_store_item(
         if store.operator_npc is None or str(store.operator_npc.agent_id) != str(npc_id):
             return _fail(ResultCode.TRADE_STORE_FORBIDDEN)
 
-        if _get_runtime_location(npc_id) != store.location_code:
-            return _fail(ResultCode.TRADE_WRONG_LOCATION)
-
         try:
             operator_inv = NpcGlobalInventory.objects.select_for_update().get(
                 npc__agent_id=str(npc_id)
@@ -757,6 +738,7 @@ def _do_list_store_item(
                 listing=listing,
                 item_id=item_id,
                 item_amount=taken,
+                remaining_uses=slot.remaining_uses,
                 produced_world_minute=slot.produced_world_minute,
                 expires_world_minute=slot.expires_world_minute,
                 source_npc=operator_inv.npc,
@@ -836,9 +818,6 @@ def _do_update_store_price(
 
         if store.operator_npc is None or str(store.operator_npc.agent_id) != str(npc_id):
             return _fail(ResultCode.TRADE_STORE_FORBIDDEN)
-
-        if _get_runtime_location(npc_id) != store.location_code:
-            return _fail(ResultCode.TRADE_WRONG_LOCATION)
 
         if listing.status != ListingStatus.ACTIVE.value:
             return _fail(ResultCode.TRADE_LISTING_NOT_ACTIVE)
@@ -922,9 +901,6 @@ def _do_delist_store_item(
         if store.operator_npc is None or str(store.operator_npc.agent_id) != str(npc_id):
             return _fail(ResultCode.TRADE_STORE_FORBIDDEN)
 
-        if _get_runtime_location(npc_id) != store.location_code:
-            return _fail(ResultCode.TRADE_WRONG_LOCATION)
-
         if listing.status != ListingStatus.ACTIVE.value:
             return _fail(ResultCode.TRADE_LISTING_NOT_ACTIVE)
 
@@ -963,6 +939,7 @@ def _do_delist_store_item(
                     slot.produced_world_minute or world_minute,
                     slot.expires_world_minute,
                     request_id,
+                    remaining_uses=slot.remaining_uses,
                 )
                 returned += take
             # Sold amounts are gone; drop the batch (keep reserved portion if any).
@@ -1059,9 +1036,6 @@ def _do_buy_from_store(
         if store.operator_npc is not None and str(store.operator_npc.agent_id) == str(npc_id):
             return _fail(ResultCode.TRADE_STORE_FORBIDDEN)
 
-        if _get_runtime_location(npc_id) != store.location_code:
-            return _fail(ResultCode.TRADE_WRONG_LOCATION)
-
         if (
             expected_store_inventory_version is not None
             and store.inventory_version != expected_store_inventory_version
@@ -1126,6 +1100,7 @@ def _do_buy_from_store(
                 slot.produced_world_minute or world_minute,
                 slot.expires_world_minute,
                 request_id,
+                remaining_uses=slot.remaining_uses,
             )
 
         # Money: buyer pays gross, store keeps net, fee goes to PUBLIC_FUND.
@@ -1191,11 +1166,12 @@ def _do_buy_from_store(
 
 
 def query_store_inventory(
-    store_code: str, npc_id: int, world_minute: int
+    store_code: str, world_minute: int
 ) -> Tuple[Optional[str], Optional[Dict[str, Any]]]:
     """Return ``(result_code_or_None, data)`` for the public store inventory.
 
-    Read-only: never writes a receipt, ledger or world event.
+    Read-only: never writes a receipt, ledger or world event. Location
+    authorization is owned by Unity; this endpoint is only a public projection.
     """
     store = VillageStore.objects.filter(store_code=store_code).first()
     if store is None:
@@ -1203,9 +1179,6 @@ def query_store_inventory(
 
     if store.status not in _TRADABLE_STORE_STATUSES:
         return ResultCode.TRADE_STORE_CLOSED, None
-
-    if _get_runtime_location(npc_id) != store.location_code:
-        return ResultCode.TRADE_WRONG_LOCATION, None
 
     items: List[Dict[str, Any]] = []
     active_listings = list(

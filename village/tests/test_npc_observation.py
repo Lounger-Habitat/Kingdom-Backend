@@ -1,4 +1,5 @@
 import uuid
+from datetime import date
 
 from django.test import TestCase
 from rest_framework.test import APIClient
@@ -114,7 +115,8 @@ class NpcObservationTests(TestCase):
             command_id=uuid.uuid4(), message_id=uuid.uuid4(), request_id=uuid.uuid4(),
             npc=self.npcs["10011"], sender_id="10011", recipient_id="WuxiVillage",
             kind="MOVE", sanitized_parameters={"location_code": "MARKET_STREET"},
-            payload_sha256="a" * 64, status="RUNNING", started_world_minute=499,
+            payload_sha256="a" * 64, status="RUNNING", received_world_minute=499,
+            started_world_minute=499,
         )
         runtime.active_command_id = active_command.command_id
         runtime.save()
@@ -168,10 +170,23 @@ class NpcObservationTests(TestCase):
                 "action": "INSPECT_INVENTORY", "success": True,
                 "result_code": "QUERY_OK", "world_minute": 501,
                 "time_revision": 7, "state_version": 4, "params": {},
+                "data": {
+                    "money": 18,
+                    "items": [
+                        {"item_id": 1030, "quantity": 2},
+                        {"item_id": 1056, "quantity": 3},
+                    ],
+                },
             },
             format="json",
         )
         self.assertEqual((recorded.status_code, recorded.data["resultCode"]), (200, "RECORDED"))
+        NpcCommandState.objects.create(
+            command_id=uuid.uuid4(), message_id=uuid.uuid4(), request_id=uuid.uuid4(),
+            npc=self.npcs["10011"], sender_id="10011", recipient_id="WuxiVillage",
+            kind="HARVEST", sanitized_parameters={"plot_code": "FARM_PLOT_A"},
+            payload_sha256="c" * 64, status="QUEUED", received_world_minute=502,
+        )
 
         response = self.api_client(self.player).get("/api/village/public/npcs/10011/observation")
         self.assertEqual(response.status_code, 200)
@@ -183,16 +198,24 @@ class NpcObservationTests(TestCase):
         self.assertEqual(data["subjective_goal"]["summary"], "扩建农田")
         self.assertEqual(
             [row["name"] for row in data["recent_commands"][:5]],
-            ["MOVE", "INSPECT_INVENTORY", "UPDATE_SUBJECTIVE_GOAL", "BUY_FROM_MARKETPLACE", "EAT"],
+            ["HARVEST", "INSPECT_INVENTORY", "UPDATE_SUBJECTIVE_GOAL", "MOVE", "BUY_FROM_MARKETPLACE"],
         )
-        self.assertEqual(data["recent_commands"][6]["name"], "WAIT")
-        self.assertEqual(data["recent_commands"][0]["summary"], "移动至市场街")
-        self.assertEqual(data["recent_commands"][0]["status"], "RUNNING")
-        self.assertEqual(data["recent_commands"][0]["started_world_minute"], 499)
+        self.assertEqual(data["recent_commands"][7]["name"], "WAIT")
+        self.assertEqual(data["recent_commands"][0]["status"], "WAITING")
+        self.assertIn("已等待", data["recent_commands"][0]["detail"])
+        self.assertEqual(data["recent_commands"][0]["received_world_minute"], 502)
         self.assertIsNone(data["recent_commands"][0]["completed_world_minute"])
         self.assertEqual(data["recent_commands"][1]["summary"], "查看背包")
-        self.assertEqual(data["recent_commands"][3]["summary"], "购买玉米 ×2")
-        self.assertEqual(data["recent_commands"][4]["summary"], "进食玉米（个人背包）")
+        self.assertEqual(data["recent_commands"][1]["detail"], "金币18，物品2种/5件。")
+        self.assertEqual(data["recent_commands"][3]["summary"], "移动至市场街")
+        self.assertEqual(data["recent_commands"][3]["status"], "RUNNING")
+        self.assertEqual(data["recent_commands"][3]["started_world_minute"], 499)
+        self.assertEqual(data["recent_commands"][3]["detail"], "已执行1分钟。")
+        self.assertEqual(data["recent_commands"][4]["summary"], "购买玉米 ×2")
+        self.assertIn("数量2", data["recent_commands"][4]["detail"])
+        self.assertEqual(data["recent_commands"][5]["summary"], "进食玉米（个人背包）")
+        self.assertTrue(all(len(row["detail"]) <= 40 for row in data["recent_commands"]))
+        self.assertNotIn("COMMAND_COMPLETED", "".join(row["detail"] for row in data["recent_commands"]))
         self.assertNotIn("sanitized_parameters", data["recent_commands"][0])
         self.assertEqual(data["relationships"][0]["other_display_name"], "杰克")
         self.assertEqual(data["commitments"][0]["commitment_type"], "MEETING")
@@ -201,6 +224,25 @@ class NpcObservationTests(TestCase):
         self.assertEqual(self.api_client(self.env, env=True).get(
             "/api/village/public/npcs/10011/observation"
         ).status_code, 403)
+
+    def test_command_detail_formats_absolute_world_minute_as_calendar_date(self):
+        minute = (date(2026, 3, 8).toordinal() - 1) * 1440 + 9 * 60 + 5
+        command = NpcCommandState.objects.create(
+            command_id=uuid.uuid4(), message_id=uuid.uuid4(), request_id=uuid.uuid4(),
+            npc=self.npcs["10011"], sender_id="10011", recipient_id="WuxiVillage",
+            kind="WAIT", sanitized_parameters={}, payload_sha256="d" * 64,
+            status="FAILED", received_world_minute=minute, completed_world_minute=minute,
+        )
+        VillageActionReceipt.objects.create(
+            request_id=command.request_id, command=command, npc=self.npcs["10011"],
+            action_kind="WAIT", success=False, result_code="UNCLASSIFIED_RESULT",
+            world_minute=minute, time_revision=7,
+        )
+
+        response = self.api_client(self.player).get("/api/village/public/npcs/10011/observation")
+        detail = response.data["data"]["recent_commands"][0]["detail"]
+        self.assertIn("03月08日 09:05", detail)
+        self.assertNotIn("739", detail)
 
     def test_public_observation_uses_command_kind_for_legacy_receipts(self):
         command = NpcCommandState.objects.create(
@@ -219,3 +261,22 @@ class NpcObservationTests(TestCase):
         response = self.api_client(self.player).get("/api/village/public/npcs/10011/observation")
         self.assertEqual(response.status_code, 200)
         self.assertEqual(response.data["data"]["recent_commands"][0]["name"], "EAT")
+
+    def test_speech_outcome_appears_in_command_history(self):
+        recorded = self.api_client(self.env, env=True).post(
+            "/api/village/runtime/instruction-outcome",
+            {
+                "request_id": "speech-activity-1", "npc_id": "10011",
+                "action": "SPEAK", "success": True,
+                "result_code": "DIALOGUE_SPOKEN", "world_minute": 501,
+                "time_revision": 7, "state_version": 4,
+                "params": {"conversation_id": "chat-1", "text": "你好", "end_turn": False},
+            },
+            format="json",
+        )
+        self.assertEqual(recorded.status_code, 200)
+
+        response = self.api_client(self.player).get("/api/village/public/npcs/10011/observation")
+        command = response.data["data"]["recent_commands"][0]
+        self.assertEqual((command["name"], command["status"]), ("SPEAK", "SUCCEEDED"))
+        self.assertEqual(command["summary"], "对话发言：“你好”")

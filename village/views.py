@@ -28,6 +28,7 @@ from .runtime_services import (
 from .phase2_services import LifeActionService, NeedsService, TickService, needs_rules, runtime_summary
 from .goal_services import update_subjective_goal
 from .agent_queries import execute_agent_query
+from .agent_context import build_agent_context
 from .dialogue_service import DialogueService
 from .services import validate_bootstrap
 
@@ -266,6 +267,7 @@ def actions_complete(request):
         result_code=result_code,
         message=message,
         data=data,
+        allow_prestart_failure=not success,
     )
 
     if not ok:
@@ -335,11 +337,12 @@ def _dialogue_response(result):
 @permission_classes([IsAuthenticated])
 def dialogue_start(request):
     if not isinstance(request.data, dict) or not set(request.data).issubset({
-        "npc_id", "target_npc_id", "topic"
+        "npc_id", "target_npc_id", "topic", "conversation_id"
     }):
         return _dialogue_response({"success": False, "result_code": ResultCode.INVALID_COMMAND_SCHEMA})
     return _dialogue_response(DialogueService.start(
-        request.data.get("npc_id"), request.data.get("target_npc_id"), request.data.get("topic", "")
+        request.data.get("npc_id"), request.data.get("target_npc_id"),
+        request.data.get("topic", ""), conversation_id=request.data.get("conversation_id")
     ))
 
 
@@ -488,6 +491,7 @@ def npc_available_actions(request, npc_id):
             "npc_profile": npc_profile,
             "locations": locations,
             "tools": tools,
+            "agent_context": build_agent_context(tool["name"] for tool in tools),
         },
     }, status=status)
 
@@ -537,12 +541,14 @@ def instruction_outcome_record(request):
     success = data.get("success")
     result_code = str(data.get("result_code", ""))
     parameters = data.get("params", {})
+    outcome_data = data.get("data", {})
     profile = NpcProfile.objects.select_related("npc").filter(
         npc__agent_id=npc_id, npc__is_test_only=False, is_active=True
     ).first()
     if (not raw_request_id or len(raw_request_id) > 128 or action not in AGENT_INSTRUCTION_ACTIONS
             or profile is None or not isinstance(success, bool)
-            or not isinstance(parameters, dict) or world_minute < 0 or time_revision < 0
+            or not isinstance(parameters, dict) or not isinstance(outcome_data, dict)
+            or world_minute < 0 or time_revision < 0
             or (state_version is not None and state_version < 0)
             or len(result_code) > 64):
         return Response({"success": False, "resultCode": "INVALID_COMMAND_SCHEMA"}, status=400)
@@ -553,7 +559,7 @@ def instruction_outcome_record(request):
             "action_kind": action,
             "success": success,
             "result_code": result_code,
-            "response_data": {"parameters": parameters},
+            "response_data": {"parameters": parameters, "data": outcome_data},
             "world_minute": world_minute,
             "time_revision": time_revision,
             "state_version": state_version,
@@ -619,6 +625,7 @@ def commands_accept(request):
         "data": {
             "command_id": str(command.command_id) if command else None,
             "status": command.status if command else None,
+            "duration_minutes": command.duration_minutes if command else None,
         },
     })
 
@@ -659,6 +666,13 @@ def commands_start(request, command_id):
         "data": {
             "command_id": str(command.command_id) if command else None,
             "status": command.status if command else None,
+            "duration_minutes": command.duration_minutes if command else None,
+            "started_world_minute": command.started_world_minute if command else None,
+            "ends_world_minute": (
+                command.started_world_minute + command.duration_minutes
+                if command and command.started_world_minute is not None and command.duration_minutes is not None
+                else None
+            ),
         },
     })
 

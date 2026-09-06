@@ -206,6 +206,36 @@ class PhaseOneFaultAcceptanceTests(TestCase):
         self.assertFalse(replay_response.data["success"])
         self.assertEqual(replay_response.data["resultCode"], ResultCode.STALE_STATE_VERSION)
 
+    def test_env_can_terminalize_prestart_failure_and_deliver_reason(self):
+        command = NpcCommandState.objects.create(
+            command_id=uuid.uuid4(), message_id=uuid.uuid4(), request_id=uuid.uuid4(),
+            npc=self.npcs["10011"], sender_id="10011", recipient_id="env-server-001",
+            kind="HARVEST", sanitized_parameters={"plot_code": "FARM_PLOT_A"},
+            payload_sha256="a" * 64, status="QUEUED",
+            received_world_minute=self.time_state.world_minute,
+        )
+        client = APIClient()
+        client.credentials(HTTP_AUTHORIZATION=f"Bearer {self._access_token(service=True)}")
+        message = "收获失败：当前地点不是 Bill 农场。"
+        response = client.post("/api/village/actions/complete", {
+            "command_id": str(command.command_id),
+            "request_id": str(command.request_id),
+            "success": False,
+            "result_code": "P3_WRONG_LOCATION",
+            "message": message,
+            "data": {},
+        }, format="json")
+
+        self.assertEqual(response.status_code, 200)
+        command.refresh_from_db()
+        self.assertEqual((command.status, command.result_code),
+                         ("FAILED", "P3_WRONG_LOCATION"))
+        delivered = OutboxService.claim_pending("10011", limit=10)
+        outcome = next(item for item in delivered if item["message_kind"] == "OUTCOME")
+        content = outcome["envelope"]["payload"]["content"]
+        self.assertEqual((content["success"], content["result_code"], content["message"]),
+                         (False, "P3_WRONG_LOCATION", message))
+
     def test_strict_command_is_rechecked_at_start_after_another_action_completes(self):
         first_content, first = self._accept("10011", state_version=0)
         _second_content, second = self._accept("10011", state_version=0)

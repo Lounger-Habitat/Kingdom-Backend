@@ -8,6 +8,8 @@ from game_time.models import GlobalGameTimeState
 from inventory.models import NpcGlobalInventory
 from items.models import Item
 from village.models import (
+    NpcActionReservation,
+    NpcDialogueSession,
     NpcRelationship,
     NpcRuntimeState,
     NpcSubjectiveGoalState,
@@ -61,6 +63,17 @@ class ResetVillageWorldTests(TestCase):
         bill_runtime.state_version = 9
         bill_runtime.save()
         NpcSubjectiveGoalState.objects.create(npc=bill_runtime.npc, summary="旧目标", status="ACTIVE")
+        reservation = NpcActionReservation.objects.create(
+            action_kind="DIALOGUE", acquired_world_minute=0, expires_world_minute=1
+        )
+        NpcDialogueSession.objects.create(
+            conversation_id="reset-dialogue",
+            initiator=bill_runtime.npc,
+            target=NpcRuntimeState.objects.get(npc__agent_id="10012").npc,
+            reservation=reservation,
+            started_world_minute=0,
+            expires_world_minute=1,
+        )
         VillageWorldEvent.objects.create(
             dedupe_key="reset-test-event",
             event_type="TEST",
@@ -102,11 +115,17 @@ class ResetVillageWorldTests(TestCase):
             },
         )
         self.assertFalse(NpcSubjectiveGoalState.objects.exists())
+        self.assertFalse(NpcDialogueSession.objects.exists())
         reset_event = VillageWorldEvent.objects.get(event_type="VILLAGE_WORLD_RESET")
         self.assertEqual(reset_event.public_data["story_id"], "BROKEN_TRADE_ROUTE_V1")
         self.assertTrue(VillageDeliveryOutbox.objects.filter(event=reset_event).exists())
         self.assertFalse(VillageStoryArc.objects.exists())
         self.assertEqual(NpcRelationship.objects.count(), 20)
+        nora_bag = NpcGlobalInventory.objects.get(npc__agent_id="10015")
+        self.assertEqual(
+            dict(nora_bag.slots.filter(item_id__in=(4001, 4002)).values_list("item_id", "item_amount")),
+            {4001: 3, 4002: 3},
+        )
         self.assertTrue(config.village_needs_enabled)
         self.assertTrue(config.village_economy_enabled)
         self.assertTrue(config.village_social_enabled)
@@ -122,3 +141,25 @@ class ResetVillageWorldTests(TestCase):
         call_command("reset_village_world", "--dry-run", stdout=StringIO())
         bag.refresh_from_db()
         self.assertEqual(bag.money, 777)
+
+    def test_restore_npc_needs_only_updates_the_five_runtime_rows(self):
+        bill = NpcRuntimeState.objects.get(npc__agent_id="10011")
+        bill.current_location_code = "GENERAL_STORE"
+        bill.hunger_fp = 999
+        bill.energy_fp = 1
+        bill.health_fp = 2
+        bill.social_fp = 998
+        bill.stress_fp = 997
+        bill.state_version = 7
+        bill.save()
+
+        call_command("restore_npc_needs", stdout=StringIO())
+
+        bill.refresh_from_db()
+        clock = GlobalGameTimeState.get_instance()
+        self.assertEqual(
+            (bill.hunger_fp, bill.energy_fp, bill.health_fp, bill.social_fp, bill.stress_fp),
+            (0, 1000, 1000, 0, 0),
+        )
+        self.assertEqual((bill.current_location_code, bill.state_version), ("GENERAL_STORE", 8))
+        self.assertEqual((bill.needs_world_minute, bill.time_revision), (clock.world_minute, clock.time_revision))

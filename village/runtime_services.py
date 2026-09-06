@@ -31,6 +31,7 @@ from django.utils import timezone
 from .models import (
     NpcActionReservation,
     NpcCommandState,
+    NpcCommitment,
     NpcDialogueSession,
     NpcProfile,
     NpcRuntimeState,
@@ -799,7 +800,7 @@ class CommandService:
 
     ALLOWED_ACTIONS = frozenset(COMMAND_CATALOG)
     READ_QUERY_ACTIONS = frozenset({
-        "OBSERVE", "INSPECT_NEARBY", "INSPECT_INVENTORY",
+        "GET_RULE", "OBSERVE", "INSPECT_NEARBY", "INSPECT_INVENTORY",
         "INSPECT_TRADE_OFFERS", "INSPECT_STORY_STATE", "INSPECT_RELEVANT_STORIES",
         "INSPECT_STORY_DETAIL", "INSPECT_ORDERS",
         "INSPECT_MARKET_STATE", "INSPECT_FARM_STATE",
@@ -841,6 +842,7 @@ class CommandService:
     }
     LOW_HEALTH_ACTIONS = READ_QUERY_ACTIONS | {"MOVE", "GO_HOME", "WAIT", "EAT", "REST", "SLEEP"}
     VARIABLE_DURATION_ACTIONS = {"REST", "SLEEP", "SOCIALIZE", "WORK_PLACEHOLDER"}
+    NEED_GATE_LIMITS = {"hunger": 900, "energy": 100, "health": 300}
 
     @staticmethod
     def allowed_actions_for(npc: NpcDefinition) -> set[str]:
@@ -860,29 +862,32 @@ class CommandService:
     @staticmethod
     def unavailable_reason(action_name: str, runtime: NpcRuntimeState) -> Optional[str]:
         action_name = str(action_name).upper()
-        if runtime.health_fp <= 300 and action_name not in CommandService.LOW_HEALTH_ACTIONS:
+        if runtime.health_fp <= CommandService.NEED_GATE_LIMITS["health"] and action_name not in CommandService.LOW_HEALTH_ACTIONS:
             return ResultCode.HEALTH_TOO_LOW
         if action_name in CommandService.WORK_ACTIONS:
-            if runtime.hunger_fp >= 900:
+            if runtime.hunger_fp >= CommandService.NEED_GATE_LIMITS["hunger"]:
                 return ResultCode.HUNGER_TOO_HIGH
-            if runtime.energy_fp <= 100:
+            if runtime.energy_fp <= CommandService.NEED_GATE_LIMITS["energy"]:
                 return ResultCode.ENERGY_TOO_LOW
         return None
 
     @staticmethod
     def apply_admin_duration(action_name: str, content: Dict[str, Any]) -> None:
-        """Replace a wire duration with the Backend-managed value for known timers."""
+        """Resolve one timer; only variable-duration actions accept a caller override."""
         if action_name not in VillageActionDurationConfig.DEFAULT_DURATIONS:
+            content.pop("duration_minutes", None)
             return
         if action_name in CommandService.VARIABLE_DURATION_ACTIONS and content.get("duration_minutes") is not None:
             return
-        duration_minutes = VillageActionDurationConfig.default_durations()[action_name]
-        configured = VillageActionDurationConfig.objects.filter(
-            action_name=action_name
-        ).values_list("duration_minutes", flat=True).first()
-        if configured:
-            duration_minutes = configured
-        content["duration_minutes"] = duration_minutes
+        if action_name == "PERFORM_COMMITMENT":
+            try:
+                commitment_id = uuid.UUID(str(content.get("params", {}).get("commitment_id")))
+            except (ValueError, TypeError):
+                commitment_id = None
+            kind = NpcCommitment.objects.filter(commitment_id=commitment_id).values_list("commitment_type", flat=True).first()
+            if kind in {"JOINT_WORK", "MEETING"}:
+                action_name = kind
+        content["duration_minutes"] = VillageActionDurationConfig.configured_duration(action_name)
 
     @staticmethod
     def compute_payload_sha256(content: Dict[str, Any]) -> str:
@@ -899,6 +904,9 @@ class CommandService:
             isinstance(params, dict) and CommandService.NEEDS_FIELDS.intersection(params)
         ):
             return ResultCode.NEEDS_FIELDS_NOT_ALLOWED
+        duration = content.get("duration_minutes")
+        if isinstance(duration, bool) or not isinstance(duration, int) or duration <= 0:
+            return ResultCode.INVALID_ACTION_DURATION
         if _fast_integration_enabled():
             if not isinstance(params, dict):
                 return ResultCode.INVALID_COMMAND_SCHEMA
@@ -921,14 +929,11 @@ class CommandService:
             return None
         start = content.get("not_before_world_minute")
         expires = content.get("expires_world_minute")
-        duration = content.get("duration_minutes")
-        if any(isinstance(value, bool) or not isinstance(value, int) for value in (start, expires, duration)):
+        if isinstance(start, bool) or not isinstance(start, int) or (
+            expires is not None and (isinstance(expires, bool) or not isinstance(expires, int))
+        ):
             return ResultCode.INVALID_COMMAND_SCHEMA
-        limits = {
-            "EAT": (30, 30), "REST": (30, 120), "SLEEP": (30, 600),
-            "SOCIALIZE": (30, 120), "WORK_PLACEHOLDER": (30, 240),
-        }
-        if start < 0 or expires < start or duration % 30 or not limits[action_name][0] <= duration <= limits[action_name][1]:
+        if start < 0 or (expires is not None and expires < start):
             return ResultCode.INVALID_ACTION_DURATION
         if action_name == "WORK_PLACEHOLDER" and start // 1440 != (start + duration - 1) // 1440:
             return ResultCode.INVALID_ACTION_DURATION
@@ -983,7 +988,21 @@ class CommandService:
         fast_integration = _fast_integration_enabled()
         content = dict(content or {})
         server_resolved_intent = content.pop("_server_resolved_intent", False) is True
-        content["params"] = dict(content.get("params") or {})
+        if not isinstance(content.get("params", {}), dict):
+            return False, ResultCode.INVALID_COMMAND_SCHEMA, None
+        content["params"] = dict(content.get("params", {}))
+        action = str(content.get("name", "")).upper()
+        if "duration_minutes" in content["params"]:
+            requested = content["params"].pop("duration_minutes")
+            if action not in CommandService.VARIABLE_DURATION_ACTIONS or (
+                "duration_minutes" in content and content["duration_minutes"] != requested
+            ):
+                return False, ResultCode.INVALID_ACTION_DURATION, None
+            content["duration_minutes"] = requested
+        if action in CommandService.VARIABLE_DURATION_ACTIONS and "duration_minutes" in content:
+            requested = content["duration_minutes"]
+            if isinstance(requested, bool) or not isinstance(requested, int) or requested <= 0:
+                return False, ResultCode.INVALID_ACTION_DURATION, None
         if fast_integration:
             content["schema_version"] = "village.command.v1"
             content["queue_mode"] = "STRICT"
@@ -993,17 +1012,10 @@ class CommandService:
             timestamp_ms = timestamp_ms or int(timezone.now().timestamp() * 1000)
             action = str(content.get("name", "")).upper()
             if action == "EAT":
-                content["duration_minutes"] = 30
                 if content["params"].get("source") == "PERSONAL_INVENTORY":
                     content["params"].setdefault("expected_asset_version", 0)
-            elif action in CommandService.PHASE2_ACTIONS:
-                requested = content.get("duration_minutes")
-                requested = requested if isinstance(requested, int) and not isinstance(requested, bool) else 30
-                requested = max(30, ((max(1, requested) + 29) // 30) * 30)
-                maximum = 600 if action == "SLEEP" else 240 if action == "WORK_PLACEHOLDER" else 120
-                content["duration_minutes"] = min(requested, maximum)
-                if action == "SOCIALIZE":
-                    content["params"].setdefault("reservation_id", str(content.get("request_id", "")))
+            elif action == "SOCIALIZE":
+                content["params"].setdefault("reservation_id", str(content.get("request_id", "")))
 
         try:
             message_id = uuid.UUID(str(envelope_id))
@@ -1044,9 +1056,6 @@ class CommandService:
             return False, ResultCode.ACTION_NOT_ALLOWED, None
         if action_name in CommandService.DIALOGUE_ACTIONS:
             return False, ResultCode.ACTION_NOT_ALLOWED, None
-        phase2_validation = CommandService.validate_phase2_command(action_name, content)
-        if phase2_validation:
-            return False, phase2_validation, None
         if action_name == "MOVE":
             params = content.get("params")
             if (not isinstance(params, dict) or set(params) not in (
@@ -1059,11 +1068,6 @@ class CommandService:
                 return False, ResultCode.SOCIAL_TARGET_INVALID, None
             if str(params.get("target_npc_id", "")) == str(sender):
                 return False, ResultCode.SOCIAL_TARGET_INVALID, None
-        # Preserve protocol validation of the caller-provided value first, then
-        # make normal commands use the Backend-administered duration.  Fast
-        # integration intentionally keeps its caller duration for harnesses.
-        if not fast_integration:
-            CommandService.apply_admin_duration(action_name, content)
         if action_name in CommandService.PHASE2_ACTIONS and not fast_integration:
             if not VillageSimulationConfig.objects.filter(
                 config_key="default", village_needs_enabled=True
@@ -1105,6 +1109,17 @@ class CommandService:
         # 计算 payload hash
         payload_sha256 = CommandService.compute_payload_sha256(content)
 
+        # Resolve after replay checks: changing admin defaults must not alter an
+        # already accepted command or turn an identical retry into a conflict.
+        CommandService.apply_admin_duration(action_name, content)
+        if action_name in VillageActionDurationConfig.DEFAULT_DURATIONS:
+            duration = content.get("duration_minutes")
+            if isinstance(duration, bool) or not isinstance(duration, int) or duration <= 0:
+                return False, ResultCode.INVALID_ACTION_DURATION, None
+        phase2_validation = CommandService.validate_phase2_command(action_name, content)
+        if phase2_validation:
+            return False, phase2_validation, None
+
         # Acquire authority time before runtime state.  Bootstrap uses this
         # same global -> command/runtime lock order for recovery snapshots.
         GlobalGameTimeState.get_instance()
@@ -1115,7 +1130,10 @@ class CommandService:
             npc=npc,
             status__in=["RECEIVED", "QUEUED", "RUNNING"],
         ).count()
-        if not fast_integration and queue_count >= CommandService.MAX_QUEUE_SIZE:
+        queue_limit = VillageSimulationConfig.objects.filter(config_key="default").values_list(
+            "command_queue_limit", flat=True
+        ).first()
+        if not fast_integration and queue_count >= max(1, queue_limit if queue_limit is not None else CommandService.MAX_QUEUE_SIZE):
             return False, ResultCode.QUEUE_FULL, None
 
         # 获取当前时间
@@ -1355,10 +1373,6 @@ class CommandService:
             rt = next((row for row in social_runtimes if row.npc_id == command.npc_id), None)
             if rt is None or (not fast_integration and any(row.action_status != "IDLE" for row in social_runtimes)):
                 return False, ResultCode.NPC_BUSY, None
-            if (not fast_integration and
-                    (len({row.current_location_code for row in social_runtimes}) != 1 or
-                     command.location_code != rt.current_location_code)):
-                return False, ResultCode.SOCIAL_TARGET_BUSY, None
             if not fast_integration and NpcActionReservation.objects.filter(
                 participants__in=[row.npc for row in social_runtimes], status="HELD", active_lock_key__isnull=False
             ).exists():
@@ -1815,7 +1829,12 @@ class ReservationService:
         held_by_participant = NpcActionReservation.objects.select_for_update().filter(
             status="HELD",
             participants__agent_id__in=normalized_ids,
-        ).distinct().first()
+        )
+        if action_kind == "DIALOGUE":
+            # 对话可与 NPC 正在执行的日常动作预约共存（边干活边聊）；
+            # 但仍与其它进行中的对话互斥，避免同一 NPC 同时开多场对话。
+            held_by_participant = held_by_participant.filter(action_kind="DIALOGUE")
+        held_by_participant = held_by_participant.distinct().first()
         if held_by_participant:
             return False, ResultCode.RESERVATION_CONFLICT, None
 

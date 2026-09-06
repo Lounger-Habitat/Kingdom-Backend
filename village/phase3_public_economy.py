@@ -43,6 +43,7 @@ from .phase3_catalog import (
     MARK_SALARY,
     RECIPE_WHITELIST,
     SAFE_STOCKS,
+    TOOL_ITEM_IDS,
 )
 from .phase3_contract import (
     DaySnapshotStatus,
@@ -139,7 +140,7 @@ def handle_import_goods(
     - Item must be in IMPORT_WHITELIST
     - Cooldown: last_caravan_day >= 3 days ago
     - Import amount = safe_stock - available_amount (capped at requested amount)
-    - PUBLIC_FUND pays price * amount
+    - Nora's own inventory balance pays price * amount
     - external_delta = -(price * amount)
     """
     item_id = params.get("item_id")
@@ -149,9 +150,10 @@ def handle_import_goods(
         return _fail(ResultCode.P3_INVALID_PARAMS)
     if not isinstance(amount, int) or isinstance(amount, bool) or amount <= 0:
         return _fail(ResultCode.P3_INVALID_PARAMS)
+    item = Item.objects.filter(item_id=item_id, is_deleted=False).first()
 
     with transaction.atomic():
-        # Lock account
+        # Lock the shared caravan cooldown record; it does not fund the import.
         try:
             account = VillageAccount.objects.select_for_update().get(account_code="PUBLIC_FUND")
         except VillageAccount.DoesNotExist:
@@ -189,23 +191,28 @@ def handle_import_goods(
         unit_price = _get_published_price(item_id)
         total_cost = unit_price * actual_amount
 
-        # Check PUBLIC_FUND can pay
-        if account.balance < total_cost:
+        # Nora is the store owner, so she pays for her own stock.
+        if inventory.money < total_cost:
             return _fail(ResultCode.P3_INSUFFICIENT_MONEY)
 
         # Execute
-        account.balance -= total_cost
         account.last_caravan_day = current_day
-        account.save(update_fields=["balance", "last_caravan_day", "updated_at"])
+        account.save(update_fields=["last_caravan_day", "updated_at"])
+        inventory.money -= total_cost
 
         # Add items to Nora's inventory
         add_batch(
             inventory, item_id, actual_amount,
             world_minute, None, request_id,
+            remaining_uses=(
+                item.max_use_count
+                if item is not None and item_id in TOOL_ITEM_IDS
+                else None
+            ),
         )
 
         inventory.asset_version += 1
-        inventory.save(update_fields=["asset_version", "updated_at"])
+        inventory.save(update_fields=["money", "asset_version", "updated_at"])
 
     return _ok(
         asset_versions={str(npc_id): inventory.asset_version},
@@ -216,6 +223,7 @@ def handle_import_goods(
                 "unit_price": unit_price,
                 "total_cost": total_cost,
             },
+            "nora_balance": inventory.money,
             "public_fund_balance": account.balance,
         },
         external_delta=-total_cost,
@@ -533,8 +541,8 @@ def _public_fund_money_delta(entry) -> int:
     """Extract the PUBLIC_FUND money delta recorded on a ledger entry.
 
     Store transaction fees are recorded under ``changes["PUBLIC_FUND"]["money"]``
-    (positive = income).  Import/export settle directly against PUBLIC_FUND via
-    ``external_delta`` (negative = expense, positive = income).
+    (positive = income).  Only EXPORT_GOODS changes PUBLIC_FUND directly;
+    IMPORT_GOODS is paid by Nora and its ``external_delta`` is external only.
     """
     delta = 0
     changes = entry.changes or {}
@@ -544,7 +552,7 @@ def _public_fund_money_delta(entry) -> int:
             delta += int(pf.get("money", 0) or 0)
         except (TypeError, ValueError):
             pass
-    if entry.entry_type in ("IMPORT_GOODS", "EXPORT_GOODS"):
+    if entry.entry_type == "EXPORT_GOODS":
         try:
             delta += int(entry.external_delta or 0)
         except (TypeError, ValueError):

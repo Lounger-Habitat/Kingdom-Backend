@@ -21,7 +21,6 @@ from .models import (
     NpcActionReservation,
     NpcDialogueSession,
     NpcNeedsDaySummary,
-    NpcProfile,
     NpcRuntimeState,
     NpcSocialDailyCounter,
     VillageActionReceipt,
@@ -38,6 +37,7 @@ from .runtime_services import CommandService, ResultCode, TimeService, _fast_int
 NEEDS_FIELDS = ("hunger", "energy", "health", "social", "stress")
 NEEDS_SCALE = 10
 MINUTES_PER_DAY = 1440
+HEALTHY_SLEEP_MINUTES = 360
 MAX_INTERVALS = 64
 ACTIVITIES = {"IDLE", "MOVE", "WORK", "SOCIALIZE", "REST", "SLEEP"}
 
@@ -128,8 +128,13 @@ def needs_rules() -> Dict[str, Any]:
             "lower_is_worse": {"low_at": 30, "critical_at": 10},
         },
         "action_gates": {
-            "WORK_PLACEHOLDER": {"hunger_below": 90, "energy_above": 10, "health_above": 30},
-            "SOCIALIZE": {"health_above": 30},
+            action: {
+                **({"hunger_below": CommandService.NEED_GATE_LIMITS["hunger"] / NEEDS_SCALE,
+                    "energy_above": CommandService.NEED_GATE_LIMITS["energy"] / NEEDS_SCALE}
+                   if action in CommandService.WORK_ACTIONS else {}),
+                "health_above": CommandService.NEED_GATE_LIMITS["health"] / NEEDS_SCALE,
+            }
+            for action in sorted(CommandService.ALLOWED_ACTIONS - CommandService.LOW_HEALTH_ACTIONS - {"SOCIALIZE"})
         },
         "effects_per_30_minutes": {
             activity: {name: rate / NEEDS_SCALE for name, rate in rates.items()}
@@ -145,6 +150,7 @@ def needs_rules() -> Dict[str, Any]:
         "eat_completion_effect": {"hunger": -45, "energy": 5},
         "socialize_daily_effect_percent": [100, 50, 25],
         "daily_health": {
+            "minimum_sleep_minutes": HEALTHY_SLEEP_MINUTES,
             "severe_hunger_all_day": -8,
             "ate_and_slept_at_least_360_minutes_and_not_injured": 2,
         },
@@ -204,9 +210,9 @@ class NeedsService:
     def _apply_rate(runtime: NpcRuntimeState, name: str, rate: int, minutes: int) -> None:
         remainder_name = f"{name}_remainder"
         value_name = f"{name}_fp"
-        numerator = rate * minutes + getattr(runtime, remainder_name)
-        delta = _trunc_div(numerator, 30)
-        setattr(runtime, remainder_name, numerator - delta * 30)
+        numerator = rate * 100 * minutes + getattr(runtime, remainder_name)
+        delta = _trunc_div(numerator, 3000)
+        setattr(runtime, remainder_name, numerator - delta * 3000)
         setattr(runtime, value_name, max(0, min(1000, getattr(runtime, value_name) + delta)))
 
     @staticmethod
@@ -214,12 +220,10 @@ class NeedsService:
         """Apply a percentage rate once, retaining sub-fixed-point residue."""
         remainder_name = f"{name}_remainder"
         value_name = f"{name}_fp"
-        numerator = rate * percent * minutes + getattr(runtime, remainder_name) * 100
+        numerator = rate * percent * minutes + getattr(runtime, remainder_name)
         delta = _trunc_div(numerator, 3000)
         residue = numerator - delta * 3000
-        # Frozen action durations are 30-minute multiples, so the residue is
-        # exactly representable by the existing denominator-30 remainder.
-        setattr(runtime, remainder_name, _trunc_div(residue, 100))
+        setattr(runtime, remainder_name, residue)
         setattr(runtime, value_name, max(0, min(1000, getattr(runtime, value_name) + delta)))
 
     @classmethod
@@ -229,14 +233,13 @@ class NeedsService:
         """Advance one same-day SOCIALIZE span with exact scaled base rates.
 
         The severe-hunger stress rate is deliberately not scaled. A denominator
-        of 3000 preserves the 25% half-fixed-point residue until the existing
-        denominator-30 remainder can represent it at the end of the span.
+        of 3000 preserves percentage-rate residue even for one-minute spans.
         """
         if runtime.needs_world_minute != start or start // MINUTES_PER_DAY != (end - 1) // MINUTES_PER_DAY:
             return ResultCode.INVALID_ACTIVITY_INTERVAL
         summary = cls._summary(runtime, start // MINUTES_PER_DAY)
-        social_numerator = runtime.social_remainder * 100
-        stress_numerator = runtime.stress_remainder * 100
+        social_numerator = runtime.social_remainder
+        stress_numerator = runtime.stress_remainder
         for _minute in range(start, end):
             severe = runtime.hunger_fp >= 900
             if severe:
@@ -253,8 +256,8 @@ class NeedsService:
             stress_numerator -= stress_delta * 3000
             runtime.stress_fp = max(0, min(1000, runtime.stress_fp + stress_delta))
 
-        runtime.social_remainder = _trunc_div(social_numerator, 100)
-        runtime.stress_remainder = _trunc_div(stress_numerator, 100)
+        runtime.social_remainder = social_numerator
+        runtime.stress_remainder = stress_numerator
         runtime.needs_world_minute = end
         summary.save(update_fields=["severe_hunger_minutes", "updated_at"])
         return None
@@ -265,7 +268,7 @@ class NeedsService:
         summary = cls._summary(runtime, day_index)
         # A one-minute loop makes the severe-hunger boundary exact even when a
         # segment crosses 90.0 halfway through a 30-minute fixed-point rate.
-        # Actions are capped at 600 minutes and advance requests at 64 spans.
+        # ponytail: one-minute iteration; batch at hunger thresholds if long spans become costly.
         for _minute in range(start, end):
             severe = runtime.hunger_fp >= 900
             if severe:
@@ -350,7 +353,7 @@ class NeedsService:
             return
         if summary.severe_hunger_minutes >= MINUTES_PER_DAY:
             runtime.health_fp = max(0, runtime.health_fp - 80)
-        elif summary.successful_meals >= 1 and summary.sleep_minutes >= 360 and not summary.injured:
+        elif summary.successful_meals >= 1 and summary.sleep_minutes >= HEALTHY_SLEEP_MINUTES and not summary.injured:
             runtime.health_fp = min(1000, runtime.health_fp + 20)
         summary.finalized = True
         summary.save(update_fields=["finalized", "updated_at"])
@@ -621,12 +624,9 @@ class LifeActionService:
         if any(isinstance(payload[name], bool) or not isinstance(payload[name], int) for name in ("start_world_minute", "completion_world_minute", "expected_state_version")):
             return ResultCode.INVALID_COMMAND_SCHEMA
         duration = payload["completion_world_minute"] - payload["start_world_minute"]
-        if duration <= 0 or (not fast_integration and duration % 30):
+        if duration <= 0:
             return ResultCode.INVALID_ACTION_DURATION
         action = payload["action"]
-        limits = {"EAT": (30, 30), "REST": (30, 120), "SLEEP": (30, 600), "SOCIALIZE": (30, 120), "WORK_PLACEHOLDER": (30, 240)}
-        if not fast_integration and not limits[action][0] <= duration <= limits[action][1]:
-            return ResultCode.INVALID_ACTION_DURATION
         try:
             uuid.UUID(str(payload["request_id"])); uuid.UUID(str(payload["command_id"]))
         except (ValueError, TypeError):
@@ -822,38 +822,25 @@ class LifeActionService:
         # state_version is only a snapshot, not a settlement lock.
         if not fast_integration and runtime.state_version < payload["expected_state_version"]:
             return terminal(ResultCode.STALE_STATE_VERSION)
-        profile = NpcProfile.objects.filter(npc=runtime.npc, is_active=True).first()
-        if not fast_integration and not profile:
-            return terminal(ResultCode.INVALID_ACTION_LOCATION)
         location = payload["location_code"]
         if not fast_integration and start > time_state.world_minute:
             return terminal(ResultCode.STALE_NEEDS_MINUTE)
-        if not fast_integration and runtime.current_location_code != location:
-            return terminal(ResultCode.INVALID_ACTION_LOCATION)
-        if not fast_integration and action == "REST" and location not in {profile.home_location_code, "RESTAURANT"}:
-            return terminal(ResultCode.INVALID_ACTION_LOCATION)
         if not fast_integration and action == "REST" and location == "RESTAURANT" and not cls._location_open(location):
             return terminal(ResultCode.LOCATION_CLOSED)
-        if not fast_integration and action == "SLEEP" and location != profile.home_location_code:
-            return terminal(ResultCode.INVALID_ACTION_LOCATION)
         if action == "WORK_PLACEHOLDER" and not fast_integration:
-            if location != profile.work_location_code:
-                return terminal(ResultCode.INVALID_ACTION_LOCATION)
             if start // MINUTES_PER_DAY != (end - 1) // MINUTES_PER_DAY:
                 return terminal(ResultCode.INVALID_ACTION_DURATION)
         if action == "EAT":
             source = payload["params"].get("source")
             if source not in {"PERSONAL_INVENTORY", "COMMUNITY_MEAL"}:
                 return terminal(ResultCode.FOOD_NOT_ALLOWED)
-            if not fast_integration and source == "COMMUNITY_MEAL" and (location != "RESTAURANT" or not cls._location_open(location)):
+            if not fast_integration and source == "COMMUNITY_MEAL" and not cls._location_open(location):
                 return terminal(ResultCode.LOCATION_CLOSED)
         if action == "SOCIALIZE":
             other = runtime_by_id.get(target_id)
             if other is None or other.npc_id == runtime.npc_id:
                 return terminal(ResultCode.SOCIAL_TARGET_INVALID)
-            if (not fast_integration and
-                    (other.action_status != "IDLE" or other.current_location_code != runtime.current_location_code or
-                     location != runtime.current_location_code)):
+            if not fast_integration and other.action_status != "IDLE":
                 return terminal(ResultCode.SOCIAL_TARGET_BUSY)
         elif not fast_integration and action != "EAT" and not cls._location_open(location):
             return terminal(ResultCode.LOCATION_CLOSED)
@@ -908,13 +895,13 @@ class LifeActionService:
             if error:
                 return terminal(error)
         if action == "WORK_PLACEHOLDER" and not fast_integration:
-            if runtime.hunger_fp >= 900:
+            if runtime.hunger_fp >= CommandService.NEED_GATE_LIMITS["hunger"]:
                 return terminal(ResultCode.HUNGER_TOO_HIGH)
-            if runtime.energy_fp <= 100:
+            if runtime.energy_fp <= CommandService.NEED_GATE_LIMITS["energy"]:
                 return terminal(ResultCode.ENERGY_TOO_LOW)
-            if runtime.health_fp <= 300:
+            if runtime.health_fp <= CommandService.NEED_GATE_LIMITS["health"]:
                 return terminal(ResultCode.HEALTH_TOO_LOW)
-        if action == "SOCIALIZE" and not fast_integration and runtime.health_fp <= 300:
+        if action == "SOCIALIZE" and not fast_integration and runtime.health_fp <= CommandService.NEED_GATE_LIMITS["health"]:
             return terminal(ResultCode.HEALTH_TOO_LOW)
         if (action == "SOCIALIZE" and not fast_integration and
                 start // MINUTES_PER_DAY != (end - 1) // MINUTES_PER_DAY):
@@ -941,7 +928,7 @@ class LifeActionService:
                 other_error = NeedsService.advance_base_locked(other, start)
                 if other_error:
                     return terminal(other_error)
-            if not fast_integration and other.health_fp <= 300:
+            if not fast_integration and other.health_fp <= CommandService.NEED_GATE_LIMITS["health"]:
                 return terminal(ResultCode.HEALTH_TOO_LOW)
             if runtime.needs_world_minute < end:
                 actor_error = NeedsService.advance_base_locked(runtime, end, finalize_days=False)

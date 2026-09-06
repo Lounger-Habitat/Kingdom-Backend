@@ -202,13 +202,13 @@ class PlantFailureTest(ProductionTestBase):
         ))
         self.assertEqual(resp["result_code"], ResultCode.P3_FORBIDDEN_ACTOR)
 
-    def test_plant_wrong_location(self):
+    def test_plant_location_is_deferred_to_unity(self):
         resp = commit_economy_action(_payload(
             "PLANT", 10011, "VILLAGE_SQUARE",
             {"plot_code": "FARM_PLOT_A", "crop_code": "CORN",
              "expected_asset_version": 0},
         ))
-        self.assertEqual(resp["result_code"], ResultCode.P3_WRONG_LOCATION)
+        self.assertEqual(resp["result_code"], ResultCode.OK)
 
     def test_plant_no_seeds(self):
         self.bill_seeds.item_amount = 0
@@ -296,7 +296,7 @@ class HarvestFailureTest(ProductionTestBase):
         ))
         self.assertEqual(resp["result_code"], ResultCode.P3_FORBIDDEN_ACTOR)
 
-    def test_harvest_wrong_location(self):
+    def test_harvest_location_is_deferred_to_unity(self):
         self._plant()
         self.time.world_minute = 700 + 2880
         self.time.save(update_fields=["world_minute"])
@@ -307,7 +307,7 @@ class HarvestFailureTest(ProductionTestBase):
             {"plot_code": "FARM_PLOT_A",
              "expected_asset_version": self.bill_inv.asset_version},
         ))
-        self.assertEqual(resp["result_code"], ResultCode.P3_WRONG_LOCATION)
+        self.assertEqual(resp["result_code"], ResultCode.OK)
 
 
 # ============================================================================
@@ -345,12 +345,12 @@ class HuntFailureTest(ProductionTestBase):
         ))
         self.assertEqual(resp["result_code"], ResultCode.P3_FORBIDDEN_ACTOR)
 
-    def test_hunt_wrong_location(self):
+    def test_hunt_location_is_deferred_to_unity(self):
         resp = commit_economy_action(_payload(
             "HUNT", 10012, "VILLAGE_SQUARE",
             {"hunt_code": "HUNT_CHICKEN", "expected_asset_version": 0},
         ))
-        self.assertEqual(resp["result_code"], ResultCode.P3_WRONG_LOCATION)
+        self.assertEqual(resp["result_code"], ResultCode.OK)
 
     def test_hunt_health_too_low(self):
         self.jack_rt.health_fp = 200
@@ -425,12 +425,12 @@ class CookFailureTest(ProductionTestBase):
         ))
         self.assertEqual(resp["result_code"], ResultCode.P3_FORBIDDEN_ACTOR)
 
-    def test_cook_wrong_location(self):
+    def test_cook_location_is_deferred_to_unity(self):
         resp = commit_economy_action(_payload(
             "COOK", 10014, "VILLAGE_SQUARE",
             {"recipe_id": 2, "expected_asset_version": 0},
         ))
-        self.assertEqual(resp["result_code"], ResultCode.P3_WRONG_LOCATION)
+        self.assertEqual(resp["result_code"], ResultCode.P3_INSUFFICIENT_ITEM)
 
     def test_cook_recipe_not_allowed(self):
         resp = commit_economy_action(_payload(

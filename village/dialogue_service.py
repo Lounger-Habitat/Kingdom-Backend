@@ -1,6 +1,5 @@
 """Small authoritative dialogue lifecycle built on the existing NPC reservation lane."""
 
-import uuid
 from typing import Any, Dict, Optional
 
 from django.db import transaction
@@ -56,11 +55,14 @@ class DialogueService:
 
     @classmethod
     @transaction.atomic
-    def start(cls, npc_id: str, target_npc_id: str, topic: str = "") -> Dict[str, Any]:
+    def start(cls, npc_id: str, target_npc_id: str, topic: str = "",
+              conversation_id: Optional[str] = None) -> Dict[str, Any]:
         npc_id, target_npc_id = str(npc_id or ""), str(target_npc_id or "")
-        if (not npc_id or not target_npc_id or npc_id == target_npc_id or
-                not isinstance(topic, str) or len(topic) > 120):
-            return _result(False, ResultCode.DIALOGUE_PARTICIPANT_INVALID)
+        conversation_id = str(conversation_id or "").strip()
+        if (not conversation_id or len(conversation_id) > 128 or not npc_id
+                or not target_npc_id or npc_id == target_npc_id
+                or not isinstance(topic, str) or len(topic) > 120):
+            return _result(False, ResultCode.INVALID_COMMAND_SCHEMA)
         if not VillageSimulationConfig.objects.filter(
             config_key="default", village_needs_enabled=True
         ).exists():
@@ -72,18 +74,31 @@ class DialogueService:
             return _result(False, ResultCode.BACKEND_UNAVAILABLE)
         cls.expire_active(time_state.world_minute)
 
+        # 会话 id 由调用方（Unity/对话编排）指定，后端不再自行生成。
         existing = NpcDialogueSession.objects.select_for_update().select_related(
             "initiator", "target", "reservation"
-        ).filter(
-            Q(initiator__agent_id=npc_id, target__agent_id=target_npc_id)
-            | Q(initiator__agent_id=target_npc_id, target__agent_id=npc_id),
-            status="ACTIVE",
-        ).first()
+        ).filter(conversation_id=conversation_id).first()
         if existing:
-            if topic.strip() and existing.topic != topic.strip():
-                existing.topic = topic.strip()
-                existing.save(update_fields=["topic", "updated_at"])
-            return _result(True, ResultCode.DIALOGUE_STARTED, reused=True, **cls._summary(existing))
+            participants = {str(existing.initiator.agent_id), str(existing.target.agent_id)}
+            if existing.status == "ACTIVE" and participants == {npc_id, target_npc_id}:
+                if topic.strip() and existing.topic != topic.strip():
+                    existing.topic = topic.strip()
+                    existing.save(update_fields=["topic", "updated_at"])
+                return _result(True, ResultCode.DIALOGUE_STARTED, reused=True, **cls._summary(existing))
+            # 历史已结束会话不可复活；会话 id 也不可被其他 NPC 对占用
+            return _result(False, ResultCode.INVALID_COMMAND_SCHEMA)
+
+        # 已在与任何人进行 ACTIVE 对话的一方视为“正忙”（含同对以新 id 重开）。
+        active_session = NpcDialogueSession.objects.select_for_update().select_related(
+            "initiator", "target", "reservation"
+        ).filter(
+            Q(initiator__agent_id=npc_id, status="ACTIVE")
+            | Q(target__agent_id=npc_id, status="ACTIVE")
+            | Q(initiator__agent_id=target_npc_id, status="ACTIVE")
+            | Q(target__agent_id=target_npc_id, status="ACTIVE"),
+        ).first()
+        if active_session:
+            return _result(False, ResultCode.SOCIAL_TARGET_BUSY, **cls._summary(active_session))
 
         runtimes = list(NpcRuntimeState.objects.select_for_update().select_related("npc").filter(
             npc__agent_id__in=[npc_id, target_npc_id], npc__is_test_only=False,
@@ -91,7 +106,8 @@ class DialogueService:
         ).order_by("npc__agent_id"))
         if {str(row.npc.agent_id) for row in runtimes} != {npc_id, target_npc_id}:
             return _result(False, ResultCode.DIALOGUE_PARTICIPANT_INVALID)
-        if any(row.action_status != "IDLE" or row.health_fp <= 300 for row in runtimes):
+        # 除睡觉外，做菜/狩猎/移动/配给等工作状态都不阻止对话（对话预约与动作预约共存）。
+        if any(row.action_status == "SLEEPING" for row in runtimes):
             return _result(False, ResultCode.SOCIAL_TARGET_BUSY)
         start = time_state.world_minute
         expires = min(start + cls.MAX_DURATION_MINUTES, (start // MINUTES_PER_DAY + 1) * MINUTES_PER_DAY)
@@ -110,6 +126,7 @@ class DialogueService:
             return _result(False, code)
         by_id = {str(row.npc.agent_id): row for row in runtimes}
         session = NpcDialogueSession.objects.create(
+            conversation_id=conversation_id,
             initiator=by_id[npc_id].npc,
             target=by_id[target_npc_id].npc,
             reservation=reservation,
@@ -126,17 +143,14 @@ class DialogueService:
     @classmethod
     @transaction.atomic
     def speak(cls, conversation_id: str, npc_id: str, text: str, end_turn: bool = False) -> Dict[str, Any]:
-        try:
-            conversation_uuid = uuid.UUID(str(conversation_id))
-        except (TypeError, ValueError):
-            return _result(False, ResultCode.DIALOGUE_NOT_FOUND)
+        conversation_id = str(conversation_id or "")
         if not isinstance(text, str) or not text.strip() or len(text) > cls.MAX_TEXT_LENGTH or not isinstance(end_turn, bool):
             return _result(False, ResultCode.DIALOGUE_TEXT_INVALID)
         try:
             time_state = GlobalGameTimeState.objects.select_for_update().get(pk=1)
             session = NpcDialogueSession.objects.select_for_update().select_related(
                 "initiator", "target", "reservation"
-            ).get(conversation_id=conversation_uuid)
+            ).get(conversation_id=conversation_id)
         except GlobalGameTimeState.DoesNotExist:
             return _result(False, ResultCode.BACKEND_UNAVAILABLE)
         except NpcDialogueSession.DoesNotExist:
@@ -169,15 +183,15 @@ class DialogueService:
     @classmethod
     @transaction.atomic
     def complete(cls, conversation_id: str, npc_id: str, reason: str = "COMPLETED") -> Dict[str, Any]:
+        conversation_id = str(conversation_id or "")
         if not isinstance(reason, str) or len(reason) > 64:
             return _result(False, ResultCode.INVALID_COMMAND_SCHEMA)
         try:
-            conversation_uuid = uuid.UUID(str(conversation_id))
             time_state = GlobalGameTimeState.objects.select_for_update().get(pk=1)
             session = NpcDialogueSession.objects.select_for_update().select_related(
                 "initiator", "target", "reservation"
-            ).get(conversation_id=conversation_uuid)
-        except (TypeError, ValueError, NpcDialogueSession.DoesNotExist):
+            ).get(conversation_id=conversation_id)
+        except NpcDialogueSession.DoesNotExist:
             return _result(False, ResultCode.DIALOGUE_NOT_FOUND)
         except GlobalGameTimeState.DoesNotExist:
             return _result(False, ResultCode.BACKEND_UNAVAILABLE)

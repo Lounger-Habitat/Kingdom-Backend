@@ -28,6 +28,7 @@ from .models import (
     NpcStoryFactAccess,
     PlayerStoryFactAccess,
     VillageActionReceipt,
+    VillageActionDurationConfig,
     VillageLocationDefinition,
     VillageSimulationConfig,
     VillageWorldEvent,
@@ -331,7 +332,7 @@ def create_commitment(
         data=_commitment_data(commitment),
         commitment_type=kind,
         world_event_id=str(event.event_id),
-        duration_minutes=1,
+        duration_minutes=VillageActionDurationConfig.configured_duration("CREATE_COMMITMENT"),
         presentation_status="ACTING",
     )
 
@@ -370,7 +371,8 @@ def cancel_commitment(
     commitment.settled_event = event
     commitment.settled_world_minute = world_minute
     commitment.save(update_fields=["status", "settled_event", "settled_world_minute", "updated_at"])
-    return _result(data=_commitment_data(commitment), world_event_id=str(event.event_id))
+    return _result(data=_commitment_data(commitment), world_event_id=str(event.event_id),
+                   duration_minutes=VillageActionDurationConfig.configured_duration("CANCEL_COMMITMENT"))
 
 
 def _transfer_commitment_assets(
@@ -417,6 +419,7 @@ def _transfer_commitment_assets(
                 slot.produced_world_minute or world_minute,
                 slot.expires_world_minute,
                 request_id,
+                remaining_uses=slot.remaining_uses,
             )
         promisor_inv.asset_version += 1
         beneficiary_inv.asset_version += 1
@@ -436,6 +439,7 @@ def perform_commitment(
     request_id: uuid.UUID,
     command_id: uuid.UUID | None = None,
     time_revision: int | None = None,
+    duration_minutes: int | None = None,
 ) -> dict[str, Any]:
     promisor = _npc(npc_id)
     commitment = NpcCommitment.objects.select_for_update().filter(
@@ -443,6 +447,11 @@ def perform_commitment(
     ).select_related("promisor_npc", "beneficiary_npc").first() if promisor else None
     if commitment is None:
         return _result("COMMITMENT_NOT_FOUND")
+    if duration_minutes is None:
+        duration_minutes = VillageActionDurationConfig.configured_duration(
+            commitment.commitment_type if commitment.commitment_type in {"JOINT_WORK", "MEETING"}
+            else "PERFORM_COMMITMENT"
+        )
     if commitment.status != "OPEN":
         return _result("COMMITMENT_ALREADY_RESOLVED")
     if commitment.commitment_type == "DELIVERY":
@@ -503,7 +512,7 @@ def perform_commitment(
         return _result(
             data=_commitment_data(commitment),
             commitment_type=commitment.commitment_type,
-            duration_minutes=120 if commitment.commitment_type == "JOINT_WORK" else 30 if commitment.commitment_type == "MEETING" else 1,
+            duration_minutes=duration_minutes,
             presentation_status="WORKING" if commitment.commitment_type == "JOINT_WORK" else "SOCIALIZING" if commitment.commitment_type == "MEETING" else "TRADING",
             world_event_id=str(event.event_id),
             phase="START",
@@ -562,7 +571,7 @@ def perform_commitment(
         data={**_commitment_data(commitment), "asset_changes": changes},
         effects=changes,
         commitment_type=commitment.commitment_type,
-        duration_minutes=120 if commitment.commitment_type == "JOINT_WORK" else 30 if commitment.commitment_type == "MEETING" else 1,
+        duration_minutes=duration_minutes,
         presentation_status="WORKING" if commitment.commitment_type == "JOINT_WORK" else "SOCIALIZING" if commitment.commitment_type == "MEETING" else "TRADING",
         world_event_id=str(event.event_id),
         phase=phase,
@@ -737,6 +746,12 @@ def complete_social_action(payload: Mapping[str, Any]) -> dict[str, Any]:
             or runtime.active_command_id != command.command_id
         ):
             return _result("SOCIAL_INVALID_PARAMS")
+        if command is not None and action != "INSPECT_SOCIAL_STATE":
+            if command.started_world_minute is None or not command.duration_minutes:
+                return _result("INVALID_ACTION_DURATION")
+            if (str(params.get("phase", "COMPLETE")).upper() != "START" and
+                    world_minute < command.started_world_minute + command.duration_minutes):
+                return _result("ACTION_NOT_FINISHED")
         if action == "INSPECT_SOCIAL_STATE":
             result = inspect_social_state(npc_id)
         elif action == "CREATE_COMMITMENT":
@@ -753,16 +768,13 @@ def complete_social_action(payload: Mapping[str, Any]) -> dict[str, Any]:
             result = perform_commitment(
                 npc_id, params, world_minute, request_id, command_id,
                 time_revision=int(state.time_revision),
+                duration_minutes=command.duration_minutes if command else None,
             )
+        if command is not None:
+            result["duration_minutes"] = command.duration_minutes
         result["request_id"] = str(request_id)
         result["world_minute"] = world_minute
         if result["status"] == "SUCCEEDED" and result.get("phase") == "START":
-            if command is not None:
-                duration = max(1, int(result.get("duration_minutes") or 1))
-                command.duration_minutes = duration
-                command.save(update_fields=["duration_minutes", "updated_at"])
-                runtime.action_ends_world_minute = world_minute + duration
-                runtime.save(update_fields=["action_ends_world_minute", "updated_at"])
             result["state_version"] = runtime.state_version if runtime else 0
             return result
 

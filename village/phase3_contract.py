@@ -218,7 +218,9 @@ ACTOR_WHITELIST = {
     ActionName.DELIST_FROM_MARKETPLACE: set(),
 }
 
-# ── Location requirements per action ───────────────────────────────
+# ── Unity-side location requirements per action ────────────────────
+# The table documents the Unity preflight contract. Backend handlers must not
+# use it as an authorization check; they may only persist reported locations.
 LOCATION_REQUIREMENTS = {
     ActionName.PLANT: "BILL_FARM",
     ActionName.HARVEST: "BILL_FARM",

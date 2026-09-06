@@ -1,6 +1,7 @@
 BASE_ACTIONS = [
     "MOVE", "WAIT", "GO_HOME",
-    "EAT", "REST", "SLEEP", "START_DIALOGUE", "SPEAK", "WORK_PLACEHOLDER",
+    "EAT", "REST", "SLEEP", "WORK_PLACEHOLDER",
+    "START_DIALOGUE", "SPEAK",
     "PROPOSE_TRADE", "RESPOND_TRADE", "CANCEL_TRADE_OFFER",
     "BUY_FROM_STORE", "BUY_FROM_MARKETPLACE", "SELL_ON_MARKETPLACE",
     "DELIST_FROM_MARKETPLACE", "BROWSE_MARKETPLACE",
@@ -183,6 +184,7 @@ TOOL_ITEM_SEEDS = [
         "item_description": "阶段三农田专用工具，可使用20次",
         "item_price": 50,
         "collectable": False,
+        "max_use_count": 20,
     },
     {
         "item_id": 4002,
@@ -191,6 +193,7 @@ TOOL_ITEM_SEEDS = [
         "item_description": "阶段三狩猎专用工具，可使用20次",
         "item_price": 50,
         "collectable": False,
+        "max_use_count": 20,
     },
     {
         "item_id": 4003,
@@ -209,6 +212,8 @@ TOOL_ITEM_SEEDS = [
 INITIAL_TOOL_GRANTS = [
     ("10011", 4001, 1, 20),   # Bill: 1 农具
     ("10012", 4002, 1, 20),   # Jack: 1 猎具
+    ("10015", 4001, 3, 20),   # Nora: 3 农具
+    ("10015", 4002, 3, 20),   # Nora: 3 猎具
 ]
 
 

@@ -39,3 +39,7 @@ logs/
 
 # Accidental files
 =5.3
+
+# DSH sandbox temp
+.dsh-tmp/
+*.bak

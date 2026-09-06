@@ -1,0 +1,17 @@
+Using existing test database for alias 'default'...
+
+.................................................................................................................................
+----------------------------------------------------------------------
+Ran 129 tests in 3.381s
+
+OK
+Preserving test database for alias 'default'...
+
+Found 129 test(s).
+
+  [backfill] Updated 0 inventory slots with _{slot_index} suffix.
+
+  [数据迁移] 回填完成: 0/0 条 PlayerRecipe 已关联 DefaultRecipe
+
+  [数据迁移] 回填完成: 0/0 条 PlayerRecipe 已关联完整菜谱目录
+System check identified no issues (0 silenced).

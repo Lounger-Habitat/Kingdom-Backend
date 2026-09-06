@@ -5,7 +5,7 @@ from django.test import TestCase, override_settings
 
 from game_time.models import GlobalGameTimeState
 from inventory.models import NpcDefinition
-from village.models import NpcRuntimeState
+from village.models import NpcRuntimeState, VillageActionDurationConfig
 from village.runtime_services import CommandService, ResultCode
 
 
@@ -54,7 +54,7 @@ class FastCommandIntegrationTests(TestCase):
 
         self.assertTrue(accepted)
         self.assertEqual(code, ResultCode.COMMAND_ACCEPTED)
-        self.assertEqual(command.duration_minutes, 60)
+        self.assertEqual(command.duration_minutes, 31)
         self.assertEqual(command.validated_at_state_version, 7)
         self.assertIsNone(command.expires_world_minute)
 
@@ -65,6 +65,31 @@ class FastCommandIntegrationTests(TestCase):
         self.assertEqual(self.runtime.action_status, "ACTING")
         self.assertEqual(self.runtime.current_action, "REST")
         self.assertEqual(self.runtime.needs_world_minute, 1000)
+
+    def test_fast_eat_uses_backend_configured_duration(self):
+        VillageActionDurationConfig.objects.update_or_create(
+            action_name="EAT", defaults={"duration_minutes": 60}
+        )
+        command_id = uuid.uuid4()
+        request_id = uuid.uuid4()
+
+        accepted, code, command = CommandService.accept_command(
+            envelope_id=str(uuid.uuid4()),
+            sender="10011",
+            recipient="env",
+            content={
+                "id": str(command_id),
+                "request_id": str(request_id),
+                "name": "eat",
+                "params": {"source": "COMMUNITY_MEAL"},
+                "duration_minutes": 30,
+            },
+            timestamp_ms=None,
+        )
+
+        self.assertTrue(accepted)
+        self.assertEqual(code, ResultCode.COMMAND_ACCEPTED)
+        self.assertEqual(command.duration_minutes, 60)
 
     def test_unknown_action_and_duplicate_identity_are_still_guarded(self):
         content = {

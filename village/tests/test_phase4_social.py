@@ -154,13 +154,13 @@ class PhaseFourSocialTest(TestCase):
             payload_sha256="test",
             status="RUNNING",
             started_world_minute=1000,
-            duration_minutes=1,
+            duration_minutes=30,
         )
         runtime = NpcRuntimeState.objects.get(npc=self.npcs["10011"])
         runtime.current_action = "PERFORM_COMMITMENT"
         runtime.action_status = "ACTING"
         runtime.action_started_world_minute = 1000
-        runtime.action_ends_world_minute = 1001
+        runtime.action_ends_world_minute = 1030
         runtime.active_command_id = command_id
         runtime.save()
         base = {
@@ -180,6 +180,13 @@ class PhaseFourSocialTest(TestCase):
         self.assertEqual(command.duration_minutes, 30)
         self.assertEqual(runtime.action_ends_world_minute, 1030)
 
+        early = complete_social_action({
+            **base,
+            "params": {"commitment_id": str(meeting.commitment_id)},
+        })
+        self.assertEqual(early["result_code"], "ACTION_NOT_FINISHED")
+        self.clock.world_minute = 1030
+        self.clock.save(update_fields=["world_minute"])
         completed = complete_social_action({
             **base,
             "params": {"commitment_id": str(meeting.commitment_id)},

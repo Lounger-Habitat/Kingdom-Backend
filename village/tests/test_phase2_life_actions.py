@@ -54,6 +54,18 @@ class LifeActionServiceTests(TestCase):
             )
             reservation.participants.set([self.npc, self.other])
 
+    @override_settings(VILLAGE_FAST_COMMAND_INTEGRATION=False)
+    def test_seven_minute_eat_settles_and_replays_without_consuming_twice(self):
+        payload = self.payload("EAT", {"source": "PERSONAL_INVENTORY", "food_instance_id": str(self.slot.instance_id), "expected_asset_version": 0})
+        payload["completion_world_minute"] = 7
+        self.arm(payload)
+        result = LifeActionService.execute(payload)
+        self.assertTrue(result["success"], result)
+        self.assertEqual(NpcCommandState.objects.get(command_id=payload["command_id"]).completed_world_minute, 7)
+        self.slot.refresh_from_db()
+        self.assertEqual(self.slot.item_amount, 0)
+        self.assertEqual(LifeActionService.execute(payload)["result_code"], ResultCode.COMMAND_REPLAYED)
+
     def test_personal_eat_is_atomic_and_replay_does_not_consume_twice(self):
         payload = self.payload("EAT", {"source": "PERSONAL_INVENTORY", "food_instance_id": str(self.slot.instance_id), "expected_asset_version": 0})
         self.arm(payload)
@@ -352,7 +364,7 @@ class LifeActionServiceTests(TestCase):
         self.assertFalse(ok)
         self.assertEqual(code, ResultCode.NEEDS_FIELDS_NOT_ALLOWED)
 
-        bad_duration = {**base, "id": str(uuid.uuid4()), "request_id": str(uuid.uuid4()), "duration_minutes": 25}
+        bad_duration = {**base, "id": str(uuid.uuid4()), "request_id": str(uuid.uuid4()), "duration_minutes": 0}
         ok, code, _ = CommandService.accept_command(
             str(uuid.uuid4()), "10011", "env", bad_duration, int(time.time() * 1000)
         )
@@ -448,7 +460,7 @@ class LifeActionServiceTests(TestCase):
 
         location = self.payload("WORK_PLACEHOLDER", {}, location="BILL_WORK", version=self.runtime.state_version)
         self.arm(location)
-        self.assertEqual(LifeActionService.execute(location)["result_code"], ResultCode.INVALID_ACTION_LOCATION)
+        self.assertEqual(LifeActionService.execute(location)["result_code"], ResultCode.LIFE_ACTION_COMPLETED)
         self.runtime.refresh_from_db(); self.assertEqual(self.runtime.action_status, "IDLE")
 
         social = self.payload("SOCIALIZE", {"target_npc_id": "10012", "reservation_id": str(uuid.uuid4())}, version=self.runtime.state_version)

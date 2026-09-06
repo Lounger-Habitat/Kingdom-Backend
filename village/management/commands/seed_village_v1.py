@@ -459,6 +459,7 @@ class Command(BaseCommand):
                     "item_description": seed["item_description"],
                     "item_price": seed["item_price"],
                     "collectable": seed["collectable"],
+                    "max_use_count": seed.get("max_use_count", 1),
                 },
             )
             if not created:

@@ -310,7 +310,9 @@ class StoreIsolationTest(DirectTradeTestBase):
         self._list(10015, "GENERAL_STORE", 1030, 10, PriceMode.ORIGINAL)
         listing = VillageStoreListing.objects.get(store=self.store, item_id=1030)
 
-        self._set_location(10011, "GENERAL_STORE")
+        # Location authorization belongs to Unity; the public projection still
+        # works even when the caller's persisted position is elsewhere.
+        self._set_location(10011, "MARKET_STREET")
         nora_money_before = self.nora_inv.money
         resp = self._buy(10011, listing.listing_id, 2)
         self.assertEqual(resp["result_code"], ResultCode.OK)
@@ -508,6 +510,23 @@ class BatchPreservationTest(DirectTradeTestBase):
         self.assertEqual(slot.expires_world_minute, 5000)
         self.assertEqual(slot.source_npc, self.nora)
 
+    def test_tool_uses_survive_list_buy_and_delist(self):
+        self._set_location(10015, "GENERAL_STORE")
+        self._give_item(self.nora_inv, 4001, 1)
+        personal = NpcGlobalInventorySlot.objects.get(bag=self.nora_inv, item_id=4001)
+        personal.remaining_uses = 17
+        personal.save(update_fields=["remaining_uses"])
+
+        self._list(10015, "GENERAL_STORE", 4001, 1, PriceMode.ORIGINAL)
+        store_slot = VillageStoreInventorySlot.objects.get(store=self.store, item_id=4001)
+        self.assertEqual(store_slot.remaining_uses, 17)
+
+        listing = VillageStoreListing.objects.get(store=self.store, item_id=4001)
+        self._set_location(10011, "GENERAL_STORE")
+        self._buy(10011, listing.listing_id, 1)
+        buyer_slot = NpcGlobalInventorySlot.objects.get(bag=self.bill_inv, item_id=4001)
+        self.assertEqual(buyer_slot.remaining_uses, 17)
+
     def test_list_does_not_duplicate_assets(self):
         self._set_location(10015, "GENERAL_STORE")
         self._give_item(self.nora_inv, 1030, 10)
@@ -578,7 +597,7 @@ class PublicInventoryFilterTest(DirectTradeTestBase):
         ))
 
         self._set_location(10011, "GENERAL_STORE")
-        code, data = query_store_inventory("GENERAL_STORE", 10011, 700)
+        code, data = query_store_inventory("GENERAL_STORE", 700)
         self.assertIsNone(code)
         items = {i["item_id"]: i for i in data["items"]}
         # 1056 was delisted -> excluded
@@ -591,7 +610,7 @@ class PublicInventoryFilterTest(DirectTradeTestBase):
         # Advance time past the batch expiry -> excluded from available amount.
         self.time.world_minute = 950
         self.time.save(update_fields=["world_minute"])
-        code, data = query_store_inventory("GENERAL_STORE", 10011, 950)
+        code, data = query_store_inventory("GENERAL_STORE", 950)
         items = {i["item_id"]: i for i in data["items"]}
         self.assertIn(1030, items)
         self.assertEqual(items[1030]["available_amount"], 0)
@@ -873,15 +892,16 @@ class TradeOfferTest(DirectTradeTestBase):
         offer = VillageTradeOffer.objects.get(offer_id=offer_id)
         self.assertEqual(offer.status, TradeOfferStatus.EXPIRED)
 
-    def test_not_colocated_cannot_settle(self):
+    def test_not_colocated_is_deferred_to_unity(self):
         self._setup_seller_items()
         prop = self._propose(10011, 10012, 1030, 5, 40)
         offer_id = prop["data"]["offer_id"]
 
-        # Move the seller away before accepting.
+        # Unity rejects this before settlement; Backend only settles the
+        # already-authorized economy request and does not re-check location.
         self._set_location(10012, "RESTAURANT")
         resp = self._respond(10012, offer_id, "ACCEPT")
-        self.assertEqual(resp["result_code"], ResultCode.TRADE_NOT_COLOCATED)
+        self.assertEqual(resp["result_code"], ResultCode.OK)
 
     def test_insufficient_item_rolls_back(self):
         # Seller has 3 items but offer is for 5.

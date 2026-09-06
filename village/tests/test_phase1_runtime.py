@@ -4,7 +4,7 @@
 import uuid
 import time
 from datetime import timedelta
-from django.test import TestCase
+from django.test import TestCase, override_settings
 from django.utils import timezone
 
 from game_time.models import GlobalGameTimeState
@@ -338,6 +338,23 @@ class CommandServiceTest(TestCase):
         self.time_state.world_minute = 1000
         self.time_state.time_revision = 5
         self.time_state.save()
+
+    @override_settings(VILLAGE_FAST_COMMAND_INTEGRATION=False)
+    def test_configured_queue_limit_is_enforced(self):
+        VillageSimulationConfig.objects.update_or_create(
+            config_key="default", defaults={"command_queue_limit": 1}
+        )
+        for expected_code in (ResultCode.COMMAND_ACCEPTED, ResultCode.QUEUE_FULL):
+            ok, code, _ = CommandService.accept_command(
+                str(uuid.uuid4()), "10011", "env-001", {
+                    "schema_version": "village.command.v1",
+                    "id": str(uuid.uuid4()), "request_id": str(uuid.uuid4()),
+                    "name": "MOVE", "params": {"location_code": "IRONSMITH"},
+                    "queue_mode": "STRICT", "expected_state_version": 10, "ttl_ms": 30000,
+                }, int(time.time() * 1000),
+            )
+            self.assertEqual(code, expected_code)
+            self.assertEqual(ok, expected_code == ResultCode.COMMAND_ACCEPTED)
 
     def test_accept_command_success(self):
         """正常命令接受"""

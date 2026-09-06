@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import uuid
+from datetime import date
 
 from django.db import connection
 from django.db.models import Count, Max, Min, Q, Sum
@@ -43,6 +44,7 @@ from .models import (
 )
 from .phase3_catalog import TOOL_ITEM_IDS
 from .phase4_contract import relationship_label, relationship_snapshot
+from .runtime_services import _OUTCOME_REASONS
 
 
 FORMAL_NPC_IDS = ("10011", "10012", "10013", "10014", "10015")
@@ -262,6 +264,224 @@ def _public_command_summary(action: str, params: dict, duration: int | None,
         goal = str(params.get("summary", "")).strip()
         return f"更新主观目标：{goal}" if goal else label
     return label
+
+
+def _public_command_detail(action: str, params: dict, duration: int | None,
+                           status: str, result_code: str, response_data: dict,
+                           received: int | None, started: int | None,
+                           completed: int | None, now: int,
+                           npc_names: dict[str, str], location_names: dict[str, str],
+                           item_names: dict[int, str], reference_data: dict) -> str:
+    """Return one concrete, player-facing result line; never expose machine codes."""
+    action, params = str(action or "").upper(), params if isinstance(params, dict) else {}
+    response = response_data if isinstance(response_data, dict) else {}
+    data = response.get("data") if isinstance(response.get("data"), dict) else response
+    effects = response.get("effects") if isinstance(response.get("effects"), dict) else {}
+    finished_at = completed if completed is not None else now
+
+    def bounded(value: str) -> str:
+        value = str(value or "").strip().replace("\n", " ")
+        return value if len(value) <= 40 else value[:39] + "…"
+
+    def elapsed(end: int) -> int | None:
+        begin = started if started is not None else received
+        return max(0, end - begin) if begin is not None else duration
+
+    def world_time(value: object) -> str:
+        try:
+            minute = max(0, int(value))
+            day = date.fromordinal(minute // 1440 + 1)
+            return f"{day:%m月%d日} {minute % 1440 // 60:02d}:{minute % 60:02d}"
+        except (TypeError, ValueError, OverflowError):
+            return "时间未知"
+
+    def number(source: dict, *keys: str):
+        for key in keys:
+            value = source.get(key) if isinstance(source, dict) else None
+            if isinstance(value, (int, float)) and not isinstance(value, bool):
+                return value
+        return None
+
+    def location_name() -> str:
+        code = params.get("location_code") or data.get("target_location_code")
+        if action == "GO_HOME" and not code:
+            code = data.get("current_location_code")
+        return location_names.get(str(code), "目标地点") if code else ""
+
+    def npc_name(*keys: str) -> str:
+        for key in keys:
+            value = params.get(key) or data.get(key)
+            if value:
+                return npc_names.get(str(value), "对方")
+        return "对方"
+
+    def named_item(value: object) -> str:
+        try:
+            return item_names.get(int(value), "物品")
+        except (TypeError, ValueError):
+            return "物品"
+
+    def item_change(kind: str) -> str:
+        rows = effects.get(kind)
+        if not isinstance(rows, list) or not rows or not isinstance(rows[0], dict):
+            return ""
+        row = rows[0]
+        amount = row.get("amount", row.get("quantity", ""))
+        return f"{named_item(row.get('item_id'))}×{amount}" if amount != "" else named_item(row.get("item_id"))
+
+    if status == "WAITING":
+        waited = max(0, now - received) if received is not None else 0
+        return bounded(f"已等待{waited}分钟，前方指令完成后开始。")
+    if status == "RUNNING":
+        spent = max(0, now - started) if started is not None else 0
+        total = duration or data.get("duration_minutes")
+        return bounded(f"已执行{spent}/{total}分钟。" if total else f"已执行{spent}分钟。")
+    if status in {"CANCELLED", "EXPIRED"}:
+        spent = elapsed(completed if completed is not None else now) or 0
+        verb = "取消" if status == "CANCELLED" else "失效"
+        return bounded(f"等待或执行{spent}分钟后{verb}。")
+    if status != "SUCCEEDED":
+        reason = _OUTCOME_REASONS.get(result_code, "执行结果未分类").replace(
+            "Backend", "服务端").replace("Hub", "服务").replace("NPC", "村民")
+        spent = elapsed(completed if completed is not None else now)
+        current = data.get("current_location_code")
+        required = data.get("required_location_code") or params.get("location_code")
+        if current and required:
+            fact = f"；当前{location_names.get(str(current), '现地点')}，要求{location_names.get(str(required), '目标地点')}"
+        elif params.get("amount") is not None:
+            fact = f"；请求数量{params['amount']}"
+        elif spent:
+            fact = f"；耗时{spent}分钟"
+        else:
+            fact = f"；发生于{world_time(completed if completed is not None else now)}"
+        return bounded(reason + fact + "。")
+
+    spent = elapsed(completed if completed is not None else now)
+    if action in {"MOVE", "GO_HOME"}:
+        destination = location_name()
+        return bounded(f"用时{spent or 0}分钟，到达{destination or '目标地点'}。")
+    if action in {"WAIT", "REST", "SLEEP", "WORK_PLACEHOLDER"}:
+        energy = number(effects.get("needs", {}), "energy")
+        extra = f"，精力变化{energy:+g}" if energy is not None else ""
+        return bounded(f"实际用时{spent if spent is not None else duration or 0}分钟{extra}。")
+    if action == "WAKE_UP":
+        slept = number(data, "slept_minutes", "actual_duration_minutes")
+        return bounded(f"实际睡眠{slept if slept is not None else spent or 0}分钟。")
+    if action == "EAT":
+        hunger = number(effects.get("needs", {}), "hunger")
+        current = number(data.get("public_needs", {}), "hunger")
+        return bounded(f"饥饿变化{hunger:+g}，当前{current:g}。" if hunger is not None and current is not None
+                       else f"用时{spent or 0}分钟，饥饿状态已结算。")
+    if action == "SOCIALIZE":
+        return bounded(f"与{npc_name('target_npc_id')}交流{spent if spent is not None else duration or 0}分钟。")
+    if action == "START_DIALOGUE":
+        return bounded(f"与{npc_name('target_npc_id')}建立对话，话题{len(str(params.get('topic', '')))}字。")
+    if action == "SPEAK":
+        ended = result_code == "DIALOGUE_COMPLETED" or bool(params.get("end_turn"))
+        return bounded(f"发送{len(str(params.get('text', '')))}字，对话{'结束' if ended else '继续'}。")
+
+    gained, consumed = item_change("items_added"), item_change("items_consumed")
+    if action in {"HARVEST", "HUNT", "COOK"} and gained:
+        return bounded(f"获得{gained}，用时{spent or 0}分钟。")
+    if action in {"PLANT", "COOK"} and consumed:
+        return bounded(f"消耗{consumed}，用时{spent or 0}分钟。")
+
+    if action == "CREATE_ORDER":
+        return bounded(f"订单开放：{named_item(params.get('item_id'))}×{params.get('amount', 0)}，单价{params.get('unit_price', 0)}。")
+    if action == "CANCEL_ORDER":
+        order = reference_data.get("orders", {}).get(str(params.get("order_id")), {})
+        return bounded(f"返还{named_item(order.get('item_id'))}×{order.get('amount', 0)}。")
+    if action == "START_DELIVERY":
+        delivery = reference_data.get("deliveries", {}).get(str(params.get("delivery_id")), {})
+        return bounded(f"配送{named_item(delivery.get('item_id'))}×{delivery.get('amount', 0)}，用时{spent or 0}分钟。")
+    if action in {"IMPORT_GOODS", "EXPORT_GOODS"}:
+        money = number(effects, "money_delta", "gold_delta")
+        verb = "增加" if action == "IMPORT_GOODS" else "减少"
+        suffix = f"，金币变化{money:+g}" if money is not None else ""
+        return bounded(f"库存{verb}{named_item(params.get('item_id'))}×{params.get('amount', 0)}{suffix}。")
+    if action == "RATE_DISH":
+        return bounded(f"提交{params.get('score', 0)}星评分，菜品属于{npc_name('owner_npc_id')}。")
+    if action == "PUBLISH_PRICE_INDEX":
+        count = len(data.get("prices", [])) if isinstance(data.get("prices"), list) else 0
+        return bounded(f"发布{count}种商品价格，时间{world_time(finished_at)}。")
+    if action == "AUDIT_PUBLIC_FUND":
+        balance = number(data, "balance", "fund_balance", "public_fund_balance")
+        return bounded(f"审计后公款余额{balance:g}金币。" if balance is not None else f"审计用时{spent or 0}分钟。")
+    if action in {"PROPOSE_TRADE", "RESPOND_TRADE", "CANCEL_TRADE_OFFER"}:
+        decision = {"ACCEPT": "接受", "REJECT": "拒绝"}.get(str(params.get("decision", "")).upper(), "处理")
+        return bounded(f"{decision}报价，涉及{params.get('amount', 0)}件物品/{params.get('gold_amount', 0)}金币。")
+    if action in {"LIST_STORE_ITEM", "UPDATE_STORE_PRICE", "DELIST_STORE_ITEM", "BUY_FROM_STORE",
+                  "SELL_ON_MARKETPLACE", "BUY_FROM_MARKETPLACE", "DELIST_FROM_MARKETPLACE"}:
+        amount, price = params.get("amount"), params.get("custom_unit_price", params.get("price"))
+        facts = [f"数量{amount}" if amount is not None else "", f"单价{price}金币" if price is not None else "",
+                 f"用时{spent}分钟" if spent is not None else ""]
+        return bounded("，".join(value for value in facts if value) + "。")
+    if action in {"CREATE_COMMITMENT", "CANCEL_COMMITMENT", "PERFORM_COMMITMENT"}:
+        due = params.get("due_world_minute") or data.get("due_world_minute")
+        return bounded(f"涉及{npc_name('beneficiary_npc_id')}，截止{world_time(due)}。" if due else f"用时{spent or 0}分钟，承诺状态已变更。")
+    if action == "STORY_VOTE":
+        votes = number(data, "vote_count", "votes")
+        plan = {"BRIDGE_REPAIR": "修桥", "FOREST_ROUTE": "森林路线", "RATION_AND_WAIT": "配给等待"}.get(
+            str(params.get("plan_code", "")).upper(), "当前方案")
+        return bounded(f"选择{plan}，当前{votes:g}票。" if votes is not None else f"选择{plan}，时间{world_time(finished_at)}。")
+    if action == "STORY_ACT":
+        progress = number(data, "progress", "story_progress")
+        amount = params.get("amount", params.get("supply_amount", params.get("meal_amount")))
+        return bounded(f"剧情进度更新为{progress:g}。" if progress is not None else f"投入资源{amount or 0}，用时{spent or 0}分钟。")
+    if action == "UPDATE_SUBJECTIVE_GOAL":
+        return bounded(f"新目标：{params.get('summary', '')}")
+
+    query_arrays = {
+        "INSPECT_NEARBY": (("nearby_npcs", "nearby_locations"), "发现{0}人、{1}处地点。"),
+        "INSPECT_TRADE_OFFERS": (("offers",), "待处理报价{0}份。"),
+        "INSPECT_RELEVANT_STORIES": (("stories",), "找到{0}条相关剧情。"),
+        "INSPECT_ORDERS": (("orders", "deliveries"), "订单{0}笔，配送{1}笔。"),
+        "INSPECT_RATEABLE_DISHES": (("dishes",), "可评分菜品{0}道。"),
+        "BROWSE_MARKETPLACE": (("listings",), "找到{0}条在售挂单。"),
+        "CHECK_MY_MARKETPLACE_LISTINGS": (("listings",), "自己的在售挂单{0}条。"),
+    }
+    if action in query_arrays:
+        keys, template = query_arrays[action]
+        counts = [len(data.get(key, [])) if isinstance(data.get(key), list) else 0 for key in keys]
+        return bounded(template.format(*counts))
+    if action == "CHECK_MARKETPLACE_HISTORY":
+        rows = data.get("history") if isinstance(data.get("history"), list) else data.get("trades", [])
+        return bounded(f"成交记录{len(rows) if isinstance(rows, list) else 0}笔。")
+    if action == "INSPECT_INVENTORY":
+        rows = data.get("items", []) if isinstance(data.get("items"), list) else []
+        total = sum(int(row.get("quantity", row.get("available_quantity", 0)) or 0) for row in rows if isinstance(row, dict))
+        money = number(data, "money", "gold") or 0
+        return bounded(f"金币{money:g}，物品{len(rows)}种/{total}件。")
+    if action == "INSPECT_FARM_STATE":
+        rows = data.get("farm_plots", data.get("plots", []))
+        rows = rows if isinstance(rows, list) else []
+        mature = sum(str(row.get("status", "")).upper() == "MATURE" for row in rows if isinstance(row, dict))
+        return bounded(f"地块{len(rows)}块，其中成熟{mature}块。")
+    if action == "INSPECT_SOCIAL_STATE":
+        relationships = data.get("relationships", [])
+        commitments = data.get("commitments", [])
+        return bounded(f"关系{len(relationships) if isinstance(relationships, list) else 0}人，承诺{len(commitments) if isinstance(commitments, list) else 0}项。")
+    if action in {"INSPECT_STORY_STATE", "INSPECT_STORY_DETAIL"}:
+        phase = _display_code(data.get("phase", data.get("current_phase")))
+        actions = data.get("available_actions", [])
+        return bounded(f"当前{phase or '未知阶段'}，可执行{len(actions) if isinstance(actions, list) else 0}项。")
+    if action == "INSPECT_RESTAURANT_STATE":
+        recipes = data.get("recipes", [])
+        return bounded(f"可用菜谱{len(recipes) if isinstance(recipes, list) else 0}道。")
+    if action == "INSPECT_STORE_INVENTORY":
+        rows = data.get("listings", data.get("items", []))
+        return bounded(f"在售商品{len(rows) if isinstance(rows, list) else 0}种。")
+    if action == "INSPECT_MARKET_STATE":
+        rows = data.get("prices", data.get("items", []))
+        return bounded(f"可交易商品{len(rows) if isinstance(rows, list) else 0}种。")
+    if action == "INSPECT_PUBLIC_ECONOMY_STATE":
+        balance = number(data, "balance", "public_fund_balance") or 0
+        return bounded(f"公款余额{balance:g}金币，时间{world_time(finished_at)}。")
+    if action == "OBSERVE":
+        needs = data.get("public_needs", {})
+        hunger, energy = number(needs, "hunger"), number(needs, "energy")
+        return bounded(f"饥饿{hunger:g}，精力{energy:g}。" if hunger is not None and energy is not None else f"时间{world_time(finished_at)}。")
+    return bounded(f"用时{spent or 0}分钟，完成于{world_time(finished_at)}。")
 
 
 def presentation_enabled() -> bool:
@@ -611,6 +831,10 @@ def public_npc_observation(npc_id: str) -> dict | None:
             | Q(command__kind__in=AGENT_INSTRUCTION_ACTIONS)
         ).select_related("command").order_by("-world_minute", "-created_at")
     )
+    waiting_commands = list(NpcCommandState.objects.filter(
+        npc=profile.npc, kind__in=AGENT_INSTRUCTION_ACTIONS,
+        status__in=["RECEIVED", "QUEUED"],
+    ).order_by("-received_world_minute", "-created_at"))
     history_rows = []
     for receipt in recent_receipts:
         command = receipt.command
@@ -650,6 +874,7 @@ def public_npc_observation(npc_id: str) -> dict | None:
             pass
 
     parameter_rows = [(parameters, action_kind) for _, action_kind, parameters, _ in history_rows]
+    parameter_rows.extend((command.sanitized_parameters, command.kind) for command in waiting_commands)
     if active_command:
         parameter_rows.append((active_command.sanitized_parameters, active_command.kind))
     for params, action in parameter_rows:
@@ -735,22 +960,62 @@ def public_npc_observation(npc_id: str) -> dict | None:
             for row in commitment_detail_rows
         },
     }
-    recent_commands = [
-        {
+    time_state = GlobalGameTimeState.objects.filter(pk=1).first()
+    current_world_minute = time_state.world_minute if time_state else 0
+    ordered_commands = []
+    for receipt, action_kind, parameters, duration in history_rows:
+        command = receipt.command
+        status = (
+            command.status if command and command.status in {"CANCELLED", "EXPIRED"}
+            else "SUCCEEDED" if receipt.success else "FAILED"
+        )
+        row = {
             "name": action_kind,
             "summary": _public_command_summary(
                 action_kind, parameters, duration,
                 names, location_names, item_names, marketplace_item_names,
                 profile.home_location_code, details
             ),
-            "status": "SUCCEEDED" if receipt.success else "FAILED",
+            "status": status,
             "result_code": receipt.result_code,
+            "received_world_minute": command.received_world_minute if command else None,
+            "started_world_minute": command.started_world_minute if command else None,
             "completed_world_minute": receipt.world_minute,
         }
-        for receipt, action_kind, parameters, duration in history_rows
-    ]
+        row["detail"] = _public_command_detail(
+            action_kind, parameters, duration, status, receipt.result_code,
+            receipt.response_data, row["received_world_minute"], row["started_world_minute"],
+            row["completed_world_minute"], current_world_minute,
+            names, location_names, item_names, details,
+        )
+        order_minute = (
+            command.received_world_minute if command and command.received_world_minute is not None
+            else command.started_world_minute if command and command.started_world_minute is not None
+            else receipt.world_minute
+        )
+        ordered_commands.append((order_minute, command.created_at if command else receipt.created_at, row))
+    for command in waiting_commands:
+        row = {
+            "name": command.kind,
+            "summary": _public_command_summary(
+                command.kind, command.sanitized_parameters, command.duration_minutes,
+                names, location_names, item_names, marketplace_item_names,
+                profile.home_location_code, details
+            ),
+            "status": "WAITING",
+            "result_code": "",
+            "received_world_minute": command.received_world_minute,
+            "started_world_minute": None,
+            "completed_world_minute": None,
+        }
+        row["detail"] = _public_command_detail(
+            command.kind, command.sanitized_parameters, command.duration_minutes,
+            "WAITING", "", {}, row["received_world_minute"], None, None,
+            current_world_minute, names, location_names, item_names, details,
+        )
+        ordered_commands.append((command.received_world_minute or -1, command.created_at, row))
     if active_command:
-        recent_commands.insert(0, {
+        row = {
             "name": active_command.kind,
             "summary": _public_command_summary(
                 active_command.kind, active_command.sanitized_parameters, active_command.duration_minutes,
@@ -759,9 +1024,23 @@ def public_npc_observation(npc_id: str) -> dict | None:
             ),
             "status": "RUNNING",
             "result_code": "",
+            "received_world_minute": active_command.received_world_minute,
             "started_world_minute": active_command.started_world_minute,
             "completed_world_minute": None,
-        })
+        }
+        row["detail"] = _public_command_detail(
+            active_command.kind, active_command.sanitized_parameters, active_command.duration_minutes,
+            "RUNNING", "", {}, row["received_world_minute"], row["started_world_minute"], None,
+            current_world_minute, names, location_names, item_names, details,
+        )
+        order_minute = (
+            active_command.received_world_minute
+            if active_command.received_world_minute is not None
+            else active_command.started_world_minute or -1
+        )
+        ordered_commands.append((order_minute, active_command.created_at, row))
+    ordered_commands.sort(key=lambda item: (item[0], item[1]), reverse=True)
+    recent_commands = [item[2] for item in ordered_commands]
     dialogue = NpcDialogueSession.objects.filter(
         Q(initiator=profile.npc) | Q(target=profile.npc), status="ACTIVE"
     ).select_related("initiator", "target").first()
@@ -777,11 +1056,10 @@ def public_npc_observation(npc_id: str) -> dict | None:
     else:
         action = runtime.current_action or "IDLE"
         action_summary = COMMAND_CATALOG.get(action, {}).get("label", "空闲")
-    time_state = GlobalGameTimeState.objects.filter(pk=1).first()
     return {
         "npc_id": npc_id,
         "display_name": profile.display_name,
-        "world_minute": time_state.world_minute if time_state else 0,
+        "world_minute": current_world_minute,
         "public_needs": {
             "hunger": runtime.hunger_fp / 10,
             "energy": runtime.energy_fp / 10,

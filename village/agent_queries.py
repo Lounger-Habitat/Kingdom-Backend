@@ -48,6 +48,7 @@ from .phase5_story import ARC_CODE, STORY_ACTION_PLANS, _snapshot
 
 
 QUERY_NAMES = frozenset({
+    "GET_RULE",
     "OBSERVE",
     "INSPECT_NEARBY",
     "INSPECT_INVENTORY",
@@ -480,12 +481,28 @@ def _marketplace_history(npc: NpcDefinition, query_params=None) -> dict:
     return marketplace_history_query(npc, query_params)
 
 
+def _rules(npc: NpcDefinition) -> dict:
+    """The NPC's current environment rules, identical to the discover projection.
+
+    Different NPCs get different rules because the text is generated from each
+    NPC's enabled instruction set.
+    """
+    from .agent_context import build_agent_context
+    from .runtime_services import CommandService
+
+    actions = CommandService.allowed_actions_for(npc)
+    if "SLEEP" in actions:
+        actions.add("WAKE_UP")
+    return build_agent_context(actions)
+
+
 def _authorized(_npc: NpcDefinition) -> dict:
     """Capability gate for parameterized legacy query endpoints."""
     return {"authorized": True}
 
 
 _HANDLERS = {
+    "GET_RULE": _rules,
     "OBSERVE": _observe,
     "INSPECT_NEARBY": _nearby,
     "INSPECT_INVENTORY": _inventory,

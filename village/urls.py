@@ -36,8 +36,8 @@ urlpatterns = [
     path("api/village/runtime/advance-needs", views.runtime_advance_needs, name="village-runtime-advance-needs"),
     path("api/village/life-actions/execute", views.life_actions_execute, name="village-life-actions-execute"),
     path("api/village/dialogues/start", views.dialogue_start, name="village-dialogue-start"),
-    path("api/village/dialogues/<uuid:conversation_id>/speak", views.dialogue_speak, name="village-dialogue-speak"),
-    path("api/village/dialogues/<uuid:conversation_id>/complete", views.dialogue_complete, name="village-dialogue-complete"),
+    path("api/village/dialogues/<str:conversation_id>/speak", views.dialogue_speak, name="village-dialogue-speak"),
+    path("api/village/dialogues/<str:conversation_id>/complete", views.dialogue_complete, name="village-dialogue-complete"),
     path("api/village/actions/complete", views.actions_complete, name="village-actions-complete"),
     path("api/village/events", views.events_list, name="village-events"),
     # 阶段一 Command API
