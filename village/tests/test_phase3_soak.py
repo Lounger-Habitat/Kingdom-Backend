@@ -68,7 +68,7 @@ def _tool_remaining(bag, tool_item_id):
     """Query remaining uses of first tool slot."""
     slot = NpcGlobalInventorySlot.objects.filter(
         bag=bag, item_id=tool_item_id, item_amount__gt=0,
-    ).exclude(remaining_uses=0).first()
+    ).exclude(usage__remaining=0).first()
     return slot.remaining_uses if slot else 0
 
 

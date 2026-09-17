@@ -1,7 +1,6 @@
 BASE_ACTIONS = [
     "MOVE", "WAIT", "GO_HOME",
     "EAT", "REST", "SLEEP", "WORK_PLACEHOLDER",
-    "START_DIALOGUE", "SPEAK",
     "PROPOSE_TRADE", "RESPOND_TRADE", "CANCEL_TRADE_OFFER",
     "BUY_FROM_STORE", "BUY_FROM_MARKETPLACE", "SELL_ON_MARKETPLACE",
     "DELIST_FROM_MARKETPLACE", "BROWSE_MARKETPLACE",
@@ -31,7 +30,7 @@ NPC_SEEDS = [
         "personal_goal": "维持三块农田生产并保住家庭储备",
         "capabilities": BASE_ACTIONS + [
             "PLANT", "HARVEST",
-            "INSPECT_MARKET_STATE", "INSPECT_FARM_STATE",
+            "INSPECT_FARM_STATE",
         ],
         "money": 200,
         "items": [(1003, 12), (1051, 18), (1019, 4), (1023, 3)],
@@ -45,10 +44,9 @@ NPC_SEEDS = [
         "work_location_code": "BUTCHER_YARD",
         "social_location_code": "RESTAURANT",
         "personality_traits": ["independent", "wry", "cautious"],
-        "personal_goal": "稳定肉类供应并确认森林旧路风险",
+        "personal_goal": "狩猎并处理猎物，出售肉类和副产品，购买工具食物并维持生活",
         "capabilities": BASE_ACTIONS + [
-            "HUNT",
-            "INSPECT_MARKET_STATE",
+            "HUNT", "PROCESS_GAME",
         ],
         "money": 240,
         "items": [(1009, 4), (1034, 3), (1056, 6), (1019, 4)],
@@ -81,9 +79,9 @@ NPC_SEEDS = [
         "personality_traits": ["creative", "ambitious", "warm", "stubborn"],
         "personal_goal": "让饭店在商路中断期间持续供应村民",
         "capabilities": BASE_ACTIONS + [
-            "COOK",
-            "LIST_STORE_ITEM", "UPDATE_STORE_PRICE", "DELIST_STORE_ITEM",
-            "INSPECT_MARKET_STATE", "INSPECT_RESTAURANT_STATE",
+            "COOK", "WITHDRAW_STORE_FUNDS", "REQUEST_DISH_REVIEW", "CANCEL_DISH_REVIEW",
+            "LIST_STORE_ITEM", "DELIST_STORE_ITEM",
+            "INSPECT_RESTAURANT_STATE",
         ],
         "money": 300,
         "items": [(1025, 10), (1042, 10), (1056, 8), (1057, 6), (1049, 8), (1058, 6)],
@@ -99,9 +97,10 @@ NPC_SEEDS = [
         "personality_traits": ["shrewd", "practical", "persuasive", "controlling"],
         "personal_goal": "恢复商路并建立可信的村庄供货网络",
         "capabilities": BASE_ACTIONS + [
-            "IMPORT_GOODS", "EXPORT_GOODS",
+            "IMPORT_GOODS", "EXPORT_GOODS", "CONTACT_CARAVAN", "WITHDRAW_STORE_FUNDS", "DEPOSIT_STORE_FUNDS", "WITHDRAW_STORE_ITEM", "SET_STORE_LIMITS",
             "LIST_STORE_ITEM", "UPDATE_STORE_PRICE", "DELIST_STORE_ITEM",
             "INSPECT_MARKET_STATE",
+            "INSPECT_CARAVAN_REQUESTS",
         ],
         "money": 450,
         "items": [(1003, 30), (1051, 36), (1049, 12), (1050, 8), (1058, 8), (1076, 6), (1002, 10)],
@@ -119,6 +118,7 @@ LOCATION_SEEDS = [
     ("BILL_FARM", "Bill 农田", (-32, 0, -59), "work", 8),
     ("JACK_HOME", "Jack 林边小屋", (-62, 2, 34), "home", 4),
     ("BUTCHER_YARD", "Jack 屠宰棚", (-49, 1, 20), "work", 4),
+    ("EMERGENCY_TRADE_POST", "林边应急商队接货点", (-94.98, 2.4783, 38.74), "market", 3),
     ("FOREST_EDGE", "森林边缘", (-81, 3, 40), "resource", 8),
     ("HUNTING_GATE", "猎场入口", (-91, 4, 47), "offmap_gate", 2),
     ("RIVER_EAST", "东侧河道", (69, -1, 0), "boundary", 0),
@@ -160,9 +160,42 @@ TEST_NPC_ISOLATION = [
 # ── Phase 3: Farm plot seeds ───────────────────────────────────────
 
 FARM_PLOT_SEEDS = [
-    {"plot_code": "FARM_PLOT_A"},
-    {"plot_code": "FARM_PLOT_B"},
-    {"plot_code": "FARM_PLOT_C"},
+    {"plot_code": code}
+    for region in ("A", "B", "C", "D")
+    for code in (
+        ([f"FARM_PLOT_{region}"] if region != "D" else ["FARM_PLOT_D_01"])
+        + [f"FARM_PLOT_{region}_{index:02d}" for index in range(2, 10)]
+    )
+]
+
+# The base Unity catalog already has the four harvested crops, but only corn
+# has a seed item.  These village-only seed definitions use the crop icon as a
+# temporary visual and are also supplied by Nora's caravan import whitelist.
+FARM_ITEM_SEEDS = [
+    {
+        "item_id": 29301,
+        "item_name": "小麦种子",
+        "item_type": "Seed",
+        "item_description": "Bill农田种植小麦所需的种子，可由Nora通过商队进货。",
+        "item_price": 5,
+        "icon_source_item_id": 1005,
+    },
+    {
+        "item_id": 29302,
+        "item_name": "胡萝卜种子",
+        "item_type": "Seed",
+        "item_description": "Bill农田种植胡萝卜所需的种子，可由Nora通过商队进货。",
+        "item_price": 5,
+        "icon_source_item_id": 1025,
+    },
+    {
+        "item_id": 29303,
+        "item_name": "土豆种薯",
+        "item_type": "Seed",
+        "item_description": "Bill农田种植土豆所需的种薯，可由Nora通过商队进货。",
+        "item_price": 5,
+        "icon_source_item_id": 1042,
+    },
 ]
 
 

@@ -174,6 +174,7 @@ class VillageTradeOfferModelTest(TestCase):
         defaults = {
             "buyer_npc": buyer or self.buyer,
             "seller_npc": seller or self.seller,
+            "proposer_npc": buyer or self.buyer,
             "item_id": 1030,
             "amount": amount,
             "gold_amount": gold_amount,
@@ -230,6 +231,11 @@ class StoreSeedMigrationTest(TestCase):
     """Migration 0011 seeds the two stores (+ accounts) idempotently."""
 
     migration_module = importlib.import_module("village.migrations.0011_phase3_store_models")
+
+    def setUp(self):
+        # This tests 0011's initial seed, not 0039's later restaurant account
+        # adjustment. Start with no stores instead of depending on migration order.
+        VillageStore.objects.filter(store_code__in=["GENERAL_STORE", "RESTAURANT_STORE"]).delete()
 
     @classmethod
     def setUpTestData(cls):

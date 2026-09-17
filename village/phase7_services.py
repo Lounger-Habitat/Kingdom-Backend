@@ -15,7 +15,7 @@ from items.models import Item
 from marketplace.models import MarketListing
 from recipes.models import Recipe
 
-from .command_catalog import AGENT_INSTRUCTION_ACTIONS, COMMAND_CATALOG
+from .command_catalog import AGENT_INSTRUCTION_ACTIONS, RECORDED_ACTIVITY_ACTIONS, COMMAND_CATALOG
 from .models import (
     DailyPriceSnapshot,
     EconomicLedgerEntry,
@@ -38,6 +38,7 @@ from .models import (
     VillageStoryArc,
     VillageStoryFact,
     VillageStoryTransitionReceipt,
+    VillageStore,
     VillageStoreListing,
     VillageTradeOffer,
     VillageWorldEvent,
@@ -52,6 +53,10 @@ PRICE_ITEM_IDS = (1030, 1056, 1053, 1067)
 FOOD_ITEM_IDS = (*PRICE_ITEM_IDS, 29001)
 SCAN_BATCH_SIZE = 200
 SCAN_EVENT_BUDGET = 1000
+# Keep existing receipts readable; retired names never return to the tool catalog.
+HISTORY_ACTIONS = AGENT_INSTRUCTION_ACTIONS | RECORDED_ACTIVITY_ACTIONS | {"START_DIALOGUE", "SPEAK"}
+PUBLIC_STORE_CODES = frozenset({"GENERAL_STORE", "RESTAURANT_STORE"})
+STORE_HISTORY_TYPES = ("LIST_STORE_ITEM", "UPDATE_STORE_PRICE", "DELIST_STORE_ITEM")
 
 
 def _display_code(value: object) -> str:
@@ -68,6 +73,9 @@ def _public_command_summary(action: str, params: dict, duration: int | None,
     label = COMMAND_CATALOG.get(action, {}).get("label", {
         "WAKE_UP": "唤醒",
         "UPDATE_SUBJECTIVE_GOAL": "更新主观目标",
+        "SPEECH": "对话发言",
+        "START_DIALOGUE": "发起对话（历史）",
+        "SPEAK": "对话发言（历史）",
     }.get(action, action or "未知指令"))
     params = params if isinstance(params, dict) else {}
     details = details or {}
@@ -131,7 +139,7 @@ def _public_command_summary(action: str, params: dict, duration: int | None,
         topic = str(params.get("topic", "")).strip()
         detail = f"与{target}开始对话" if target else label
         return f"{detail}：{topic}" if topic else detail
-    if action == "SPEAK":
+    if action in {"SPEECH", "SPEAK"}:
         speech = str(params.get("text", "")).strip()
         return f"对话发言：“{speech}”" if speech else label
     if action == "PLANT":
@@ -141,7 +149,7 @@ def _public_command_summary(action: str, params: dict, duration: int | None,
         plot = _display_code(params.get("plot_code"))
         return f"收获{plot}" if plot else label
     if action == "HUNT":
-        hunt = {"HUNT_CHICKEN": "肉类"}.get(str(params.get("hunt_code", "")).upper(), "")
+        hunt = {"HUNT_CHICKEN": "肉类（旧命令）", "HUNT_ANIMALS": "待处理猎物"}.get(str(params.get("hunt_code", "")).upper(), "")
         return f"狩猎{hunt}" if hunt else label
     if action == "COOK":
         recipe = params.get("recipe_id")
@@ -171,6 +179,17 @@ def _public_command_summary(action: str, params: dict, duration: int | None,
         detail = f"配送{goods} ×{delivery.get('amount')}" if goods else label
         return f"{detail}至{destination}" if destination else detail
     if action in {"IMPORT_GOODS", "EXPORT_GOODS"}:
+        rows = params.get("items")
+        if action == "IMPORT_GOODS" and isinstance(rows, list):
+            parts = []
+            for row in rows:
+                if isinstance(row, dict):
+                    goods = named_item(row.get("item_id"))
+                    amount = row.get("amount")
+                    if goods and amount is not None:
+                        parts.append(f"{goods} ×{amount}")
+            if parts:
+                return f"{label}：" + "、".join(parts)
         goods, amount = item("item_id"), params.get("amount")
         return f"{label}{goods} ×{amount}" if goods and amount is not None else label
     if action == "RATE_DISH":
@@ -376,12 +395,15 @@ def _public_command_detail(action: str, params: dict, duration: int | None,
         return bounded(f"与{npc_name('target_npc_id')}交流{spent if spent is not None else duration or 0}分钟。")
     if action == "START_DIALOGUE":
         return bounded(f"与{npc_name('target_npc_id')}建立对话，话题{len(str(params.get('topic', '')))}字。")
-    if action == "SPEAK":
+    if action in {"SPEECH", "SPEAK"}:
         ended = result_code == "DIALOGUE_COMPLETED" or bool(params.get("end_turn"))
         return bounded(f"发送{len(str(params.get('text', '')))}字，对话{'结束' if ended else '继续'}。")
 
     gained, consumed = item_change("items_added"), item_change("items_consumed")
-    if action in {"HARVEST", "HUNT", "COOK"} and gained:
+    if action in {"HUNT", "PROCESS_GAME"} and data.get("production"):
+        gained = "、".join(f"{named_item(row.get('item_id'))}×{row.get('amount', 0)}"
+                           for row in data["production"].get("outputs", []))
+    if action in {"HARVEST", "HUNT", "PROCESS_GAME", "COOK"} and gained:
         return bounded(f"获得{gained}，用时{spent or 0}分钟。")
     if action in {"PLANT", "COOK"} and consumed:
         return bounded(f"消耗{consumed}，用时{spent or 0}分钟。")
@@ -398,6 +420,14 @@ def _public_command_detail(action: str, params: dict, duration: int | None,
         money = number(effects, "money_delta", "gold_delta")
         verb = "增加" if action == "IMPORT_GOODS" else "减少"
         suffix = f"，金币变化{money:+g}" if money is not None else ""
+        imports = data.get("imports") if action == "IMPORT_GOODS" else None
+        if isinstance(imports, list):
+            parts = []
+            for row in imports:
+                if isinstance(row, dict):
+                    parts.append(f"{named_item(row.get('item_id'))}×{row.get('amount', 0)}")
+            if parts:
+                return bounded(f"库存{verb}{'、'.join(parts)}{suffix}。")
         return bounded(f"库存{verb}{named_item(params.get('item_id'))}×{params.get('amount', 0)}{suffix}。")
     if action == "RATE_DISH":
         return bounded(f"提交{params.get('score', 0)}星评分，菜品属于{npc_name('owner_npc_id')}。")
@@ -466,14 +496,19 @@ def _public_command_detail(action: str, params: dict, duration: int | None,
         actions = data.get("available_actions", [])
         return bounded(f"当前{phase or '未知阶段'}，可执行{len(actions) if isinstance(actions, list) else 0}项。")
     if action == "INSPECT_RESTAURANT_STATE":
-        recipes = data.get("recipes", [])
-        return bounded(f"可用菜谱{len(recipes) if isinstance(recipes, list) else 0}道。")
+        menu = data.get("menu") or {}
+        items = menu.get("items", [])
+        return bounded(f"餐厅状态{data.get('status', 'UNAVAILABLE')}，在售菜单{len(items) if isinstance(items, list) else 0}项。")
     if action == "INSPECT_STORE_INVENTORY":
         rows = data.get("listings", data.get("items", []))
         return bounded(f"在售商品{len(rows) if isinstance(rows, list) else 0}种。")
     if action == "INSPECT_MARKET_STATE":
-        rows = data.get("prices", data.get("items", []))
-        return bounded(f"可交易商品{len(rows) if isinstance(rows, list) else 0}种。")
+        status = {"PRESENT": "在场", "CLOSED": "未到访或已离开", "ROUTE_NOT_OPEN": "路线未开通"}.get(data.get("caravan", {}).get("status"), "未知")
+        total = data.get("total", 0)
+        return bounded(f"商队{status}，当趟可交易商品共{total}种。")
+    if action == "INSPECT_CARAVAN_REQUESTS":
+        rows = data.get("requestable_items", [])
+        return bounded(f"可登记补货商品{len(rows)}种，已登记{sum(bool(row.get('requested')) for row in rows)}种。")
     if action == "INSPECT_PUBLIC_ECONOMY_STATE":
         balance = number(data, "balance", "public_fund_balance") or 0
         return bounded(f"公款余额{balance:g}金币，时间{world_time(finished_at)}。")
@@ -501,7 +536,7 @@ def _category(event: VillageWorldEvent) -> str:
         return "STORY"
     if any(word in event_type for word in (
         "TRADE", "ORDER", "STORE", "PRICE", "FUND", "IMPORT", "EXPORT",
-        "COOK", "HARVEST", "HUNT", "PLANT",
+        "COOK", "HARVEST", "HUNT", "PROCESS_GAME", "PLANT",
     )):
         return "ECONOMY"
     return "NPC"
@@ -596,16 +631,8 @@ def _coverage_days() -> tuple[float, float]:
 
 
 def _fund_delta(entry: EconomicLedgerEntry) -> int:
-    value = 0
-    public_fund = (entry.changes or {}).get("PUBLIC_FUND")
-    if isinstance(public_fund, dict):
-        try:
-            value += int(public_fund.get("money", 0) or 0)
-        except (TypeError, ValueError):
-            pass
-    if entry.entry_type in {"IMPORT_GOODS", "EXPORT_GOODS"}:
-        value += int(entry.external_delta or 0)
-    return value
+    from .phase3_public_economy import _public_fund_money_delta
+    return _public_fund_money_delta(entry)
 
 
 def _public_economy(world_minute: int) -> dict:
@@ -682,8 +709,8 @@ def _public_story(player_id: str) -> dict:
         }
     elif fact is not None and arc.current_plan == "FOREST_ROUTE":
         progress = {
-            "forest_route_scouted": fact.forest_route_scouted,
-            "forest_route_supply": fact.forest_route_supply,
+            "retired": True,
+            "message": "森林旧路方案已退役；历史进度不再是工作目标。Nora可独立付费开通应急商队。",
         }
         if fact.emergency_caravan_contacted:
             progress["emergency_caravan_status"] = (
@@ -710,6 +737,7 @@ def _public_story(player_id: str) -> dict:
         "arc_code": arc.arc_code,
         "public_problem": arc.current_phase,
         "public_plan": arc.current_plan or None,
+        "retired_plan": arc.current_plan == "FOREST_ROUTE",
         "progress": progress,
         "player_contribution": {
             "event_count": len(contribution_events),
@@ -789,6 +817,232 @@ def public_overview(player_id: str) -> dict:
     }
 
 
+def public_store(store_code: str) -> dict | None:
+    """Return a bounded, player-safe projection for one physical village shop."""
+    store_code = str(store_code or "").upper()
+    if store_code not in PUBLIC_STORE_CODES:
+        return None
+    store = VillageStore.objects.select_related("operator_npc", "account").filter(
+        store_code=store_code
+    ).first()
+    if store is None:
+        return None
+
+    time_state = GlobalGameTimeState.objects.filter(pk=1).first()
+    world_minute = time_state.world_minute if time_state else 0
+    from .phase3_direct_trade import store_inventory_status
+    from .lucy_restaurant import store_available
+    inventory_status, _ = store_inventory_status(store, world_minute)
+
+    listing_rows = list(
+        VillageStoreListing.objects.filter(store=store)
+        .select_related("listed_by_npc")
+        .prefetch_related("inventory_slots")
+        .order_by("listed_world_minute", "listing_id")
+    )
+    listing_by_id = {str(row.listing_id): row for row in listing_rows}
+    items = {item.item_id: item for item in Item.objects.filter(
+        item_id__in={row.item_id for row in listing_rows}
+    )}
+    item_names = {key: item.item_name for key, item in items.items()}
+    from inventory.batches import project_public_batch
+    npc_names = {
+        str(row.npc.agent_id): row.display_name
+        for row in NpcProfile.objects.select_related("npc").filter(is_active=True)
+    }
+
+    listings = []
+    for listing in listing_rows:
+        if listing.status != "ACTIVE":
+            continue
+        batches = []
+        available_amount = 0
+        for slot in listing.inventory_slots.all():
+            if slot.item_amount <= 0:
+                continue
+            available = store_available(slot, world_minute)
+            if available <= 0:
+                continue
+            attributes = slot.item_attributes if isinstance(slot.item_attributes, dict) else {}
+            batch = {
+                "available_amount": available,
+                "expires_world_minute": slot.expires_world_minute,
+                "batch": project_public_batch(
+                    slot, items.get(slot.item_id), world_minute, available,
+                    expires_world_minute=slot.expires_world_minute,
+                    freshness_unknown=bool(attributes.get("freshness_unknown")),
+                ),
+            }
+            if slot.remaining_uses is not None:
+                batch["remaining_uses"] = slot.remaining_uses
+            for source, target in (
+                ("dish_quality", "dish_quality"),
+                ("rated", "rated"),
+                ("overall_score", "overall_score"),
+                ("ingredient", "ingredients"),
+            ):
+                if attributes.get(source) not in (None, ""):
+                    batch[target] = attributes[source]
+            batches.append(batch)
+            available_amount += available
+        listings.append({
+            "listing_id": str(listing.listing_id),
+            "item_id": listing.item_id,
+            "item_name": item_names.get(listing.item_id, f"物品#{listing.item_id}"),
+            "available_amount": available_amount,
+            "unit_price": listing.unit_price,
+            "price_mode": listing.price_mode,
+            "listed_world_minute": listing.listed_world_minute,
+            "public_meal_code": listing.public_meal_code or None,
+            "batches": batches,
+        })
+
+    listing_ids = list(listing_by_id)
+    matching_entries = EconomicLedgerEntry.objects.filter(
+        changes__listing_id__in=listing_ids,
+    ).select_related("actor_npc").order_by("-world_minute", "-id")
+    entries = [
+        *matching_entries.filter(entry_type__in=STORE_HISTORY_TYPES)[:30],
+        *matching_entries.filter(entry_type="BUY_FROM_STORE")[:30],
+    ]
+    receipts = {
+        str(row.request_id): row.response_data
+        for row in VillageActionReceipt.objects.filter(
+            request_id__in=[entry.request_id for entry in entries]
+        )
+    }
+
+    def entry_data(entry):
+        response = receipts.get(str(entry.request_id)) or {}
+        data = response.get("data") if isinstance(response, dict) else {}
+        return data if isinstance(data, dict) else {}
+
+    def actor(entry):
+        npc_id = str(entry.actor_npc.agent_id) if entry.actor_npc else None
+        return npc_id, npc_names.get(npc_id, entry.actor_npc.name if entry.actor_npc else "")
+
+    listing_history = []
+    transactions = []
+    for entry in entries:
+        changes = entry.changes if isinstance(entry.changes, dict) else {}
+        listing = listing_by_id.get(str(changes.get("listing_id", "")))
+        if listing is None:
+            continue
+        data = entry_data(entry)
+        actor_id, actor_name = actor(entry)
+        if entry.entry_type == "BUY_FROM_STORE":
+            if len(transactions) >= 30:
+                continue
+            transactions.append({
+                "ledger_id": entry.id,
+                "listing_id": str(listing.listing_id),
+                "buyer_npc_id": actor_id,
+                "buyer_display_name": actor_name,
+                "item_id": listing.item_id,
+                "item_name": item_names.get(listing.item_id, f"物品#{listing.item_id}"),
+                "amount": data.get("amount", 0),
+                "gross_amount": data.get("gross_amount", changes.get("gross_amount", 0)),
+                "fee_amount": data.get("fee_amount", changes.get("fee_amount", 0)),
+                "store_net_amount": data.get("store_net_amount", changes.get("store_net_amount", 0)),
+                "subsidy_amount": data.get("subsidy_amount", 0),
+                "public_meal_code": listing.public_meal_code or None,
+                "world_minute": entry.world_minute,
+            })
+        elif len(listing_history) < 30:
+            listing_history.append({
+                "ledger_id": entry.id,
+                "action": entry.entry_type.removesuffix("_STORE_ITEM").removesuffix("_STORE_PRICE"),
+                "listing_id": str(listing.listing_id),
+                "actor_npc_id": actor_id,
+                "actor_display_name": actor_name,
+                "item_id": listing.item_id,
+                "item_name": item_names.get(listing.item_id, f"物品#{listing.item_id}"),
+                "amount": data.get("amount", changes.get("amount")),
+                "unit_price": data.get("unit_price", changes.get("unit_price")),
+                "price_mode": data.get("price_mode", changes.get("price_mode")),
+                "world_minute": entry.world_minute,
+            })
+
+    day_start = world_minute // 1440 * 1440
+    today_changes = list(EconomicLedgerEntry.objects.filter(
+        entry_type="BUY_FROM_STORE",
+        changes__listing_id__in=listing_ids,
+        world_minute__gte=day_start,
+        world_minute__lt=day_start + 1440,
+    ).values_list("changes", flat=True))
+    today_gross = sum(
+        (row.get("gross_amount") or (row.get("public_meal") or {}).get("gross_amount") or 0)
+        for row in today_changes if isinstance(row, dict)
+    )
+    operator_id = str(store.operator_npc.agent_id) if store.operator_npc else None
+    operator_name = npc_names.get(
+        operator_id, store.operator_npc.name if store.operator_npc else ""
+    )
+    result = {
+        "store_code": store.store_code,
+        "display_name": store.display_name,
+        "operator_npc_id": operator_id,
+        "operator_display_name": operator_name,
+        "operational_status": store.status,
+        "inventory_status": inventory_status,
+        "world_minute": world_minute,
+        "summary": {
+            "active_listing_count": len(listings),
+            "available_amount": sum(row["available_amount"] for row in listings),
+            "today_transaction_count": len(today_changes),
+            "today_gross": today_gross,
+        },
+        "listings": listings,
+        "listing_history": listing_history,
+        "transactions": transactions,
+    }
+    if store_code == "GENERAL_STORE":
+        account = getattr(store, "account", None)
+        result["coin_balance"] = account.balance if account is not None else None
+        result["inventory"] = _public_store_inventory(store, world_minute)
+        result["warehouse"] = _public_store_inventory(store, world_minute, unlisted_only=True)
+    return result
+
+
+def _public_store_inventory(store, world_minute, *, unlisted_only=False):
+    """Store-owned stock; the warehouse excludes batches on active shelves."""
+    from inventory.batches import project_public_batch
+    from .lucy_restaurant import store_available
+
+    slots = store.inventory_slots.filter(item_amount__gt=0)
+    if unlisted_only:
+        slots = slots.exclude(listing__status="ACTIVE")
+    slots = list(slots
+                 .select_related("listing", "usage", "dish", "review")
+                 .order_by("item_id", "id"))
+    items = {item.item_id: item for item in Item.objects.filter(item_id__in={s.item_id for s in slots})}
+    rows = {}
+    for slot in slots:
+        item = items.get(slot.item_id)
+        row = rows.setdefault(slot.item_id, {
+            "item_id": slot.item_id, "item_name": item.item_name if item else f"物品#{slot.item_id}",
+            "total_amount": 0, "available_amount": 0, "listed_amount": 0,
+            "unlisted_amount": 0, "reserved_amount": 0, "unavailable_amount": 0, "batches": [],
+        })
+        available = store_available(slot, world_minute)
+        reserved = min(slot.item_amount, max(0, slot.reserved_amount))
+        listed = slot.listing is not None and slot.listing.status == "ACTIVE"
+        amounts = {"total_amount": slot.item_amount, "available_amount": available,
+                   "listed_amount": available if listed else 0,
+                   "unlisted_amount": 0 if listed else available, "reserved_amount": reserved,
+                   "unavailable_amount": max(0, slot.item_amount - reserved - available)}
+        for key, amount in amounts.items():
+            row[key] += amount
+        attributes = slot.item_attributes or {}
+        row["batches"].append({
+            **amounts, "is_listed": listed,
+            "batch": project_public_batch(slot, item, world_minute, slot.item_amount,
+                expires_world_minute=slot.expires_world_minute,
+                freshness_unknown=bool(attributes.get("freshness_unknown"))),
+        })
+    return list(rows.values())
+
+
 def public_npc_observation(npc_id: str) -> dict | None:
     profile = NpcProfile.objects.select_related("npc").filter(
         npc__agent_id=npc_id, npc__is_test_only=False, is_active=True
@@ -827,8 +1081,8 @@ def public_npc_observation(npc_id: str) -> dict | None:
         })
     recent_receipts = list(
         VillageActionReceipt.objects.filter(npc=profile.npc).filter(
-            Q(action_kind__in=AGENT_INSTRUCTION_ACTIONS)
-            | Q(command__kind__in=AGENT_INSTRUCTION_ACTIONS)
+            Q(action_kind__in=HISTORY_ACTIONS)
+            | Q(command__kind__in=HISTORY_ACTIONS)
         ).select_related("command").order_by("-world_minute", "-created_at")
     )
     waiting_commands = list(NpcCommandState.objects.filter(
@@ -839,7 +1093,7 @@ def public_npc_observation(npc_id: str) -> dict | None:
     for receipt in recent_receipts:
         command = receipt.command
         action_kind = (
-            command.kind if command and command.kind in AGENT_INSTRUCTION_ACTIONS
+            command.kind if command and command.kind in HISTORY_ACTIONS
             else receipt.action_kind
         )
         raw_parameters = (command.sanitized_parameters if command else

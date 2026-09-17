@@ -22,6 +22,39 @@ from .models import MarketListing, MarketListingSource, MarketListingStatus, Mar
 MARKETPLACE_LISTING_DURATION_HOURS = 168  # 7 days
 
 
+def _world_minute():
+    from game_time.models import GlobalGameTimeState
+    return GlobalGameTimeState.objects.select_for_update().get(pk=1).world_minute
+
+
+def _listing_batch(listing):
+    """Old NPC perishables without captured batch metadata remain unverified."""
+    snap = dict(listing.item_snapshot or {})
+    # Never restore mutable instance attributes from the historical audit JSON.
+    snap.update({"itemID": listing.item_id, "itemAmount": listing.total_amount,
+                 "rated": listing.rated, "ratingPrice": listing.rating_price,
+                 "overallScore": listing.overall_score, "ingredient": listing.ingredient,
+                 "cookTime": listing.cook_time, "dishQuality": listing.dish_quality,
+                 "remainingUses": listing.remaining_uses, "reviewComment": listing.review_comment,
+                 "dishMetadata": listing.dish_metadata, "itemBagName": listing.item_bag_name})
+    if listing.source_type == MarketListingSource.NPC and "batchMetadataVersion" not in snap:
+        from village.phase3_catalog import CORN_OUTPUT_ITEM_ID, HUNT_MEAT_ITEM_IDS, PREY_ITEM_IDS, RECIPE_WHITELIST
+        from recipes.models import Recipe
+        perishables = set(HUNT_MEAT_ITEM_IDS) | set(PREY_ITEM_IDS) | {CORN_OUTPUT_ITEM_ID}
+        perishables.update(Recipe.objects.filter(pk__in=RECIPE_WHITELIST).values_list("item_id", flat=True))
+        if listing.item_id in perishables:
+            snap["freshnessUnknown"] = True
+    return snap
+
+
+def _apply_batch(slot, snap):
+    slot.dish_metadata = dict(snap.get("dishMetadata") or {})
+    slot.produced_world_minute = snap.get("producedWorldMinute")
+    slot.expires_world_minute = snap.get("expiresWorldMinute")
+    slot.freshness_unknown = bool(snap.get("freshnessUnknown", False))
+    slot.source_request_id = snap.get("sourceRequestId")
+
+
 def get_player_main_bag(player):
     return InventoryBag.objects.get_or_create(player=player, character_id=player.username)
 
@@ -135,6 +168,7 @@ def clear_slot_if_empty(slot):
         slot.hide_in_shop = False
         slot.remaining_uses = None
         slot.review_comment = ""
+        _apply_batch(slot, {})
         update_fields = [
             "item_id",
             "item_amount",
@@ -148,13 +182,15 @@ def clear_slot_if_empty(slot):
             "dish_quality",
             "hide_in_shop",
             "remaining_uses",
-            "review_comment",
+            "review_comment", "produced_world_minute", "expires_world_minute", "freshness_unknown", "dish_metadata",
         ]
+        update_fields.append("source_request_id")
         slot.save(update_fields=update_fields)
 
 
 def snapshot_slot(slot):
     return {
+        "dishMetadata": slot.dish_metadata,
         "instanceID": str(slot.instance_id),
         "itemID": slot.item_id,
         "itemAmount": slot.item_amount,
@@ -168,6 +204,11 @@ def snapshot_slot(slot):
         "hideInShop": slot.hide_in_shop,
         "remainingUses": slot.remaining_uses,
         "reviewComment": slot.review_comment,
+        "batchMetadataVersion": 1,
+        "producedWorldMinute": slot.produced_world_minute,
+        "expiresWorldMinute": slot.expires_world_minute,
+        "freshnessUnknown": slot.freshness_unknown,
+        "sourceRequestId": str(slot.source_request_id) if getattr(slot, "source_request_id", None) else None,
     }
 
 
@@ -201,6 +242,10 @@ def is_special_instance(snap):
             snap.get("dishQuality", 3) != 3,
             snap.get("remainingUses") is not None,
             bool(snap.get("reviewComment")),
+            snap.get("producedWorldMinute") is not None,
+            snap.get("expiresWorldMinute") is not None,
+            bool(snap.get("freshnessUnknown")),
+            bool(snap.get("dishMetadata")),
         ]
     )
 
@@ -273,11 +318,13 @@ def _listing_seller_owner(listing):
 
 
 def _return_items_to_bag(bag, listing, amount):
-    snap = listing.item_snapshot
+    snap = _listing_batch(listing)
     special = is_special_instance(snap)
 
     if not special:
-        existing = bag.slots.filter(item_id=listing.item_id, item_amount__gt=0).first()
+        existing = bag.slots.filter(item_id=listing.item_id, item_amount__gt=0,
+            produced_world_minute__isnull=True, expires_world_minute__isnull=True, freshness_unknown=False,
+            usage__remaining__isnull=True).first()
         if existing:
             existing.item_amount += amount
             existing.save(update_fields=["item_amount"])
@@ -295,6 +342,7 @@ def _return_items_to_bag(bag, listing, amount):
     slot.dish_quality = listing.dish_quality
     slot.remaining_uses = listing.remaining_uses
     slot.review_comment = listing.review_comment
+    _apply_batch(slot, snap)
     slot.save()
     return slot
 
@@ -303,7 +351,9 @@ def _add_snapshot_item_to_bag(bag, snap, amount):
     special = is_special_instance(snap)
 
     if not special:
-        existing = bag.slots.filter(item_id=snap.get("itemID", 0), item_amount__gt=0).first()
+        existing = bag.slots.filter(item_id=snap.get("itemID", 0), item_amount__gt=0,
+            produced_world_minute__isnull=True, expires_world_minute__isnull=True, freshness_unknown=False,
+            usage__remaining__isnull=True).first()
         if existing:
             existing.item_amount += amount
             existing.save(update_fields=["item_amount"])
@@ -324,6 +374,7 @@ def _add_snapshot_item_to_bag(bag, snap, amount):
     slot.hide_in_shop = False
     slot.remaining_uses = snap.get("remainingUses")
     slot.review_comment = snap.get("reviewComment", "")
+    _apply_batch(slot, snap)
     slot.save()
     return slot
 
@@ -348,9 +399,13 @@ def browse_listings(
     max_price=None,
     sort_by="newest",
     status=MarketListingStatus.ACTIVE,
+    expire=True,
 ):
-    expire_due_listings()
+    if expire:
+        expire_due_listings()
     qs = MarketListing.objects.all()
+    if not expire and status == MarketListingStatus.ACTIVE:
+        qs = qs.filter(Q(expires_at__isnull=True) | Q(expires_at__gt=timezone.now()))
     if status:
         qs = qs.filter(status=status)
     if keyword:
@@ -377,9 +432,12 @@ def browse_listings(
     return qs.select_related("seller", "seller_npc").order_by(sort_map.get(sort_by, "-created_at"))
 
 
-def get_npc_listings(npc, status=""):
-    expire_due_listings()
+def get_npc_listings(npc, status="", *, expire=True):
+    if expire:
+        expire_due_listings()
     qs = MarketListing.objects.filter(seller_npc=npc)
+    if not expire and status == MarketListingStatus.ACTIVE:
+        qs = qs.filter(Q(expires_at__isnull=True) | Q(expires_at__gt=timezone.now()))
     if status:
         qs = qs.filter(status=status)
     return qs.select_related("seller_npc").order_by("-created_at")
@@ -396,6 +454,7 @@ def get_npc_history(npc, role="all"):
 
 @transaction.atomic
 def _create_listing_for_owner(owner, instance_id, amount, price, *, expected_asset_version=None):
+    world_minute = _world_minute()
     owner = _lock_owner(owner)
     if owner["kind"] == "npc" and expected_asset_version is not None and owner["bag"].asset_version != expected_asset_version:
         return None, "资产版本不匹配"
@@ -409,6 +468,14 @@ def _create_listing_for_owner(owner, instance_id, amount, price, *, expected_ass
         return None, "价格必须大于0"
     if slot.item_amount < amount:
         return None, "物品数量不足"
+    if slot.freshness_unknown:
+        return None, "物品保质期来源未核实，暂不能出售"
+    if slot.expires_world_minute is not None and slot.expires_world_minute <= world_minute:
+        return None, "物品已过期"
+    if owner["kind"] == "npc":
+        from village.phase3_asset_service import get_available_slot_amount
+        if get_available_slot_amount(slot, world_minute) < amount:
+            return None, "未预留的有效物品数量不足"
 
     commission = calculate_commission(price * amount)
     if price * amount - commission <= 0 and owner["kind"] != "system":
@@ -448,7 +515,7 @@ def create_npc_listing(npc, instance_id, amount, price, expected_asset_version=N
 
 
 @transaction.atomic
-def _delist_listing_for_owner(owner, listing_id, *, expected_asset_version=None):
+def _delist_listing_for_owner(owner, listing_id, *, expected_asset_version=None, include_returned_items=False):
     try:
         listing = MarketListing.objects.select_for_update().get(pk=listing_id)
     except MarketListing.DoesNotExist:
@@ -464,14 +531,18 @@ def _delist_listing_for_owner(owner, listing_id, *, expected_asset_version=None)
     if listing.status != MarketListingStatus.ACTIVE:
         return None, "挂单不在出售中状态"
 
+    returned_items = []
     if listing.remaining_amount > 0:
-        _return_items_to_bag(owner["bag"], listing, listing.remaining_amount)
+        received = _return_items_to_bag(owner["bag"], listing, listing.remaining_amount)
+        if include_returned_items:
+            from village.agent_feedback import received_batch
+            returned_items.append(received_batch(received, listing.remaining_amount))
 
     listing.remaining_amount = 0
     listing.status = MarketListingStatus.DELISTED
     listing.save(update_fields=["remaining_amount", "status", "updated_at"])
     _bump_npc_asset_version(owner["bag"])
-    return owner["bag"], None
+    return ({"bag": owner["bag"], "returned_items": returned_items} if include_returned_items else owner["bag"]), None
 
 
 @transaction.atomic
@@ -480,9 +551,9 @@ def delist_listing(player, listing_id):
 
 
 @transaction.atomic
-def delist_npc_listing(npc, listing_id, expected_asset_version=None):
+def delist_npc_listing(npc, listing_id, expected_asset_version=None, include_returned_items=False):
     return _delist_listing_for_owner(
-        _resolve_owner(npc), listing_id, expected_asset_version=expected_asset_version
+        _resolve_owner(npc), listing_id, expected_asset_version=expected_asset_version, include_returned_items=include_returned_items
     )
 
 
@@ -504,6 +575,7 @@ def delist_system_listing(listing_id):
 
 @transaction.atomic
 def _buy_listing_for_owner(buyer_owner, listing_id, amount, *, expected_asset_version=None, admin_purchase=False):
+    world_minute = _world_minute()
     if amount <= 0:
         return None, "数量必须大于0"
 
@@ -514,6 +586,12 @@ def _buy_listing_for_owner(buyer_owner, listing_id, amount, *, expected_asset_ve
 
     if listing.status != MarketListingStatus.ACTIVE:
         return None, "挂单不在出售中状态"
+    batch = _listing_batch(listing)
+    if batch.get("freshnessUnknown"):
+        return None, "挂单物品保质期来源未核实，暂不能成交"
+    expiry = batch.get("expiresWorldMinute")
+    if expiry is not None and expiry <= world_minute:
+        return None, "挂单物品已过期"
     if listing.expires_at and listing.expires_at <= timezone.now():
         _expire_single_listing(listing)
         return None, "挂单已过期"
@@ -549,7 +627,7 @@ def _buy_listing_for_owner(buyer_owner, listing_id, amount, *, expected_asset_ve
             seller_owner["money_source_admin_sell"] if admin_purchase else seller_owner["money_source_sell"],
         )
 
-    _add_snapshot_item_to_bag(buyer_owner["bag"], listing.item_snapshot, amount)
+    received = _add_snapshot_item_to_bag(buyer_owner["bag"], batch, amount)
     listing.remaining_amount -= amount
     if listing.remaining_amount <= 0:
         listing.status = MarketListingStatus.SOLD_OUT
@@ -572,7 +650,11 @@ def _buy_listing_for_owner(buyer_owner, listing_id, amount, *, expected_asset_ve
         system_income=settlement["system_income"],
     )
 
-    return {"bag": buyer_owner["bag"], "transaction": tx, "listing": listing}, None
+    result = {"bag": buyer_owner["bag"], "transaction": tx, "listing": listing}
+    if buyer_owner["kind"] == "npc":
+        from village.agent_feedback import received_batch
+        result["purchased_batches"] = [received_batch(received, amount)]
+    return result, None
 
 
 @transaction.atomic

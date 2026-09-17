@@ -43,6 +43,8 @@ from .models import (
     VillageWorldEvent,
 )
 from game_time.models import GlobalGameTimeState
+from .phase3_contract import ResultCode as Phase3ResultCode
+from .phase5_contract import is_repair_labor, REPAIR_LABOR_MINUTES
 from inventory.models import NpcDefinition
 
 from .command_catalog import COMMAND_CATALOG
@@ -50,6 +52,16 @@ from .command_catalog import COMMAND_CATALOG
 
 def _fast_integration_enabled() -> bool:
     return bool(getattr(settings, "VILLAGE_FAST_COMMAND_INTEGRATION", False))
+
+
+def _world_time_text(world_minute: Optional[int]) -> Optional[str]:
+    if world_minute is None:
+        return None
+    try:
+        value = datetime.min + timedelta(minutes=int(world_minute))
+    except (TypeError, ValueError, OverflowError):
+        return None
+    return f"{value.month:02d}月{value.day:02d}日{value.hour:02d}时{value.minute:02d}分"
 
 
 # ============================================================================
@@ -152,9 +164,10 @@ _OUTCOME_ACTION_LABELS = {
     "MOVE": "移动", "WAIT": "等待", "GO_HOME": "回家", "EAT": "进食",
     "REST": "休息", "SLEEP": "睡眠", "SOCIALIZE": "社交",
     "WORK_PLACEHOLDER": "工作", "PLANT": "播种", "HARVEST": "收获",
-    "HUNT": "狩猎", "COOK": "烹饪", "CREATE_ORDER": "创建订单",
+    "HUNT": "狩猎", "PROCESS_GAME": "处理猎物", "COOK": "烹饪", "CREATE_ORDER": "创建订单",
     "CANCEL_ORDER": "取消订单", "START_DELIVERY": "配送",
     "IMPORT_GOODS": "进货", "EXPORT_GOODS": "出货", "RATE_DISH": "菜品评分",
+    "REQUEST_DISH_REVIEW": "提交菜品品鉴", "CANCEL_DISH_REVIEW": "取消菜品品鉴",
     "PUBLISH_PRICE_INDEX": "发布价格指数", "AUDIT_PUBLIC_FUND": "公共资金审计",
     "PROPOSE_TRADE": "发起交易", "RESPOND_TRADE": "响应交易",
     "CANCEL_TRADE_OFFER": "取消交易报价", "LIST_STORE_ITEM": "商品上架",
@@ -170,7 +183,7 @@ _OUTCOME_ACTION_LABELS = {
     "OBSERVE": "读取状态", "INSPECT_NEARBY": "读取附近信息", "INSPECT_INVENTORY": "读取背包",
     "INSPECT_TRADE_OFFERS": "读取交易报价", "INSPECT_STORY_STATE": "读取剧情状态",
     "INSPECT_RELEVANT_STORIES": "读取相关剧情", "INSPECT_STORY_DETAIL": "读取剧情详情",
-    "INSPECT_ORDERS": "读取订单", "INSPECT_MARKET_STATE": "读取市场状态",
+    "INSPECT_ORDERS": "读取订单", "INSPECT_MARKET_STATE": "读取市场状态", "INSPECT_CARAVAN_REQUESTS": "读取商队补货需求",
     "INSPECT_FARM_STATE": "读取农田状态", "INSPECT_RESTAURANT_STATE": "读取餐厅状态",
     "INSPECT_RATEABLE_DISHES": "读取可评分菜品", "INSPECT_PUBLIC_ECONOMY_STATE": "读取公共经济状态",
     "INSPECT_SOCIAL_STATE": "读取社交状态",
@@ -180,6 +193,28 @@ _OUTCOME_ACTION_LABELS = {
 }
 
 _OUTCOME_REASONS = {
+    "RESTAURANT_FIXED_PRICE_REQUIRED": "普通饭店菜只能按默认价值或已品鉴价格上架，请使用ORIGINAL",
+    "RESTAURANT_DISH_REQUIRED": "必须选择可用于饭店普通菜单的真实菜品",
+    "DISH_REVIEW_INCOMPLETE": "历史菜品评分信息不完整，暂不能按点评价上架",
+    "DISH_REVIEW_NOT_PENDING": "品鉴已完成、取消或不存在，请刷新待评清单",
+    "DISH_REVIEW_EXPIRED": "待评或菜品已过期，请刷新待评清单",
+    "DISH_REVIEW_INVALID_SCORES": "请提供色香味形四项1至10分的有限数值",
+    "PUBLIC_MEAL_USE_STORE": "请先从饭店0元领取公共餐，再进食个人库存中的具体餐食",
+    "PUBLIC_MEAL_DAILY_LIMIT_REACHED": "今天的公共餐额度已用完，社区餐和救济餐共享额度",
+    "PUBLIC_MEAL_FUND_INSUFFICIENT": "公共基金余额不足，餐食和额度均未扣除",
+    "PUBLIC_MEAL_BUDGET_EXHAUSTED": "已批准的供餐预算不足，餐食和额度均未扣除",
+    "PUBLIC_MEAL_INVALID_BATCH": "只能使用Lucy新制作且未领取过补贴的真实餐食",
+    "LUCY_ACTION_NOT_FINISHED": "尚未达到动作配置的完成时间",
+    "HUNT_CODE_RETIRED": "旧狩猎规则已退役，请使用HUNT_ANIMALS获取待处理猎物",
+    "PREY_UNAVAILABLE": "指定猎物不存在、已过期或正在被占用，请刷新库存",
+    "PREY_FRESHNESS_UNKNOWN": "猎物缺少可靠鲜期记录，不能加工",
+    "PRODUCTION_RESOURCE_UNAVAILABLE": "工作预留的猎物或工具已不可用，工作已停止",
+    "PRODUCTION_NOT_FINISHED": "尚未达到数据库配置的完成时间",
+    "PRODUCTION_COMMAND_REQUIRED": "必须通过正式狩猎或加工命令开工后才能结算",
+    "PRODUCTION_SETTLEMENT_REQUIRED": "生产必须由Backend结算钱货，不能仅上报动作成功",
+    "INVALID_ACTION_DURATION": "动作时长配置缺失或不是正数，请检查数据库配置",
+    "NPC_AWAY": "NPC当前缺席，不能执行工作",
+    "STORY_ACTION_RETIRED": "森林旧路侦察和补给已经退役；Nora付费即可开通应急商队",
     "BACKEND_UNAVAILABLE": "Backend 暂不可用，尚未确认最终结果",
     "INVALID_ENVELOPE": "消息信封格式无效", "INVALID_COMMAND_SCHEMA": "命令字段或参数格式无效",
     "UNKNOWN_ACTION": "动作名称未知", "ACTION_NOT_ALLOWED": "当前状态不允许执行此动作",
@@ -197,6 +232,17 @@ _OUTCOME_REASONS = {
     "P3_INSUFFICIENT_MONEY": "金币不足", "P3_TOOL_BROKEN": "所需工具已损坏",
     "P3_PLOT_NOT_READY": "地块尚未准备好", "P3_RECIPE_NOT_ALLOWED": "当前菜谱不允许制作",
     "P3_ORDER_NOT_OPEN": "订单不存在或已关闭", "P3_DELIVERY_NOT_READY": "配送尚未准备好",
+    "CARAVAN_CLOSED": "商队仅在每天11:00至15:00营业",
+    "CARAVAN_TOO_LATE": "剩余营业时间不足，请等待明天11点",
+    "CARAVAN_ROUTE_NOT_OPEN": "尚未开通可到访的商队路线",
+    "CARAVAN_INSUFFICIENT_STOCK": "本趟商队余货不足，请查询库存后重新选择数量",
+    "CARAVAN_ITEM_UNAVAILABLE": "需求中存在不可供应的物品",
+    "CARAVAN_CAPACITY_EXCEEDED": "需求品类数超过可供运力",
+    "CARAVAN_EXPORT_CAPACITY_EXCEEDED": "本趟商队剩余收购数量不足",
+    "CARAVAN_SUPPLY_UNAVAILABLE": "本趟供货目录不可用",
+    "CARAVAN_ACTION_NOT_FINISHED": "交易尚未达到计划完成时间",
+    "STORE_RESERVE_REQUIRED": "提款后必须保留商店经营储备",
+    "EXPORT_SAFETY_STOCK_REQUIRED": "出口后村庄安全库存不足",
     "P3_PRICE_UNAVAILABLE": "当前价格不可用", "P3_CARAVAN_COOLDOWN": "商队仍在冷却中",
     "P3_ASSET_VERSION_CONFLICT": "经济资产版本已变化，请刷新后重试",
     "P3_REQUEST_CONFLICT": "经济请求冲突，请刷新后重试", "P3_DAY_NOT_READY": "当天经济数据尚未准备好",
@@ -223,59 +269,115 @@ _OUTCOME_REASONS = {
     "STORY_VERSION_CONFLICT": "剧情版本已变化，请刷新后重试", "STORY_PHASE_INVALID": "当前剧情阶段不允许此操作",
     "STORY_PLAN_INVALID": "剧情方案无效", "STORY_FACT_NOT_UNLOCKED": "相关剧情事实尚未解锁",
     "STORY_MEETING_NOT_OPEN": "剧情会议尚未开放", "STORY_MEETING_ALREADY_SETTLED": "剧情会议已经结算",
-    "STORY_NOT_ENOUGH_ATTENDANCE": "出席人数不足", "STORY_VOTE_INVALID": "剧情投票参数无效",
+    "STORY_MEETING_NOT_FOUND": "该会议编号不存在，请查询会议详情核对编号",
+    "STORY_MEETING_NOT_STARTED": "尚未到会议开始时间，请核对开始时间后再投票或结算",
+    "STORY_MEETING_CLOSED": "会议已关闭或投票窗口已结束，请查询会议状态",
+    "STORY_NOT_ENOUGH_ATTENDANCE": "会议须Mark在场、至少3人出席并有3张有效票", "STORY_VOTE_INVALID": "剧情投票参数无效",
+    "MARK_UNAVAILABLE": "Mark当前失能或睡眠，不能履职",
+    "STORY_ACTOR_UNAVAILABLE": "当前身体状况不能执行这项公共工作",
+    "STORY_ACTOR_BUSY": "当前另有进行中的动作，不能同时履行公共工作",
+    "PUBLIC_AUTHORIZATION_REQUIRED": "需要已通过会议的有效decision_id，请先查询公共决定",
+    "PUBLIC_DECISION_NOT_PUBLISHED": "该公共决定尚未由Mark公布",
+    "PUBLIC_AUTHORIZATION_EXPIRED": "公共授权已过期、撤销或被新决定替代",
+    "PUBLIC_BUDGET_EXCEEDED": "采购金额超过该决定的剩余预算",
+    "PUBLIC_PROPOSAL_REQUIRED": "该候选方案尚未登记预算、执行人与期限，不能投票",
+    "PUBLIC_PROPOSAL_LOCKED": "已有村民投票，提案条款不能再修改",
+    "PUBLIC_MEETING_ALREADY_OPEN": "已有开放会议或当天已召集过会议，请查询现有会议",
+    "PUBLIC_DECISION_ALREADY_PUBLISHED": "该决定已经公布，不能重复发布",
+    "PUBLIC_LIMIT_OUTSIDE_AUTHORIZATION": "限购物品、额度或期限与已批准公共规则不符",
+    "PUBLIC_EVIDENCE_INVALID": "需要属于当前授权的真实已成功工程凭证",
+    "PUBLIC_EVIDENCE_ALREADY_REVIEWED": "该工程凭证已经审核，不能重复增加信任或计薪",
+    "PUBLIC_FACT_ALREADY_PUBLISHED": "该历史事实已经公开",
+    "PUBLIC_NO_SALARY_DUE": "没有尚未支付的已赚取工资",
     "STORY_FORBIDDEN_ACTOR": "当前 NPC 无权执行该剧情操作", "STORY_ACTION_INVALID": "剧情行动不适用于当前计划",
     "STORY_LOCATION_INVALID": "剧情行动地点不正确", "STORY_RESOURCE_INSUFFICIENT": "剧情资源不足",
     "STORY_FUND_INSUFFICIENT": "剧情资金不足", "STORY_TRUST_TOO_LOW": "信任度不足",
     "STORY_NOT_READY": "剧情当前尚未准备好", "STORY_REQUEST_CONFLICT": "剧情请求冲突，请刷新后重试",
-    "STORY_RATION_LIMIT_REACHED": "剧情行动额度已用尽", "GOAL_VERSION_CONFLICT": "目标版本已变化，请刷新后重试",
+    "STORY_RATION_LIMIT_REACHED": "该商品今日限购额度不足", "GOAL_VERSION_CONFLICT": "目标版本已变化，请刷新后重试",
     "INVALID_GOAL_SCHEMA": "主观目标格式无效", "HANDSHAKE_REQUIRED": "尚未完成 Hub 会话握手",
     "COMMAND_EXPIRED": "命令已过期", "COMMAND_NOT_FOUND": "命令不存在",
     "COMMAND_NOT_CANCELLABLE": "命令当前不可取消", "SETTLEMENT_IN_PROGRESS": "命令正在结算中",
 }
 
 
-def _outcome_message(action: str, result_code: str, success: bool) -> str:
+def _outcome_message(
+    action: str, result_code: str, success: bool,
+    world_minute: Optional[int] = None, data: Optional[Dict[str, Any]] = None,
+) -> str:
     action = str(action or "UNKNOWN").upper()
     label = _OUTCOME_ACTION_LABELS.get(action, action)
+    data = data or {}
+    prefix = _world_time_text(world_minute)
+    prefix = f"世界时间：{prefix}；" if prefix else ""
+
+    trade_action = action.removeprefix("ECONOMY_")
+    detail = data.get("data") or data
+    if not success and result_code == "STORY_LOCATION_INVALID" and detail.get("action_code") == "CONTACT_EMERGENCY_CARAVAN":
+        return "请回杂货铺开通"
+    if not success and detail.get("failure_kind") == "PERSONAL_FOOD_INSTANCE_NOT_FOUND":
+        return f"{prefix}个人背包中没有这份食物；商店批次编号不是购买后个人食物的编号。"
+    if data.get("store_code") == "GENERAL_STORE":
+        if data.get("sale_mode") == "IMMEDIATE_STORE":
+            if not success and result_code == "TRADE_INSUFFICIENT_MONEY":
+                return f"{prefix}商店金币不足，无法收购。"
+            if success:
+                items = data.get("items") or [data]
+                sold = "、".join(f"{row.get('item_name') or row.get('item_id')}×{row.get('amount')}（每份{row.get('unit_price')}金币）" for row in items)
+                return f"{prefix}已向商店售出{sold}，按物品价值结算；商店已支付{data.get('gold_amount')}金币至你的个人钱包。"
+            if result_code == "TRADE_INSUFFICIENT_ITEM":
+                return f"{prefix}物品{data.get('unavailable_item_id')}可售数量不足，整批未成交，钱货不变。"
+            if result_code == "TRADE_ITEM_NOT_FOR_SALE" and data.get("tool_buyback_policy") == "FULL_DURABILITY_ONLY":
+                return f"{prefix}杂货铺按原价自动收购只接受满耐久工具；物品{data.get('unavailable_item_id')}的耐久不符合要求，整批未成交，钱货不变。请查询背包中的耐久和不可收购原因。"
+        if success and trade_action == "PROPOSE_TRADE":
+            return f"{prefix}商店收购报价已提出，等待对方确认；尚未转移钱货。"
+        if success and trade_action == "RESPOND_TRADE" and data.get("status") == "ACCEPTED":
+            return f"{prefix}杂货铺账户已向NPC {data.get('seller_npc_id')}的个人钱包支付{data.get('gold_amount')}金币，货物已进入商店未上架库存。"
+    if data.get("action_code") == "REPAIR_LABOR" and success:
+        return f"{prefix}已完成60游戏分钟修桥劳动，工程记入1人时。"
+
+    failure_kind = str(data.get("failure_kind") or "")
+    if action == "PLANT" and failure_kind == "PLOT_ALREADY_PLANTED":
+        mature = _world_time_text(data.get("mature_world_minute")) or "未知"
+        reason = (
+            f"当前地块{data.get('plot_code') or '未知'}已种植"
+            f"{data.get('crop_code') or '未知作物'}，成熟时间是{mature}"
+        )
+        return f"{prefix}PLANT（播种）失败：{reason}。"
+    if action == "HARVEST" and failure_kind == "PLOT_NOT_MATURE":
+        mature = _world_time_text(data.get("mature_world_minute")) or "未知"
+        reason = (
+            f"当前地块{data.get('plot_code') or '未知'}的"
+            f"{data.get('crop_code') or '未知作物'}尚未成熟，成熟时间是{mature}"
+        )
+        return f"{prefix}HARVEST（收获）失败：{reason}。"
+    if action == "HARVEST" and failure_kind == "PLOT_EMPTY":
+        return f"{prefix}HARVEST（收获）失败：当前地块{data.get('plot_code') or '未知'}为空，不能收获。"
+    if result_code == Phase3ResultCode.P3_INVALID_PARAMS and data.get("invalid_field"):
+        field = data["invalid_field"]
+        received = data.get("received_value")
+        allowed = data.get("allowed_values")
+        suffix = f"，允许值是{allowed}" if allowed else ""
+        reason = f"参数{field}的值{received if received not in (None, '') else '为空'}无效{suffix}"
+        return f"{prefix}{action}（{label}）失败：{reason}。"
+    if result_code == "TRADE_OFFER_ALREADY_RESOLVED" and data.get("offer_status"):
+        reason = f"报价{data.get('offer_id')}当前状态为{data['offer_status']}"
+        if data.get("cancelled_by_npc_id"):
+            reason += f"，已由NPC {data['cancelled_by_npc_id']}撤销"
+        return f"{prefix}{action}（{label}）失败：{reason}；本次未成交。"
+    if result_code == "P3_RECIPE_NOT_ALLOWED" and data.get("invalid_field") == "recipe_id":
+        return f"{prefix}COOK（烹饪）失败：菜谱编号{data.get('received_value')}无效；请从GET_RULE.cooking_recipes返回的recipe_id选择。"
     if result_code == ResultCode.COMMAND_ACCEPTED:
-        return f"已接受「{label}」指令，正在执行。"
+        return f"{prefix}已接受「{label}」指令，正在执行。"
     if result_code == ResultCode.COMMAND_REPLAYED:
-        return "该指令已处理过，返回已保存的结果。"
+        return f"{prefix}该指令已处理过，返回已保存的结果。"
     if result_code == ResultCode.SLEEP_INTERRUPTED:
-        return "已提前唤醒 NPC，睡眠被中断。"
+        return f"{prefix}已提前唤醒 NPC，睡眠被中断。"
     if success:
-        return f"「{label}」已完成。"
+        return f"{prefix}「{label}」已完成。"
     reason = _OUTCOME_REASONS.get(result_code)
     if reason is None:
         reason = f"服务端返回 {result_code or '未知结果'}"
-    return f"「{label}」失败：{reason}。"
-
-
-def _outcome_next_action(result_code: str) -> Optional[str]:
-    if result_code == ResultCode.BACKEND_UNAVAILABLE:
-        return "RETRY"
-    if result_code in {ResultCode.NPC_BUSY, ResultCode.QUEUE_FULL, ResultCode.SETTLEMENT_IN_PROGRESS}:
-        return "WAIT"
-    if result_code in {"FOOD_NOT_AVAILABLE", "FOOD_NOT_ALLOWED", "P3_INSUFFICIENT_ITEM", "P3_INSUFFICIENT_MONEY", "TRADE_INSUFFICIENT_ITEM", "TRADE_INSUFFICIENT_MONEY"}:
-        return "INSPECT_INVENTORY"
-    if result_code in {"P3_PLOT_NOT_READY"}:
-        return "INSPECT_FARM_STATE"
-    if result_code in {"P3_RECIPE_NOT_ALLOWED", "LOCATION_CLOSED"}:
-        return "INSPECT_RESTAURANT_STATE"
-    if result_code in {"TRADE_LISTING_NOT_FOUND", "TRADE_LISTING_NOT_ACTIVE", "TRADE_STORE_CLOSED", "TRADE_STORE_FORBIDDEN", "TRADE_STORE_VERSION_CONFLICT"}:
-        return "INSPECT_STORE_INVENTORY"
-    if result_code in {"MARKETPLACE_LISTING_NOT_FOUND", "MARKETPLACE_LISTING_NOT_ACTIVE", "MARKETPLACE_FORBIDDEN"}:
-        return "BROWSE_MARKETPLACE"
-    if result_code in {"TRADE_OFFER_NOT_FOUND", "TRADE_OFFER_EXPIRED", "TRADE_OFFER_ALREADY_RESOLVED"}:
-        return "INSPECT_TRADE_OFFERS"
-    if result_code in {"P3_WRONG_LOCATION", "INVALID_ACTION_LOCATION", "TRADE_WRONG_LOCATION", "TRADE_NOT_COLOCATED", "SOCIAL_NOT_COLOCATED"}:
-        return "MOVE"
-    if result_code in {"STORY_VERSION_CONFLICT", "STORY_PHASE_INVALID", "STORY_NOT_READY", "STORY_REQUEST_CONFLICT"}:
-        return "INSPECT_STORY_STATE"
-    if result_code in {"INVALID_COMMAND_SCHEMA", "INVALID_ENVELOPE", "P3_INVALID_PARAMS", "SOCIAL_INVALID_PARAMS", "STORY_VOTE_INVALID", "STORY_ACTION_INVALID"}:
-        return "FIX_COMMAND"
-    return None
+    return f"{prefix}「{label}」失败：{reason}。"
 
 
 # ============================================================================
@@ -407,7 +509,7 @@ class BootstrapService:
 
     @staticmethod
     @transaction.atomic
-    def get_bootstrap() -> Dict[str, Any]:
+    def get_bootstrap(recovery: bool = False) -> Dict[str, Any]:
         """获取启动快照。
 
         Returns:
@@ -422,7 +524,9 @@ class BootstrapService:
         time_state = GlobalGameTimeState.objects.select_for_update().get(pk=1)
         from .dialogue_service import DialogueService
         DialogueService.expire_active(
-            time_state.world_minute, include_unexpired=True, force_invalid=True
+            time_state.world_minute,
+            include_unexpired=recovery,
+            force_invalid=recovery,
         )
 
         # Lock the formal ownership set before validating or serializing it.
@@ -803,7 +907,7 @@ class CommandService:
         "GET_RULE", "OBSERVE", "INSPECT_NEARBY", "INSPECT_INVENTORY",
         "INSPECT_TRADE_OFFERS", "INSPECT_STORY_STATE", "INSPECT_RELEVANT_STORIES",
         "INSPECT_STORY_DETAIL", "INSPECT_ORDERS",
-        "INSPECT_MARKET_STATE", "INSPECT_FARM_STATE",
+        "INSPECT_MARKET_STATE", "INSPECT_CARAVAN_REQUESTS", "INSPECT_FARM_STATE",
         "INSPECT_RESTAURANT_STATE", "INSPECT_RATEABLE_DISHES",
         "INSPECT_PUBLIC_ECONOMY_STATE",
         "BROWSE_MARKETPLACE", "CHECK_MY_MARKETPLACE_LISTINGS",
@@ -814,10 +918,10 @@ class CommandService:
     MAX_QUEUE_SIZE = 10
     MAX_CLOCK_SKEW_MS = 5 * 60 * 1000
     PHASE2_ACTIONS = {"EAT", "REST", "SLEEP", "SOCIALIZE", "WORK_PLACEHOLDER"}
-    DIALOGUE_ACTIONS = {"START_DIALOGUE", "SPEAK"}
     PHASE3_ACTIONS = {
-        "PLANT", "HARVEST", "HUNT", "COOK", "CREATE_ORDER", "CANCEL_ORDER",
-        "START_DELIVERY", "IMPORT_GOODS", "EXPORT_GOODS", "RATE_DISH",
+        "PLANT", "HARVEST", "HUNT", "PROCESS_GAME", "COOK", "CREATE_ORDER", "CANCEL_ORDER",
+        "START_DELIVERY", "IMPORT_GOODS", "EXPORT_GOODS", "RATE_DISH", "REQUEST_DISH_REVIEW", "CANCEL_DISH_REVIEW",
+        "CONTACT_CARAVAN", "WITHDRAW_STORE_FUNDS", "DEPOSIT_STORE_FUNDS", "WITHDRAW_STORE_ITEM", "SET_STORE_LIMITS",
         "PUBLISH_PRICE_INDEX", "AUDIT_PUBLIC_FUND", "PROPOSE_TRADE",
         "RESPOND_TRADE", "CANCEL_TRADE_OFFER", "LIST_STORE_ITEM",
         "UPDATE_STORE_PRICE", "DELIST_STORE_ITEM", "BUY_FROM_STORE",
@@ -838,10 +942,10 @@ class CommandService:
     }
     NEEDS_FIELDS = {"hunger", "energy", "health", "social", "stress"}
     WORK_ACTIONS = {
-        "WORK_PLACEHOLDER", "PLANT", "HARVEST", "HUNT", "COOK", "START_DELIVERY",
+        "WORK_PLACEHOLDER", "PLANT", "HARVEST", "HUNT", "PROCESS_GAME", "COOK", "START_DELIVERY",
     }
     LOW_HEALTH_ACTIONS = READ_QUERY_ACTIONS | {"MOVE", "GO_HOME", "WAIT", "EAT", "REST", "SLEEP"}
-    VARIABLE_DURATION_ACTIONS = {"REST", "SLEEP", "SOCIALIZE", "WORK_PLACEHOLDER"}
+    VARIABLE_DURATION_ACTIONS = {"WAIT", "REST", "SLEEP", "SOCIALIZE", "WORK_PLACEHOLDER"}
     NEED_GATE_LIMITS = {"hunger": 900, "energy": 100, "health": 300}
 
     @staticmethod
@@ -874,7 +978,10 @@ class CommandService:
     @staticmethod
     def apply_admin_duration(action_name: str, content: Dict[str, Any]) -> None:
         """Resolve one timer; only variable-duration actions accept a caller override."""
-        if action_name not in VillageActionDurationConfig.DEFAULT_DURATIONS:
+        if is_repair_labor(action_name, content.get("params")):
+            content["duration_minutes"] = REPAIR_LABOR_MINUTES
+            return
+        if action_name not in VillageActionDurationConfig.timed_actions():
             content.pop("duration_minutes", None)
             return
         if action_name in CommandService.VARIABLE_DURATION_ACTIONS and content.get("duration_minutes") is not None:
@@ -1054,8 +1161,6 @@ class CommandService:
             return False, ResultCode.ACTION_NOT_ALLOWED, None
         if action_name in CommandService.READ_QUERY_ACTIONS:
             return False, ResultCode.ACTION_NOT_ALLOWED, None
-        if action_name in CommandService.DIALOGUE_ACTIONS:
-            return False, ResultCode.ACTION_NOT_ALLOWED, None
         if action_name == "MOVE":
             params = content.get("params")
             if (not isinstance(params, dict) or set(params) not in (
@@ -1112,7 +1217,14 @@ class CommandService:
         # Resolve after replay checks: changing admin defaults must not alter an
         # already accepted command or turn an identical retry into a conflict.
         CommandService.apply_admin_duration(action_name, content)
-        if action_name in VillageActionDurationConfig.DEFAULT_DURATIONS:
+        from .jack_production import JACK_ACTIONS, RULE_VERSION, validate_intent
+        if action_name in JACK_ACTIONS:
+            error = validate_intent(action_name, content["params"])
+            if str(npc.agent_id) != "10012":
+                error = "P3_FORBIDDEN_ACTOR"
+            if error:
+                return False, error, None
+        if action_name in VillageActionDurationConfig.timed_actions():
             duration = content.get("duration_minutes")
             if isinstance(duration, bool) or not isinstance(duration, int) or duration <= 0:
                 return False, ResultCode.INVALID_ACTION_DURATION, None
@@ -1156,6 +1268,10 @@ class CommandService:
                 content["expires_world_minute"] < time_state.world_minute):
             return False, ResultCode.MESSAGE_EXPIRED, None
         params = content["params"]
+        if action_name in {"MOVE", "GO_HOME", "SLEEP"}:
+            from .dialogue_service import DialogueService
+            if DialogueService.active_for_npc(npc):
+                return False, ResultCode.SOCIAL_TARGET_BUSY, None
         location_code = params.get("location_code", "")
         point_code = params.get("point_code", "")
         if action_name in CommandService.PHASE2_ACTIONS:
@@ -1174,6 +1290,7 @@ class CommandService:
             target_id=content.get("target_id", ""),
             location_code=location_code or point_code,
             sanitized_parameters=params,
+            production_state={"rule_version": RULE_VERSION} if action_name in JACK_ACTIONS else {},
             payload_sha256=payload_sha256,
             queue_mode=content.get("queue_mode", "STRICT"),
             status="RECEIVED",
@@ -1190,7 +1307,7 @@ class CommandService:
         # Story mutations already have a Backend transaction service. Keep the
         # command row as the durable lifecycle anchor instead of introducing a
         # second executor in Unity.
-        if action_name in CommandService.STORY_ACTIONS:
+        if action_name in CommandService.STORY_ACTIONS and not is_repair_labor(action_name, params):
             from .phase5_story import dispatch_story_command
             story_payload = dict(content)
             story_payload["command"] = action_name
@@ -1211,9 +1328,12 @@ class CommandService:
                 return receipt.success, story_code, command
             ActionService.complete_action(
                 command.command_id, command.request_id, False, story_code,
-                message="Story command rejected by Backend story rules.",
+                message=story_result.get("message") or "Story command rejected by Backend story rules.",
                 data=story_result, allow_prestart_failure=True,
             )
+            # complete_action loads its own model instance; serialize the saved
+            # terminal state, not this stale RECEIVED object, to the Unity caller.
+            command.refresh_from_db()
             return False, story_code, command
 
         return True, ResultCode.COMMAND_ACCEPTED, command
@@ -1428,10 +1548,30 @@ class CommandService:
         # 校验 NPC 是否空闲
         if not fast_integration and rt.action_status != "IDLE":
             return False, ResultCode.NPC_BUSY, None
-        if not fast_integration and NpcActionReservation.objects.filter(
+        held_reservations = NpcActionReservation.objects.filter(
             participants=rt.npc, status="HELD", active_lock_key__isnull=False
-        ).exists():
+        )
+        if command.kind not in {"MOVE", "GO_HOME", "SLEEP"}:
+            held_reservations = held_reservations.exclude(action_kind="DIALOGUE")
+        else:
+            from .dialogue_service import DialogueService
+            if DialogueService.active_for_npc(rt.npc):
+                return False, ResultCode.SOCIAL_TARGET_BUSY, None
+        if not fast_integration and held_reservations.exists():
             return False, ResultCode.NPC_BUSY, None
+
+        if is_repair_labor(command.kind, command.sanitized_parameters):
+            from .phase5_story import repair_labor_unavailable
+            error = repair_labor_unavailable(rt, time_state.world_minute, command.sanitized_parameters)
+            if error:
+                ActionService.complete_action(command.command_id, command.request_id, False, error,
+                    message="修桥劳动开始条件不满足。", allow_prestart_failure=True)
+                return False, error, command
+            if rt.active_command_id is not None or rt.action_status != "IDLE":
+                return False, ResultCode.NPC_BUSY, None
+            command.duration_minutes = REPAIR_LABOR_MINUTES
+            command.sanitized_parameters = dict(command.sanitized_parameters, _repair_needs_until=time_state.world_minute)
+            command.save(update_fields=["duration_minutes", "sanitized_parameters", "updated_at"])
 
         if not fast_integration and command.kind not in CommandService.PHASE2_ACTIONS:
             unavailable = CommandService.unavailable_reason(command.kind, rt)
@@ -1445,6 +1585,23 @@ class CommandService:
 
         # ``time_state`` remains locked from the first lifecycle read through
         # transition to RUNNING; do not re-read an unlocked minute here.
+        if command.kind == "PLANT":
+            from .phase3_production import plant_preflight
+            failure = plant_preflight(int(command.npc.agent_id), command.sanitized_parameters, time_state.world_minute)
+            if failure:
+                ActionService.complete_action(command.command_id, command.request_id, False,
+                    failure["result_code"], data=failure.get("data"), allow_prestart_failure=True)
+                return False, failure["result_code"], command
+        if command.kind in {"IMPORT_GOODS", "EXPORT_GOODS"}:
+            from .caravan import sync_visit, trade_window
+            sync_visit(time_state.world_minute)
+            error = trade_window(time_state.world_minute, command.duration_minutes or 0)
+            if not error and start_world_minute is not None:
+                error = trade_window(start_world_minute, command.duration_minutes or 0)
+            if error:
+                ActionService.complete_action(command.command_id, command.request_id, False, error,
+                    message="Caravan is unavailable for this trade duration.", allow_prestart_failure=True)
+                return False, error, command
         now_ms = int(timezone.now().timestamp() * 1000)
         if (not fast_integration and command.not_before_world_minute is not None and
                 command.not_before_world_minute > time_state.world_minute):
@@ -1537,6 +1694,18 @@ class CommandService:
         # 本地钟，保证结算（life-actions/execute 的身份校验）与 Unity 本地动作
         # 区间精确一致，避免本地钟偏差导致 NPC_BUSY。
         start_minute = start_world_minute if start_world_minute is not None else time_state.world_minute
+        from .jack_production import is_jack_work, start_work
+        if is_jack_work(command):
+            # The committed Unity authority tick defines formal production start.
+            # Return that minute to Unity (which arms the returned interval), so
+            # an in-flight tick cannot strand the command or backdate daily costs.
+            start_minute = time_state.world_minute
+            error = start_work(rt, command, start_minute)
+            if error:
+                command.status = "RECEIVED"
+                ActionService.complete_action(command.command_id, command.request_id, False, error,
+                    allow_prestart_failure=True)
+                return False, error, command
         command.started_world_minute = start_minute
         command.state_version = rt.state_version
         command.save()
@@ -1628,7 +1797,22 @@ class ActionService:
         ):
             return False, ResultCode.NPC_BUSY, None
 
-        if success:
+        timed_repair = is_repair_labor(command.kind, command.sanitized_parameters)
+        from .jack_production import is_jack_work, settle_work_needs
+        jack_work = is_jack_work(command)
+        if jack_work and success:
+            return False, "PRODUCTION_SETTLEMENT_REQUIRED", None
+        if timed_repair and success:
+            if command.started_world_minute is None or time_state.world_minute < command.started_world_minute + REPAIR_LABOR_MINUTES:
+                return False, "REPAIR_LABOR_NOT_FINISHED", None
+        if timed_repair:
+            from .phase2_services import settle_repair_needs_locked
+            error = settle_repair_needs_locked(rt, command, time_state.world_minute)
+            if error and success:
+                success, result_code = False, error
+        elif jack_work:
+            settle_work_needs(rt, command, time_state.world_minute)
+        elif success or command.kind in {"PLANT", "HARVEST", "HUNT", "PROCESS_GAME", "COOK"}:
             from .phase2_services import settle_action_needs_locked
             started = command.started_world_minute
             ended = (
@@ -1636,13 +1820,56 @@ class ActionService:
                 if started is not None and command.duration_minutes else None
             )
             error = settle_action_needs_locked(
-                rt, command.kind, started, ended, base_until=time_state.world_minute
+                rt, "REPAIR_LABOR" if timed_repair else command.kind, started, ended, base_until=time_state.world_minute
             )
             if error:
                 return False, error, None
 
+        if timed_repair and success:
+            from .phase5_story import complete_story_action
+            params = dict(command.sanitized_parameters)
+            params.pop("expected_story_version", None)
+            params.pop("_repair_needs_until", None)
+            story_result = complete_story_action({
+                "request_id": str(request_id), "npc_id": str(command.npc.agent_id),
+                "current_location_code": rt.current_location_code, "params": params,
+            }, _labor_command=command)
+            if story_result.get("result_code") == "OK":
+                receipt = VillageActionReceipt.objects.get(request_id=request_id)
+                rt.state_version += 1
+                rt.current_action = ""
+                rt.action_status = "IDLE"
+                rt.action_started_world_minute = None
+                rt.action_ends_world_minute = None
+                rt.active_command_id = None
+                rt.last_simulated_world_minute = time_state.world_minute
+                rt.time_revision = time_state.time_revision
+                rt.save()
+                command.status = "SUCCEEDED"
+                command.result_code = "OK"
+                command.completed_world_minute = time_state.world_minute
+                command.state_version = rt.state_version
+                command.save()
+                receipt.command = command
+                receipt.state_version = rt.state_version
+                receipt.save(update_fields=["command", "state_version"])
+                OutboxService.ensure_outcome(receipt)
+                return True, "OK", receipt
+            success = False
+            result_code = story_result["result_code"]
+            data = story_result
         command.status = "SETTLING"
         command.save(update_fields=["status", "updated_at"])
+
+        # The authenticated Unity completion reports actual arrival. Persist it
+        # with completion so a following repair command need not wait for the
+        # periodic checkpoint (which is blocked while this write is in flight).
+        if success and command.kind in {"MOVE", "GO_HOME"} and data:
+            from .models import VillageLocationDefinition
+            arrived = data.get("current_location_code")
+            if arrived and VillageLocationDefinition.objects.filter(location_code=arrived, is_active=True).exists():
+                rt.current_location_code = arrived
+                rt.current_point_code = data.get("current_point_code") or arrived
 
         # 创建世界事件
         event_type = "NPC_ACTION_COMPLETED" if success else "NPC_ACTION_FAILED"
@@ -1685,7 +1912,9 @@ class ActionService:
         # 更新 NPC 运行时状态
         rt.state_version += 1
         rt.current_action = ""
-        rt.action_status = "IDLE"
+        rt.action_status = "AWAY" if jack_work and (rt.action_status == "AWAY" or (
+            rt.away_until_world_minute is not None and rt.away_until_world_minute > time_state.world_minute
+        )) else "IDLE"
         rt.action_started_world_minute = None
         rt.action_ends_world_minute = None
         rt.active_command_id = None
@@ -1738,38 +1967,9 @@ class ActionService:
             },
         )
 
-        VillageDeliveryOutbox.objects.get_or_create(
-            dedupe_key=f"event:{event.event_id}",
-            defaults={
-                "delivery_id": uuid.uuid4(),
-                "recipient": command.sender_id,
-                "message_kind": "EVENT",
-                "command": command,
-                "receipt": receipt,
-                "event": event,
-                "payload": {
-                "schema_version": "village.event.v1",
-                "event_id": str(event.event_id),
-                "event_sequence": event.event_sequence,
-                "event_type": event.event_type,
-                "world_minute": event.world_minute,
-                "time_revision": event.time_revision,
-                "actor_npc_id": str(command.npc.agent_id),
-                "participant_npc_ids": [str(command.npc.agent_id)],
-                "location_code": event.location_code,
-                "point_code": event.point_code,
-                "command_id": str(command.command_id),
-                "request_id": str(receipt.request_id),
-                "cause_event_id": None,
-                "visibility": event.visibility,
-                "public_status_code": rt.action_status,
-                "public_data": event.public_data,
-                "summary": event.hub_summary,
-                },
-                "priority": 5,
-                "status": "PENDING",
-            },
-        )
+        # 二跑复盘（R1）：不再为终态动作事件手建 EVENT 投递行。执行者通过上面的
+        # OUTCOME 行收到完整结果；事件本身已落库 VillageWorldEvent 存档，
+        # 动作类事件的广播投递由 phase4_visibility.SUPPRESS_ACTION_EVENT_DELIVERY 控制。
 
         return True, result_code, receipt
 
@@ -1927,9 +2127,15 @@ class OutboxService:
             payload["data"] = payload_data
         if not str(payload.get("message") or "").strip():
             payload["message"] = _outcome_message(
-                payload.get("action"), payload.get("result_code"), bool(payload.get("success")))
-        payload.setdefault("next_action", None if payload.get("success") else
-                           _outcome_next_action(payload.get("result_code")))
+                payload.get("action"), payload.get("result_code"), bool(payload.get("success")),
+                payload.get("world_minute"), payload.get("data"))
+        elif "世界时间：" not in str(payload["message"]):
+            world_time = _world_time_text(payload.get("world_minute"))
+            if world_time:
+                payload["message"] = f"世界时间：{world_time}；{payload['message']}"
+        # The result carries facts only. The agent must decide whether and when
+        # to query or retry; server-generated next actions caused loops.
+        payload["next_action"] = None
         if command:
             payload.setdefault("ref_id", str(command.command_id))
             payload.setdefault("original_message_id", str(command.message_id))
@@ -1960,6 +2166,11 @@ class OutboxService:
             existing_payload = dict(entry.payload or {})
             changed = False
             for key in ("action", "phase", "terminal", "message", "next_action"):
+                if key == "next_action":
+                    if existing_payload.get(key) is not None:
+                        existing_payload[key] = None
+                        changed = True
+                    continue
                 if key not in existing_payload or existing_payload[key] in (None, ""):
                     existing_payload[key] = payload.get(key)
                     changed = True

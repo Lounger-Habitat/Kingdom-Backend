@@ -8,7 +8,7 @@ from rest_framework.response import Response
 
 from account.env_auth import EnvServerJWTAuthentication
 
-from .command_catalog import AGENT_INSTRUCTION_ACTIONS, COMMAND_CATALOG, agent_tool
+from .command_catalog import AGENT_INSTRUCTION_ACTIONS, RECORDED_ACTIVITY_ACTIONS, COMMAND_CATALOG, agent_tool
 from .models import (
     NpcProfile,
     VillageActionReceipt,
@@ -141,7 +141,8 @@ def bootstrap_validation(request):
 @permission_classes([IsAuthenticated])
 def runtime_bootstrap(request):
     """GET /api/village/runtime/bootstrap"""
-    data = BootstrapService.get_bootstrap()
+    recovery = str(request.query_params.get("recovery", "false")).lower() == "true"
+    data = BootstrapService.get_bootstrap(recovery=recovery)
     if "error" in data:
         return Response({"success": False, "resultCode": data["error"]}, status=409)
     return Response({"success": True, "data": data})
@@ -491,17 +492,13 @@ def npc_available_actions(request, npc_id):
             "npc_profile": npc_profile,
             "locations": locations,
             "tools": tools,
-            "agent_context": build_agent_context(tool["name"] for tool in tools),
+            "agent_context": build_agent_context((tool["name"] for tool in tools), profile=profile),
         },
     }, status=status)
 
 
-@api_view(["GET"])
-@authentication_classes([EnvServerJWTAuthentication])
-@permission_classes([IsAuthenticated])
-def npc_discover(request, npc_id):
-    """Complete dynamic Discover projection used by the formal Hub path."""
-    return npc_available_actions(request, npc_id)
+# Both URLs share the same DRF view; never pass a DRF Request into a second wrapper.
+npc_discover = npc_available_actions
 
 
 @api_view(["GET"])
@@ -518,7 +515,7 @@ def npc_agent_query(request, npc_id, query_name):
 @authentication_classes([EnvServerJWTAuthentication])
 @permission_classes([IsAuthenticated])
 def instruction_outcome_record(request):
-    """Persist terminal outcomes for Agent instructions that bypass command lifecycle."""
+    """Persist instruction and speech activity receipts without executing an action."""
     data = request.data
     action = str(data.get("action", "")).upper()
     npc_id = str(data.get("npc_id", ""))
@@ -545,7 +542,8 @@ def instruction_outcome_record(request):
     profile = NpcProfile.objects.select_related("npc").filter(
         npc__agent_id=npc_id, npc__is_test_only=False, is_active=True
     ).first()
-    if (not raw_request_id or len(raw_request_id) > 128 or action not in AGENT_INSTRUCTION_ACTIONS
+    if (not raw_request_id or len(raw_request_id) > 128
+            or action not in AGENT_INSTRUCTION_ACTIONS | RECORDED_ACTIVITY_ACTIONS
             or profile is None or not isinstance(success, bool)
             or not isinstance(parameters, dict) or not isinstance(outcome_data, dict)
             or world_minute < 0 or time_revision < 0

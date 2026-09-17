@@ -35,7 +35,7 @@ class Command(BaseCommand):
         # 找出 remaining_uses=NULL 且属于 Usable 类型物品的格位
         ghosts = InventorySlot.objects.filter(
             item_id__in=usable_item_ids,
-            remaining_uses__isnull=True,
+            usage__remaining__isnull=True,
             item_amount__gt=0,
         )
 

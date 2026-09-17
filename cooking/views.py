@@ -222,7 +222,7 @@ def cook(request):
 
         # 3. 配方匹配
         input_item_ids = set(ing["itemId"] for ing in ingredients)
-        all_recipes = list(Recipe.objects.prefetch_related("ingredients").all())
+        all_recipes = list(Recipe.objects.prefetch_related("ingredients").filter(village_only=False))
 
         matched_recipe = None
         for recipe in all_recipes:
@@ -352,6 +352,7 @@ def _clear_slot_if_empty(slot):
         slot.item_bag_name = ""
         slot.cook_time = 0
         slot.dish_quality = 3
+        slot.dish_metadata = {}
         slot.hide_in_shop = False
         slot.remaining_uses = None
         slot.review_comment = ""
@@ -377,53 +378,21 @@ def _add_dish_to_bag(bag, item_id, ingredient, cook_time, dish_quality):
     empty.ingredient = ingredient
     empty.cook_time = cook_time
     empty.dish_quality = dish_quality
+    empty.dish_metadata = {}
     empty.item_bag_name = f"{item_name}_{empty.slot_index}"
     empty.save()
 
 
 def _calculate_dish_quality(recipe, player_ing_map, ingredients_exact, cook_time):
-    """
-    品质计算（移植自 Unity CraftingPanel.CalculateDishQuality）。
-    基础品质 + 食材匹配惩罚 + 随机波动 + 烹饪时间加成。
-    """
-    quality = recipe.default_dish_quality
+    from .dish_rules import calculate_quality
+    return calculate_quality(recipe, player_ing_map, ingredients_exact, cook_time, random)
 
-    # 食材匹配惩罚
-    for ri in recipe.ingredients.all():
-        player_count = player_ing_map.get(ri.item_id, 0)
-        if player_count <= 0:
-            quality -= 3  # 完全没放
-        elif player_count < ri.count:
-            quality -= 1  # 数量不足
-        elif player_count > ri.count:
-            quality -= 1  # 数量超过
-
-    # 随机波动：70%不变，18% -1，12% +1
-    roll = random.randint(0, 99)
-    if roll >= 70:
-        quality += -1 if roll < 88 else 1
-
-    # 烹饪时间加成（使用实际烹饪时间与默认时间的偏差）
-    time_bonus = _get_cook_time_quality_bonus(cook_time, recipe.default_cook_time)
-    quality += time_bonus
-
-    # 完全匹配时品质最低为2
-    if ingredients_exact:
-        quality = max(quality, 2)
-
-    return max(1, min(6, quality))
 
 
 def _get_cook_time_quality_bonus(actual, default_time):
-    """烹饪时间品质加成（移植自 Unity GetCookTimeQualityBonus）。"""
-    diff = abs(actual - default_time)
-    if diff == 0:
-        return 2
-    if diff <= 6:
-        return 1
-    if diff <= 35:
-        return 0
-    return -1
+    from .dish_rules import cook_time_bonus
+    return cook_time_bonus(actual, default_time)
+
 
 
 def _apply_pity(user, recipe_id, quality, cook_time, default_cook_time):

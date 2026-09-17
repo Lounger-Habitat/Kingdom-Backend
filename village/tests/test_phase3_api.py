@@ -15,6 +15,7 @@ from inventory.models import NpcDefinition, NpcGlobalInventory, NpcGlobalInvento
 from village.models import (
     DailyPriceSnapshot,
     NpcCommandState,
+    NpcRuntimeState,
     VillageAccount,
     VillageActionReceipt,
     VillageFarmPlot,
@@ -79,6 +80,9 @@ class Phase3EconomyApiTests(TestCase):
                 npc=npc, defaults={"money": 200, "asset_version": 1}
             )
             self.inventories[npc_id] = inv
+            # Production commands require the runtime row that Unity seeds
+            # via checkpoints; the service rejects otherwise (Unity authority).
+            NpcRuntimeState.objects.get_or_create(npc=npc)
 
         # Enable economy
         self.config, _ = VillageSimulationConfig.objects.get_or_create(
@@ -218,23 +222,6 @@ class Phase3EconomyApiTests(TestCase):
         self.assertEqual(resp.status_code, 200)
         data = resp.json()
         self.assertEqual(data["result_code"], ResultCode.P3_FORBIDDEN_ACTOR)
-
-    def test_complete_wrong_location(self):
-        """Wrong location returns 200 with P3_WRONG_LOCATION."""
-        payload = _economy_action_payload(
-            command_name="PLANT",
-            npc_id=10011,
-            current_location_code="RESTAURANT",  # wrong
-        )
-        resp = self.client.post(
-            "/api/village/economy/actions/complete",
-            payload,
-            format="json",
-            HTTP_AUTHORIZATION=self._auth_header(),
-        )
-        self.assertEqual(resp.status_code, 200)
-        data = resp.json()
-        self.assertEqual(data["result_code"], ResultCode.P3_WRONG_LOCATION)
 
     def test_complete_replay(self):
         """Same request_id + same payload returns replayed=true."""
@@ -428,7 +415,12 @@ class Phase3EconomyApiTests(TestCase):
         self.assertIn("active_deliveries", inner)
         self.assertIn("public_fund_balance", inner)
         self.assertIn("npc_asset_versions", inner)
-        self.assertEqual(len(inner["farm_plots"]), 3)
+        self.assertEqual(len(inner["farm_plots"]), 36)
+        self.assertEqual(len(inner["allowed_plot_codes"]), 36)
+        self.assertEqual(
+            inner["allowed_crop_codes"], ["CORN", "WHEAT", "CARROT", "POTATO"]
+        )
+        self.assertIn("batch_id", inner["farm_plots"][0])
 
     def test_snapshot_mature_projection(self):
         """GROWING plot with current time >= mature is reported as MATURE."""

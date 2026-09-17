@@ -10,6 +10,10 @@ from . import phase7_views
 urlpatterns = [
     path("api/village/public/journal", phase7_views.journal, name="village-public-journal"),
     path("api/village/public/overview", phase7_views.overview, name="village-public-overview"),
+    path("api/village/public/stores/<str:store_code>", phase7_views.store, name="village-public-store"),
+    path("api/village/public/caravans/<str:route>", phase7_views.caravan, name="village-public-caravan"),
+    path("api/village/public/caravan-demands", phase7_views.caravan_demands, name="village-public-caravan-demands"),
+    path("api/village/public/market", phase7_views.market, name="village-public-market"),
     path("api/village/public/npcs/<str:npc_id>/observation", phase7_views.npc_observation, name="village-public-npc-observation"),
     path("api/village/operations/snapshot", phase7_views.operations, name="village-operations-snapshot"),
     # 阶段零 API

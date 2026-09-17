@@ -1,5 +1,6 @@
 import uuid
 from django.db import models
+from inventory.components import BatchComponents, UsageFields, DishFields, ReviewFields
 from account.models import GameAccount
 from items.models import Item, ItemType
 
@@ -98,22 +99,19 @@ class InventoryBag(models.Model):
         return f"{self.character_id} (player={self.player_id}, money={self.money})"
 
 
-class InventorySlot(models.Model):
+class InventorySlot(BatchComponents):
     bag = models.ForeignKey(InventoryBag, on_delete=models.CASCADE, related_name="slots")
     slot_index = models.IntegerField()
     instance_id = models.UUIDField(default=uuid.uuid4, editable=False)
     item_id = models.IntegerField(default=0)
     item_amount = models.IntegerField(default=0)
-    rated = models.BooleanField(default=False)
-    rating_price = models.IntegerField(default=-1)
-    overall_score = models.FloatField(default=0, help_text="评价分数 0-100")
-    ingredient = models.CharField(max_length=200, default="", blank=True)
     item_bag_name = models.CharField(max_length=100, default="", blank=True)
-    cook_time = models.IntegerField(default=0, help_text="烹饪时长（秒）")
-    dish_quality = models.IntegerField(default=3, help_text="品质：1略逊 2一般 3正常 4优秀 5极品 6绝品")
+    quality = models.IntegerField(default=3, help_text="品质：1略逊 2一般 3正常 4优秀 5极品 6绝品")
     hide_in_shop = models.BooleanField(default=False, help_text="是否在商店面板中隐藏此物品")
-    remaining_uses = models.IntegerField(null=True, blank=True, help_text="剩余使用次数，null=不适用，-1=无限次")
-    review_comment = models.TextField(default="", blank=True, help_text="AI点评评语")
+    produced_world_minute = models.BigIntegerField(null=True, blank=True)
+    expires_world_minute = models.BigIntegerField(null=True, blank=True)
+    source_request_id = models.UUIDField(null=True, blank=True)
+    freshness_unknown = models.BooleanField(default=False)
 
     class Meta:
         ordering = ["slot_index"]
@@ -340,27 +338,21 @@ class NpcGlobalInventory(models.Model):
         return f"全局库存: {self.npc.name} (money={self.money})"
 
 
-class NpcGlobalInventorySlot(models.Model):
+class NpcGlobalInventorySlot(BatchComponents):
     """NPC全局库存的物品格位。"""
     bag = models.ForeignKey(NpcGlobalInventory, on_delete=models.CASCADE, related_name="slots")
     slot_index = models.IntegerField()
     instance_id = models.UUIDField(default=uuid.uuid4, editable=False)
     item_id = models.IntegerField(default=0)
     item_amount = models.IntegerField(default=0)
-    rated = models.BooleanField(default=False)
-    rating_price = models.IntegerField(default=-1)
-    overall_score = models.FloatField(default=0)
-    ingredient = models.CharField(max_length=200, default="", blank=True)
     item_bag_name = models.CharField(max_length=100, default="", blank=True)
-    cook_time = models.IntegerField(default=0)
-    dish_quality = models.IntegerField(default=3)
+    quality = models.IntegerField(default=3)
     hide_in_shop = models.BooleanField(default=False)
-    remaining_uses = models.IntegerField(null=True, blank=True)
-    review_comment = models.TextField(default="", blank=True)
     # Phase 3 batch tracking fields
     produced_world_minute = models.BigIntegerField("生产世界分钟", null=True, blank=True)
     expires_world_minute = models.BigIntegerField("过期世界分钟", null=True, blank=True)
     source_request_id = models.UUIDField("来源请求ID", null=True, blank=True)
+    freshness_unknown = models.BooleanField(default=False)
 
     class Meta:
         ordering = ["slot_index"]
@@ -383,3 +375,27 @@ class EnvActionReceipt(models.Model):
 
     def __str__(self):
         return f"{self.action} player={self.player_id} request={self.request_id}"
+
+
+class InventorySlotUsage(UsageFields):
+    owner = models.OneToOneField(InventorySlot, on_delete=models.CASCADE, primary_key=True, related_name="usage")
+
+
+class InventorySlotDish(DishFields):
+    owner = models.OneToOneField(InventorySlot, on_delete=models.CASCADE, primary_key=True, related_name="dish")
+
+
+class InventorySlotReview(ReviewFields):
+    owner = models.OneToOneField(InventorySlot, on_delete=models.CASCADE, primary_key=True, related_name="review")
+
+
+class NpcGlobalInventorySlotUsage(UsageFields):
+    owner = models.OneToOneField(NpcGlobalInventorySlot, on_delete=models.CASCADE, primary_key=True, related_name="usage")
+
+
+class NpcGlobalInventorySlotDish(DishFields):
+    owner = models.OneToOneField(NpcGlobalInventorySlot, on_delete=models.CASCADE, primary_key=True, related_name="dish")
+
+
+class NpcGlobalInventorySlotReview(ReviewFields):
+    owner = models.OneToOneField(NpcGlobalInventorySlot, on_delete=models.CASCADE, primary_key=True, related_name="review")

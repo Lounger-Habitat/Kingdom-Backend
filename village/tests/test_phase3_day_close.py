@@ -18,11 +18,15 @@ from inventory.models import (
 from recipes.models import Recipe, RecipeIngredient
 from village.models import (
     DailyPriceSnapshot,
+    EconomicLedgerEntry,
     NpcTradeDelivery,
     NpcTradeOrder,
     VillageAccount,
     VillageRestaurantState,
     VillageSimulationConfig,
+    VillageStore,
+    VillageStoreInventorySlot,
+    VillageWorldEvent,
 )
 from village.phase3_contract import (
     DaySnapshotStatus,
@@ -35,6 +39,7 @@ from village.phase3_contract import (
 from village.phase3_day_close import (
     calculate_price,
     get_restaurant_status,
+    get_store_availability,
     get_store_status,
     handle_day_close,
 )
@@ -174,6 +179,36 @@ class RestaurantStatusTest(TestCase):
 
 
 # ============================================================================
+# Store status（二跑复盘 R7：日间查询与日结共用同一判定）
+# ============================================================================
+
+
+class StoreStatusConsistencyTest(TestCase):
+    def setUp(self):
+        self.time = GlobalGameTimeState.get_instance()
+        self.time.world_minute = 700
+        self.time.save()
+        self.store, _ = VillageStore.objects.get_or_create(
+            store_code="GENERAL_STORE", defaults={"status": "OPEN"},
+        )
+
+    def test_day_close_and_direct_trade_share_one_status(self):
+        from village.phase3_direct_trade import store_inventory_status as direct
+
+        # 空店 → 真正的 OUT_OF_STOCK。
+        self.assertEqual(get_store_status(700), "OUT_OF_STOCK")
+        self.assertEqual(get_store_availability(700), {})
+
+        # 有货但 SAFE_STOCKS 其它 SKU 缺 → LOW_STOCK（告警不是关门），两入口一致。
+        VillageStoreInventorySlot.objects.create(store=self.store, item_id=1049, item_amount=12)
+        status, available = direct(self.store, 700)
+        self.assertEqual(status, "LOW_STOCK")
+        self.assertEqual(available, {1049: 12})
+        self.assertEqual(get_store_status(700), status)
+        self.assertEqual(get_store_availability(700), available)
+
+
+# ============================================================================
 # Day-close success
 # ============================================================================
 
@@ -187,6 +222,20 @@ class DayCloseSuccessTest(DayCloseTestBase):
 
         self.account.refresh_from_db()
         self.assertEqual(self.account.last_closed_day_index, 0)
+
+    def test_day_close_store_status_matches_daytime_query_and_carries_detail(self):
+        """二跑复盘 R7：日结 store_status 与日间查询同语义，且带按 SKU 明细。"""
+        resp = self._close_day(0)
+        self.assertEqual(resp["result_code"], ResultCode.OK)
+        data = resp["data"]
+        self.assertIn("store_status", data)
+        self.assertIn("store_available_by_item", data)
+        # 与日间查询共用同一判定函数（本测试环境无库存 → OUT_OF_STOCK / 空明细）。
+        self.assertEqual(data["store_status"], get_store_status(self.time.world_minute))
+        self.assertEqual(data["store_available_by_item"], get_store_availability(self.time.world_minute))
+        event = VillageWorldEvent.objects.get(event_id=resp["event"]["event_id"])
+        self.assertEqual(event.public_data["store_status"], data["store_status"])
+        self.assertEqual(event.public_data["store_available_by_item"], data["store_available_by_item"])
 
     def test_day_close_expires_orders(self):
         """OPEN/MATCHED orders past day_end_minute should be expired."""
@@ -439,15 +488,30 @@ class FoodSpoilageTest(DayCloseTestBase):
 class TravelerSalesTest(DayCloseTestBase):
     def setUp(self):
         super().setUp()
-        # Create published price snapshot
-        DailyPriceSnapshot.objects.create(
-            day_index=0,
-            prices={"1053": 25, "1067": 22},
-            status=DaySnapshotStatus.PUBLISHED,
-        )
+        from items.models import Item
+        from village.models import VillageStoreAccount
+        Item.objects.update_or_create(item_id=1053,defaults={"item_name":"辣子鸡丁","item_type":"食物","item_price":25,"sell_percentage":1})
+        self.restaurant,_=VillageStore.objects.get_or_create(store_code="RESTAURANT_STORE",defaults={"display_name":"饭店","location_code":"RESTAURANT","operator_npc":self.lucy,"status":"OPEN","minimum_fee":1})
+        self.store_account,_=VillageStoreAccount.objects.get_or_create(store=self.restaurant,defaults={"balance":0,"minimum_operating_balance":0})
+        self.account.audit_opening_balance = self.account.balance
+        self.account.save(update_fields=["audit_opening_balance"])
+
+    def _close_day(self, day_index):
+        # Explicitly list fixture dishes; day close itself must never take personal food.
+        from village.lucy_restaurant import list_meal
+        from village.phase3_asset_service import get_available_slot_amount
+        from django.db import transaction
+        for slot in self.lucy_inv.slots.filter(item_id=1053,item_amount__gt=0):
+            available=get_available_slot_amount(slot,(day_index+1)*1440-1)
+            if available:
+                with transaction.atomic():
+                    result=list_meal(10014,{"store_code":"RESTAURANT_STORE","item_id":1053,"amount":available,
+                        "price_mode":"ORIGINAL","food_instance_id":str(slot.instance_id)},(day_index+1)*1440-1,uuid.uuid4())
+                    self.assertEqual(result["result_code"],ResultCode.OK,result)
+        return super()._close_day(day_index)
 
     def test_traveler_sales_success(self):
-        """Lucy sells dishes to travelers at published price."""
+        """Travelers buy explicitly listed dishes at the restaurant's fixed price."""
         # Create 3 unexpired Lucy dishes
         for i in range(3):
             NpcGlobalInventorySlot.objects.create(
@@ -465,7 +529,21 @@ class TravelerSalesTest(DayCloseTestBase):
         self.assertEqual(sales["revenue"], 50)  # 2 * 25
 
         self.lucy_inv.refresh_from_db()
-        self.assertEqual(self.lucy_inv.money, lucy_money_before + 50)
+        self.assertEqual(self.lucy_inv.money, lucy_money_before)
+        self.store_account.refresh_from_db()
+        self.assertEqual(self.store_account.balance,48)
+        self.account.refresh_from_db()
+        from village.public_finance import reconcile
+        self.assertTrue(reconcile(self.account)["balance_matches"])
+
+        # A positive NPC balance change must carry an auditable external
+        # source on the emitted day-close event and ledger.
+        event = VillageWorldEvent.objects.get(event_id=resp["event"]["event_id"])
+        self.assertEqual(event.effects["traveler_sales"], sales)
+        self.assertEqual(event.effects["external_delta"], 50)
+        ledger = EconomicLedgerEntry.objects.get(request_id=_day_close_request_id(0))
+        self.assertEqual(ledger.changes["traveler_revenue"], 50)
+        self.assertEqual(ledger.external_delta, 50)
 
     def test_traveler_sales_max_two_per_day(self):
         """At most 2 dishes sold per day-close."""

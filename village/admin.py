@@ -39,6 +39,9 @@ from .models import (
     VillageStoryVote,
     VillageStoryTransitionReceipt,
     VillageRouteAttempt,
+    VillageCaravanRequest,
+    VillageCaravanVisit,
+    VillageCaravanConfig,
 )
 from .runtime_services import CommandService
 
@@ -82,6 +85,7 @@ class VillageLocationDefinitionAdmin(admin.ModelAdmin):
 
 @admin.register(VillageSimulationConfig)
 class VillageSimulationConfigAdmin(admin.ModelAdmin):
+    exclude = tuple(field.name for field in VillageSimulationConfig._meta.fields if field.name.startswith("caravan_"))
     list_display = (
         "config_key", "village_simulation_enabled", "village_hub_command_adapter_enabled",
         "village_economy_enabled", "village_social_enabled", "village_story_enabled",
@@ -90,6 +94,63 @@ class VillageSimulationConfigAdmin(admin.ModelAdmin):
 
     def has_add_permission(self, request):
         return not VillageSimulationConfig.objects.exists()
+
+
+class CaravanItemChoiceField(forms.ModelMultipleChoiceField):
+    def label_from_instance(self, item):
+        return f"{item.item_id} · {item.item_name}"
+
+
+class VillageCaravanConfigForm(forms.ModelForm):
+    class Meta:
+        model = VillageCaravanConfig
+        fields = [field.name for field in VillageSimulationConfig._meta.fields if field.name.startswith("caravan_")]
+        labels = {"caravan_normal_capacity": "正常路线每趟进口总量",
+                  "caravan_emergency_capacity": "应急路线每趟进口总量",
+                  "caravan_contact_cost": "首次开通应急路线费用"}
+        help_texts = {"caravan_normal_capacity": "有效到访时按此数量配货，不再随机减少总量。",
+                      "caravan_emergency_capacity": "有效到访时按此数量配货，不再随机减少总量。"}
+
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        from items.models import Item
+        for name, label in (("caravan_item_ids", "可登记进口物品"), ("caravan_export_item_ids", "出口收购物品")):
+            self.fields[name] = CaravanItemChoiceField(
+                queryset=Item.objects.filter(is_deleted=False).order_by("item_id"),
+                to_field_name="item_id", required=False, label=label,
+                widget=admin.widgets.FilteredSelectMultiple(label, False),
+                help_text="选择完整目录；留空表示禁用该方向的商品。")
+            self.initial[name] = getattr(self.instance, name)
+
+    def clean_caravan_item_ids(self):
+        return sorted(item.item_id for item in self.cleaned_data["caravan_item_ids"])
+
+    def clean_caravan_export_item_ids(self):
+        return sorted(item.item_id for item in self.cleaned_data["caravan_export_item_ids"])
+
+
+@admin.register(VillageCaravanConfig)
+class VillageCaravanConfigAdmin(admin.ModelAdmin):
+    form = VillageCaravanConfigForm
+    list_display = ("config_key", "caravan_normal_capacity", "caravan_emergency_capacity", "caravan_export_capacity")
+    fieldsets = (
+        ("进出口数量与目录", {"fields": ("caravan_normal_capacity", "caravan_emergency_capacity",
+            "caravan_item_ids", "caravan_export_capacity", "caravan_export_item_ids"),
+            "description": "修改用于后续到访；当前商队的库存、报价和收购总量保持不变。出口总量由所有品种共同消耗。"}),
+        ("价格浮动", {"fields": ("caravan_import_price_min_percent", "caravan_import_price_max_percent",
+            "caravan_export_price_min_percent", "caravan_export_price_max_percent"),
+            "description": "100 表示标准价格；标准价取最新已发布物价，无发布价时取基础价。每趟按物品抽取百分比，四舍五入到金币且至少 1 金币。"}),
+        ("路线", {"fields": ("caravan_contact_cost",)}),
+    )
+
+    def has_add_permission(self, request):
+        return not VillageSimulationConfig.objects.filter(config_key="default").exists()
+
+    def has_delete_permission(self, request, obj=None):
+        return False
+
+    def get_queryset(self, request):
+        return super().get_queryset(request).filter(config_key="default")
 
 
 @admin.register(VillageActionDurationConfig)
@@ -291,6 +352,8 @@ class VillageStoreAccountAdmin(admin.ModelAdmin):
 
 @admin.register(VillageStoreInventorySlot)
 class VillageStoreInventorySlotAdmin(admin.ModelAdmin):
+    from inventory.forms import BatchComponentForm
+    form = BatchComponentForm
     list_display = ("instance_id", "store", "listing", "item_id", "item_amount", "reserved_amount", "expires_world_minute")
     search_fields = ("instance_id", "store__store_code")
     list_filter = ("store",)
@@ -475,3 +538,13 @@ class VillageRouteAttemptAdmin(StoryReadOnlyAdmin):
     )
     list_filter = ("result_code",)
     search_fields = ("route_attempt_id", "request_id", "arc__arc_code")
+
+
+@admin.register(VillageCaravanVisit)
+class VillageCaravanVisitAdmin(StoryReadOnlyAdmin):
+    list_display = ("day_index", "route", "location_code", "error_code")
+
+
+@admin.register(VillageCaravanRequest)
+class VillageCaravanRequestAdmin(StoryReadOnlyAdmin):
+    list_display = ("day_index", "item_ids", "submitted_world_minute")

@@ -218,16 +218,15 @@ class RestaurantService:
             )
 
             # 查找是否有同类物品可堆叠
-            existing_slot = InventorySlot.objects.filter(
+            candidates = InventorySlot.objects.filter(
                 bag=bag,
                 item_id=menu_item.item_id,
-                rated=menu_item.rated,
-                rating_price=menu_item.rating_price,
-                overall_score=menu_item.overall_score,
-                ingredient=menu_item.ingredient,
-                dish_quality=menu_item.dish_quality,
-                cook_time=menu_item.cook_time,
-            ).first()
+                quality=menu_item.dish_quality,
+            )
+            matching_fields = ("rated", "rating_price", "overall_score", "ingredient", "cook_time")
+            existing_slot = next((row for row in candidates if all(
+                getattr(row, name) == getattr(menu_item, name) for name in matching_fields
+            )), None)
 
             if existing_slot:
                 existing_slot.item_amount += menu_item.quantity

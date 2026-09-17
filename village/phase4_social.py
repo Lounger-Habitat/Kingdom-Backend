@@ -44,6 +44,7 @@ from .phase4_contract import (
     relationship_label,
     relationship_snapshot,
     validate_commitment_target,
+    commitment_target_errors,
 )
 from .phase4_visibility import enqueue_event_deliveries, resolve_witnesses
 
@@ -262,12 +263,15 @@ def complete_delivery_commitment(
 
 
 def _commitment_data(commitment: NpcCommitment) -> dict[str, Any]:
+    from .agent_feedback import add_item_names
     return {
         "commitment_id": str(commitment.commitment_id),
         "commitment_type": commitment.commitment_type,
         "promisor_npc_id": str(commitment.promisor_npc.agent_id),
+        "promisor_name": commitment.promisor_npc.name,
         "beneficiary_npc_id": str(commitment.beneficiary_npc.agent_id),
-        "target": dict(commitment.target or {}),
+        "beneficiary_name": commitment.beneficiary_npc.name,
+        "target": add_item_names(dict(commitment.target or {})),
         "due_world_minute": commitment.due_world_minute,
         "status": commitment.status,
     }
@@ -288,23 +292,29 @@ def create_commitment(
     due = params.get("due_world_minute")
     if promisor is None or beneficiary is None or promisor.pk == beneficiary.pk:
         return _result("SOCIAL_INVALID_PARAMS")
-    if target is None or not isinstance(due, int) or isinstance(due, bool) or due <= world_minute:
-        return _result("SOCIAL_INVALID_PARAMS")
+    if target is None:
+        return _result("SOCIAL_INVALID_PARAMS", data={"field_errors": commitment_target_errors(kind, params.get("target"))})
+    if not isinstance(due, int) or isinstance(due, bool) or due <= world_minute:
+        return _result("SOCIAL_INVALID_PARAMS", data={"field_errors": [
+            {"field": "due_world_minute", "message": "必须是晚于当前世界分钟的整数"}]})
     if kind in {"JOINT_WORK", "MEETING"} and not VillageLocationDefinition.objects.filter(
         location_code=target["location_code"], is_active=True
     ).exists():
-        return _result("SOCIAL_INVALID_PARAMS")
-    if NpcCommitment.objects.filter(
+        return _result("SOCIAL_INVALID_PARAMS", data={"field_errors": [
+            {"field": "target.location_code", "message": "必须是实际存在且启用的地点代码"}]})
+    existing = NpcCommitment.objects.filter(
         promisor_npc=promisor,
         beneficiary_npc=beneficiary,
         commitment_type=kind,
         target=target,
         status="OPEN",
-    ).exists():
-        return _result("COMMITMENT_DUPLICATE_OPEN")
+    ).first()
+    if existing:
+        return _result("COMMITMENT_DUPLICATE_OPEN", data=_commitment_data(existing))
     location = NpcRuntimeState.objects.filter(npc=promisor).values_list(
         "current_location_code", flat=True
     ).first() or ""
+    commitment_id = uuid.uuid4()
     event = _event(
         event_type="COMMITMENT_CREATED",
         world_minute=world_minute,
@@ -315,11 +325,13 @@ def create_commitment(
         participants=[str(promisor.agent_id), str(beneficiary.agent_id)],
         location_code=location,
         visibility="PARTICIPANTS",
-        public_data={"commitment_type": kind, "hub_summary": "A structured commitment was created."},
-        private_data={"target": target, "due_world_minute": due},
+        public_data={"commitment_id": str(commitment_id), "commitment_type": kind, "status": "OPEN",
+                     "hub_summary": "A structured commitment was created."},
+        private_data={"target": target, "due_world_minute": due, "promisor_npc_id": str(promisor.agent_id),
+                      "beneficiary_npc_id": str(beneficiary.agent_id)},
     )
     commitment = NpcCommitment.objects.create(
-        commitment_type=kind,
+        commitment_id=commitment_id, commitment_type=kind,
         promisor_npc=promisor,
         beneficiary_npc=beneficiary,
         target=target,
@@ -352,9 +364,9 @@ def cancel_commitment(
     if commitment is None:
         return _result("COMMITMENT_NOT_FOUND")
     if commitment.status != "OPEN":
-        return _result("COMMITMENT_ALREADY_RESOLVED")
+        return _result("COMMITMENT_ALREADY_RESOLVED", data=_commitment_data(commitment))
     if commitment.due_world_minute <= world_minute:
-        return _result("COMMITMENT_EXPIRED")
+        return _result("COMMITMENT_EXPIRED", data=_commitment_data(commitment))
     event = _event(
         event_type="COMMITMENT_CANCELLED",
         world_minute=world_minute,
@@ -381,7 +393,7 @@ def _transfer_commitment_assets(
     request_id: uuid.UUID,
 ) -> tuple[bool, str, dict[str, Any]]:
     """Move NPC assets using phase-three's existing FEFO and reservation checks."""
-    from .phase3_asset_service import add_batch
+    from .phase3_asset_service import add_batch, BATCH_ITEM_ATTRIBUTES
     from .phase3_direct_trade import _consume_personal_fefo_available, _get_buyer_available_money
 
     promisor_id = str(commitment.promisor_npc.agent_id)
@@ -396,7 +408,8 @@ def _transfer_commitment_assets(
     if commitment.commitment_type == "REPAYMENT" or target.get("asset_kind") == "GOLD":
         gold = int(target.get("gold_amount", 0))
         if _get_buyer_available_money(promisor_inv) < gold:
-            return False, "INSUFFICIENT_MONEY", {}
+            return False, "INSUFFICIENT_MONEY", {"required_amount": gold,
+                "available_amount": _get_buyer_available_money(promisor_inv), "payer": promisor_id}
         promisor_inv.money -= gold
         beneficiary_inv.money += gold
         promisor_inv.asset_version += 1
@@ -410,7 +423,10 @@ def _transfer_commitment_assets(
         try:
             consumed = _consume_personal_fefo_available(promisor_inv, item_id, amount, world_minute)
         except ValueError:
-            return False, "INSUFFICIENT_ITEM", {}
+            from .phase3_asset_service import get_available_slot_amount
+            return False, "INSUFFICIENT_ITEM", {"item_id": item_id, "required_amount": amount,
+                "available_amount": sum(get_available_slot_amount(s, world_minute)
+                    for s in promisor_inv.slots.filter(item_id=item_id, item_amount__gt=0))}
         for slot, taken in consumed:
             add_batch(
                 beneficiary_inv,
@@ -420,6 +436,7 @@ def _transfer_commitment_assets(
                 slot.expires_world_minute,
                 request_id,
                 remaining_uses=slot.remaining_uses,
+                item_attributes={key: getattr(slot, key) for key in BATCH_ITEM_ATTRIBUTES},
             )
         promisor_inv.asset_version += 1
         beneficiary_inv.asset_version += 1
@@ -453,11 +470,12 @@ def perform_commitment(
             else "PERFORM_COMMITMENT"
         )
     if commitment.status != "OPEN":
-        return _result("COMMITMENT_ALREADY_RESOLVED")
+        return _result("COMMITMENT_ALREADY_RESOLVED", data=_commitment_data(commitment))
     if commitment.commitment_type == "DELIVERY":
-        return _result("DELIVERY_REQUIRES_TRADE")
+        return _result("DELIVERY_REQUIRES_TRADE", data={"commitment_id": str(commitment.pk),
+            "instruction": "交付承诺需通过实际交易完成，请查询交易报价和库存。"})
     if commitment.due_world_minute <= world_minute:
-        return _result("COMMITMENT_EXPIRED")
+        return _result("COMMITMENT_EXPIRED", data=_commitment_data(commitment))
 
     phase = str(params.get("phase", "COMPLETE")).upper()
     if phase not in {"START", "COMPLETE", "RESULT"}:
@@ -476,14 +494,17 @@ def perform_commitment(
     location = str(target.get("location_code", ""))
     if commitment.commitment_type in {"JOINT_WORK", "MEETING"}:
         if not runtime or not beneficiary_runtime or runtime.current_location_code != location or beneficiary_runtime.current_location_code != location:
-            return _result("SOCIAL_NOT_COLOCATED")
+            return _result("SOCIAL_NOT_COLOCATED", data={"commitment_id": str(commitment.pk),
+                "required_location_code": location, "current_location_code": runtime.current_location_code if runtime else None,
+                "target_npc_id": str(commitment.beneficiary_npc.agent_id)})
         actor_is_current_command = (
             command_id is not None
             and runtime.active_command_id == command_id
             and runtime.current_action == "PERFORM_COMMITMENT"
         )
         if (runtime.action_status != "IDLE" and not actor_is_current_command) or beneficiary_runtime.action_status != "IDLE":
-            return _result("SOCIAL_PARTICIPANT_UNAVAILABLE")
+            return _result("SOCIAL_PARTICIPANT_UNAVAILABLE", data={"commitment_id": str(commitment.pk),
+                "target_npc_id": str(commitment.beneficiary_npc.agent_id)})
 
     participants = [str(promisor.agent_id), str(commitment.beneficiary_npc.agent_id)]
     witnesses = resolve_witnesses(location, participants)
@@ -522,7 +543,7 @@ def perform_commitment(
     if commitment.commitment_type in {"REPAYMENT", "DONATION"}:
         success, code, changes = _transfer_commitment_assets(commitment, world_minute, request_id)
         if not success:
-            return _result(code)
+            return _result(code, data={"commitment_id": str(commitment.pk), **changes})
     event = _event(
         event_type="COMMITMENT_COMPLETED",
         world_minute=world_minute,
@@ -619,7 +640,9 @@ def inspect_social_state(npc_id: Any) -> dict[str, Any]:
     ).select_related("to_npc")
     commitments = NpcCommitment.objects.filter(
         models.Q(promisor_npc=npc) | models.Q(beneficiary_npc=npc)
-    ).select_related("promisor_npc", "beneficiary_npc").order_by("-updated_at")[:20]
+    ).select_related("promisor_npc", "beneficiary_npc").order_by("-updated_at")
+    total_commitments = commitments.count()
+    commitments = list(commitments.filter(status="OPEN")) + list(commitments.exclude(status="OPEN")[:20])
     rel_data = []
     for relation in relationships:
         other = relation.to_npc
@@ -631,6 +654,7 @@ def inspect_social_state(npc_id: Any) -> dict[str, Any]:
         ).exists()
         rel_data.append({
             "other_npc_id": str(other.agent_id),
+            "other_npc_name": other.name,
             "label": relationship_label(relationship_snapshot(relation), has_open),
             "has_open_commitment": has_open,
         })
@@ -638,7 +662,12 @@ def inspect_social_state(npc_id: Any) -> dict[str, Any]:
         "npc_id": str(npc.agent_id),
         "relationships": rel_data,
         "commitments": [_commitment_data(row) for row in commitments],
-        "fact_codes": list(NpcStoryFactAccess.objects.filter(npc=npc).values_list("fact_code", flat=True)),
+        "total_commitments": total_commitments,
+        "has_more_history": total_commitments > len(commitments),
+        "fact_codes": list(NpcStoryFactAccess.objects.filter(npc=npc).exclude(
+            fact_code="FOREST_OLD_ROUTE").values_list("fact_code", flat=True)),
+        "historical_fact_codes": list(NpcStoryFactAccess.objects.filter(
+            npc=npc, fact_code="FOREST_OLD_ROUTE").values_list("fact_code", flat=True)),
     })
 
 

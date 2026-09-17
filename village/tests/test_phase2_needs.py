@@ -24,7 +24,7 @@ class NeedsServiceTests(TestCase):
             npc=npc, display_name="Bill", occupation="farmer",
             home_location_code="BILL_HOME", work_location_code="BILL_HOME",
             social_location_code="BILL_HOME",
-            capabilities=["EAT", "REST", "SLEEP", "START_DIALOGUE", "SPEAK", "WORK_PLACEHOLDER"],
+            capabilities=["EAT", "REST", "SLEEP", "WORK_PLACEHOLDER"],
         )
         self.runtime = NpcRuntimeState.objects.create(npc=npc, needs_world_minute=0)
         time_state = GlobalGameTimeState.get_instance()
@@ -84,7 +84,14 @@ class NeedsServiceTests(TestCase):
         self.assertTrue(all(summary.finalized for summary in summaries))
         self.assertLess(summaries[0].severe_hunger_minutes, 1440)
         self.assertEqual([summary.severe_hunger_minutes for summary in summaries[1:]], [1440, 1440])
-        self.assertEqual(self.runtime.health_fp, 840)
+        # Two all-day severe-hunger penalties plus three core nights with no sleep.
+        self.assertEqual(self.runtime.health_fp, 690)
+
+    def test_sleep_curve_rewards_one_continuous_block(self):
+        self.assertEqual(
+            [NeedsService._sleep_curve_percent(minutes) for minutes in (0, 120, 240, 360, 480, 600, 720)],
+            [0, 6, 25, 56, 100, 110, 110],
+        )
 
     def test_oversized_cutover_gap_is_rejected_without_replay(self):
         time_state = GlobalGameTimeState.get_instance()
@@ -253,7 +260,7 @@ class NeedsServiceTests(TestCase):
             {"EAT", "MOVE"},
         )
         for tool in response.data["data"]["tools"]:
-            self.assertEqual(set(tool), {"name", "description", "parameters"})
+            self.assertEqual(set(tool), {"name", "description", "parameters", "tags"})
             self.assertTrue({"type", "properties", "required"}.issubset(tool["parameters"]))
 
     def test_sleeping_discover_exposes_clock_remaining_time_and_wake_up(self):
@@ -278,9 +285,17 @@ class NeedsServiceTests(TestCase):
 
     def test_command_catalog_is_the_allowed_action_source(self):
         self.assertEqual(CommandService.ALLOWED_ACTIONS, frozenset(COMMAND_CATALOG))
-        self.assertEqual(len(COMMAND_CATALOG), 56)
+        self.assertIn("PROCESS_GAME", COMMAND_CATALOG)
         for action in COMMAND_CATALOG:
-            self.assertEqual(set(agent_tool(action)), {"name", "description", "parameters"})
+            tool = agent_tool(action)
+            self.assertEqual(set(tool), {"name", "description", "parameters", "tags"})
+            if action in CommandService.READ_QUERY_ACTIONS:
+                self.assertEqual(tool["tags"], ["read"], action)
+            else:
+                self.assertEqual(tool["tags"], [], action)
+        # 阶段三/四的这两个查询同样只读，必须携带 read 标签。
+        for query in ("INSPECT_STORE_INVENTORY", "INSPECT_SOCIAL_STATE"):
+            self.assertEqual(agent_tool(query)["tags"], ["read"], query)
 
     def test_invalid_command_catalog_fails_fast(self):
         with TemporaryDirectory() as directory:
@@ -294,7 +309,7 @@ class NeedsServiceTests(TestCase):
         self.runtime.save(update_fields=["hunger_fp"])
         result = runtime_summary("10011")
         self.assertNotIn("WORK_PLACEHOLDER", result["available_actions"])
-        self.assertIn("START_DIALOGUE", result["available_actions"])
+        self.assertNotIn("START_DIALOGUE", result["available_actions"])
         self.assertNotIn("SPEAK", result["available_actions"])
 
         self.runtime.hunger_fp = 200

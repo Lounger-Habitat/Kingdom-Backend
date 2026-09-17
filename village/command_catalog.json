@@ -4,7 +4,7 @@
       "name": "MOVE",
       "phase": "阶段一",
       "label": "移动",
-      "description": "前往指定地点；以寻路到达为准，仅“导航超时（秒）”生效。",
+      "description": "前往指定地点；以寻路到达为准，仅“导航超时（秒）”生效。location_code 必须是地点代码（如 BILL_FARM、GENERAL_STORE、BILL_HOME、MARKET_STREET），农田 plot_code 不能作为 location_code。",
       "parameters": {
         "type": "object",
         "properties": {
@@ -19,8 +19,16 @@
         },
         "required": [],
         "oneOf": [
-          {"required": ["location_code"]},
-          {"required": ["target_npc_id"]}
+          {
+            "required": [
+              "location_code"
+            ]
+          },
+          {
+            "required": [
+              "target_npc_id"
+            ]
+          }
         ]
       }
     },
@@ -28,10 +36,16 @@
       "name": "WAIT",
       "phase": "阶段一",
       "label": "等待",
-      "description": "原地等待；耗时由系统决定（单位：世界分钟），无需传参；执行结果在 duration_minutes 字段返回实际消耗。",
+      "description": "原地等待；可指定正整数世界分钟时长，省略时使用后端配置；执行结果在 duration_minutes 字段返回实际消耗。",
       "parameters": {
         "type": "object",
-        "properties": {},
+        "properties": {
+          "duration_minutes": {
+            "type": "integer",
+            "description": "等待时长（世界分钟）",
+            "minimum": 1
+          }
+        },
         "required": []
       }
     },
@@ -50,7 +64,7 @@
       "name": "EAT",
       "phase": "阶段二",
       "label": "进食",
-      "description": "进食并结算饥饿值；时长使用后端配置（世界分钟）。",
+      "description": "先INSPECT_INVENTORY选择available_quantity>0、未过期且未预留的具体熟食，必须同时传source=PERSONAL_INVENTORY与food_instance_id；进食按实际配置耗时和结算需求。公共餐先BUY_FROM_STORE以0金领取到个人库存，再EAT；旧source=COMMUNITY_MEAL停用。",
       "parameters": {
         "type": "object",
         "properties": {
@@ -58,19 +72,20 @@
             "type": "string",
             "description": "食物来源",
             "enum": [
-              "PERSONAL_INVENTORY",
-              "COMMUNITY_MEAL"
+              "PERSONAL_INVENTORY"
             ]
           },
           "food_instance_id": {
             "type": "string",
-            "description": "食物实例ID；选择公共餐食时不传",
+            "description": "个人库存中的具体食物实例ID；公共餐须先领取到个人库存",
             "format": "uuid"
           }
         },
         "required": [
-          "source"
-        ]
+          "source",
+          "food_instance_id"
+        ],
+        "additionalProperties": false
       }
     },
     {
@@ -151,7 +166,7 @@
       "name": "PLANT",
       "phase": "阶段三",
       "label": "播种",
-      "description": "在 Bill 农田播种；耗时由系统决定（单位：世界分钟），无需传参；执行结果在 duration_minutes 字段返回实际消耗。",
+      "description": "在 Bill 农田播种；必须先 MOVE 到农田地点 BILL_FARM，plot_code 从 INSPECT_FARM_STATE 返回的空地中选择；耗时由系统决定（单位：世界分钟），执行结果在 duration_minutes 字段返回实际消耗。",
       "parameters": {
         "type": "object",
         "properties": {
@@ -161,7 +176,13 @@
           },
           "crop_code": {
             "type": "string",
-            "description": "作物代码"
+            "description": "作物代码",
+            "enum": [
+              "CORN",
+              "WHEAT",
+              "CARROT",
+              "POTATO"
+            ]
           }
         },
         "required": [
@@ -174,7 +195,7 @@
       "name": "HARVEST",
       "phase": "阶段三",
       "label": "收获",
-      "description": "在 Bill 农田收获；耗时由系统决定（单位：世界分钟），无需传参；执行结果在 duration_minutes 字段返回实际消耗。",
+      "description": "在 Bill 农田收获；必须先 MOVE 到农田地点 BILL_FARM，plot_code 从 INSPECT_FARM_STATE 返回的成熟地块中选择；耗时由系统决定（单位：世界分钟），执行结果在 duration_minutes 字段返回实际消耗。",
       "parameters": {
         "type": "object",
         "properties": {
@@ -192,14 +213,16 @@
       "name": "HUNT",
       "phase": "阶段三",
       "label": "狩猎",
-      "description": "在狩猎入口狩猎；耗时由系统决定（单位：世界分钟），无需传参；执行结果在 duration_minutes 字段返回实际消耗。",
+      "description": "在HUNTING_GATE狩猎，获得1只待处理鸡、猪或牛；需可用猎具和健康体力。时长仅由数据库决定。同日第二次及以后另扣配置的精力。去BUTCHER_YARD处理后才得到肉类。",
       "parameters": {
         "type": "object",
         "properties": {
           "hunt_code": {
             "type": "string",
             "description": "狩猎项目代码",
-            "enum": ["HUNT_CHICKEN"]
+            "enum": [
+              "HUNT_ANIMALS"
+            ]
           }
         },
         "required": [
@@ -208,10 +231,33 @@
       }
     },
     {
+      "name": "PROCESS_GAME",
+      "phase": "阶段三",
+      "label": "处理猎物",
+      "description": "在BUTCHER_YARD处理库存查询中的指定猎物实例，每次1件，消耗1次猎具，产出肉和羽毛或粗皮革；肉继承猎物到期时间。时长仅由数据库决定。",
+      "parameters": {
+        "type": "object",
+        "properties": {
+          "prey_instance_id": {
+            "type": "string",
+            "format": "uuid",
+            "description": "库存中待处理猎物的实例ID"
+          },
+          "expected_asset_version": {
+            "type": "integer",
+            "minimum": 0
+          }
+        },
+        "required": [
+          "prey_instance_id"
+        ]
+      }
+    },
+    {
       "name": "COOK",
       "phase": "阶段三",
       "label": "烹饪",
-      "description": "在餐厅烹饪；耗时由系统决定（单位：世界分钟），无需传参；执行结果在 duration_minutes 字段返回实际消耗。",
+      "description": "在餐厅（地点代码 RESTAURANT）烹饪；耗时由系统决定（单位：世界分钟），无需传参；执行结果在 duration_minutes 字段返回实际消耗。",
       "parameters": {
         "type": "object",
         "properties": {
@@ -313,24 +359,38 @@
       "name": "IMPORT_GOODS",
       "phase": "阶段三",
       "label": "外部进货",
-      "description": "在贸易道路向商队进货；耗时由系统决定（单位：世界分钟），无需传参；执行结果在 duration_minutes 字段返回实际消耗。",
+      "description": "每天11:00至15:00向当前商队进货，默认耗时10世界分钟，必须能在15点前完成。先查市场caravan地点及库存并移动到该处；只从现有库存中自主选择购买。仅使用NPC个人可用金币，货物进入个人背包；需要售卖时再用LIST_STORE_ITEM从个人背包自主上架。 商品范围和价格使用本趟到访快照；后台配置修改不影响本趟现货和成交价。",
       "parameters": {
         "type": "object",
         "properties": {
-          "item_id": {
-            "type": "integer",
-            "description": "物品ID",
-            "minimum": 1
-          },
-          "amount": {
-            "type": "integer",
-            "description": "数量",
-            "minimum": 1
+          "items": {
+            "type": "array",
+            "description": "要进货的商品清单；每项包含 item_id 和 amount，不设安全库存上限。",
+            "minItems": 1,
+            "items": {
+              "type": "object",
+              "properties": {
+                "item_id": {
+                  "type": "integer",
+                  "description": "物品ID",
+                  "minimum": 1
+                },
+                "amount": {
+                  "type": "integer",
+                  "description": "数量",
+                  "minimum": 1
+                }
+              },
+              "required": [
+                "item_id",
+                "amount"
+              ],
+              "additionalProperties": false
+            }
           }
         },
         "required": [
-          "item_id",
-          "amount"
+          "items"
         ]
       }
     },
@@ -338,7 +398,7 @@
       "name": "EXPORT_GOODS",
       "phase": "阶段三",
       "label": "外部出货",
-      "description": "在贸易道路向商队出货；耗时由系统决定（单位：世界分钟），无需传参；执行结果在 duration_minutes 字段返回实际消耗。",
+      "description": "向在场商队出售个人可用物品。允许品种和报价取自本趟配置快照，所有品种共用本趟出口收购总量；先用INSPECT_MARKET_STATE查看export_remaining_amount和export_unit_price。出口扣个人背包、收入归个人，并保留村庄安全库存。超过剩余额度整笔失败，不部分成交。",
       "parameters": {
         "type": "object",
         "properties": {
@@ -363,30 +423,59 @@
       "name": "RATE_DISH",
       "phase": "阶段三",
       "label": "菜品评分",
-      "description": "在档案馆为菜品评分；耗时由系统决定（单位：世界分钟），无需传参；执行结果在 duration_minutes 字段返回实际消耗。",
+      "description": "Mark在RECORD_HALL对Lucy送来的具体菜使用本人LLM品鉴。先INSPECT_RATEABLE_DISHES读取真实快照，再提交review_id、四项1–10分和评语。后台计算总分及点评价；不再接受旧单个1–5分。",
       "parameters": {
         "type": "object",
         "properties": {
-          "owner_npc_id": {
+          "review_id": {
             "type": "string",
-            "description": "菜品所属NPC ID"
-          },
-          "food_instance_id": {
-            "type": "string",
-            "description": "食物实例ID；选择公共餐食时不传",
             "format": "uuid"
           },
-          "score": {
-            "type": "integer",
-            "description": "评分",
-            "minimum": 1,
-            "maximum": 5
+          "scores": {
+            "type": "object",
+            "properties": {
+              "color": {
+                "type": "number",
+                "minimum": 1,
+                "maximum": 10
+              },
+              "aroma": {
+                "type": "number",
+                "minimum": 1,
+                "maximum": 10
+              },
+              "taste": {
+                "type": "number",
+                "minimum": 1,
+                "maximum": 10
+              },
+              "presentation": {
+                "type": "number",
+                "minimum": 1,
+                "maximum": 10
+              }
+            },
+            "required": [
+              "color",
+              "aroma",
+              "taste",
+              "presentation"
+            ]
+          },
+          "comment": {
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 2000
+          },
+          "customer_feedback": {
+            "type": "string",
+            "maxLength": 2000
           }
         },
         "required": [
-          "owner_npc_id",
-          "food_instance_id",
-          "score"
+          "review_id",
+          "scores",
+          "comment"
         ]
       }
     },
@@ -394,7 +483,7 @@
       "name": "PUBLISH_PRICE_INDEX",
       "phase": "阶段三",
       "label": "发布价格指数",
-      "description": "在档案馆发布当日价格指数；耗时由系统决定（单位：世界分钟），无需传参；执行结果在 duration_minutes 字段返回实际消耗。",
+      "description": "公布当前游戏日已有的价格草稿；已公布不能重复发。与其他有效公共工作共用每天一次的基础餐参考价薪酬。",
       "parameters": {
         "type": "object",
         "properties": {},
@@ -405,7 +494,7 @@
       "name": "AUDIT_PUBLIC_FUND",
       "phase": "阶段三",
       "label": "审计公款",
-      "description": "在档案馆审计公共资金；耗时由系统决定（单位：世界分钟），无需传参；执行结果在 duration_minutes 字段返回实际消耗。",
+      "description": "核对当前游戏日公款：独立期初余额加真实分录，与实际余额比较。重复审计可查账但同日不重复计薪；旧历史缺基准会明确标注。",
       "parameters": {
         "type": "object",
         "properties": {},
@@ -415,14 +504,23 @@
     {
       "name": "PROPOSE_TRADE",
       "phase": "阶段三",
-      "label": "发起交易报价",
-      "description": "向指定 NPC 发起结构化定向报价；耗时由系统决定（单位：世界分钟），无需传参；执行结果在 duration_minutes 字段返回实际消耗。",
+      "label": "交易报价或向商店售货",
+      "description": "向杂货铺卖货：指定side=SELL、store_code=GENERAL_STORE、items物品列表，可一次卖多种物品；无需target_npc_id、报价金额或期限，无需Nora回应或在场。先查INSPECT_INVENTORY：sale.unit_price为每件实际售价；sale.allowed=false表示当前不可出售，reason说明原因。工具只收满耐久批次。商店营业且全部钱货充足才整批成交；任一物品不足整批失败，店款不足提示商店金币不足，无法收购。重复item_id合并数量；兼容单品item_id+amount，但不可与items混填。个人交易及Nora主动商店BUY仍是单品报价，必填target_npc_id、item_id、amount、gold_amount，由对方回应。耗时由系统决定，结果返回duration_minutes。",
       "parameters": {
         "type": "object",
         "properties": {
           "target_npc_id": {
             "type": "string",
-            "description": "目标NPC ID"
+            "description": "个人交易及Nora主动商店BUY时必填的目标NPC ID；向商店SELL时省略，兼容旧值10015。"
+          },
+          "side": {
+            "type": "string",
+            "description": "报价方向：BUY 表示向目标买入，SELL 表示向目标卖出；省略时默认为 BUY",
+            "enum": [
+              "BUY",
+              "SELL"
+            ],
+            "default": "BUY"
           },
           "item_id": {
             "type": "integer",
@@ -434,18 +532,45 @@
             "description": "数量",
             "minimum": 1
           },
+          "items": {
+            "type": "array",
+            "minItems": 1,
+            "description": "仅用于向商店SELL的物品列表，例如[{\"item_id\":1030,\"amount\":6},{\"item_id\":1049,\"amount\":5}]。重复物品合并数量；不能与顶层item_id/amount混填。整批一次结算，失败时全部钱货不变。",
+            "items": {
+              "type": "object",
+              "properties": {
+                "item_id": {
+                  "type": "integer",
+                  "minimum": 1
+                },
+                "amount": {
+                  "type": "integer",
+                  "minimum": 1
+                }
+              },
+              "required": [
+                "item_id",
+                "amount"
+              ],
+              "additionalProperties": false
+            }
+          },
           "gold_amount": {
             "type": "integer",
-            "description": "金币数量",
+            "description": "个人交易及Nora主动商店BUY时必填的整笔报价。NPC向商店SELL时省略，后台按item_price计算并忽略旧报价金额。",
             "minimum": 1
+          },
+          "store_code": {
+            "type": "string",
+            "description": "可选，GENERAL_STORE。其他正式NPC发SELL时直接按物品价值卖店，无需Nora接受；Nora主动发BUY时仍由对方回应。商店付款，货进店内未上架库存；不填则为NPC个人交易。"
+          },
+          "commitment_id": {
+            "type": "string",
+            "format": "uuid",
+            "description": "可选：关联开放DELIVERY承诺，仅限NPC个人交易。卖方为承诺人、买方为受益人，物品/数量/金额必须与target一致；接受成交后才完成承诺，不得用于store_code商店交易。"
           }
         },
-        "required": [
-          "target_npc_id",
-          "item_id",
-          "amount",
-          "gold_amount"
-        ]
+        "required": []
       }
     },
     {
@@ -499,14 +624,17 @@
       "name": "LIST_STORE_ITEM",
       "phase": "阶段三",
       "label": "上架商品",
-      "description": "经营 NPC 将个人库存中的任意真实物品转入自己经营的商店并上架。先查看 INSPECT_INVENTORY 和 INSPECT_MARKET_STATE，由 Agent 自主选择物品、数量和价格；上架必须使用 CUSTOM 并填写正整数 custom_unit_price。Nora杂货铺使用GENERAL_STORE，地点为GENERAL_STORE；Lucy饭店使用RESTAURANT_STORE，地点为RESTAURANT。",
+      "description": "经营者将真实批次上架本店。Lucy饭店必须指定food_instance_id，price_mode=ORIGINAL，普通菜后端按品质默认价值/有效点评价定价，不提交custom_unit_price；公共餐另传public_meal_code及有效decision_id，顾客0元。Nora杂货铺仍可CUSTOM自由定价。stock_source=STORE从本店未上架库存取货；下架只停售留店。",
       "parameters": {
         "type": "object",
         "properties": {
           "store_code": {
             "type": "string",
             "description": "商店唯一代码，不是地点代码",
-            "enum": ["GENERAL_STORE", "RESTAURANT_STORE"]
+            "enum": [
+              "GENERAL_STORE",
+              "RESTAURANT_STORE"
+            ]
           },
           "item_id": {
             "type": "integer",
@@ -521,20 +649,46 @@
           "price_mode": {
             "type": "string",
             "description": "定价方式",
-            "enum": ["CUSTOM"]
+            "enum": [
+              "ORIGINAL",
+              "CUSTOM"
+            ]
           },
           "custom_unit_price": {
             "type": "integer",
             "description": "Agent 根据库存、需求、参考价格和风险自主决定的单价，必须为正整数",
             "minimum": 1
+          },
+          "stock_source": {
+            "type": "string",
+            "enum": [
+              "PERSONAL",
+              "STORE"
+            ],
+            "description": "默认PERSONAL从个人背包上架；STORE从本店未上架库存取货。"
+          },
+          "food_instance_id": {
+            "type": "string",
+            "format": "uuid"
+          },
+          "decision_id": {
+            "type": "string",
+            "format": "uuid"
+          },
+          "public_meal_code": {
+            "type": "string",
+            "enum": [
+              "C1",
+              "C2",
+              "R1"
+            ]
           }
         },
         "required": [
           "store_code",
           "item_id",
           "amount",
-          "price_mode",
-          "custom_unit_price"
+          "price_mode"
         ]
       }
     },
@@ -542,7 +696,7 @@
       "name": "UPDATE_STORE_PRICE",
       "phase": "阶段三",
       "label": "修改商品价格",
-      "description": "经营 NPC 修改上架商品单价；耗时由系统决定（单位：世界分钟），无需传参；执行结果在 duration_minutes 字段返回实际消耗。",
+      "description": "Nora可修改本人杂货铺普通上架价格。Lucy饭店价格由后端固定，不能使用此动作任意改价。",
       "parameters": {
         "type": "object",
         "properties": {
@@ -575,7 +729,7 @@
       "name": "DELIST_STORE_ITEM",
       "phase": "阶段三",
       "label": "下架商品",
-      "description": "经营 NPC 下架商品并取回库存；耗时由系统决定（单位：世界分钟），无需传参；执行结果在 duration_minutes 字段返回实际消耗。",
+      "description": "撤下本店商品，库存留在商店未上架仓库，可重新上架；不会转入个人背包。",
       "parameters": {
         "type": "object",
         "properties": {
@@ -650,7 +804,7 @@
       "name": "BUY_FROM_MARKETPLACE",
       "phase": "阶段三",
       "label": "购买全服商品",
-      "description": "在市场街购买全服 Marketplace 挂单；耗时由系统决定（单位：世界分钟），无需传参；执行结果在 duration_minutes 字段返回实际消耗。",
+      "description": "在市场街（地点代码 MARKET_STREET）购买全服 Marketplace 挂单；耗时由系统决定（单位：世界分钟），无需传参；执行结果在 duration_minutes 字段返回实际消耗。",
       "parameters": {
         "type": "object",
         "properties": {
@@ -701,7 +855,10 @@
           "store_code": {
             "type": "string",
             "description": "商店唯一代码，不是地点代码",
-            "enum": ["GENERAL_STORE", "RESTAURANT_STORE"]
+            "enum": [
+              "GENERAL_STORE",
+              "RESTAURANT_STORE"
+            ]
           }
         },
         "required": [
@@ -724,7 +881,7 @@
       "name": "CREATE_COMMITMENT",
       "phase": "阶段四",
       "label": "创建承诺",
-      "description": "创建结构化 NPC 承诺；时长使用后端配置（世界分钟）。",
+      "description": "自主创建承诺；beneficiary_npc_id必须是另一名NPC，due_world_minute必须晚于当前世界分钟。按commitment_type选target结构，不得增减字段。创建不转移钱货；履约再验证库存、资金、地点和期限。DONATION仅向指定NPC赠款/物，不是公共捐款；DELIVERY须关联真实个人交易完成；JOINT_WORK只记协作履约，不代替烹饪或公共工程结算。",
       "parameters": {
         "type": "object",
         "properties": {
@@ -745,11 +902,11 @@
           },
           "target": {
             "type": "object",
-            "description": "承诺的结构化目标"
+            "description": "按下方oneOf选择与commitment_type一致的结构；金额/数量为正整数，地点必须实际存在，work_code是双方约定的工作标识。"
           },
           "due_world_minute": {
             "type": "integer",
-            "description": "承诺截止世界分钟",
+            "description": "截止世界分钟，必须严格大于OBSERVE返回的当前world_minute。",
             "minimum": 0
           }
         },
@@ -758,6 +915,294 @@
           "commitment_type",
           "target",
           "due_world_minute"
+        ],
+        "oneOf": [
+          {
+            "properties": {
+              "commitment_type": {
+                "enum": [
+                  "DELIVERY"
+                ]
+              },
+              "target": {
+                "type": "object",
+                "properties": {
+                  "item_id": {
+                    "type": "integer",
+                    "enum": [
+                      1003,
+                      1009,
+                      1022,
+                      1026,
+                      1030,
+                      1033,
+                      1034,
+                      1038,
+                      1040,
+                      1049,
+                      1050,
+                      1051,
+                      1053,
+                      1054,
+                      1056,
+                      1057,
+                      1058,
+                      1061,
+                      1067,
+                      1071,
+                      1076,
+                      1077,
+                      1099,
+                      1108,
+                      4001,
+                      4002,
+                      29104,
+                      29105
+                    ],
+                    "description": "承诺系统实际支持的物品ID白名单；还需具备真实可用物品。"
+                  },
+                  "amount": {
+                    "type": "integer",
+                    "minimum": 1
+                  },
+                  "gold_amount": {
+                    "type": "integer",
+                    "minimum": 1
+                  }
+                },
+                "required": [
+                  "item_id",
+                  "amount",
+                  "gold_amount"
+                ],
+                "additionalProperties": false
+              }
+            }
+          },
+          {
+            "properties": {
+              "commitment_type": {
+                "enum": [
+                  "REPAYMENT"
+                ]
+              },
+              "target": {
+                "type": "object",
+                "properties": {
+                  "gold_amount": {
+                    "type": "integer",
+                    "minimum": 1
+                  }
+                },
+                "required": [
+                  "gold_amount"
+                ],
+                "additionalProperties": false
+              }
+            }
+          },
+          {
+            "properties": {
+              "commitment_type": {
+                "enum": [
+                  "DONATION"
+                ]
+              },
+              "target": {
+                "type": "object",
+                "properties": {
+                  "asset_kind": {
+                    "type": "string",
+                    "enum": [
+                      "GOLD"
+                    ]
+                  },
+                  "gold_amount": {
+                    "type": "integer",
+                    "minimum": 1
+                  }
+                },
+                "required": [
+                  "asset_kind",
+                  "gold_amount"
+                ],
+                "additionalProperties": false
+              }
+            }
+          },
+          {
+            "properties": {
+              "commitment_type": {
+                "enum": [
+                  "DONATION"
+                ]
+              },
+              "target": {
+                "type": "object",
+                "properties": {
+                  "asset_kind": {
+                    "type": "string",
+                    "enum": [
+                      "ITEM"
+                    ]
+                  },
+                  "item_id": {
+                    "type": "integer",
+                    "enum": [
+                      1003,
+                      1009,
+                      1022,
+                      1026,
+                      1030,
+                      1033,
+                      1034,
+                      1038,
+                      1040,
+                      1049,
+                      1050,
+                      1051,
+                      1053,
+                      1054,
+                      1056,
+                      1057,
+                      1058,
+                      1061,
+                      1067,
+                      1071,
+                      1076,
+                      1077,
+                      1099,
+                      1108,
+                      4001,
+                      4002,
+                      29104,
+                      29105
+                    ],
+                    "description": "承诺系统实际支持的物品ID白名单；还需具备真实可用物品。"
+                  },
+                  "amount": {
+                    "type": "integer",
+                    "minimum": 1
+                  }
+                },
+                "required": [
+                  "asset_kind",
+                  "item_id",
+                  "amount"
+                ],
+                "additionalProperties": false
+              }
+            }
+          },
+          {
+            "properties": {
+              "commitment_type": {
+                "enum": [
+                  "JOINT_WORK"
+                ]
+              },
+              "target": {
+                "type": "object",
+                "properties": {
+                  "location_code": {
+                    "type": "string",
+                    "minLength": 1,
+                    "pattern": "\\S"
+                  },
+                  "work_code": {
+                    "type": "string",
+                    "minLength": 1,
+                    "pattern": "\\S"
+                  }
+                },
+                "required": [
+                  "location_code",
+                  "work_code"
+                ],
+                "additionalProperties": false
+              }
+            }
+          },
+          {
+            "properties": {
+              "commitment_type": {
+                "enum": [
+                  "MEETING"
+                ]
+              },
+              "target": {
+                "type": "object",
+                "properties": {
+                  "location_code": {
+                    "type": "string",
+                    "minLength": 1,
+                    "pattern": "\\S"
+                  }
+                },
+                "required": [
+                  "location_code"
+                ],
+                "additionalProperties": false
+              }
+            }
+          }
+        ],
+        "additionalProperties": false,
+        "examples": [
+          {
+            "beneficiary_npc_id": "10011",
+            "commitment_type": "DELIVERY",
+            "target": {
+              "item_id": 1030,
+              "amount": 1,
+              "gold_amount": 8
+            },
+            "due_world_minute": 2000
+          },
+          {
+            "beneficiary_npc_id": "10011",
+            "commitment_type": "REPAYMENT",
+            "target": {
+              "gold_amount": 2
+            },
+            "due_world_minute": 2000
+          },
+          {
+            "beneficiary_npc_id": "10011",
+            "commitment_type": "DONATION",
+            "target": {
+              "asset_kind": "GOLD",
+              "gold_amount": 2
+            },
+            "due_world_minute": 2000
+          },
+          {
+            "beneficiary_npc_id": "10011",
+            "commitment_type": "DONATION",
+            "target": {
+              "asset_kind": "ITEM",
+              "item_id": 1030,
+              "amount": 1
+            },
+            "due_world_minute": 2000
+          },
+          {
+            "beneficiary_npc_id": "10011",
+            "commitment_type": "JOINT_WORK",
+            "target": {
+              "location_code": "RESTAURANT",
+              "work_code": "MEAL_PREPARATION"
+            },
+            "due_world_minute": 2000
+          },
+          {
+            "beneficiary_npc_id": "10011",
+            "commitment_type": "MEETING",
+            "target": {
+              "location_code": "RECORD_HALL"
+            },
+            "due_world_minute": 2000
+          }
         ]
       }
     },
@@ -784,7 +1229,7 @@
       "name": "PERFORM_COMMITMENT",
       "phase": "阶段四",
       "label": "履行承诺",
-      "description": "履行承诺；时长使用后端配置，共同工作和见面使用各自配置。",
+      "description": "履行本人仍开放且未过期的承诺。REPAYMENT/DONATION实际转移个人钱货；MEETING/JOINT_WORK双方需在target.location_code并可参与，工作承诺不直接产菜或记公共工程量。DELIVERY不能用此指令直接完成，须PROPOSE_TRADE附commitment_id并由对方接受相同物品、数量和金额的个人交易。",
       "parameters": {
         "type": "object",
         "properties": {
@@ -814,7 +1259,11 @@
           },
           "plan_code": {
             "type": "string",
-            "description": "选择的方案代码"
+            "description": "选择的方案代码",
+            "enum": [
+              "BRIDGE_REPAIR",
+              "RATION_AND_WAIT"
+            ]
           }
         },
         "required": [
@@ -827,13 +1276,13 @@
       "name": "STORY_ACT",
       "phase": "阶段五",
       "label": "剧情行动",
-      "description": "执行当前剧情阶段允许的村庄行动。",
+      "description": "执行已开放剧情行动，或由Mark召集会议、登记提案、公布决议/历史事实、审核工程凭证、领取欠薪。新公共决定需要Mark在场及至少三张有效票，执行须符合已公布授权。",
       "parameters": {
         "type": "object",
         "properties": {
           "action_code": {
             "type": "string",
-            "description": "剧情行动代码"
+            "description": "剧情行动代码；Mark行政入口：CALL_MEETING、REGISTER_PROPOSAL、PUBLISH_DECISION、REVEAL_STORY_FACT、CLAIM_PUBLIC_SALARY；审核工程使用MANAGE_REPAIR_LEDGER。"
           },
           "item_id": {
             "type": "integer",
@@ -852,8 +1301,9 @@
           },
           "labor_hours": {
             "type": "integer",
-            "description": "投入工时",
-            "minimum": 1
+            "description": "修桥劳动每次计划1人时，省略或填1；实际占用60游戏分钟，完整完成才入账，未完成不计工时",
+            "minimum": 1,
+            "maximum": 1
           },
           "route_attempt_id": {
             "type": "string",
@@ -895,8 +1345,155 @@
           },
           "meal_amount": {
             "type": "integer",
-            "description": "公共餐食数量",
+            "description": "PROVIDE_COMMUNITY_MEAL将Lucy已制作的具体餐上架，实际领取时才计供餐份数；必须带food_instance_id/public_meal_code/decision_id。",
             "minimum": 1
+          },
+          "item_ids": {
+            "type": "array",
+            "items": {
+              "type": "integer"
+            },
+            "description": "首次应急联络时可附带下次到货物品需求。"
+          },
+          "expires_world_minute": {
+            "type": "integer",
+            "minimum": 1,
+            "description": "提案必填的授权到期分钟；执行公共限购时必须与已批准期限一致。"
+          },
+          "meeting_id": {
+            "type": "string",
+            "format": "uuid",
+            "description": "REGISTER_PROPOSAL使用的开放会议ID；PUBLISH_DECISION也可传此ID，核实真实出席与投票后结算并公布。"
+          },
+          "decision_id": {
+            "type": "string",
+            "format": "uuid",
+            "description": "已通过表决的公共决定ID；采购、配给及工程贡献/审核必需。公布可用此ID，或用meeting_id结算真实投票后公布。"
+          },
+          "evidence_request_id": {
+            "type": "string",
+            "format": "uuid",
+            "description": "MANAGE_REPAIR_LEDGER要审核的真实成功工程凭证request_id。"
+          },
+          "plan_code": {
+            "type": "string",
+            "enum": [
+              "BRIDGE_REPAIR",
+              "RATION_AND_WAIT"
+            ],
+            "description": "要登记的现有候选方案。"
+          },
+          "budget_gold": {
+            "type": "integer",
+            "minimum": 0,
+            "description": "修桥采购预算，或RATION_AND_WAIT中明确meal_service供餐预算；不会自动拨款。"
+          },
+          "executor_npc_id": {
+            "type": "string",
+            "description": "提案执行人：修桥采购/配给为10015，旧路侦察为10012。"
+          },
+          "starts_world_minute": {
+            "type": "integer",
+            "minimum": 0,
+            "description": "CALL_MEETING会议开始世界分钟，不得早于当前时间；默认立即开始，当日截止。"
+          },
+          "ration_daily_limits": {
+            "type": "object",
+            "additionalProperties": {
+              "type": "integer",
+              "minimum": 1
+            },
+            "description": "配给提案必填，例如{\"29001\":1}；键为真实物品ID，值为每人每日额度。"
+          },
+          "fact_code": {
+            "type": "string",
+            "enum": [
+              "DEFERRED_BRIDGE_BUDGET"
+            ],
+            "description": "Mark可公开的本人已知历史预算事实。"
+          },
+          "food_instance_id": {
+            "type": "string",
+            "format": "uuid"
+          },
+          "public_meal_code": {
+            "type": "string",
+            "enum": [
+              "C1",
+              "C2",
+              "R1"
+            ]
+          },
+          "stock_source": {
+            "type": "string",
+            "enum": [
+              "PERSONAL",
+              "STORE"
+            ]
+          },
+          "meal_service": {
+            "type": "object",
+            "properties": {
+              "executor_npc_id": {
+                "type": "string",
+                "enum": [
+                  "10014"
+                ]
+              },
+              "store_code": {
+                "type": "string",
+                "enum": [
+                  "RESTAURANT_STORE"
+                ]
+              },
+              "menu_codes": {
+                "type": "array",
+                "items": {
+                  "type": "string",
+                  "enum": [
+                    "C1",
+                    "C2",
+                    "R1"
+                  ]
+                }
+              },
+              "subsidies": {
+                "type": "object",
+                "description": "所选C1=9、C2=12、R1=9金币/份，不随评分上浮。"
+              },
+              "beneficiaries": {
+                "type": "array",
+                "items": {
+                  "type": "string",
+                  "enum": [
+                    "10011",
+                    "10012",
+                    "10013",
+                    "10014",
+                    "10015"
+                  ]
+                }
+              },
+              "starts_world_minute": {
+                "type": "integer",
+                "minimum": 0
+              },
+              "per_npc_daily_limit": {
+                "type": "integer",
+                "enum": [
+                  1
+                ]
+              },
+              "village_daily_limit": {
+                "type": "integer",
+                "minimum": 1,
+                "maximum": 5
+              }
+            },
+            "required": [
+              "menu_codes",
+              "subsidies"
+            ]
           }
         },
         "required": [
@@ -905,151 +1502,198 @@
       }
     },
     {
-      "name": "START_DIALOGUE",
-      "phase": "阶段二",
-      "label": "发起对话",
-      "description": "尝试与距离自己4米以内的NPC开始对话。成功时立即建立或复用对话，并返回conversation_id；失败时返回不能开始对话的原因。",
-      "parameters": {
-        "type": "object",
-        "properties": {
-          "target_npc_id": {
-            "type": "string",
-            "description": "目标NPC的ID。目标必须距离自己4米以内，不能填写自己的ID。"
-          },
-          "topic": {
-            "type": "string",
-            "description": "可选的对话主题，说明想与对方讨论什么。",
-            "maxLength": 120
-          }
-        },
-        "required": ["target_npc_id"]
-      }
-    },
-    {
-      "name": "SPEAK",
-      "phase": "阶段二",
-      "label": "对话发言",
-      "description": "在已经建立的对话中发言；允许同一NPC连续发言。双方必须仍在4米以内，超过范围时对话会结束并返回失败原因。",
-      "parameters": {
-        "type": "object",
-        "properties": {
-          "conversation_id": {
-            "type": "string",
-            "format": "uuid",
-            "description": "START_DIALOGUE成功后返回的对话ID。"
-          },
-          "text": {
-            "type": "string",
-            "description": "要对对方说的话。",
-            "minLength": 1,
-            "maxLength": 100
-          },
-          "end_turn": {
-            "type": "boolean",
-            "description": "是否在本次发言后表示自己希望结束对话。设置为true后自己不能继续发言；双方都表示结束后，对话才会完成。",
-            "default": false
-          }
-        },
-        "required": ["conversation_id", "text"]
-      }
-    },
-    {
       "name": "GET_RULE",
       "phase": "查询",
       "label": "获取村庄规则",
-      "description": "获取当前适用于你自己的村庄环境规则（需求数值、行动耗时、各指令前提等；不同村民可执行的规则不同）。连接后、规则可能变化时或不确定时调用。",
-      "parameters": {"type": "object", "properties": {}, "required": []}
+      "description": "获取当前适用于你自己的村庄环境规则（包含你的 NPC 编号、姓名、地点代码、需求数值、行动耗时和各指令前提；不同村民可执行的规则不同）。连接后、规则可能变化时或不确定时调用。",
+      "parameters": {
+        "type": "object",
+        "properties": {},
+        "required": []
+      }
     },
     {
       "name": "OBSERVE",
       "phase": "查询",
       "label": "观察自身状态",
-      "description": "查看当前时间、地点、动作和生活需求。",
-      "parameters": {"type": "object", "properties": {}, "required": []}
+      "description": "查看当前时间、地点、动作和生活需求，返回你的 self_npc_id 与 self_name；只返回当前动态状态，规则请使用 GET_RULE。",
+      "parameters": {
+        "type": "object",
+        "properties": {},
+        "required": []
+      }
     },
     {
       "name": "INSPECT_NEARBY",
       "phase": "查询",
       "label": "观察附近",
       "description": "查看自身周围20米内的NPC和地点，返回它们的名称、ID、状态和距离。",
-      "parameters": {"type": "object", "properties": {}, "required": []}
+      "parameters": {
+        "type": "object",
+        "properties": {},
+        "required": []
+      }
     },
     {
       "name": "INSPECT_INVENTORY",
       "phase": "查询",
       "label": "查看背包",
-      "description": "查看自己的金币、物品数量和物品实例ID。",
-      "parameters": {"type": "object", "properties": {}, "required": []}
+      "description": "查看自己的金币和物品。可选item_ids仅查指定物品，此时不附带钱包和店铺信息。工具查询包含范围内的tool_summaries，可用总次数不等于某一把工具的剩余次数。每件物品返回编号、名称、类型、数量、可用数量及出售信息；工具有实例和耐久，食物有food_instance_id及可读有效期。sale.unit_price为向sale.target出售每件可获得的金币；sale.allowed=false时reason说明不可出售原因。",
+      "parameters": {
+        "type": "object",
+        "properties": {"item_ids": {"type": "array", "items": {"type": "integer", "minimum": 1}, "minItems": 1, "maxItems": 100}},
+        "required": []
+      }
     },
     {
       "name": "INSPECT_TRADE_OFFERS",
       "phase": "查询",
       "label": "查看交易报价",
       "description": "查看自己收到和发出的待处理交易报价。",
-      "parameters": {"type": "object", "properties": {}, "required": []}
+      "parameters": {
+        "type": "object",
+        "properties": {},
+        "required": []
+      }
     },
     {
       "name": "INSPECT_STORY_STATE",
       "phase": "查询",
       "label": "查看剧情状态",
       "description": "查看当前剧情、开放会议、候选方案和可执行剧情行动。",
-      "parameters": {"type": "object", "properties": {}, "required": []}
+      "parameters": {
+        "type": "object",
+        "properties": {},
+        "required": []
+      }
     },
     {
       "name": "INSPECT_RELEVANT_STORIES",
       "phase": "查询",
       "label": "查看相关剧情",
       "description": "查看与自己有关的剧情目录和摘要。",
-      "parameters": {"type": "object", "properties": {}, "required": []}
+      "parameters": {
+        "type": "object",
+        "properties": {},
+        "required": []
+      }
     },
     {
       "name": "INSPECT_STORY_DETAIL",
       "phase": "查询",
       "label": "查看剧情详情",
       "description": "按剧情唯一ID查看自己有权限看到的剧情详情。",
-      "parameters": {"type": "object", "properties": {"story_id": {"type": "string"}}, "required": ["story_id"]}
+      "parameters": {
+        "type": "object",
+        "properties": {
+          "story_id": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "story_id"
+        ]
+      }
     },
     {
       "name": "INSPECT_ORDERS",
       "phase": "查询",
       "label": "查看订单",
       "description": "查看自己的交易订单和相关配送任务。",
-      "parameters": {"type": "object", "properties": {}, "required": []}
+      "parameters": {
+        "type": "object",
+        "properties": {},
+        "required": []
+      }
     },
     {
       "name": "INSPECT_MARKET_STATE",
       "phase": "查询",
-      "label": "查看市场状态",
-      "description": "查看市场价格、可交易物品、交付地点和商队状态。",
-      "parameters": {"type": "object", "properties": {}, "required": []}
+      "label": "查看商队交易状态",
+      "description": "查看商队状态、地点、到访时间、本趟进口余货和进出口报价。caravan的import_total_amount/import_remaining_amount表示进口初始总量/剩余总量，export_total_amount/export_remaining_amount表示本趟跨品种共享的收购上限/剩余额度。items含当趟进口现货或收购报价；export_unit_price不代表还有收购额度，须同时检查export_remaining_amount。不按个人余额或库存筛选。item_id仅筛选当前交易商品；page/page_size仅分页items，默认20、最大50；item_found仅表示在当前交易目录中找到商品。补货目录及登记情况请用INSPECT_CARAVAN_REQUESTS。",
+      "parameters": {
+        "type": "object",
+        "properties": {
+          "item_id": {
+            "type": "integer",
+            "description": "可选，指定当前交易商品ID；不查询补货目录。",
+            "minimum": 0
+          },
+          "page": {
+            "type": "integer",
+            "description": "页码，从1开始；HTTP 查询参数使用正十进制数字字符串",
+            "minimum": 1
+          },
+          "page_size": {
+            "type": "integer",
+            "description": "每页数量，默认20，最大50；HTTP 查询参数使用正十进制数字字符串",
+            "minimum": 1,
+            "maximum": 50
+          }
+        },
+        "required": []
+      }
+    },
+    {
+      "name": "INSPECT_CARAVAN_REQUESTS",
+      "phase": "阶段三",
+      "label": "查看商队补货需求",
+      "description": "查看完整可登记进口目录requestable_items及已登记标记requested=true，不分页、不随机抽取。arrival_world_time是当前可登记的目标到访时间：11:00前当天，否则次日；import_total_amount是当前配置下目标路线的进口总数量。route_open和arrival_conditional说明到访条件。目录来自后台配置，不代表当前现货；当前买卖用INSPECT_MARKET_STATE，提交或替换整份需求用CONTACT_CARAVAN。",
+      "parameters": {
+        "type": "object",
+        "properties": {},
+        "required": [],
+        "additionalProperties": false
+      }
     },
     {
       "name": "INSPECT_FARM_STATE",
       "phase": "查询",
       "label": "查看农田状态",
-      "description": "查看农田地块、作物成熟状态和可播种作物。",
-      "parameters": {"type": "object", "properties": {}, "required": []}
+      "description": "查看农田状态。省略 plot_code 返回全部36块；指定 plot_code 时只返回该地块。空地只返回 EMPTY；生长中返回作物和剩余成熟时间；成熟地块返回作物及可收获状态。空值或非法编号返回 INVALID_QUERY_PARAMS。",
+      "parameters": {
+        "type": "object",
+        "properties": {
+          "plot_code": {
+            "type": "string",
+            "description": "可选地块编号；传入后只返回该地块，允许首尾空白和大小写差异。"
+          }
+        },
+        "required": []
+      }
     },
     {
       "name": "INSPECT_RESTAURANT_STATE",
       "phase": "查询",
       "label": "查看饭店状态",
-      "description": "查看饭店营业状态、可用菜谱、材料需求和材料是否充足。",
-      "parameters": {"type": "object", "properties": {}, "required": []}
+      "description": "查询餐厅营业状态和在售菜单。经营者另可查看餐厅店款、未上架可用库存、待评样品预留和当前公共餐授权、补贴、剩余预算、期限、份额及阻碍。菜谱与材料清单请查GET_RULE.cooking_recipes，个人可用食材查INSPECT_INVENTORY。只读查询不批准或预留公款。",
+      "parameters": {
+        "type": "object",
+        "properties": {},
+        "required": []
+      }
     },
     {
       "name": "INSPECT_RATEABLE_DISHES",
       "phase": "查询",
       "label": "查看待评分菜品",
-      "description": "查看可以评分的菜品、所属NPC和食物实例ID。",
-      "parameters": {"type": "object", "properties": {}, "required": []}
+      "description": "默认读取仍有效的待评请求；空列表只表示当前没有待评，不代表历史请求未完成或已过期。可传review_id查询该请求的最终状态，已完成时返回原评分和价格。仅返回本人可见的请求。",
+      "parameters": {
+        "type": "object",
+        "properties": {"review_id": {"type": "string", "format": "uuid"}},
+        "required": []
+      }
     },
     {
       "name": "INSPECT_PUBLIC_ECONOMY_STATE",
       "phase": "查询",
       "label": "查看公共经济",
-      "description": "查看当日价格指数、公款余额和审计状态。",
-      "parameters": {"type": "object", "properties": {}, "required": []}
+      "description": "查看当日价格指数、公款余额和审计状态；返回当日价格指数的 DRAFT/PUBLISHED 状态。没有草稿时查询不会生成草稿，应等待日结。",
+      "parameters": {
+        "type": "object",
+        "properties": {},
+        "required": []
+      }
     },
     {
       "name": "BROWSE_MARKETPLACE",
@@ -1059,8 +1703,16 @@
       "parameters": {
         "type": "object",
         "properties": {
-          "item_id": {"type": "integer", "minimum": 1, "description": "可选，按物品ID筛选"},
-          "limit": {"type": "integer", "minimum": 1, "description": "可选，返回数量，默认20"}
+          "item_id": {
+            "type": "integer",
+            "minimum": 1,
+            "description": "可选，按物品ID筛选"
+          },
+          "limit": {
+            "type": "integer",
+            "minimum": 1,
+            "description": "可选，返回数量，默认20"
+          }
         },
         "required": []
       }
@@ -1070,14 +1722,189 @@
       "phase": "查询",
       "label": "查看我的全服挂单",
       "description": "查看自己当前在全服 Marketplace 的挂单。",
-      "parameters": {"type": "object", "properties": {}, "required": []}
+      "parameters": {
+        "type": "object",
+        "properties": {},
+        "required": []
+      }
     },
     {
       "name": "CHECK_MARKETPLACE_HISTORY",
       "phase": "查询",
       "label": "查看全服成交历史",
       "description": "查看自己相关的全服 Marketplace 成交历史。",
-      "parameters": {"type": "object", "properties": {}, "required": []}
+      "parameters": {
+        "type": "object",
+        "properties": {},
+        "required": []
+      }
+    },
+    {
+      "name": "CONTACT_CARAVAN",
+      "phase": "阶段三",
+      "label": "联络商队",
+      "description": "在杂货铺登记补货品种，先用INSPECT_CARAVAN_REQUESTS查看完整可登记目录和目标到访时间。item_ids为完整需求集合，新登记替换该目标批次的旧需求。11:00前完成针对当天，否则针对次日。只登记品种不指定数量，品种数不得超过该路线配置的进口总量；到访时按配置总量配货。成功回执仅说明登记成功、route_open路线状态、arrival_world_time目标到访时间及当前世界时间；完整登记情况用INSPECT_CARAVAN_REQUESTS查询。登记不购买、不自动开通路线；后台变更会影响后续批次，请到访后查询库存和报价。",
+      "parameters": {
+        "type": "object",
+        "properties": {
+          "item_ids": {
+            "type": "array",
+            "items": {
+              "type": "integer"
+            },
+            "minItems": 1
+          }
+        },
+        "required": [
+          "item_ids"
+        ]
+      }
+    },
+    {
+      "name": "WITHDRAW_STORE_FUNDS",
+      "phase": "阶段三",
+      "label": "商店提款",
+      "description": "经营者在本人商店提取可用金币到个人钱包。Lucy在RESTAURANT提RESTAURANT_STORE、储备0；Nora在GENERAL_STORE按现有储备提款。",
+      "parameters": {
+        "type": "object",
+        "properties": {
+          "store_code": {
+            "type": "string"
+          },
+          "amount": {
+            "type": "integer",
+            "minimum": 1
+          },
+          "expected_account_version": {
+            "type": "integer"
+          }
+        },
+        "required": [
+          "store_code",
+          "amount"
+        ]
+      }
+    },
+    {
+      "name": "SET_STORE_LIMITS",
+      "phase": "阶段三",
+      "label": "设置商店限购",
+      "description": "设置每人每天购买上限及到期时间；daily_limit=0取消本店规则，不影响公共限购。到期时间适用于本店当前整组规则。",
+      "parameters": {
+        "type": "object",
+        "properties": {
+          "store_code": {
+            "type": "string"
+          },
+          "item_id": {
+            "type": "integer"
+          },
+          "daily_limit": {
+            "type": "integer",
+            "minimum": 0
+          },
+          "expires_world_minute": {
+            "type": "integer"
+          }
+        },
+        "required": [
+          "store_code",
+          "item_id",
+          "daily_limit",
+          "expires_world_minute"
+        ]
+      }
+    },
+    {
+      "name": "DEPOSIT_STORE_FUNDS",
+      "phase": "阶段三",
+      "label": "商店存款",
+      "description": "Nora在自己的杂货铺将个人可用金币存入商店账户。不收费，不产生营业收入，金额不能超过未被交易占用的个人资金。",
+      "parameters": {
+        "type": "object",
+        "properties": {
+          "store_code": {
+            "type": "string",
+            "enum": [
+              "GENERAL_STORE"
+            ]
+          },
+          "amount": {
+            "type": "integer",
+            "minimum": 1
+          }
+        },
+        "required": [
+          "store_code",
+          "amount"
+        ]
+      }
+    },
+    {
+      "name": "WITHDRAW_STORE_ITEM",
+      "phase": "阶段三",
+      "label": "商店取货",
+      "description": "Nora在自己的杂货铺将未上架、未占用、未过期的库存取到个人背包。已上架商品先下架；保留批次属性，之后可自行到商队出口，收入归个人。",
+      "parameters": {
+        "type": "object",
+        "properties": {
+          "store_code": {
+            "type": "string",
+            "enum": [
+              "GENERAL_STORE"
+            ]
+          },
+          "amount": {
+            "type": "integer",
+            "minimum": 1
+          },
+          "item_id": {
+            "type": "integer",
+            "minimum": 1
+          }
+        },
+        "required": [
+          "store_code",
+          "amount",
+          "item_id"
+        ]
+      }
+    },
+    {
+      "name": "REQUEST_DISH_REVIEW",
+      "phase": "阶段三",
+      "label": "提交具体菜品给Mark品鉴",
+      "description": "提交具体菜品给Mark品鉴。Lucy提交时须到RECORD_HALL，样品预留最多180游戏分钟；取消后解锁，不改变鲜期。",
+      "parameters": {
+        "type": "object",
+        "properties": {
+          "food_instance_id": {
+            "type": "string",
+            "format": "uuid"
+          }
+        },
+        "required": [
+          "food_instance_id"
+        ]
+      }
+    },
+    {
+      "name": "CANCEL_DISH_REVIEW",
+      "phase": "阶段三",
+      "label": "取消自己提交的待评菜",
+      "description": "取消自己提交的待评菜。Lucy提交时须到RECORD_HALL，样品预留最多180游戏分钟；取消后解锁，不改变鲜期。",
+      "parameters": {
+        "type": "object",
+        "properties": {
+          "review_id": {
+            "type": "string",
+            "format": "uuid"
+          }
+        },
+        "required": [
+          "review_id"
+        ]
+      }
     }
   ]
 }

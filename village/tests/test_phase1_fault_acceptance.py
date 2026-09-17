@@ -287,7 +287,7 @@ class PhaseOneFaultAcceptanceTests(TestCase):
         self.assertEqual(replay_receipt.request_id, receipt.request_id)
 
         # A corrupted redelivery with a fresh request id must not create a new
-        # Outcome/Event/Outbox pair after the command is terminal.
+        # receipt/event/outcome pair after the command is terminal.
         ok, code, _ = ActionService.complete_action(
             command.command_id, uuid.uuid4(), True, ResultCode.MOVE_COMPLETED
         )
@@ -295,14 +295,17 @@ class PhaseOneFaultAcceptanceTests(TestCase):
         self.assertEqual(code, ResultCode.NPC_BUSY)
         self.assertEqual(VillageActionReceipt.objects.filter(command=command).count(), 1)
         self.assertEqual(VillageWorldEvent.objects.filter(command_id=command.command_id).count(), 1)
-        self.assertEqual(VillageDeliveryOutbox.objects.filter(command=command).count(), 2)
+        # 二跑复盘 R1：动作事件只存不投，outbox 只剩执行者的 OUTCOME。
+        self.assertEqual(VillageDeliveryOutbox.objects.filter(command=command).count(), 1)
+        self.assertFalse(VillageDeliveryOutbox.objects.filter(command=command, message_kind="EVENT").exists())
 
     def test_outbox_recovers_after_crash_before_send_and_after_send_before_ack(self):
         command, _receipt = self._start_and_complete("10011")
         entries = OutboxService.claim_pending("10011", limit=10)
         # The command sender is the single intended recipient and each result is
         # only materialized in the durable Outbox, never sent inline by complete.
-        self.assertEqual({entry["message_kind"] for entry in entries}, {"OUTCOME", "EVENT"})
+        # 二跑复盘 R1：动作事件不再投递，仅剩 OUTCOME 一种。
+        self.assertEqual({entry["message_kind"] for entry in entries}, {"OUTCOME"})
         self.assertEqual(
             {entry["delivery_id"] for entry in entries},
             {entry["envelope"]["id"] for entry in entries},
@@ -322,16 +325,16 @@ class PhaseOneFaultAcceptanceTests(TestCase):
             ok, code = OutboxService.ack_delivery(uuid.UUID(entry["delivery_id"]))
             self.assertTrue(ok, code)
         self.assertEqual(
-            VillageDeliveryOutbox.objects.filter(command=command, status="ACKED").count(), 2
+            VillageDeliveryOutbox.objects.filter(command=command, status="ACKED").count(), 1
         )
 
     def test_complete_persists_outbox_before_any_relay_claim(self):
         command, receipt = self._start_and_complete("10012")
         # Fault injection: Backend exits directly after the transaction commits.
-        # A fresh service call sees both final messages without relying on RAM.
-        self.assertEqual(VillageDeliveryOutbox.objects.filter(receipt=receipt).count(), 2)
+        # A fresh service call sees the final message without relying on RAM.
+        self.assertEqual(VillageDeliveryOutbox.objects.filter(receipt=receipt).count(), 1)
         delivered = OutboxService.claim_pending("10012", limit=10)
-        self.assertEqual(len(delivered), 2)
+        self.assertEqual(len(delivered), 1)
         self.assertTrue(all(item["envelope"]["id"] == item["delivery_id"] for item in delivered))
 
     def test_reservation_orders_multi_npc_participants_and_recovers_expired_lock(self):
@@ -433,7 +436,8 @@ class PhaseOneFaultAcceptanceTests(TestCase):
         self.assertEqual(event.event_type, "NPC_ACTION_FAILED")
 
         initial = OutboxService.claim_pending("10011", limit=10)
-        self.assertEqual({item["message_kind"] for item in initial}, {"OUTCOME", "EVENT"})
+        # 二跑复盘 R1：终态动作事件只存不投，仅剩 OUTCOME 回执。
+        self.assertEqual({item["message_kind"] for item in initial}, {"OUTCOME"})
         self.assertEqual(
             {item["delivery_id"] for item in initial},
             {item["envelope"]["id"] for item in initial},
@@ -578,7 +582,8 @@ class PhaseOneFaultAcceptanceTests(TestCase):
             15,
         )
         self.assertEqual(VillageWorldEvent.objects.filter(event_type="NPC_ACTION_COMPLETED").count(), 15)
-        self.assertEqual(VillageDeliveryOutbox.objects.filter(status="PENDING").count(), 30)
+        # 15 条 OUTCOME；动作事件不再生成投递行（R1：只存不投）。
+        self.assertEqual(VillageDeliveryOutbox.objects.filter(status="PENDING").count(), 15)
         for runtime in self.runtimes.values():
             runtime.refresh_from_db()
             self.assertEqual(runtime.action_status, "IDLE")

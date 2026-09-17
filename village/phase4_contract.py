@@ -92,55 +92,43 @@ def _positive_int(value: Any) -> bool:
     return isinstance(value, int) and not isinstance(value, bool) and value > 0
 
 
-def validate_commitment_target(commitment_type: str, target: Any) -> Dict[str, Any] | None:
-    """Return a normalized target or ``None`` for an invalid target."""
+def commitment_target_errors(commitment_type: str, target: Any) -> list[dict[str, str]]:
+    """Give the Agent field-specific errors without changing the target rules."""
     if not isinstance(target, dict):
-        return None
+        return [{"field": "target", "message": "必须是结构化对象"}]
     try:
         kind = CommitmentType(str(commitment_type).upper())
     except ValueError:
+        return [{"field": "commitment_type", "message": "不支持的承诺类型"}]
+    fields = {
+        CommitmentType.DELIVERY: {"item_id", "amount", "gold_amount"},
+        CommitmentType.REPAYMENT: {"gold_amount"},
+        CommitmentType.JOINT_WORK: {"location_code", "work_code"},
+        CommitmentType.MEETING: {"location_code"},
+    }
+    if kind is CommitmentType.DONATION:
+        if target.get("asset_kind") not in ("GOLD", "ITEM"):
+            return [{"field": "target.asset_kind", "message": "必须是GOLD或ITEM"}]
+        required = {"asset_kind", "gold_amount"} if target["asset_kind"] == "GOLD" else {"asset_kind", "item_id", "amount"}
+    else:
+        required = fields[kind]
+    errors = [{"field": f"target.{key}", "message": "缺少必填字段"} for key in sorted(required - set(target))]
+    errors += [{"field": f"target.{key}", "message": "此承诺类型不接受该字段"} for key in sorted(set(target) - required)]
+    for key in sorted(required & set(target)):
+        value = target[key]
+        if key in {"item_id", "amount", "gold_amount"} and not _positive_int(value):
+            errors.append({"field": f"target.{key}", "message": "必须是正整数"})
+        elif key == "item_id" and value not in BASE_PRICES:
+            errors.append({"field": "target.item_id", "message": "不在承诺物品白名单；请按工具schema选择"})
+        elif key in {"location_code", "work_code"} and (not isinstance(value, str) or not value.strip()):
+            errors.append({"field": f"target.{key}", "message": "必须是非空字符串"})
+    return errors
+
+
+def validate_commitment_target(commitment_type: str, target: Any) -> Dict[str, Any] | None:
+    """Return a normalized target or ``None`` for an invalid target."""
+    if commitment_target_errors(commitment_type, target):
         return None
-
-    if kind is CommitmentType.DELIVERY:
-        required = {"item_id", "amount", "gold_amount"}
-        if set(target) != required:
-            return None
-        if (
-            not _positive_int(target["item_id"])
-            or not _positive_int(target["amount"])
-            or not _positive_int(target["gold_amount"])
-            or target["item_id"] not in BASE_PRICES
-        ):
-            return None
-    elif kind is CommitmentType.REPAYMENT:
-        if set(target) != {"gold_amount"} or not _positive_int(target["gold_amount"]):
-            return None
-    elif kind is CommitmentType.DONATION:
-        if set(target) not in ({"asset_kind", "gold_amount"}, {"asset_kind", "item_id", "amount"}):
-            return None
-        if target["asset_kind"] == "GOLD":
-            if set(target) != {"asset_kind", "gold_amount"} or not _positive_int(target["gold_amount"]):
-                return None
-        elif target["asset_kind"] == "ITEM":
-            if (
-                set(target) != {"asset_kind", "item_id", "amount"}
-                or not _positive_int(target["item_id"])
-                or not _positive_int(target["amount"])
-                or target["item_id"] not in BASE_PRICES
-            ):
-                return None
-        else:
-            return None
-    elif kind is CommitmentType.JOINT_WORK:
-        if set(target) != {"location_code", "work_code"} or not all(
-            isinstance(target[key], str) and target[key].strip()
-            for key in ("location_code", "work_code")
-        ):
-            return None
-    elif kind is CommitmentType.MEETING:
-        if set(target) != {"location_code"} or not isinstance(target["location_code"], str) or not target["location_code"].strip():
-            return None
-
     return dict(target)
 
 

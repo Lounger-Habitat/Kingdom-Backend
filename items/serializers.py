@@ -19,6 +19,11 @@ class ItemSerializer(serializers.ModelSerializer):
     useEffectData = serializers.JSONField(source="use_effect_data")
     maxUseCount = serializers.IntegerField(source="max_use_count")
     isDeleted = serializers.BooleanField(source="is_deleted")
+    inventoryRules = serializers.SerializerMethodField()
+
+    def get_inventoryRules(self, obj):
+        from inventory.batches import item_rules
+        return item_rules(obj)
 
     class Meta:
         model = Item
@@ -27,6 +32,7 @@ class ItemSerializer(serializers.ModelSerializer):
             "itemUseRadius", "canPickedup", "canDropped", "canCarried",
             "itemPrice", "sellPercentage", "iconUrl", "iconImage",
             "useEffectType", "useEffectData", "maxUseCount", "isDeleted",
+            "inventoryRules",
         ]
 
     def get_iconUrl(self, obj):

@@ -15,12 +15,14 @@ from village.models import (
     PlayerStoryFactAccess,
     VillageAccount,
     VillageActionReceipt,
+    VillageDeliveryOutbox,
     VillageSimulationConfig,
     VillageStoryArc,
     VillageStoryFact,
     VillageStoryMeeting,
     VillageStoryTransitionReceipt,
     VillageStoryVote,
+    VillagePublicDecision,
     VillageWorldEvent,
 )
 from village.phase5_contract import StoryActionCode, StoryPhase, StoryPlan, StoryResultCode
@@ -36,6 +38,32 @@ from village.runtime_services import CommandService
 
 
 class PhaseFiveStoryTest(TestCase):
+    def test_wrong_emergency_opening_location_is_informational_and_durable(self):
+        self.story_arc()
+        runtime = NpcRuntimeState.objects.get(npc=self.npcs["10015"])
+        runtime.current_location_code = "EMERGENCY_TRADE_POST"
+        runtime.save(update_fields=["current_location_code"])
+        command_id, request_id = str(uuid.uuid4()), str(uuid.uuid4())
+        envelope_id = str(uuid.uuid4())
+        content = {"schema_version": "village.command.v1", "id": command_id,
+            "request_id": request_id, "name": "STORY_ACT", "params": {
+                "action_code": "CONTACT_EMERGENCY_CARAVAN", "expected_story_version": 0,
+                "route_attempt_id": str(uuid.uuid4())}, "queue_mode": "STRICT",
+            "not_before_world_minute": 0, "expires_world_minute": 120,
+            "ttl_ms": 120000, "duration_minutes": 1}
+        ok, code, command = CommandService.accept_command(envelope_id=envelope_id, sender="10015",
+            recipient="WuxiVillage", timestamp_ms=int(time.time() * 1000), content=content)
+        self.assertFalse(ok)
+        self.assertEqual(code, "STORY_LOCATION_INVALID")
+        status = CommandService.serialize_status(command)
+        self.assertEqual(status["status"], "FAILED")
+        self.assertIsNotNone(status["receipt"])
+        data = status["receipt"]["data"]
+        self.assertEqual(data["message"], "请回杂货铺开通")
+        self.assertNotIn("next_action", data)
+        self.assertNotIn("next_action_params", data)
+        self.assertEqual(VillageActionReceipt.objects.filter(command=command).count(), 1)
+
     def setUp(self):
         self.config, _ = VillageSimulationConfig.objects.update_or_create(
             config_key="default",
@@ -77,7 +105,24 @@ class PhaseFiveStoryTest(TestCase):
             phase_entered_day=0,
         )
         fact = VillageStoryFact.objects.create(arc=arc, last_progress_day=0)
+        if phase == "EXECUTION" and plan in {"BRIDGE_REPAIR", "RATION_AND_WAIT"}:
+            meeting = self.meeting(arc=arc, opened_day=0, closes_day=0, candidate_plans=[plan], status="SETTLED", selected_plan=plan)
+            self.decision = VillagePublicDecision.objects.create(meeting=meeting, plan_code=plan, terms=self.proposal_terms(plan), approved_world_minute=0, published_world_minute=0)
+            if plan == "RATION_AND_WAIT":
+                fact.ration_rules_published = True
+                fact.save(update_fields=["ration_rules_published"])
         return arc, fact
+
+    def meeting(self, **kwargs):
+        # Explicit approved-proposal fixtures; production never invents terms.
+        kwargs.setdefault("proposals", {plan: self.proposal_terms(plan) for plan in kwargs["candidate_plans"]})
+        return VillageStoryMeeting.objects.create(**kwargs)
+
+    def proposal_terms(self, plan):
+        return {"plan_code": plan, "budget_gold": 1000 if plan == "BRIDGE_REPAIR" else 0,
+                "executor_npc_id": "10012" if plan == "FOREST_ROUTE" else "10015",
+                "expires_world_minute": self.clock.world_minute + 3 * 1440,
+                "purchase_item_ids": [4003], "ration_daily_limits": {"1030": 1}}
 
     def slot(self, npc_id, item_id, amount):
         bag = NpcGlobalInventory.objects.get(npc__agent_id=npc_id)
@@ -86,6 +131,8 @@ class PhaseFiveStoryTest(TestCase):
         )
 
     def action(self, action_code, npc_id, version, **params):
+        if hasattr(self, "decision"):
+            params.setdefault("decision_id", str(self.decision.pk))
         return complete_story_action({
             "request_id": str(uuid.uuid4()),
             "npc_id": npc_id,
@@ -113,6 +160,41 @@ class PhaseFiveStoryTest(TestCase):
         self.assertEqual(disabled["result_code"], StoryResultCode.FEATURE_DISABLED.value)
         self.assertEqual(VillageStoryArc.objects.count(), 1)
 
+    def test_story_idle_notice_is_broadcast_once_per_world_day(self):
+        """二跑复盘 R3：AFTERMATH 无行动时，每世界日至多一条"自主安排"通报。"""
+        from items.models import Item
+
+        # 备足粮/工具，让 AFTERMATH 不因短缺提前推进（只按天数推进）。
+        Item.objects.update_or_create(item_id=1003, defaults={"item_type": "食物"})
+        for npc_id in ("10011", "10012", "10013", "10014", "10015"):
+            self.slot(npc_id, 1003, 20)
+        tool_bag = NpcGlobalInventory.objects.get(npc__agent_id="10012")
+        NpcGlobalInventorySlot.objects.create(
+            bag=tool_bag, slot_index=1, item_id=4001, item_amount=20, remaining_uses=20,
+        )
+
+        # bootstrap 时 AFTERMATH 无行动 → 当日一条通报，措辞是"通报"不是指令。
+        bootstrap_story()
+        notices = VillageWorldEvent.objects.filter(event_type="STORY_IDLE_NOTICE")
+        self.assertEqual(notices.count(), 1)
+        notice = notices.get()
+        self.assertIn("由你自己安排", notice.hub_summary)
+        self.assertIn("什么都不做也可以", notice.hub_summary)
+        self.assertEqual(
+            set(VillageDeliveryOutbox.objects.filter(event=notice).values_list("recipient", flat=True)),
+            {"10011", "10012", "10013", "10014", "10015", "ENV_CLIENTS"},
+        )
+
+        # 同一世界日重复日结不重复发（幂等）。
+        process_day_close(0, 1440)
+        self.assertEqual(VillageWorldEvent.objects.filter(event_type="STORY_IDLE_NOTICE").count(), 1)
+
+        # 第 1 天即满足门槛并进入下一阶段，不再发空窗通报。
+        process_day_close(1, 2 * 1440)
+        arc = VillageStoryArc.objects.get(arc_code="BROKEN_TRADE_ROUTE_V1")
+        self.assertNotEqual(arc.current_phase, "AFTERMATH")
+        self.assertEqual(VillageWorldEvent.objects.filter(event_type="STORY_IDLE_NOTICE").count(), 1)
+
     def test_unity_story_paths_return_the_frozen_snapshot(self):
         client = APIClient()
         client.force_authenticate(user=GameAccount.objects.create(username="phase5-api", password="x"))
@@ -134,7 +216,7 @@ class PhaseFiveStoryTest(TestCase):
                 "id": str(uuid.uuid4()),
                 "request_id": str(uuid.uuid4()),
                 "name": "STORY_ACT",
-                "params": {"action_code": "REPAIR_LABOR", "expected_story_version": 0, "labor_hours": 1},
+                "params": {"action_code": "DONATE_REPAIR_RESOURCES", "expected_story_version": 0, "gold_amount": 1, "decision_id": str(self.decision.pk)},
                 "queue_mode": "STRICT",
                 "not_before_world_minute": 0,
                 "expires_world_minute": 120,
@@ -146,9 +228,9 @@ class PhaseFiveStoryTest(TestCase):
         self.assertEqual(result_code, "OK")
         self.assertIsNotNone(command)
         self.assertEqual(command.status, "SUCCEEDED")
-        self.assertEqual(VillageStoryFact.objects.get().repair_labor_hours, 1)
+        self.assertEqual(VillageAccount.objects.get(account_code="PUBLIC_FUND").balance, 1)
 
-    def test_npc_fact_can_unlock_route_but_player_private_fact_cannot(self):
+    def test_historical_forest_facts_do_not_unlock_retired_route(self):
         PlayerStoryFactAccess.objects.create(player_id="player-1", fact_code="FOREST_OLD_ROUTE", unlocked_world_minute=0)
         bootstrap_story()
         arc = VillageStoryArc.objects.get()
@@ -161,17 +243,18 @@ class PhaseFiveStoryTest(TestCase):
         self.assertEqual(snapshot["facts"]["forest_route_known"], False)
         access.is_public = True
         access.save(update_fields=["is_public"])
-        self.assertEqual(get_story_snapshot()["data"]["facts"]["forest_route_known"], True)
+        self.assertEqual(get_story_snapshot()["data"]["facts"]["forest_route_known"], False)
+        self.assertTrue(NpcStoryFactAccess.objects.filter(pk=access.pk, is_public=True).exists())
 
     def test_meeting_tie_uses_player_support_then_safe_priority(self):
         arc, _ = self.story_arc(phase=StoryPhase.FIRST_COUNCIL.value, plan="")
-        meeting = VillageStoryMeeting.objects.create(
+        meeting = self.meeting(
             arc=arc, meeting_type="FIRST_COUNCIL", opened_day=0, closes_day=0,
-            candidate_plans=["BRIDGE_REPAIR", "FOREST_ROUTE", "RATION_AND_WAIT"],
+            candidate_plans=["BRIDGE_REPAIR", "RATION_AND_WAIT"],
         )
         for index, (npc_id, plan) in enumerate({
-            "10011": "BRIDGE_REPAIR", "10012": "FOREST_ROUTE", "10013": "BRIDGE_REPAIR",
-            "10014": "FOREST_ROUTE", "10015": "RATION_AND_WAIT",
+            "10011": "BRIDGE_REPAIR", "10012": "RATION_AND_WAIT", "10013": "BRIDGE_REPAIR",
+            "10014": "RATION_AND_WAIT",
         }.items()):
             result = submit_story_vote({
                 "request_id": str(uuid.uuid4()), "npc_id": npc_id,
@@ -181,15 +264,15 @@ class PhaseFiveStoryTest(TestCase):
             self.assertEqual(result["result_code"], "OK", index)
         player = submit_story_vote({
             "request_id": str(uuid.uuid4()), "expected_story_version": 0,
-            "params": {"meeting_id": str(meeting.meeting_id), "plan_code": "FOREST_ROUTE", "expected_story_version": 0},
+            "params": {"meeting_id": str(meeting.meeting_id), "plan_code": "RATION_AND_WAIT", "expected_story_version": 0},
         }, player_id="player-1")
         self.assertEqual(player["result_code"], "OK")
         settled = settle_story_meeting(meeting.meeting_id, expected_story_version=0, world_minute=0)
-        self.assertEqual(settled["data"]["plan_code"], "FOREST_ROUTE")
+        self.assertEqual(settled["data"]["plan_code"], "RATION_AND_WAIT")
 
-    def test_insufficient_attendance_retries_then_falls_back_to_ration(self):
+    def test_insufficient_attendance_cannot_invent_a_public_decision(self):
         arc, _ = self.story_arc(phase=StoryPhase.FIRST_COUNCIL.value, plan="")
-        meeting = VillageStoryMeeting.objects.create(
+        meeting = self.meeting(
             arc=arc, meeting_type="FIRST_COUNCIL", opened_day=0, closes_day=0,
             candidate_plans=["BRIDGE_REPAIR", "RATION_AND_WAIT"],
         )
@@ -198,14 +281,15 @@ class PhaseFiveStoryTest(TestCase):
         meeting.refresh_from_db()
         self.assertEqual(meeting.retry_count, 1)
         second = settle_story_meeting(meeting.meeting_id, expected_story_version=0, world_minute=1440)
-        self.assertEqual(second["data"]["plan_code"], "RATION_AND_WAIT")
+        self.assertEqual(second["result_code"], StoryResultCode.NOT_ENOUGH_ATTENDANCE.value)
         arc.refresh_from_db()
-        self.assertEqual(arc.current_plan, "RATION_AND_WAIT")
-        self.assertEqual(arc.ration_until_day, 3)
+        self.assertEqual(arc.current_plan, "")
+        self.assertIsNone(arc.ration_until_day)
+        self.assertEqual(VillagePublicDecision.objects.count(), 0)
 
     def test_ration_plan_opens_review_after_three_days(self):
         arc, _ = self.story_arc(phase=StoryPhase.FIRST_COUNCIL.value, plan="")
-        meeting = VillageStoryMeeting.objects.create(
+        meeting = self.meeting(
             arc=arc, meeting_type="FIRST_COUNCIL", opened_day=0, closes_day=0,
             candidate_plans=["RATION_AND_WAIT"],
         )
@@ -229,14 +313,14 @@ class PhaseFiveStoryTest(TestCase):
 
     def test_donation_is_atomic_idempotent_and_updates_ledger_relationship(self):
         arc, fact = self.story_arc()
-        self.slot("10011", 1003, 12)
+        self.slot("10011", 1002, 12)
         request_id = uuid.uuid4()
         payload = {
             "request_id": str(request_id), "npc_id": "10011",
             "current_location_code": "REPAIR_YARD", "expected_story_version": 0,
             "action_code": StoryActionCode.DONATE_REPAIR_RESOURCES.value,
             "params": {"action_code": StoryActionCode.DONATE_REPAIR_RESOURCES.value,
-                        "expected_story_version": 0, "item_id": 1003, "amount": 10},
+                        "expected_story_version": 0, "item_id": 1002, "amount": 10, "decision_id": str(self.decision.pk)},
         }
         first = complete_story_action(payload)
         second = complete_story_action(payload)
@@ -285,7 +369,34 @@ class PhaseFiveStoryTest(TestCase):
         self.assertEqual(replay["result_code"], StoryResultCode.ROUTE_ATTEMPT_REPLAY.value)
         self.assertEqual(VillageStoryVote.objects.count(), 0)
 
-    def test_forest_success_with_low_public_account_is_controlled_trade(self):
+    def test_contact_always_succeeds_charges_server_price_and_submits_demand(self):
+        from items.models import Item
+        from village.models import VillageCaravanRequest
+        Item.objects.update_or_create(item_id=1049, defaults={"item_name": "盐", "is_deleted": False})
+        arc, fact = self.story_arc(plan=StoryPlan.FOREST_ROUTE.value)
+        fact.forest_route_scouted = 2
+        fact.forest_route_supply = 1
+        fact.save()
+        result = self.action(StoryActionCode.CONTACT_EMERGENCY_CARAVAN.value, "10015", 0,
+            location_code="GENERAL_STORE", route_attempt_id=str(uuid.uuid4()), gold_amount=1, item_ids=[1049])
+        self.assertEqual(result["result_code"], "OK")
+        fact.refresh_from_db()
+        self.assertTrue(fact.emergency_caravan_succeeded)
+        self.assertEqual(NpcGlobalInventory.objects.get(npc__agent_id="10015").money, 900)
+        self.assertEqual(NpcRuntimeState.objects.get(npc__agent_id="10012").health_fp, 1000)
+        self.assertEqual(VillageCaravanRequest.objects.get(pk=0).item_ids, [1049])
+
+    def test_repair_material_purchase_uses_server_unit_price(self):
+        arc, fact = self.story_arc()
+        VillageAccount.objects.filter(account_code="PUBLIC_FUND").update(balance=500)
+        result = self.action(StoryActionCode.PURCHASE_REPAIR_MATERIALS.value, "10015", 0,
+            location_code="GENERAL_STORE", item_id=4003, amount=4, gold_amount=1)
+        self.assertEqual(result["result_code"], "OK")
+        fact.refresh_from_db()
+        self.assertEqual(fact.repair_metal, 4)
+        self.assertEqual(VillageAccount.objects.get(account_code="PUBLIC_FUND").balance, 300)
+
+    def test_retired_forest_progress_does_not_automatically_finish_story(self):
         arc, fact = self.story_arc(plan=StoryPlan.FOREST_ROUTE.value)
         fact.emergency_caravan_succeeded = True
         fact.public_trust = 5
@@ -293,8 +404,9 @@ class PhaseFiveStoryTest(TestCase):
         fact.save(update_fields=["emergency_caravan_succeeded", "public_trust", "last_progress_day"])
         result = process_day_close(2, 2 * 1440)
         arc.refresh_from_db()
-        self.assertEqual(result["data"]["outcome"], "CONTROLLED_TRADE")
-        self.assertTrue(arc.is_completed)
+        self.assertIsNone(result["data"]["outcome"])
+        self.assertFalse(arc.is_completed)
+        self.assertTrue(get_story_snapshot()["data"]["retired_plan"])
 
     def test_ration_limits_are_part_of_story_fact(self):
         arc, _ = self.story_arc(plan=StoryPlan.RATION_AND_WAIT.value)
@@ -337,7 +449,7 @@ class PhaseFiveStoryTest(TestCase):
         self.clock.save(update_fields=["world_minute"])
         bootstrap_story()
 
-        result = process_day_close(start_day + 3, (start_day + 3) * 1440)
+        result = process_day_close(start_day + 1, (start_day + 1) * 1440)
         arc = VillageStoryArc.objects.get()
 
         self.assertFalse(arc.is_completed)

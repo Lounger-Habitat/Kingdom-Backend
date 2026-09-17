@@ -1,6 +1,7 @@
 import uuid
 from django.conf import settings
 from django.db import models
+from inventory.components import BatchComponents, UsageFields, DishFields, ReviewFields
 from account.models import GameAccount
 from inventory.models import NpcDefinition
 
@@ -18,7 +19,7 @@ class MarketListingStatus(models.TextChoices):
     EXPIRED = "expired", "已过期"
 
 
-class MarketListing(models.Model):
+class MarketListing(BatchComponents):
     source_type = models.CharField(
         max_length=10, choices=MarketListingSource.choices, default=MarketListingSource.PLAYER
     )
@@ -49,17 +50,10 @@ class MarketListing(models.Model):
         max_length=20, choices=MarketListingStatus.choices, default=MarketListingStatus.ACTIVE
     )
 
-    item_snapshot = models.JSONField(default=dict, blank=True, help_text="完整物品实例属性快照")
+    item_snapshot = models.JSONField(default=dict, blank=True, help_text="上架时原始审计快照；菜品、点评及次数以明细表为准")
 
-    rated = models.BooleanField(default=False)
-    rating_price = models.IntegerField(default=-1)
-    overall_score = models.FloatField(default=0)
-    ingredient = models.CharField(max_length=200, default="", blank=True)
     item_bag_name = models.CharField(max_length=100, default="", blank=True)
-    cook_time = models.IntegerField(default=0)
-    dish_quality = models.IntegerField(default=3)
-    remaining_uses = models.IntegerField(null=True, blank=True)
-    review_comment = models.TextField(default="", blank=True)
+    quality = models.IntegerField(default=3)
 
     created_at = models.DateTimeField(auto_now_add=True)
     updated_at = models.DateTimeField(auto_now=True)
@@ -109,6 +103,19 @@ class MarketListing(models.Model):
         else:
             seller_name = "系统"
         return f"Listing #{self.pk} [{seller_name}] item={self.item_id} x{self.remaining_amount}/{self.total_amount} @{self.price}"
+
+    def save(self, *args, **kwargs):
+        # Import missing component inputs once at creation, including admin-created
+        # system tools. Explicit instance attributes take precedence over JSON.
+        if self._state.adding:
+            snapshot = self.item_snapshot or {}
+            for name, key in (("dish_metadata", "dishMetadata"), ("remaining_uses", "remainingUses"),
+                              ("ingredient", "ingredient"), ("cook_time", "cookTime"),
+                              ("rated", "rated"), ("rating_price", "ratingPrice"),
+                              ("overall_score", "overallScore"), ("review_comment", "reviewComment")):
+                if key in snapshot and name not in self.__dict__.get("_component_values", {}):
+                    setattr(self, name, snapshot[key])
+        return super().save(*args, **kwargs)
 
 
 class MarketTransaction(models.Model):
@@ -186,3 +193,15 @@ class MarketTransaction(models.Model):
     def __str__(self):
         buyer_id = self.buyer_id or self.buyer_npc_id
         return f"Tx #{self.pk} listing={self.listing_id} {self.amount}x @{self.unit_price} -> {buyer_id}"
+
+
+class MarketListingUsage(UsageFields):
+    owner = models.OneToOneField(MarketListing, on_delete=models.CASCADE, primary_key=True, related_name="usage")
+
+
+class MarketListingDish(DishFields):
+    owner = models.OneToOneField(MarketListing, on_delete=models.CASCADE, primary_key=True, related_name="dish")
+
+
+class MarketListingReview(ReviewFields):
+    owner = models.OneToOneField(MarketListing, on_delete=models.CASCADE, primary_key=True, related_name="review")

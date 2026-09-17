@@ -38,6 +38,11 @@ class StoryCommand(str, Enum):
 
 
 class StoryActionCode(str, Enum):
+    CALL_MEETING = "CALL_MEETING"
+    REGISTER_PROPOSAL = "REGISTER_PROPOSAL"
+    PUBLISH_DECISION = "PUBLISH_DECISION"
+    REVEAL_STORY_FACT = "REVEAL_STORY_FACT"
+    CLAIM_PUBLIC_SALARY = "CLAIM_PUBLIC_SALARY"
     MANAGE_REPAIR_LEDGER = "MANAGE_REPAIR_LEDGER"
     PURCHASE_REPAIR_MATERIALS = "PURCHASE_REPAIR_MATERIALS"
     DONATE_REPAIR_RESOURCES = "DONATE_REPAIR_RESOURCES"
@@ -60,6 +65,9 @@ class StoryResultCode(str, Enum):
     PLAN_INVALID = "STORY_PLAN_INVALID"
     FACT_NOT_UNLOCKED = "STORY_FACT_NOT_UNLOCKED"
     MEETING_NOT_OPEN = "STORY_MEETING_NOT_OPEN"
+    MEETING_NOT_FOUND = "STORY_MEETING_NOT_FOUND"
+    MEETING_NOT_STARTED = "STORY_MEETING_NOT_STARTED"
+    MEETING_CLOSED = "STORY_MEETING_CLOSED"
     MEETING_ALREADY_SETTLED = "STORY_MEETING_ALREADY_SETTLED"
     NOT_ENOUGH_ATTENDANCE = "STORY_NOT_ENOUGH_ATTENDANCE"
     VOTE_INVALID = "STORY_VOTE_INVALID"
@@ -88,16 +96,13 @@ BRIDGE_STATES = ("BROKEN", "MATERIALS_READY", "REPAIRING", "REPAIRED")
 SAFE_PLAN_PRIORITY = (
     StoryPlan.RATION_AND_WAIT.value,
     StoryPlan.BRIDGE_REPAIR.value,
-    StoryPlan.FOREST_ROUTE.value,
 )
 PLAN_REQUIRED_FACT = {
     StoryPlan.BRIDGE_REPAIR.value: None,
-    StoryPlan.FOREST_ROUTE.value: "FOREST_OLD_ROUTE",
     StoryPlan.RATION_AND_WAIT.value: None,
 }
 STORY_FACT_CODES = frozenset({
     "BRIDGE_FOUNDATION_WARNING",
-    "FOREST_OLD_ROUTE",
     "DEFERRED_BRIDGE_BUDGET",
     "BORROWED_RESERVE_SEEDS",
     "EXPENSIVE_CARAVAN_OPTION",
@@ -109,7 +114,9 @@ STORY_COMMAND_PARAM_WHITELIST = {
         "action_code", "expected_story_version", "item_id", "amount", "gold_amount",
         "labor_hours", "route_attempt_id", "segment_code", "companion_npc_id",
         "supply_item_id", "supply_amount", "limit_item_id", "daily_limit",
-        "meal_item_id", "meal_amount",
+        "meal_item_id", "meal_amount", "meal_service", "food_instance_id", "public_meal_code", "stock_source", "item_ids", "expires_world_minute",
+        "meeting_id", "plan_code", "budget_gold", "executor_npc_id", "ration_daily_limits",
+        "starts_world_minute", "decision_id", "evidence_request_id", "fact_code",
     }),
 }
 
@@ -120,9 +127,7 @@ STORY_ACTION_PLANS = {
     StoryActionCode.TRANSPORT_REPAIR_MATERIALS.value: {StoryPlan.BRIDGE_REPAIR.value},
     StoryActionCode.REPAIR_LABOR.value: {StoryPlan.BRIDGE_REPAIR.value},
     StoryActionCode.PROVIDE_REPAIR_MEAL.value: {StoryPlan.BRIDGE_REPAIR.value},
-    StoryActionCode.SCOUT_FOREST_ROUTE.value: {StoryPlan.FOREST_ROUTE.value},
-    StoryActionCode.SUPPLY_FOREST_ROUTE.value: {StoryPlan.FOREST_ROUTE.value},
-    StoryActionCode.CONTACT_EMERGENCY_CARAVAN.value: {StoryPlan.FOREST_ROUTE.value},
+    StoryActionCode.CONTACT_EMERGENCY_CARAVAN.value: {"", "BRIDGE_REPAIR", "RATION_AND_WAIT", "FOREST_ROUTE"},
     StoryActionCode.PUBLISH_RATION_RULES.value: {StoryPlan.RATION_AND_WAIT.value},
     StoryActionCode.ENABLE_STORE_LIMITS.value: {StoryPlan.RATION_AND_WAIT.value},
     StoryActionCode.PROVIDE_COMMUNITY_MEAL.value: {StoryPlan.RATION_AND_WAIT.value},
@@ -135,8 +140,6 @@ STORY_ACTION_ACTORS = {
     StoryActionCode.TRANSPORT_REPAIR_MATERIALS.value: {"10012"},
     StoryActionCode.REPAIR_LABOR.value: FORMAL_NPC_IDS,
     StoryActionCode.PROVIDE_REPAIR_MEAL.value: {"10014"},
-    StoryActionCode.SCOUT_FOREST_ROUTE.value: {"10012"},
-    StoryActionCode.SUPPLY_FOREST_ROUTE.value: FORMAL_NPC_IDS,
     StoryActionCode.CONTACT_EMERGENCY_CARAVAN.value: {"10015"},
     StoryActionCode.PUBLISH_RATION_RULES.value: {"10013"},
     StoryActionCode.ENABLE_STORE_LIMITS.value: {"10015"},
@@ -150,13 +153,24 @@ STORY_ACTION_LOCATIONS = {
     StoryActionCode.TRANSPORT_REPAIR_MATERIALS.value: {"REPAIR_YARD", "OLD_BRIDGE"},
     StoryActionCode.REPAIR_LABOR.value: {"REPAIR_YARD", "OLD_BRIDGE"},
     StoryActionCode.PROVIDE_REPAIR_MEAL.value: {"RESTAURANT"},
-    StoryActionCode.SCOUT_FOREST_ROUTE.value: {"FOREST_EDGE"},
-    StoryActionCode.SUPPLY_FOREST_ROUTE.value: {"FOREST_EDGE", "RESTAURANT"},
     StoryActionCode.CONTACT_EMERGENCY_CARAVAN.value: {"MARKET_STREET", "GENERAL_STORE"},
     StoryActionCode.PUBLISH_RATION_RULES.value: {"RECORD_HALL"},
     StoryActionCode.ENABLE_STORE_LIMITS.value: {"GENERAL_STORE"},
     StoryActionCode.PROVIDE_COMMUNITY_MEAL.value: {"RESTAURANT"},
 }
 
+ADMIN_STORY_ACTIONS = {"CALL_MEETING", "REGISTER_PROPOSAL", "PUBLISH_DECISION", "REVEAL_STORY_FACT", "CLAIM_PUBLIC_SALARY"}
+for _action in ADMIN_STORY_ACTIONS:
+    STORY_ACTION_PLANS[_action] = {plan.value for plan in StoryPlan} | {""}
+    STORY_ACTION_ACTORS[_action] = {"10013"}
+    STORY_ACTION_LOCATIONS[_action] = {"RECORD_HALL"}
+RETIRED_STORY_ACTIONS = frozenset({"SCOUT_FOREST_ROUTE", "SUPPLY_FOREST_ROUTE"})
 ALL_STORY_ACTIONS = frozenset(STORY_ACTION_PLANS)
+REPAIR_LABOR_MINUTES = 60
+
+
+def is_repair_labor(action, params):
+    return str(action).upper() == "STORY_ACT" and str((params or {}).get("action_code", "")).upper() == "REPAIR_LABOR"
+
+
 ALL_STORY_RESULT_CODES = frozenset(item.value for item in StoryResultCode)

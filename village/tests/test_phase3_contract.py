@@ -47,13 +47,14 @@ class ActionNameTest(TestCase):
     """All 24 action names must be present and stable."""
 
     def test_all_action_names_count(self):
-        self.assertEqual(len(ActionName), 24)
+        self.assertEqual(len(ActionName), 32)
 
     def test_action_name_values(self):
         expected = {
-            "PLANT", "HARVEST", "HUNT", "COOK",
+            "PLANT", "HARVEST", "HUNT", "PROCESS_GAME", "COOK",
+            "REQUEST_DISH_REVIEW", "CANCEL_DISH_REVIEW",
             "CREATE_ORDER", "CANCEL_ORDER", "START_DELIVERY",
-            "IMPORT_GOODS", "EXPORT_GOODS",
+            "IMPORT_GOODS", "EXPORT_GOODS", "CONTACT_CARAVAN", "WITHDRAW_STORE_FUNDS", "DEPOSIT_STORE_FUNDS", "WITHDRAW_STORE_ITEM", "SET_STORE_LIMITS",
             "RATE_DISH", "PUBLISH_PRICE_INDEX", "AUDIT_PUBLIC_FUND",
             "EAT", "COMMUNITY_MEAL",
             "PROPOSE_TRADE", "RESPOND_TRADE", "CANCEL_TRADE_OFFER",
@@ -179,7 +180,7 @@ class ParamWhitelistTest(TestCase):
     def test_import_goods_params(self):
         self.assertEqual(
             PARAM_WHITELIST[ActionName.IMPORT_GOODS],
-            frozenset({"item_id", "amount"}),
+            frozenset({"items", "item_id", "amount", "store_code"}),
         )
 
     def test_export_goods_params(self):
@@ -191,7 +192,7 @@ class ParamWhitelistTest(TestCase):
     def test_rate_dish_params(self):
         self.assertEqual(
             PARAM_WHITELIST[ActionName.RATE_DISH],
-            frozenset({"owner_npc_id", "food_instance_id", "score"}),
+            frozenset({"review_id", "scores", "comment", "customer_feedback"}),
         )
 
     def test_publish_price_index_params(self):
@@ -264,13 +265,16 @@ class DurationTest(TestCase):
 
     def test_all_actions_have_duration(self):
         for an in ActionName:
-            self.assertIn(an, ACTION_DURATION)
+            if an in {ActionName.HUNT, ActionName.PROCESS_GAME}:
+                self.assertNotIn(an, ACTION_DURATION)
+            else:
+                self.assertIn(an, ACTION_DURATION)
 
     def test_plant_duration(self):
         self.assertEqual(ACTION_DURATION[ActionName.PLANT], 60)
 
     def test_hunt_duration(self):
-        self.assertEqual(ACTION_DURATION[ActionName.HUNT], 120)
+        self.assertNotIn(ActionName.HUNT, ACTION_DURATION)
 
     def test_cook_duration(self):
         self.assertEqual(ACTION_DURATION[ActionName.COOK], 90)
@@ -283,19 +287,23 @@ class EnumStabilityTest(TestCase):
     """Frozen enum values must not change."""
 
     def test_plot_codes(self):
-        self.assertEqual(PLOT_CODES, ("FARM_PLOT_A", "FARM_PLOT_B", "FARM_PLOT_C"))
+        self.assertEqual(len(PLOT_CODES), 36)
+        self.assertEqual(PLOT_CODES[:3], ("FARM_PLOT_A", "FARM_PLOT_A_02", "FARM_PLOT_A_03"))
+        self.assertIn("FARM_PLOT_B", PLOT_CODES)
+        self.assertIn("FARM_PLOT_C", PLOT_CODES)
+        self.assertIn("FARM_PLOT_D_09", PLOT_CODES)
 
     def test_crop_codes(self):
-        self.assertEqual(CROP_CODES, ("CORN",))
+        self.assertEqual(CROP_CODES, ("CORN", "WHEAT", "CARROT", "POTATO"))
 
     def test_hunt_codes(self):
-        self.assertEqual(HUNT_CODES, ("HUNT_CHICKEN",))
+        self.assertEqual(HUNT_CODES, ("HUNT_ANIMALS",))
 
     def test_delivery_points(self):
         self.assertEqual(DELIVERY_POINTS, ("MARKET_STREET", "RESTAURANT", "GENERAL_STORE"))
 
     def test_recipe_whitelist(self):
-        self.assertEqual(RECIPE_WHITELIST, frozenset({2, 12}))
+        self.assertTrue({2, 3, 6, 12, 16, 27}.issubset(RECIPE_WHITELIST))
 
     def test_side_enum(self):
         self.assertEqual(Side.BUY, "BUY")
@@ -352,8 +360,8 @@ class Phase3TradeActionContractTest(TestCase):
         self.assertEqual(
             PARAM_WHITELIST[ActionName.PROPOSE_TRADE],
             frozenset({
-                "target_npc_id", "item_id", "amount", "gold_amount",
-                "conversation_id", "expected_seller_asset_version", "expires_world_minute", "commitment_id",
+                "target_npc_id", "side", "item_id", "amount", "gold_amount",
+                "conversation_id", "expected_seller_asset_version", "expires_world_minute", "commitment_id", "store_code",
             }),
         )
 
@@ -382,8 +390,9 @@ class Phase3TradeActionContractTest(TestCase):
         self.assertEqual(
             PARAM_WHITELIST[ActionName.LIST_STORE_ITEM],
             frozenset({
-                "store_code", "item_id", "amount", "price_mode", "custom_unit_price",
+                "store_code", "item_id", "amount", "price_mode", "custom_unit_price", "stock_source",
                 "expected_operator_asset_version", "expected_store_inventory_version",
+                "food_instance_id", "public_meal_code", "decision_id",
             }),
         )
 

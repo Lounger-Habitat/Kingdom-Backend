@@ -29,6 +29,7 @@ from village.models import (
 )
 from village.seed_data import (
     FORMAL_NPC_AGENT_IDS,
+    FARM_ITEM_SEEDS,
     FARM_PLOT_SEEDS,
     INITIAL_SUPPLEMENTARY_GRANTS,
     INITIAL_TOOL_GRANTS,
@@ -77,6 +78,7 @@ class Command(BaseCommand):
             "preserved_nonempty": 0,
             "test_npcs": 0,
             "farm_plots": 0,
+            "farm_items": 0,
             "village_accounts": 0,
             "tool_items": 0,
             "tool_grants": 0,
@@ -96,9 +98,12 @@ class Command(BaseCommand):
             self._seed_phase4_social(summary)
             # Phase 3 seeds
             self._seed_tool_items(summary)
+            self._seed_farm_items(summary)
             self._seed_farm_plots(summary)
             self._seed_village_accounts(summary)
             self._seed_phase3_grants(summary)
+            from village.lucy_configuration import configure_lucy
+            summary["lucy_definitions"] = configure_lucy()
             if dry_run:
                 transaction.set_rollback(True)
 
@@ -472,8 +477,37 @@ class Command(BaseCommand):
             summary["tool_items"] += 1
 
     @staticmethod
+    def _seed_farm_items(summary):
+        """Create only missing village seed items; never rewrite catalog rows."""
+        for seed in FARM_ITEM_SEEDS:
+            icon_source = Item.objects.filter(item_id=seed["icon_source_item_id"]).first()
+            defaults = {
+                "item_name": seed["item_name"],
+                "item_type": seed["item_type"],
+                "item_description": seed["item_description"],
+                "item_price": seed["item_price"],
+                "collectable": False,
+            }
+            if icon_source is not None:
+                defaults["icon_url"] = icon_source.icon_url
+                defaults["icon_image"] = icon_source.icon_image.name or None
+            item, created = Item.objects.get_or_create(
+                item_id=seed["item_id"],
+                defaults=defaults,
+            )
+            if not created and (
+                item.item_name != seed["item_name"]
+                or item.item_type != seed["item_type"]
+            ):
+                raise CommandError(
+                    f"农田种子 item {seed['item_id']} 已存在但定义不兼容: "
+                    f"{item.item_name}/{item.item_type}"
+                )
+            summary["farm_items"] += 1
+
+    @staticmethod
     def _seed_farm_plots(summary):
-        """Idempotently create the three farm plots, all EMPTY."""
+        """Idempotently create all farm cells without changing old batches."""
         for seed in FARM_PLOT_SEEDS:
             VillageFarmPlot.objects.get_or_create(
                 plot_code=seed["plot_code"],

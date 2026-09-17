@@ -1,4 +1,4 @@
-﻿import uuid
+import uuid
 import random
 from django.db import transaction
 from django.db.models import Max
@@ -18,6 +18,7 @@ from .serializers import (
     InventoryResponseSerializer, DualBagResponseSerializer, ErrorResponseSerializer,
     serialize_npc_global_bag,
 )
+from .components import BATCH_COPY_FIELDS, copy_batch_attributes, same_batch_attributes
 from items.models import Item, ItemType
 from account.env_auth import EnvServerJWTAuthentication
 from account.authentication import GameJWTAuthentication
@@ -79,6 +80,11 @@ def clear_slot_if_empty(slot):
         slot.hide_in_shop = False
         slot.remaining_uses = None
         slot.review_comment = ""
+        slot.dish_metadata = {}
+        slot.produced_world_minute = None
+        slot.expires_world_minute = None
+        slot.source_request_id = None
+        slot.freshness_unknown = False
         slot.save()
 
 
@@ -161,8 +167,10 @@ def inventory_add(request, character_id):
 
 @extend_schema(responses={200: InventoryResponseSerializer, 400: ErrorResponseSerializer})
 @api_view(["POST"])
+@transaction.atomic
 def inventory_rate(request, character_id):
     bag = get_or_create_bag(request.user, character_id)
+    bag = InventoryBag.objects.select_for_update().get(pk=bag.pk)
     instance_id = request.data.get("instanceId")
     rating_price = request.data.get("ratingPrice", 0)
     overall_score = request.data.get("overallScore", 0)
@@ -182,6 +190,7 @@ def inventory_rate(request, character_id):
         new_slot = find_empty_slot(bag)
         new_slot.item_id = slot.item_id
         new_slot.item_amount = 1
+        copy_batch_attributes(slot, new_slot)
         new_slot.rated = True
         new_slot.rating_price = rating_price
         new_slot.overall_score = overall_score
@@ -230,8 +239,10 @@ def inventory_remove(request, character_id):
 
 @extend_schema(responses={200: InventoryResponseSerializer, 400: ErrorResponseSerializer})
 @api_view(["POST"])
+@transaction.atomic
 def inventory_swap(request, character_id):
     bag = get_or_create_bag(request.user, character_id)
+    bag = InventoryBag.objects.select_for_update().get(pk=bag.pk)
     from_index = request.data.get("fromIndex")
     to_index = request.data.get("toIndex")
 
@@ -242,7 +253,7 @@ def inventory_swap(request, character_id):
     to_slot, _ = bag.slots.get_or_create(slot_index=to_index, defaults={"item_id": 0, "item_amount": 0})
 
     # Swap all fields
-    fields = ["item_id", "item_amount", "rated", "rating_price", "ingredient", "item_bag_name", "cook_time", "dish_quality", "hide_in_shop", "remaining_uses", "review_comment"]
+    fields = ["item_id", "item_amount", "item_bag_name", "hide_in_shop", *BATCH_COPY_FIELDS]
     from_vals = {f: getattr(from_slot, f) for f in fields}
     to_vals = {f: getattr(to_slot, f) for f in fields}
 
@@ -263,8 +274,10 @@ def inventory_swap(request, character_id):
 
 @extend_schema(responses={200: InventoryResponseSerializer, 400: ErrorResponseSerializer})
 @api_view(["POST"])
+@transaction.atomic
 def inventory_transfer(request, character_id):
     bag = get_or_create_bag(request.user, character_id)
+    bag = InventoryBag.objects.select_for_update().get(pk=bag.pk)
     instance_id = request.data.get("instanceId")
     amount = request.data.get("amount", 1)
     target_id = request.data.get("targetCharacterId")
@@ -277,10 +290,13 @@ def inventory_transfer(request, character_id):
         return Response(error_response("物品数量不足"), status=400)
 
     target_bag = get_or_create_bag(request.user, target_id)
+    if target_bag.pk == bag.pk:
+        return Response(error_response("不能向同一个背包转移物品"), status=400)
     is_npc_target = (target_id != "player")
 
     # Find or create target slot
-    target_slot = target_bag.slots.filter(item_id=source_slot.item_id, item_amount__gt=0).first()
+    target_slot = next((row for row in target_bag.slots.filter(item_id=source_slot.item_id, item_amount__gt=0)
+                        if same_batch_attributes(row, source_slot)), None)
     if target_slot:
         target_slot.item_amount += amount
         # 不改变已有槽位的 hide_in_shop，避免覆盖NPC预设物品的可见性
@@ -289,6 +305,7 @@ def inventory_transfer(request, character_id):
         empty = find_empty_slot(target_bag)
         empty.item_id = source_slot.item_id
         empty.item_amount = amount
+        copy_batch_attributes(source_slot, empty)
         empty.rated = source_slot.rated
         empty.rating_price = source_slot.rating_price
         empty.ingredient = source_slot.ingredient
@@ -301,6 +318,7 @@ def inventory_transfer(request, character_id):
         empty.save()
 
     source_slot.item_amount -= amount
+    source_slot.save(update_fields=["item_amount"])
     clear_slot_if_empty(source_slot)
 
     return Response(dual_bag_response(bag, target_bag))
@@ -313,29 +331,18 @@ def inventory_compact(request, character_id):
     bag = get_or_create_bag(request.user, character_id)
 
     with transaction.atomic():
-        # 收集所有有物品的槽位，按原 slot_index 排序保持相对顺序
-        filled_slots = list(bag.slots.filter(item_amount__gt=0).order_by("slot_index"))
-        # 删除所有槽位
-        bag.slots.all().delete()
-        # 用新编号重建
-        for new_index, old_slot in enumerate(filled_slots):
-            InventorySlot.objects.create(
-                bag=bag,
-                slot_index=new_index,
-                instance_id=old_slot.instance_id,
-                item_id=old_slot.item_id,
-                item_amount=old_slot.item_amount,
-                rated=old_slot.rated,
-                rating_price=old_slot.rating_price,
-                overall_score=old_slot.overall_score,
-                ingredient=old_slot.ingredient,
-                item_bag_name=old_slot.item_bag_name,
-                cook_time=old_slot.cook_time,
-                dish_quality=old_slot.dish_quality,
-                hide_in_shop=old_slot.hide_in_shop,
-                remaining_uses=old_slot.remaining_uses,
-                review_comment=old_slot.review_comment,
-            )
+        bag = InventoryBag.objects.select_for_update().get(pk=bag.pk)
+        filled_slots = list(bag.slots.select_for_update().filter(item_amount__gt=0).order_by("slot_index"))
+        bag.slots.filter(item_amount__lte=0).delete()
+        # Reindex in place: preserve parent PKs, batch IDs and component ownership.
+        # A disjoint temporary range avoids the unique (bag, slot_index) constraint.
+        temporary_start = min([0, *(row.slot_index for row in filled_slots)]) - len(filled_slots) - 1
+        for offset, row in enumerate(filled_slots):
+            row.slot_index = temporary_start + offset
+            row.save(update_fields=["slot_index"])
+        for index, row in enumerate(filled_slots):
+            row.slot_index = index
+            row.save(update_fields=["slot_index"])
 
     return Response(success_response(bag))
 
@@ -1077,17 +1084,9 @@ def _calc_rating_price(quality_price, dish_quality):
 
 
 def _calc_overall_score(scores, difficulty):
-    """计算总分（与Unity端逻辑一致）。"""
-    color = scores.get("color", 0)
-    aroma = scores.get("aroma", 0)
-    taste = scores.get("taste", 0)
-    presentation = scores.get("presentation", 0)
+    from cooking.dish_rules import overall_score
+    return overall_score(scores, difficulty, random)
 
-    base_bonus = (difficulty - 1) * 5
-    weighted = color * 0.2 + aroma * 0.2 + taste * 0.4 + presentation * 0.2
-    jitter = random.uniform(-3, 3)
-    raw = base_bonus + weighted / 10 * (100 - base_bonus) + jitter
-    return round(max(0, min(100, raw)) * 10) / 10
 
 
 def _build_judge_prompt(item_detail, slot, recipe):
@@ -1251,6 +1250,7 @@ def inventory_judge(request, character_id):
             new_slot = find_empty_slot(bag)
             new_slot.item_id = slot.item_id
             new_slot.item_amount = 1
+            copy_batch_attributes(slot, new_slot)
             new_slot.rated = True
             new_slot.rating_price = rating_price
             new_slot.overall_score = overall_score
@@ -1262,12 +1262,11 @@ def inventory_judge(request, character_id):
             new_slot.review_comment = comment
             new_slot.save()
         else:
-            InventorySlot.objects.filter(pk=slot.pk).update(
-                rated=True,
-                rating_price=rating_price,
-                overall_score=overall_score,
-                review_comment=comment,
-            )
+            slot.rated = True
+            slot.rating_price = rating_price
+            slot.overall_score = overall_score
+            slot.review_comment = comment
+            slot.save(update_fields=["rated", "rating_price", "overall_score", "review_comment"])
 
         # 扣除行动力
         player.action_points -= judge_cost
@@ -1386,6 +1385,7 @@ def inventory_judge_by_agent(request, character_id):
             new_slot = find_empty_slot(bag)
             new_slot.item_id = slot.item_id
             new_slot.item_amount = 1
+            copy_batch_attributes(slot, new_slot)
             new_slot.rated = True
             new_slot.rating_price = rating_price
             new_slot.overall_score = overall_score
@@ -1397,12 +1397,11 @@ def inventory_judge_by_agent(request, character_id):
             new_slot.review_comment = comment
             new_slot.save()
         else:
-            InventorySlot.objects.filter(pk=slot.pk).update(
-                rated=True,
-                rating_price=rating_price,
-                overall_score=overall_score,
-                review_comment=comment,
-            )
+            slot.rated = True
+            slot.rating_price = rating_price
+            slot.overall_score = overall_score
+            slot.review_comment = comment
+            slot.save(update_fields=["rated", "rating_price", "overall_score", "review_comment"])
 
         # 扣除行动力
         player.action_points -= judge_cost
@@ -1550,18 +1549,12 @@ def _character_trade_copy_slot(source_slot, target_owner, amount):
             hide_in_shop=False,
         ).exists()
 
-    existing = target_bag.slots.select_for_update().filter(
+    candidates = target_bag.slots.select_for_update().filter(
         item_id=source_slot.item_id,
         item_amount__gt=0,
-        rated=source_slot.rated,
-        rating_price=source_slot.rating_price,
-        overall_score=source_slot.overall_score,
-        ingredient=source_slot.ingredient,
-        cook_time=source_slot.cook_time,
-        dish_quality=source_slot.dish_quality,
-        remaining_uses=source_slot.remaining_uses,
-        review_comment=source_slot.review_comment,
-    ).order_by("hide_in_shop", "slot_index", "id").first()
+        quality=source_slot.quality,
+    ).order_by("hide_in_shop", "slot_index", "id")
+    existing = next((row for row in candidates if same_batch_attributes(row, source_slot)), None)
     if existing:
         existing.item_amount += amount
         # 同步模板白名单结果，同时修正历史上写错的可见性。
@@ -1582,6 +1575,7 @@ def _character_trade_copy_slot(source_slot, target_owner, amount):
 
     target.item_id = source_slot.item_id
     target.item_amount = amount
+    copy_batch_attributes(source_slot, target)
     target.rated = source_slot.rated
     target.rating_price = source_slot.rating_price
     target.overall_score = source_slot.overall_score

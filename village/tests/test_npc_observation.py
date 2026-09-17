@@ -267,7 +267,7 @@ class NpcObservationTests(TestCase):
             "/api/village/runtime/instruction-outcome",
             {
                 "request_id": "speech-activity-1", "npc_id": "10011",
-                "action": "SPEAK", "success": True,
+                "action": "SPEECH", "success": True,
                 "result_code": "DIALOGUE_SPOKEN", "world_minute": 501,
                 "time_revision": 7, "state_version": 4,
                 "params": {"conversation_id": "chat-1", "text": "你好", "end_turn": False},
@@ -278,5 +278,16 @@ class NpcObservationTests(TestCase):
 
         response = self.api_client(self.player).get("/api/village/public/npcs/10011/observation")
         command = response.data["data"]["recent_commands"][0]
-        self.assertEqual((command["name"], command["status"]), ("SPEAK", "SUCCEEDED"))
+        self.assertEqual((command["name"], command["status"]), ("SPEECH", "SUCCEEDED"))
         self.assertEqual(command["summary"], "对话发言：“你好”")
+
+    def test_retired_dialogue_receipts_remain_readable(self):
+        for index, action in enumerate(("START_DIALOGUE", "SPEAK")):
+            VillageActionReceipt.objects.create(
+                request_id=uuid.uuid4(), npc=self.npcs["10011"], action_kind=action,
+                success=True, result_code="DIALOGUE_SPOKEN", world_minute=510 + index,
+                time_revision=7, response_data={"parameters": {"text": "历史发言"}},
+            )
+        response = self.api_client(self.player).get("/api/village/public/npcs/10011/observation")
+        names = {row["name"] for row in response.data["data"]["recent_commands"]}
+        self.assertTrue({"START_DIALOGUE", "SPEAK"}.issubset(names))

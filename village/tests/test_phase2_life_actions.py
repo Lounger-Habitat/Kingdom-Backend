@@ -5,7 +5,7 @@ from django.test import TestCase, override_settings
 from game_time.models import GlobalGameTimeState
 from inventory.models import NpcDefinition, NpcGlobalInventory, NpcGlobalInventorySlot
 from items.models import Item, ItemType
-from village.models import NpcActionReservation, NpcCommandState, NpcNeedsDaySummary, NpcProfile, NpcRuntimeState, VillageActionReceipt, VillageDeliveryOutbox, VillageLocationDefinition, VillageSimulationConfig
+from village.models import NpcActionReservation, NpcCommandState, NpcNeedsDaySummary, NpcProfile, NpcRuntimeState, VillageActionReceipt, VillageDeliveryOutbox, VillageLocationDefinition, VillageSimulationConfig, VillageWorldEvent
 from village.phase2_services import LifeActionService, runtime_summary
 from village.runtime_services import CommandService, ResultCode
 
@@ -274,7 +274,8 @@ class LifeActionServiceTests(TestCase):
         self.runtime.needs_world_minute = 1410
         self.runtime.health_fp = 900
         self.runtime.save(update_fields=["needs_world_minute", "health_fp"])
-        NpcNeedsDaySummary.objects.create(npc=self.npc, day_index=0, sleep_minutes=360)
+        NpcNeedsDaySummary.objects.create(npc=self.npc, day_index=0, sleep_minutes=360,
+            longest_continuous_sleep_minutes=360, core_night_sleep_minutes=360)
         payload = self.payload(
             "EAT",
             {
@@ -295,7 +296,7 @@ class LifeActionServiceTests(TestCase):
         self.assertEqual(self.runtime.health_fp, 920)
         self.assertEqual((summary.successful_meals, summary.finalized), (1, True))
 
-    def test_exact_day_boundary_community_meal_uses_the_action_day(self):
+    def test_old_community_meal_is_rejected_even_at_day_boundary(self):
         time_state = GlobalGameTimeState.get_instance()
         time_state.world_minute = 1440
         time_state.save(update_fields=["world_minute"])
@@ -307,10 +308,10 @@ class LifeActionServiceTests(TestCase):
         payload["completion_world_minute"] = 1440
         self.arm(payload)
         result = LifeActionService.execute(payload)
-        self.assertTrue(result["success"])
+        self.assertFalse(result["success"])
+        self.assertEqual(result["result_code"], "PUBLIC_MEAL_USE_STORE")
         from village.models import VillageCommunityMealDailyUsage
-        usage = VillageCommunityMealDailyUsage.objects.get()
-        self.assertEqual(usage.day_index, 0)
+        self.assertFalse(VillageCommunityMealDailyUsage.objects.exists())
 
     def test_success_wire_envelopes_match_phase_one_shape_and_hide_internal_hash(self):
         payload = self.payload(
@@ -323,16 +324,16 @@ class LifeActionServiceTests(TestCase):
         self.assertNotIn("request_payload_sha256", result)
         self.assertEqual(result["reason_code"], "")
         outcome = VillageDeliveryOutbox.objects.get(message_kind="OUTCOME").payload
-        event = VillageDeliveryOutbox.objects.get(message_kind="EVENT").payload
         self.assertTrue({
             "schema_version", "ref_id", "original_message_id", "request_id", "npc_id",
             "success", "result_code", "world_event_id", "world_minute", "time_revision",
             "state_version", "effects",
         }.issubset(outcome))
-        self.assertTrue({
-            "schema_version", "event_id", "event_sequence", "event_type", "actor_npc_id",
-            "participant_npc_ids", "location_code", "command_id", "request_id", "public_data",
-        }.issubset(event))
+        # 二跑复盘 R1：生命动作事件不再生成投递行，事件本身仍落库存档。
+        self.assertFalse(VillageDeliveryOutbox.objects.filter(message_kind="EVENT").exists())
+        event_row = VillageWorldEvent.objects.get(event_id=outcome["world_event_id"])
+        self.assertEqual(event_row.event_type, "npc_action_completed")
+        self.assertEqual(event_row.actor_npc.agent_id, "10011")
         self.assertIsInstance(result["effects"]["items"], list)
         self.assertIsInstance(result["effects"]["relationships"], list)
         self.assertEqual(result["effects"]["needs"], {"hunger": -45.0, "energy": 5.0})
@@ -447,7 +448,12 @@ class LifeActionServiceTests(TestCase):
         receipt = VillageActionReceipt.objects.get(request_id=payload["request_id"])
         self.assertEqual((command.status, self.runtime.action_status, self.runtime.needs_world_minute, self.inventory.asset_version), ("FAILED", "IDLE", 0, 0))
         self.assertFalse(receipt.success)
-        self.assertEqual(VillageDeliveryOutbox.objects.filter(receipt=receipt).count(), 2)
+        # 二跑复盘 R1：动作事件只存不投，仅剩执行者的 OUTCOME 行。
+        self.assertEqual(VillageDeliveryOutbox.objects.filter(receipt=receipt).count(), 1)
+        self.assertEqual(
+            VillageDeliveryOutbox.objects.filter(receipt=receipt).get().message_kind,
+            "OUTCOME",
+        )
         replay = LifeActionService.execute(payload)
         self.assertFalse(replay["success"])
         self.assertEqual(replay["result_code"], ResultCode.FOOD_NOT_AVAILABLE)

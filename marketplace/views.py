@@ -9,7 +9,7 @@ from inventory.serializers import serialize_bag
 from items.models import Item
 
 from .models import MarketListing, MarketListingSource, MarketListingStatus, MarketTransaction
-from .serializers import serialize_listing, serialize_transaction, success_response, error_response
+from .serializers import serialize_listing, serialize_listings, serialize_transaction, success_response, error_response
 from . import services
 
 
@@ -105,7 +105,7 @@ def marketplace_browse(request):
     paginator = Paginator(qs, page_size)
     page_obj = paginator.get_page(page)
 
-    listings = [serialize_listing(l, request.user) for l in page_obj]
+    listings = serialize_listings(page_obj, request.user)
 
     return Response(success_response({
         "listings": listings,
@@ -155,7 +155,7 @@ def marketplace_my_listings(request):
     paginator = Paginator(qs, page_size)
     page_obj = paginator.get_page(page)
 
-    listings = [serialize_listing(l, request.user) for l in page_obj]
+    listings = serialize_listings(page_obj, request.user)
 
     return Response(success_response({
         "listings": listings,

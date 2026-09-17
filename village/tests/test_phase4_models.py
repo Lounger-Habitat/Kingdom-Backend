@@ -26,7 +26,7 @@ class PhaseFourModelSeedTest(TestCase):
         }
         GlobalGameTimeState.get_instance()
 
-    def test_seed_creates_twenty_directed_relationships_and_five_facts(self):
+    def test_seed_creates_twenty_directed_relationships_and_four_active_facts(self):
         summary = {"relationships": 0, "story_fact_access": 0, "phase4_action_configs": 0}
         command = Command()
 
@@ -42,12 +42,11 @@ class PhaseFourModelSeedTest(TestCase):
                 (edge.affinity, edge.trust, edge.obligation, edge.conflict),
                 (affinity, trust, obligation, conflict),
             )
-        self.assertEqual(NpcStoryFactAccess.objects.count(), 5)
+        self.assertEqual(NpcStoryFactAccess.objects.count(), 4)
         self.assertEqual(
             set(NpcStoryFactAccess.objects.values_list("fact_code", flat=True)),
             {
                 "BRIDGE_FOUNDATION_WARNING",
-                "FOREST_OLD_ROUTE",
                 "DEFERRED_BRIDGE_BUDGET",
                 "BORROWED_RESERVE_SEEDS",
                 "EXPENSIVE_CARAVAN_OPTION",
@@ -83,6 +82,7 @@ class PhaseFourModelSeedTest(TestCase):
         offer = VillageTradeOffer.objects.create(
             buyer_npc=self.npcs["10012"],
             seller_npc=self.npcs["10011"],
+            proposer_npc=self.npcs["10012"],
             commitment=commitment,
             item_id=1051,
             amount=1,

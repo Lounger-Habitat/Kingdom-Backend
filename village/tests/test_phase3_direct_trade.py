@@ -101,6 +101,7 @@ class DirectTradeTestBase(TestCase):
             agent_id="10015", defaults={"name": "nora"},
         )
 
+        NpcGlobalInventory.objects.get_or_create(npc=self.mark, defaults={"money":0})
         self.bill_inv, _ = NpcGlobalInventory.objects.get_or_create(
             npc=self.bill, defaults={"money": 200},
         )
@@ -138,8 +139,9 @@ class DirectTradeTestBase(TestCase):
             account_code="PUBLIC_FUND", defaults={"balance": 500, "last_closed_day_index": -1},
         )
         self.public_fund.balance = 500
+        self.public_fund.audit_opening_balance = 500
         self.public_fund.asset_version = 0
-        self.public_fund.save(update_fields=["balance", "asset_version"])
+        self.public_fund.save(update_fields=["balance", "audit_opening_balance", "asset_version"])
 
         self.store, _ = VillageStore.objects.get_or_create(
             store_code="GENERAL_STORE",
@@ -257,11 +259,13 @@ class DirectTradeTestBase(TestCase):
         )
 
     def _propose(self, buyer_id, target_id, item_id, amount, gold, location="MARKET_STREET",
-                 expires=2000, request_id=None):
+                 expires=2000, request_id=None, side=None):
         params = {
             "target_npc_id": str(target_id), "item_id": item_id, "amount": amount,
             "gold_amount": gold, "expires_world_minute": expires,
         }
+        if side is not None:
+            params["side"] = side
         return commit_economy_action(
             _payload("PROPOSE_TRADE", buyer_id, location, params, request_id)
         )
@@ -542,7 +546,7 @@ class BatchPreservationTest(DirectTradeTestBase):
 
 
 class DelistTest(DirectTradeTestBase):
-    def test_delist_returns_unsold_and_sold_not_recoverable(self):
+    def test_delist_keeps_unsold_owned_by_store(self):
         self._set_location(10015, "GENERAL_STORE")
         self._give_item(self.nora_inv, 1030, 20)
         self._list(10015, "GENERAL_STORE", 1030, 20, PriceMode.ORIGINAL)
@@ -556,13 +560,14 @@ class DelistTest(DirectTradeTestBase):
             {"listing_id": str(listing.listing_id)},
         ))
         self.assertEqual(resp["result_code"], ResultCode.OK)
-        self.assertEqual(resp["data"]["returned_amount"], 17)
+        self.assertEqual(resp["data"]["returned_amount"], 0)
 
         nora_total = sum(
             s.item_amount for s in
             NpcGlobalInventorySlot.objects.filter(bag=self.nora_inv, item_id=1030)
         )
-        self.assertEqual(nora_total, 17)
+        self.assertEqual(nora_total, 0)
+        self.assertEqual(sum(VillageStoreInventorySlot.objects.filter(store=self.store, listing__isnull=True).values_list("item_amount", flat=True)), 17)
 
         listing.refresh_from_db()
         self.assertEqual(listing.status, ListingStatus.DELISTED)
@@ -599,6 +604,8 @@ class PublicInventoryFilterTest(DirectTradeTestBase):
         self._set_location(10011, "GENERAL_STORE")
         code, data = query_store_inventory("GENERAL_STORE", 700)
         self.assertIsNone(code)
+        self.assertEqual(data["operational_status"], self.store.status)
+        self.assertEqual(data["inventory_status"], data["store_status"])
         items = {i["item_id"]: i for i in data["items"]}
         # 1056 was delisted -> excluded
         self.assertNotIn(1056, items)
@@ -616,12 +623,84 @@ class PublicInventoryFilterTest(DirectTradeTestBase):
         self.assertEqual(items[1030]["available_amount"], 0)
 
 
+class StoreInventoryStatusTest(DirectTradeTestBase):
+    """二跑复盘 R7：库存告警语义——有货即非 OUT_OF_STOCK，缺货是告警不是关门。"""
+
+    def _stock(self, item_id, amount, reserved=0, expires=None):
+        return VillageStoreInventorySlot.objects.create(
+            store=self.store, item_id=item_id, item_amount=amount,
+            reserved_amount=reserved, expires_world_minute=expires,
+        )
+
+    def test_out_of_stock_only_when_nothing_saleable(self):
+        from village.phase3_direct_trade import store_inventory_status
+
+        VillageStoreInventorySlot.objects.filter(store=self.store).delete()
+        status, available = store_inventory_status(self.store, 700)
+        self.assertEqual(status, "OUT_OF_STOCK")
+        self.assertEqual(available, {})
+
+    def test_partial_stock_is_low_stock_not_out_of_stock(self):
+        from village.phase3_direct_trade import store_inventory_status
+
+        # 只卖盐（1049）：SAFE_STOCKS 里其它 SKU 全缺 → LOW_STOCK（告警），不是关门。
+        self._stock(1049, 12)
+        status, available = store_inventory_status(self.store, 700)
+        self.assertEqual(status, "LOW_STOCK")
+        self.assertEqual(available, {1049: 12})
+
+        # 预留量从可售数扣除；全过期后回到真正的 OUT_OF_STOCK。
+        VillageStoreInventorySlot.objects.filter(store=self.store).delete()
+        self._stock(1049, 12, reserved=8)
+        status, available = store_inventory_status(self.store, 700)
+        self.assertEqual(available, {1049: 4})
+        self.assertEqual(status, "LOW_STOCK")
+
+        slot = VillageStoreInventorySlot.objects.get(store=self.store)
+        slot.expires_world_minute = 600
+        slot.save(update_fields=["expires_world_minute"])
+        status, available = store_inventory_status(self.store, 700)
+        self.assertEqual(status, "OUT_OF_STOCK")
+
+    def test_query_exposes_available_by_item(self):
+        self._stock(1049, 12)
+        code, data = query_store_inventory("GENERAL_STORE", 700)
+        self.assertIsNone(code)
+        self.assertEqual(data["inventory_status"], "LOW_STOCK")
+        self.assertEqual(data["available_by_item"], {"1049": 12})
+
+
 # ============================================================================
 # Store purchase pricing & fee split
 # ============================================================================
 
 
 class BuyPricingTest(DirectTradeTestBase):
+    def test_purchase_returns_actual_personal_food_batches_and_replay_keeps_ids(self):
+        self._setup_listing(amount=3)
+        listing = VillageStoreListing.objects.get(store=self.store, item_id=1030)
+        store_slot = VillageStoreInventorySlot.objects.get(listing=listing)
+        self._set_location(10011, "GENERAL_STORE")
+        payload = _payload("BUY_FROM_STORE", 10011, "GENERAL_STORE",
+            {"listing_id": str(listing.listing_id), "amount": 2})
+        bought = commit_economy_action(payload)
+        self.assertEqual(bought["result_code"], "OK")
+        batch = bought["data"]["purchased_batches"][0]
+        personal = NpcGlobalInventorySlot.objects.get(bag=self.bill_inv, instance_id=batch["food_instance_id"])
+        self.assertEqual(personal.item_amount, 2)
+        self.assertNotEqual(str(store_slot.instance_id), batch["food_instance_id"])
+        self.assertEqual(batch["source"], "PERSONAL_INVENTORY")
+        replay = commit_economy_action(payload)
+        self.assertEqual(replay["data"]["purchased_batches"], bought["data"]["purchased_batches"])
+        wrong = commit_economy_action(_payload("EAT", 10011, "GENERAL_STORE",
+            {"source": batch["source"], "food_instance_id": str(store_slot.instance_id)}))
+        self.assertEqual(wrong["data"]["failure_kind"], "PERSONAL_FOOD_INSTANCE_NOT_FOUND")
+        eaten = commit_economy_action(_payload("EAT", 10011, "GENERAL_STORE",
+            {"source": batch["source"], "food_instance_id": batch["food_instance_id"]}))
+        self.assertEqual(eaten["result_code"], "OK")
+        personal.refresh_from_db()
+        self.assertEqual(personal.item_amount, 1)
+
     def _setup_listing(self, amount=20, price_mode=PriceMode.ORIGINAL, custom=None):
         self._set_location(10015, "GENERAL_STORE")
         self._give_item(self.nora_inv, 1030, amount)
@@ -773,6 +852,16 @@ class TradeOfferTest(DirectTradeTestBase):
         self.assertEqual(offer.status, TradeOfferStatus.PENDING)
         self.assertEqual(offer.buyer_npc.agent_id, "10011")
         self.assertEqual(offer.seller_npc.agent_id, "10012")
+
+    def test_sell_side_maps_proposer_as_seller_and_counterparty_responds(self):
+        self._setup_seller_items()
+        resp = self._propose(10012, 10011, 1030, 2, 16, side="SELL")
+        self.assertEqual(resp["result_code"], ResultCode.OK)
+        offer = VillageTradeOffer.objects.get(offer_id=resp["data"]["offer_id"])
+        self.assertEqual(offer.proposer_npc.agent_id, "10012")
+        self.assertEqual(offer.buyer_npc.agent_id, "10011")
+        self.assertEqual(offer.seller_npc.agent_id, "10012")
+        self.assertEqual(self._respond(10011, offer.offer_id, "ACCEPT")["result_code"], ResultCode.OK)
 
     def test_propose_target_not_found(self):
         resp = self._propose(10011, 99999, 1030, 5, 40)
@@ -1050,7 +1139,7 @@ class AuditAndLedgerTest(DirectTradeTestBase):
         audit = resp["effects"]["audit"]
         self.assertTrue(audit["balance_matches"])
         # Public fund is 500 + 4 fee = 504 at recompute time (before the audit's
-        # own 1-gold Mark salary is deducted).
+        # own daily meal-reference salary is deducted).
         self.assertEqual(audit["expected_balance"], 504)
         self.assertEqual(audit["actual_balance"], 504)
 

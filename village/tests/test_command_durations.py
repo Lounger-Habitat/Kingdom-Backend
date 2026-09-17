@@ -44,14 +44,14 @@ class CommandDurationTests(TestCase):
     def test_both_modes_use_defaults_and_preserve_optional_agent_minutes(self):
         for fast in (False, True):
             with self.settings(VILLAGE_FAST_COMMAND_INTEGRATION=fast):
-                for action in ("WAIT", "EAT", "PLANT", "CREATE_COMMITMENT", "CANCEL_COMMITMENT"):
+                for action in ("EAT", "PLANT", "CREATE_COMMITMENT", "CANCEL_COMMITMENT"):
                     with self.subTest(fast=fast, action=action):
                         self.configure(action, 7)
-                        params = {"source": "COMMUNITY_MEAL"} if action == "EAT" else {}
+                        params = {"source": "PERSONAL_INVENTORY", "food_instance_id": str(uuid.uuid4())} if action == "EAT" else {}
                         ok, code, command = self.accept(self.content(action, params=params, duration_minutes=30))
                         self.assertTrue(ok, code)
                         self.assertEqual(command.duration_minutes, 7)
-                for action in ("REST", "SLEEP", "WORK_PLACEHOLDER"):
+                for action in ("WAIT", "REST", "SLEEP", "WORK_PLACEHOLDER"):
                     self.configure(action, 45)
                     for params, expected in (({}, 45), ({"duration_minutes": 75}, 75), ({"duration_minutes": 7}, 7)):
                         with self.subTest(fast=fast, action=action, params=params):

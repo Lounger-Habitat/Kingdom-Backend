@@ -124,41 +124,30 @@ def get_restaurant_status(available_dish_count: int) -> str:
 
 
 def get_store_status(world_minute: int) -> str:
-    """Return GENERAL_STORE status from the store's independent inventory.
+    """GENERAL_STORE 库存告警状态，与日间查询共用同一判定（二跑复盘 R7）。
 
-    Reads ``VillageStoreInventorySlot`` (not Nora's personal bag), excluding
-    expired batches and reserved quantities, and compares against SAFE_STOCKS.
+    只查标签；按 SKU 明细见 ``get_store_availability``。
     """
-    from .models import VillageStore, VillageStoreInventorySlot
+    from .models import VillageStore
+    from .phase3_direct_trade import store_inventory_status
 
     try:
         store = VillageStore.objects.get(store_code="GENERAL_STORE")
     except VillageStore.DoesNotExist:
-        return StoreStatus.OUT_OF_STOCK
+        return StoreStatus.OUT_OF_STOCK.value
+    return store_inventory_status(store, world_minute)[0]
 
-    available_by_item: Dict[int, int] = {}
-    for slot in VillageStoreInventorySlot.objects.filter(
-        store=store, item_amount__gt=0
-    ):
-        if slot.expires_world_minute is not None and slot.expires_world_minute <= world_minute:
-            continue
-        available = max(0, slot.item_amount - slot.reserved_amount)
-        available_by_item[slot.item_id] = available_by_item.get(slot.item_id, 0) + available
 
-    has_out = False
-    has_low = False
-    for item_id, safe in SAFE_STOCKS.items():
-        available = available_by_item.get(item_id, 0)
-        if available <= 0 and safe > 0:
-            has_out = True
-        elif 0 < available < safe:
-            has_low = True
+def get_store_availability(world_minute: int) -> Dict[int, int]:
+    """GENERAL_STORE 按 SKU 的可售数量，与 get_store_status 同一次判定。"""
+    from .models import VillageStore
+    from .phase3_direct_trade import store_inventory_status
 
-    if has_out:
-        return StoreStatus.OUT_OF_STOCK
-    if has_low:
-        return StoreStatus.LOW_STOCK
-    return StoreStatus.NORMAL
+    try:
+        store = VillageStore.objects.get(store_code="GENERAL_STORE")
+    except VillageStore.DoesNotExist:
+        return {}
+    return store_inventory_status(store, world_minute)[1]
 
 
 # ── Main day-close entry point ───────────────────────────────────────────────
@@ -261,6 +250,7 @@ def handle_day_close(
         lucy_available = _get_available_dish_count_with_expiry(day_end_minute)
         restaurant_status = get_restaurant_status(lucy_available)
         store_status = get_store_status(world_minute)
+        store_available_by_item = get_store_availability(world_minute)
 
         # Create or update restaurant state
         rest_state, _ = VillageRestaurantState.objects.update_or_create(
@@ -273,8 +263,10 @@ def handle_day_close(
         )
         all_changes["restaurant_status"] = restaurant_status
         all_changes["store_status"] = store_status
+        all_changes["store_available_by_item"] = store_available_by_item
 
         # ── Step 6: Update account and save receipt ──────────────────────────
+        account.refresh_from_db(fields=["asset_version"])
         account.last_closed_day_index = day_index
         account.asset_version += 1
         account.save(update_fields=["last_closed_day_index", "asset_version", "updated_at"])
@@ -288,6 +280,7 @@ def handle_day_close(
                 "day_end_minute": day_end_minute,
                 "restaurant_status": restaurant_status,
                 "store_status": store_status,
+                "store_available_by_item": store_available_by_item,
                 "traveler_sales": sales_result,
                 "spoilage": spoilage_result,
                 "expired": expire_result,
@@ -307,9 +300,25 @@ def handle_day_close(
             participant_npc_ids=["10013"],
             location_code="RECORD_HALL",
             request_id=request_id,
-            effects={"day_index": day_index},
+            # Keep the source of NPC money increases on the public event too.
+            # The ledger already records these values, but exposing them here
+            # makes a day-close balance change auditable from the event alone.
+            effects={
+                "day_index": day_index,
+                "traveler_sales": sales_result,
+                "external_delta": total_external_delta,
+            },
             visibility="PUBLIC",
-            public_data={"day_index": day_index, "restaurant_status": restaurant_status},
+            public_data={
+                "day_index": day_index,
+                "restaurant_status": restaurant_status,
+                "store_status": store_status,
+                "store_available_by_item": store_available_by_item,
+                "traveler_sales": sales_result,
+                "external_delta": total_external_delta,
+            },
+            player_summary="日结已完成。",
+            hub_summary="日结已完成。",
         )
         from .phase4_visibility import enqueue_event_deliveries
         enqueue_event_deliveries(event)
@@ -349,6 +358,8 @@ def handle_day_close(
                 "spoilage_count": spoilage_result.get("count", 0),
                 "traveler_sales": sales_result.get("sold", 0),
                 "traveler_revenue": sales_result.get("revenue", 0),
+                "PUBLIC_FUND": {"money": sales_result.get("fee_amount", 0)},
+                "STORE:RESTAURANT_STORE": {"money": sales_result.get("store_net_amount", 0)},
             },
             external_delta=total_external_delta,
             world_minute=world_minute,
@@ -456,41 +467,11 @@ def _spoil_food(day_end_minute: int) -> Tuple[Dict[str, Any], int]:
 
 
 def _get_available_dish_count_with_expiry(day_end_minute: int) -> int:
-    """Count Lucy's dishes that are unexpired (after day-close) and unreserved."""
-    from recipes.models import Recipe
-    from .phase3_catalog import RECIPE_WHITELIST
+    from .models import VillageStoreInventorySlot
+    from .lucy_restaurant import store_available
+    return sum(store_available(s, day_end_minute) for s in VillageStoreInventorySlot.objects.filter(
+        store_id="RESTAURANT_STORE", listing__status="ACTIVE", item_amount__gt=0))
 
-    recipe_output_ids = list(
-        Recipe.objects.filter(pk__in=RECIPE_WHITELIST).values_list("item_id", flat=True)
-    )
-    if not recipe_output_ids:
-        return 0
-
-    try:
-        inventory = NpcGlobalInventory.objects.get(npc__agent_id="10014")
-    except NpcGlobalInventory.DoesNotExist:
-        return 0
-
-    slots = NpcGlobalInventorySlot.objects.filter(
-        bag=inventory,
-        item_id__in=recipe_output_ids,
-        item_amount__gt=0,
-    )
-
-    total = 0
-    for slot in slots:
-        # Only count if NOT expired at day end
-        if slot.expires_world_minute is not None and slot.expires_world_minute <= day_end_minute:
-            continue
-        reserved = (
-            NpcTradeDelivery.objects.filter(
-                seller_slot_instance_id=slot.instance_id,
-                status=DeliveryStatus.ACTIVE,
-            ).aggregate(total=models.Sum("reserved_amount"))["total"]
-            or 0
-        )
-        total += max(0, slot.item_amount - reserved)
-    return total
 
 
 def _traveler_sales(
@@ -498,81 +479,56 @@ def _traveler_sales(
     day_end_minute: int,
     request_id: uuid.UUID,
 ) -> Tuple[Dict[str, Any], int]:
-    """Lucy restaurant: sell up to TRAVELER_MAX_SALES unexpired, unreserved
-    dishes to external travelers at recent published price.
-
-    Returns (result_dict, external_delta).
-    """
-    from recipes.models import Recipe
-    from .phase3_catalog import RECIPE_WHITELIST
-    from .phase3_asset_service import deterministic_rng
-
-    recipe_output_ids = list(
-        Recipe.objects.filter(pk__in=RECIPE_WHITELIST).values_list("item_id", flat=True)
-    )
-    if not recipe_output_ids:
-        return {"sold": 0, "revenue": 0}, 0
-
-    try:
-        lucy_inv = NpcGlobalInventory.objects.select_for_update().get(
-            npc__agent_id="10014"
-        )
-    except NpcGlobalInventory.DoesNotExist:
-        return {"sold": 0, "revenue": 0}, 0
-
-    # Get published price for the most recent published snapshot
-    published_price = _get_latest_published_price()
-
-    # FEFO order: earliest expiry first
-    slots = list(
-        NpcGlobalInventorySlot.objects.select_for_update()
-        .filter(
-            bag=lucy_inv,
-            item_id__in=recipe_output_ids,
-            item_amount__gt=0,
-        )
-        .order_by(
-            models.F("expires_world_minute").asc(nulls_last=True),
-            models.F("produced_world_minute").asc(nulls_last=True),
-            "instance_id",
-        )
-    )
-
-    sold = 0
-    revenue = 0
-
+    from .models import VillageStore, VillageStoreAccount, VillageStoreListing, VillageStoreInventorySlot
+    from .lucy_restaurant import store_available
+    from .lucy_cooking import fixed_price
+    from .phase3_direct_trade import _compute_fee
+    store = VillageStore.objects.select_for_update().filter(pk="RESTAURANT_STORE", status="OPEN").first()
+    if not store:
+        return {"sold": 0, "revenue": 0, "fee_amount": 0}, 0
+    account = VillageStoreAccount.objects.select_for_update().filter(store=store).first()
+    fund = VillageAccount.objects.select_for_update().filter(account_code="PUBLIC_FUND").first()
+    if not account or not fund:
+        return {"sold": 0, "revenue": 0, "fee_amount": 0}, 0
+    sold = gross = fees = 0
+    rows = []
+    slots = VillageStoreInventorySlot.objects.select_for_update().select_related("listing").filter(
+        store=store, listing__status="ACTIVE", listing__public_meal_code="", listing__unit_price__gt=0,
+        item_amount__gt=0).order_by(models.F("expires_world_minute").asc(nulls_last=True), "instance_id")
     for slot in slots:
+        available = store_available(slot, day_end_minute)
+        try:
+            price = fixed_price(slot.item_id, slot.item_attributes)
+            fee, net = _compute_fee(price, store.transaction_fee_bps, store.minimum_fee)
+        except ValueError:
+            continue
+        if price != slot.listing.unit_price:
+            continue
+        take = min(available, TRAVELER_MAX_SALES - sold)
+        if take <= 0:
+            continue
+        slot.item_amount -= take
+        slot.save(update_fields=["item_amount"])
+        sold += take
+        gross += take * price
+        fees += take * fee
+        rows.append({"listing_id": str(slot.listing_id), "amount": take, "unit_price": price})
+        if not any(store_available(s, day_end_minute) for s in VillageStoreInventorySlot.objects.filter(listing=slot.listing)):
+            VillageStoreListing.objects.filter(pk=slot.listing_id).update(status="SOLD_OUT")
         if sold >= TRAVELER_MAX_SALES:
             break
+    if sold:
+        account.balance += gross - fees
+        account.account_version += 1
+        account.save(update_fields=["balance", "account_version", "updated_at"])
+        fund.balance += fees
+        fund.asset_version += 1
+        fund.save(update_fields=["balance", "asset_version", "updated_at"])
+        store.inventory_version += 1
+        store.save(update_fields=["inventory_version", "updated_at"])
+    return {"sold": sold, "revenue": gross, "fee_amount": fees, "store_net_amount": gross-fees,
+            "income_account": "STORE:RESTAURANT_STORE", "sales": rows}, gross
 
-        # Skip expired dishes
-        if slot.expires_world_minute is not None and slot.expires_world_minute <= day_end_minute:
-            continue
-
-        # Skip reserved items
-        reserved = (
-            NpcTradeDelivery.objects.filter(
-                seller_slot_instance_id=slot.instance_id,
-                status=DeliveryStatus.ACTIVE,
-            ).aggregate(total=models.Sum("reserved_amount"))["total"]
-            or 0
-        )
-        available = max(0, slot.item_amount - reserved)
-        if available <= 0:
-            continue
-
-        # Sell 1 dish
-        dish_price = published_price.get(slot.item_id, BASE_PRICES.get(slot.item_id, 10))
-        slot.item_amount -= 1
-        slot.save(update_fields=["item_amount"])
-        lucy_inv.money += dish_price
-        sold += 1
-        revenue += dish_price
-
-    if sold > 0:
-        lucy_inv.save(update_fields=["money", "updated_at"])
-
-    return {"sold": sold, "revenue": revenue}, revenue
 
 
 def _get_latest_published_price() -> Dict[int, int]:
@@ -607,13 +563,8 @@ def _generate_price_snapshot(
             prices[item_id] = base_price
             continue
 
-        # Sum available inventory across all NPCs
-        total_available = 0
-        slots = NpcGlobalInventorySlot.objects.filter(
-            item_id=item_id, item_amount__gt=0
-        )
-        for slot in slots:
-            total_available += get_available_slot_amount(slot)
+        from .caravan import available_village_stock
+        total_available = available_village_stock(item_id, world_minute)
 
         prices[item_id] = calculate_price(base_price, total_available, safe_stock)
 

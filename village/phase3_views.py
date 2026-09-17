@@ -40,6 +40,8 @@ from .models import (
 from .phase3_asset_service import commit_economy_action
 from .phase3_direct_trade import _store_inventory_status, query_store_inventory
 from .phase3_contract import (
+    CROP_CODES,
+    PLOT_CODES,
     VILLAGE_ECONOMY_ACTION_V1,
     FarmPlotStatus,
     ResultCode,
@@ -220,7 +222,7 @@ def economy_store_inventory(request, store_code):
         time_state = GlobalGameTimeState.objects.filter(pk=1).first()
         world_minute = time_state.world_minute if time_state else 0
 
-        result_code, data = query_store_inventory(store_code, world_minute)
+        result_code, data = query_store_inventory(store_code, world_minute, request.query_params.get("npc_id"))
         if result_code is not None:
             return _error_response(result_code, status=200)
         return Response(
@@ -251,7 +253,7 @@ def economy_snapshot(request):
 
         # Farm plots with mature projection
         farm_plots = []
-        for plot in VillageFarmPlot.objects.order_by("plot_code"):
+        for plot in VillageFarmPlot.objects.filter(plot_code__in=PLOT_CODES).order_by("plot_code"):
             status = plot.status
             # Time projection: if GROWING and current time >= mature, report as MATURE
             if (
@@ -265,13 +267,14 @@ def economy_snapshot(request):
                     "plot_code": plot.plot_code,
                     "status": status,
                     "crop_code": plot.crop_code or "",
+                    "batch_id": str(plot.batch_id) if plot.batch_id else None,
                     "planted_world_minute": plot.planted_world_minute,
                     "mature_world_minute": plot.mature_world_minute,
                 }
             )
 
         # Prices: latest published snapshot, fallback to base prices
-        from .phase3_catalog import BASE_PRICES
+        from .phase3_catalog import BASE_PRICES, farm_crop_catalog
 
         latest_published = (
             DailyPriceSnapshot.objects.filter(status="PUBLISHED")
@@ -346,6 +349,7 @@ def economy_snapshot(request):
         stores = []
         for store in VillageStore.objects.order_by("store_code"):
             store_account = VillageStoreAccount.objects.filter(store=store).first()
+            inventory_status = _store_inventory_status(store, world_minute)
             stores.append({
                 "store_code": store.store_code,
                 "location_code": store.location_code,
@@ -353,7 +357,8 @@ def economy_snapshot(request):
                     str(store.operator_npc.agent_id) if store.operator_npc else None
                 ),
                 "operational_status": store.status,
-                "store_status": _store_inventory_status(store, world_minute),
+                "inventory_status": inventory_status,
+                "store_status": inventory_status,
                 "inventory_version": store.inventory_version,
                 "account_version": store_account.account_version if store_account else 0,
                 "audit": {
@@ -371,6 +376,7 @@ def economy_snapshot(request):
                 "offer_id",
                 "buyer_npc__agent_id",
                 "seller_npc__agent_id",
+                "proposer_npc__agent_id", "buying_store_id", "location_code",
                 "item_id",
                 "amount",
                 "gold_amount",
@@ -384,6 +390,10 @@ def economy_snapshot(request):
                     "offer_id": str(o["offer_id"]),
                     "buyer_npc_id": str(o["buyer_npc__agent_id"]),
                     "seller_npc_id": str(o["seller_npc__agent_id"]),
+                    "proposer_npc_id": str(o["proposer_npc__agent_id"]),
+                    "side": "BUY" if o["proposer_npc__agent_id"] == o["buyer_npc__agent_id"] else "SELL",
+                    "store_code": o["buying_store_id"],
+                    "location_code": o["location_code"],
                     "item_id": o["item_id"],
                     "amount": o["amount"],
                     "gold_amount": o["gold_amount"],
@@ -393,15 +403,25 @@ def economy_snapshot(request):
             ],
         }
 
+        from .caravan import projection
         return Response(
             {
                 "success": True,
                 "data": {
+                    "caravan": projection(world_minute),
                     "world_minute": world_minute,
                     "last_closed_day_index": last_closed_day_index,
+                    "allowed_plot_codes": list(PLOT_CODES),
+                    "allowed_crop_codes": list(CROP_CODES),
+                    "crop_catalog": farm_crop_catalog(),
                     "farm_plots": farm_plots,
                     "prices": prices,
                     "restaurant_status": restaurant_status,
+                    "operational_status": (
+                        VillageStore.objects.filter(store_code="GENERAL_STORE")
+                        .values_list("status", flat=True).first()
+                    ),
+                    "inventory_status": store_status,
                     "store_status": store_status,
                     "open_orders": open_orders,
                     "active_deliveries": active_deliveries,

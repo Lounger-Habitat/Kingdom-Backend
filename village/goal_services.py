@@ -34,7 +34,8 @@ def _state_data(state: NpcSubjectiveGoalState | None) -> dict:
             "goal_version": state.goal_version,
             "updated_world_minute": state.updated_world_minute,
         }
-    return {"subjective_goal": goal, "goal_version": state.goal_version}
+    return {"subjective_goal": goal, "goal_version": state.goal_version,
+            "goal_id": str(state.goal_id) if state.goal_id else None, "goal_status": state.status}
 
 
 def _payload_hash(envelope: Mapping[str, Any]) -> str:

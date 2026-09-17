@@ -23,6 +23,8 @@ from marketplace.services import (
 
 class MarketplaceNpcSupportTests(TestCase):
     def setUp(self):
+        from game_time.models import GlobalGameTimeState
+        GlobalGameTimeState.get_instance()
         self.item = Item.objects.create(item_id=9001, item_name="测试苹果", item_type=ItemType.INGREDIENT)
 
         self.player_seller = GameAccount.objects.create(username="seller", password="x")

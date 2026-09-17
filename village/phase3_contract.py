@@ -17,12 +17,20 @@ class ActionName(str, Enum):
     PLANT = "PLANT"
     HARVEST = "HARVEST"
     HUNT = "HUNT"
+    PROCESS_GAME = "PROCESS_GAME"
     COOK = "COOK"
     CREATE_ORDER = "CREATE_ORDER"
     CANCEL_ORDER = "CANCEL_ORDER"
     START_DELIVERY = "START_DELIVERY"
+    CONTACT_CARAVAN = "CONTACT_CARAVAN"
+    WITHDRAW_STORE_FUNDS = "WITHDRAW_STORE_FUNDS"
+    DEPOSIT_STORE_FUNDS = "DEPOSIT_STORE_FUNDS"
+    WITHDRAW_STORE_ITEM = "WITHDRAW_STORE_ITEM"
+    SET_STORE_LIMITS = "SET_STORE_LIMITS"
     IMPORT_GOODS = "IMPORT_GOODS"
     EXPORT_GOODS = "EXPORT_GOODS"
+    REQUEST_DISH_REVIEW = "REQUEST_DISH_REVIEW"
+    CANCEL_DISH_REVIEW = "CANCEL_DISH_REVIEW"
     RATE_DISH = "RATE_DISH"
     PUBLISH_PRICE_INDEX = "PUBLISH_PRICE_INDEX"
     AUDIT_PUBLIC_FUND = "AUDIT_PUBLIC_FUND"
@@ -171,19 +179,27 @@ class TradeOfferStatus(str, Enum):
 
 
 # ── Plot codes ─────────────────────────────────────────────────────
-PLOT_CODES = ("FARM_PLOT_A", "FARM_PLOT_B", "FARM_PLOT_C")
+PLOT_CODES = tuple(
+    code
+    for region in ("A", "B", "C", "D")
+    for code in (
+        # Keep the legacy A/B/C codes as the first cell of their region.
+        ([f"FARM_PLOT_{region}"] if region != "D" else ["FARM_PLOT_D_01"])
+        + [f"FARM_PLOT_{region}_{index:02d}" for index in range(2, 10)]
+    )
+)
 
 # ── Crop codes ─────────────────────────────────────────────────────
-CROP_CODES = ("CORN",)
+CROP_CODES = ("CORN", "WHEAT", "CARROT", "POTATO")
 
 # ── Hunt codes ─────────────────────────────────────────────────────
-HUNT_CODES = ("HUNT_CHICKEN",)
+HUNT_CODES = ("HUNT_ANIMALS",)
 
 # ── Delivery points ────────────────────────────────────────────────
 DELIVERY_POINTS = ("MARKET_STREET", "RESTAURANT", "GENERAL_STORE")
 
 # ── Recipe whitelist ───────────────────────────────────────────────
-RECIPE_WHITELIST = frozenset({2, 12})
+from .phase3_catalog import RECIPE_WHITELIST
 
 # ── Score range ────────────────────────────────────────────────────
 SCORE_MIN = 1
@@ -195,20 +211,28 @@ ACTOR_WHITELIST = {
     ActionName.PLANT: {"10011"},
     ActionName.HARVEST: {"10011"},
     ActionName.HUNT: {"10012"},
+    ActionName.PROCESS_GAME: {"10012"},
     ActionName.COOK: {"10014"},
     ActionName.CREATE_ORDER: {"10011", "10012", "10014", "10015"},
     ActionName.CANCEL_ORDER: set(),  # any NPC who owns the order
     ActionName.START_DELIVERY: set(),  # seller of the delivery
+    ActionName.CONTACT_CARAVAN: {"10015"},
+    ActionName.WITHDRAW_STORE_FUNDS: {"10014", "10015"},
+    ActionName.DEPOSIT_STORE_FUNDS: {"10015"},
+    ActionName.WITHDRAW_STORE_ITEM: {"10015"},
+    ActionName.SET_STORE_LIMITS: {"10015"},
     ActionName.IMPORT_GOODS: {"10015"},
     ActionName.EXPORT_GOODS: {"10015"},
+    ActionName.REQUEST_DISH_REVIEW: {"10014"},
+    ActionName.CANCEL_DISH_REVIEW: {"10014"},
     ActionName.RATE_DISH: {"10013"},
     ActionName.PUBLISH_PRICE_INDEX: {"10013"},
     ActionName.AUDIT_PUBLIC_FUND: {"10013"},
     ActionName.EAT: set(),  # any NPC
     ActionName.COMMUNITY_MEAL: set(),  # any NPC
     ActionName.PROPOSE_TRADE: set(),  # any formal NPC
-    ActionName.RESPOND_TRADE: set(),  # runtime-validated as the offer seller
-    ActionName.CANCEL_TRADE_OFFER: set(),  # runtime-validated as the offer buyer
+    ActionName.RESPOND_TRADE: set(),  # runtime-validated as the non-proposer
+    ActionName.CANCEL_TRADE_OFFER: set(),  # runtime-validated as the proposer
     ActionName.LIST_STORE_ITEM: {"10014", "10015"},  # store operators only
     ActionName.UPDATE_STORE_PRICE: {"10014", "10015"},
     ActionName.DELIST_STORE_ITEM: {"10014", "10015"},
@@ -225,12 +249,20 @@ LOCATION_REQUIREMENTS = {
     ActionName.PLANT: "BILL_FARM",
     ActionName.HARVEST: "BILL_FARM",
     ActionName.HUNT: "HUNTING_GATE",
+    ActionName.PROCESS_GAME: "BUTCHER_YARD",
     ActionName.COOK: "RESTAURANT",
     ActionName.CREATE_ORDER: None,  # any valid location
     ActionName.CANCEL_ORDER: None,
     ActionName.START_DELIVERY: None,  # validated against delivery_point_code
-    ActionName.IMPORT_GOODS: "TRADE_ROAD",
-    ActionName.EXPORT_GOODS: "TRADE_ROAD",
+    ActionName.CONTACT_CARAVAN: "GENERAL_STORE",
+    ActionName.WITHDRAW_STORE_FUNDS: None,
+    ActionName.DEPOSIT_STORE_FUNDS: "GENERAL_STORE",
+    ActionName.WITHDRAW_STORE_ITEM: "GENERAL_STORE",
+    ActionName.SET_STORE_LIMITS: "GENERAL_STORE",
+    ActionName.IMPORT_GOODS: None,
+    ActionName.EXPORT_GOODS: None,
+    ActionName.REQUEST_DISH_REVIEW: "RECORD_HALL",
+    ActionName.CANCEL_DISH_REVIEW: None,
     ActionName.RATE_DISH: "RECORD_HALL",
     ActionName.PUBLISH_PRICE_INDEX: "RECORD_HALL",
     ActionName.AUDIT_PUBLIC_FUND: "RECORD_HALL",
@@ -252,13 +284,19 @@ LOCATION_REQUIREMENTS = {
 ACTION_DURATION = {
     ActionName.PLANT: 60,
     ActionName.HARVEST: 90,
-    ActionName.HUNT: 120,
     ActionName.COOK: 90,
     ActionName.CREATE_ORDER: 1,
     ActionName.CANCEL_ORDER: 1,
     ActionName.START_DELIVERY: 1,
-    ActionName.IMPORT_GOODS: 120,
-    ActionName.EXPORT_GOODS: 120,
+    ActionName.CONTACT_CARAVAN: 1,
+    ActionName.WITHDRAW_STORE_FUNDS: 1,
+    ActionName.DEPOSIT_STORE_FUNDS: 1,
+    ActionName.WITHDRAW_STORE_ITEM: 1,
+    ActionName.SET_STORE_LIMITS: 1,
+    ActionName.IMPORT_GOODS: 10,
+    ActionName.EXPORT_GOODS: 10,
+    ActionName.REQUEST_DISH_REVIEW: 1,
+    ActionName.CANCEL_DISH_REVIEW: 1,
     ActionName.RATE_DISH: 30,
     ActionName.PUBLISH_PRICE_INDEX: 30,
     ActionName.AUDIT_PUBLIC_FUND: 30,
@@ -278,9 +316,15 @@ ACTION_DURATION = {
 
 # ── Param whitelists per action ────────────────────────────────────
 PARAM_WHITELIST = {
+    ActionName.CONTACT_CARAVAN: frozenset({"item_ids"}),
+    ActionName.WITHDRAW_STORE_FUNDS: frozenset({"store_code", "amount", "expected_account_version"}),
+    ActionName.DEPOSIT_STORE_FUNDS: frozenset({"store_code", "amount"}),
+    ActionName.WITHDRAW_STORE_ITEM: frozenset({"store_code", "item_id", "amount"}),
+    ActionName.SET_STORE_LIMITS: frozenset({"store_code", "item_id", "daily_limit", "expires_world_minute"}),
     ActionName.PLANT: frozenset({"plot_code", "crop_code", "expected_asset_version"}),
     ActionName.HARVEST: frozenset({"plot_code", "expected_asset_version"}),
     ActionName.HUNT: frozenset({"hunt_code", "expected_asset_version"}),
+    ActionName.PROCESS_GAME: frozenset({"prey_instance_id", "expected_asset_version"}),
     ActionName.COOK: frozenset({"recipe_id", "expected_asset_version"}),
     ActionName.CREATE_ORDER: frozenset({
         "side", "item_id", "amount", "unit_price",
@@ -292,22 +336,27 @@ PARAM_WHITELIST = {
         "delivery_id", "buyer_npc_id", "seller_npc_id",
         "delivery_point_code",
     }),
-    ActionName.IMPORT_GOODS: frozenset({"item_id", "amount"}),
+    # ``items`` is the current multi-item form; the scalar fields remain
+    # accepted for deployed clients that still send one item per command.
+    ActionName.IMPORT_GOODS: frozenset({"items", "item_id", "amount"}),
     ActionName.EXPORT_GOODS: frozenset({"item_id", "amount", "expected_asset_version"}),
-    ActionName.RATE_DISH: frozenset({"owner_npc_id", "food_instance_id", "score"}),
+    ActionName.REQUEST_DISH_REVIEW: frozenset({"food_instance_id"}),
+    ActionName.CANCEL_DISH_REVIEW: frozenset({"review_id"}),
+    ActionName.RATE_DISH: frozenset({"review_id", "scores", "comment", "customer_feedback"}),
     ActionName.PUBLISH_PRICE_INDEX: frozenset({"day_index"}),
     ActionName.AUDIT_PUBLIC_FUND: frozenset({"day_index"}),
     ActionName.EAT: frozenset({"source", "food_instance_id", "expected_asset_version"}),
     ActionName.COMMUNITY_MEAL: frozenset({"expected_asset_version"}),
     ActionName.PROPOSE_TRADE: frozenset({
-        "target_npc_id", "item_id", "amount", "gold_amount",
+        "target_npc_id", "side", "item_id", "amount", "items", "gold_amount",
         "conversation_id", "expected_seller_asset_version", "expires_world_minute",
-        "commitment_id",
+        "commitment_id", "store_code",
     }),
     ActionName.RESPOND_TRADE: frozenset({"offer_id", "decision"}),
     ActionName.CANCEL_TRADE_OFFER: frozenset({"offer_id"}),
     ActionName.LIST_STORE_ITEM: frozenset({
-        "store_code", "item_id", "amount", "price_mode", "custom_unit_price",
+        "food_instance_id", "public_meal_code", "decision_id",
+        "store_code", "item_id", "amount", "price_mode", "custom_unit_price", "stock_source",
         "expected_operator_asset_version", "expected_store_inventory_version",
     }),
     ActionName.UPDATE_STORE_PRICE: frozenset({

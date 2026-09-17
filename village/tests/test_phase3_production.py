@@ -21,7 +21,7 @@ from village.models import (
     VillageSimulationConfig,
 )
 from village.phase3_asset_service import commit_economy_action
-from village.phase3_catalog import HUNT_MEAT_ITEM_IDS
+from village.phase3_catalog import CORN_GROWTH_MINUTES, HUNT_MEAT_ITEM_IDS
 from village.phase3_contract import (
     VILLAGE_ECONOMY_ACTION_V1,
     ResultCode,
@@ -47,6 +47,8 @@ class ProductionTestBase(TestCase):
     """Shared setUp: config, time, NPCs, inventories, tools, seeds, plots."""
 
     def setUp(self):
+        from items.models import Item
+        Item.objects.get_or_create(item_id=1053, defaults={"item_name": "辣子鸡丁", "item_type": "食物", "item_price": 27, "sell_percentage": 1})
         VillageSimulationConfig.objects.create(
             config_key="default", village_economy_enabled=True,
         )
@@ -146,14 +148,23 @@ class ProductionTestBase(TestCase):
         ))
 
     def _hunt(self, **overrides):
+        # Compatibility fixture: a formal HUNT accepted before animal production.
+        from village.models import NpcCommandState
         params = {
             "hunt_code": "HUNT_CHICKEN",
             "expected_asset_version": self.jack_inv.asset_version,
         }
         params.update(overrides.pop("params", {}))
-        return commit_economy_action(_payload(
+        payload = _payload(
             "HUNT", 10012, "HUNTING_GATE", params, **overrides,
-        ))
+        )
+        cmd = NpcCommandState.objects.create(
+            command_id=payload['command_id'], request_id=payload['request_id'], message_id=payload['message_id'],
+            npc=self.jack, kind='HUNT', status='RUNNING', sanitized_parameters=params,
+            started_world_minute=695, duration_minutes=5, production_state={},
+        )
+        self.jack_rt.active_command_id=cmd.command_id;self.jack_rt.needs_world_minute=695;self.jack_rt.save()
+        return commit_economy_action(payload)
 
     def _cook(self, recipe_id=2, **overrides):
         params = {
@@ -183,14 +194,31 @@ class PlantSuccessTest(ProductionTestBase):
 
         # Tool durability decreased
         self.bill_farm_tool.refresh_from_db()
-        self.assertEqual(self.bill_farm_tool.remaining_uses, 19)
+        slots = list(self.bill_inv.slots.filter(item_id=4001))
+        self.assertEqual(sum(row.item_amount for row in slots), 5)
+        self.assertEqual(sum(row.item_amount * row.remaining_uses for row in slots), 99)
 
         # Plot created
         plot = VillageFarmPlot.objects.get(plot_code="FARM_PLOT_A")
         self.assertEqual(plot.status, "GROWING")
         self.assertIsNotNone(plot.batch_id)
-        self.assertEqual(plot.mature_world_minute, 700 + 2880)
+        self.assertEqual(plot.mature_world_minute, 700 + CORN_GROWTH_MINUTES)
         self.assertIsNotNone(plot.yield_seed)
+
+    def test_plant_uses_selected_crop_rule_on_independent_cell(self):
+        NpcGlobalInventorySlot.objects.create(
+            bag=self.bill_inv, slot_index=2, item_id=29301, item_amount=2,
+        )
+        resp = self._plant(params={
+            "plot_code": "FARM_PLOT_A_02",
+            "crop_code": "WHEAT",
+        })
+
+        self.assertEqual(resp["result_code"], ResultCode.OK)
+        plot = VillageFarmPlot.objects.get(plot_code="FARM_PLOT_A_02")
+        self.assertEqual(plot.crop_code, "WHEAT")
+        self.assertEqual(resp["effects"]["plot"]["crop_code"], "WHEAT")
+        self.assertEqual(resp["effects"]["items_consumed"], [{"item_id": 29301, "amount": 1}])
 
 
 class PlantFailureTest(ProductionTestBase):
@@ -238,9 +266,10 @@ class HarvestSuccessTest(ProductionTestBase):
         # Plant first
         plant_resp = self._plant()
         self.assertEqual(plant_resp["result_code"], ResultCode.OK)
+        planted_batch_id = plant_resp["effects"]["plot"]["batch_id"]
 
         # Advance time past maturity
-        self.time.world_minute = 700 + 2880
+        self.time.world_minute = 700 + CORN_GROWTH_MINUTES
         self.time.save(update_fields=["world_minute"])
 
         # Refresh asset version
@@ -270,12 +299,19 @@ class HarvestSuccessTest(ProductionTestBase):
 
         # Tool durability decreased (plant used 1, harvest used 1)
         self.bill_farm_tool.refresh_from_db()
-        self.assertEqual(self.bill_farm_tool.remaining_uses, 18)
+        slots = list(self.bill_inv.slots.filter(item_id=4001))
+        self.assertEqual(sum(row.item_amount for row in slots), 5)
+        self.assertEqual(sum(row.item_amount * row.remaining_uses for row in slots), 98)
 
         # Plot cleared
         plot = VillageFarmPlot.objects.get(plot_code="FARM_PLOT_A")
         self.assertEqual(plot.status, "EMPTY")
         self.assertIsNone(plot.batch_id)
+        harvested = resp["effects"]["plot"]
+        self.assertEqual(harvested["harvested_crop_code"], "CORN")
+        self.assertEqual(harvested["harvested_batch_id"], planted_batch_id)
+        self.assertEqual(harvested["harvested_by_npc_id"], "10011")
+        self.assertEqual(harvested["output"]["item_id"], 1030)
 
 
 class HarvestFailureTest(ProductionTestBase):
@@ -287,7 +323,7 @@ class HarvestFailureTest(ProductionTestBase):
 
     def test_harvest_wrong_npc(self):
         self._plant()
-        self.time.world_minute = 700 + 2880
+        self.time.world_minute = 700 + CORN_GROWTH_MINUTES
         self.time.save(update_fields=["world_minute"])
 
         resp = commit_economy_action(_payload(
@@ -298,7 +334,7 @@ class HarvestFailureTest(ProductionTestBase):
 
     def test_harvest_location_is_deferred_to_unity(self):
         self._plant()
-        self.time.world_minute = 700 + 2880
+        self.time.world_minute = 700 + CORN_GROWTH_MINUTES
         self.time.save(update_fields=["world_minute"])
         self.bill_inv.refresh_from_db()
 
@@ -334,7 +370,9 @@ class HuntSuccessTest(ProductionTestBase):
 
         # Tool durability decreased
         self.jack_hunt_tool.refresh_from_db()
-        self.assertEqual(self.jack_hunt_tool.remaining_uses, 14)
+        slots = list(self.jack_inv.slots.filter(item_id=4002))
+        self.assertEqual(sum(row.item_amount for row in slots), 3)
+        self.assertEqual(sum(row.item_amount * row.remaining_uses for row in slots), 44)
 
 
 class HuntFailureTest(ProductionTestBase):
@@ -345,12 +383,12 @@ class HuntFailureTest(ProductionTestBase):
         ))
         self.assertEqual(resp["result_code"], ResultCode.P3_FORBIDDEN_ACTOR)
 
-    def test_hunt_location_is_deferred_to_unity(self):
+    def test_hunt_without_formal_command_rejected_even_with_reported_location(self):
         resp = commit_economy_action(_payload(
             "HUNT", 10012, "VILLAGE_SQUARE",
             {"hunt_code": "HUNT_CHICKEN", "expected_asset_version": 0},
         ))
-        self.assertEqual(resp["result_code"], ResultCode.OK)
+        self.assertEqual(resp["result_code"], "PRODUCTION_COMMAND_REQUIRED")
 
     def test_hunt_health_too_low(self):
         self.jack_rt.health_fp = 200
@@ -402,7 +440,8 @@ class CookSuccessTest(ProductionTestBase):
         )
         self.assertTrue(dish_slots.exists())
         dish = dish_slots.first()
-        self.assertEqual(dish.dish_quality, 3)
+        self.assertIn(dish.dish_quality, range(2, 7))
+        self.assertEqual(dish.dish_metadata["base_quality"], 3)
         self.assertFalse(dish.rated)
         self.assertEqual(dish.expires_world_minute, 700 + 2880)
 
@@ -487,7 +526,7 @@ class ConcurrentOpsTest(ProductionTestBase):
     def test_two_harvests_on_same_plot_second_fails(self):
         """First HARVEST succeeds; second sees EMPTY plot and fails."""
         self._plant()
-        self.time.world_minute = 700 + 2880
+        self.time.world_minute = 700 + CORN_GROWTH_MINUTES
         self.time.save(update_fields=["world_minute"])
         self.bill_inv.refresh_from_db()
 

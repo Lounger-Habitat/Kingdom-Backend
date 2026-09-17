@@ -18,6 +18,37 @@ ENV_CLIENTS = "ENV_CLIENTS"
 VISIBILITIES = {"PUBLIC", "PARTICIPANTS", "PRESENT", "PLAYER_PRIVATE", "SYSTEM"}
 SAFE_PUBLIC_VALUE = re.compile(r"[A-Za-z0-9_-]{1,64}")
 
+# 二跑复盘（R1 回声 / R7 视觉静默）：动作类终态事件对执行者本人是回声
+# （本人已通过 OUTCOME 通道收到完整结果），对他人当前只有低价值噪声。
+# 事件本身仍落库 VillageWorldEvent（存档完整）；这里只关掉投递。
+# 后续需要"见证者 + 客户端"广播时改回 False 并恢复投递断言即可，无需迁移。
+# ponytail: 单布尔开关是刻意简化；将来要分事件族恢复时再拆成白名单表。
+SUPPRESS_ACTION_EVENT_DELIVERY = True
+SUPPRESSED_ACTION_EVENT_TYPES = {
+    "NPC_ACTION_COMPLETED",
+    "NPC_ACTION_FAILED",
+    "NPC_ACTION_INTERRUPTED",
+    "DIALOGUE_SETTLED",
+}
+TRADE_EVENT_TYPES = {
+    "ECONOMY_PROPOSE_TRADE",
+    "ECONOMY_RESPOND_TRADE",
+    "ECONOMY_CANCEL_TRADE_OFFER",
+}
+REVIEW_EVENT_TYPES = {"ECONOMY_REQUEST_DISH_REVIEW", "ECONOMY_CANCEL_DISH_REVIEW", "ECONOMY_RATE_DISH"}
+STORE_SALE_EVENT = "ECONOMY_BUY_FROM_STORE"
+
+
+def _is_action_event(event: VillageWorldEvent) -> bool:
+    # phase1/phase3 用大写 NPC_ACTION_*，phase2 生命动作历史用 npc_action_* 小写，统一归一后判断。
+    event_type = str(getattr(event, "event_type", "") or "").upper()
+    # Direct trade events are participant notifications, not actor echoes.
+    # Their own recipient projection below deliberately excludes the actor.
+    return (
+        (event_type.startswith("ECONOMY_") and event_type not in TRADE_EVENT_TYPES | REVIEW_EVENT_TYPES | {STORE_SALE_EVENT})
+        or event_type in SUPPRESSED_ACTION_EVENT_TYPES
+    )
+
 
 def _ids(values: Iterable[Any] | None) -> list[str]:
     return [str(value) for value in (values or []) if value is not None]
@@ -120,15 +151,37 @@ def event_payload(event: VillageWorldEvent, recipient: str | None = None) -> dic
 
 
 def _recipients(event: VillageWorldEvent) -> list[str]:
+    if SUPPRESS_ACTION_EVENT_DELIVERY and _is_action_event(event):
+        return []
     visibility = _visibility(event)
     participants = _ids(getattr(event, "participant_npc_ids", []))
     witnesses = _ids(getattr(event, "witness_npc_ids", []))
     players = _ids(getattr(event, "player_ids", []))
 
-    if visibility == "PUBLIC":
+    if event.event_type == STORE_SALE_EVENT:
+        # Older purchase events were public actor echoes, not operator receipts.
+        # Do not turn that historical data into new village-wide broadcasts.
+        if visibility != "PARTICIPANTS":
+            return []
+        actor_id = str(event.actor_npc.agent_id) if event.actor_npc else None
+        return list(dict.fromkeys(p for p in participants if p != actor_id))
+
+    if visibility == "PUBLIC" and event.event_type == "ECONOMY_AUDIT_PUBLIC_FUND":
+        effects = getattr(event, "effects", {}) or {}
+        audit = effects.get("audit") if isinstance(effects, dict) else None
+        recipients = [str(event.actor_npc.agent_id)] if (
+            isinstance(audit, dict) and audit.get("balance_matches") is True and event.actor_npc
+        ) else list(FORMAL_NPC_IDS)
+    elif visibility == "PUBLIC" and event.event_type in {"ECONOMY_EAT", "ECONOMY_HUNT"}:
+        actor = [str(event.actor_npc.agent_id)] if event.actor_npc else []
+        recipients = list(dict.fromkeys(actor + participants + witnesses))
+    elif visibility == "PUBLIC":
         recipients = list(FORMAL_NPC_IDS)
     elif visibility == "PARTICIPANTS":
         recipients = participants
+        if event.event_type in TRADE_EVENT_TYPES | REVIEW_EVENT_TYPES and event.actor_npc:
+            actor_id = str(event.actor_npc.agent_id)
+            recipients = [recipient for recipient in recipients if recipient != actor_id]
     elif visibility == "PRESENT":
         recipients = list(dict.fromkeys(participants + witnesses))
     else:

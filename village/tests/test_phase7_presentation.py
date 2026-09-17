@@ -11,6 +11,7 @@ from rest_framework_simplejwt.tokens import AccessToken
 from account.models import GameAccount
 from game_time.models import GlobalGameTimeState
 from inventory.models import NpcDefinition, NpcGlobalInventory, NpcGlobalInventorySlot
+from items.models import Item
 from village.models import (
     DailyPriceSnapshot,
     EconomicLedgerEntry,
@@ -27,6 +28,10 @@ from village.models import (
     VillageStoryArc,
     VillageStoryFact,
     VillageStoryTransitionReceipt,
+    VillageStore,
+    VillageStoreAccount,
+    VillageStoreInventorySlot,
+    VillageStoreListing,
     VillageWorldEvent,
 )
 from village.phase7_services import SCAN_BATCH_SIZE, SCAN_EVENT_BUDGET, public_journal
@@ -101,7 +106,11 @@ class Phase7PresentationTests(TestCase):
         self.config.village_presentation_enabled = False
         self.config.save(update_fields=["village_presentation_enabled"])
         client = self._client(self.player)
-        for path in ("/api/village/public/journal", "/api/village/public/overview"):
+        for path in (
+            "/api/village/public/journal",
+            "/api/village/public/overview",
+            "/api/village/public/stores/GENERAL_STORE",
+        ):
             response = client.get(path)
             self.assertEqual(response.status_code, 404)
             self.assertEqual(response.data["resultCode"], "VILLAGE_PRESENTATION_DISABLED")
@@ -127,6 +136,196 @@ class Phase7PresentationTests(TestCase):
         self.config.save(update_fields=["village_debug_overlay_enabled"])
         with override_settings(DEBUG=False):
             self.assertEqual(env_client.get("/api/village/operations/snapshot").status_code, 404)
+
+    def test_public_store_shows_shelf_history_and_sales_without_private_data(self):
+        Item.objects.create(item_id=45001, item_name="测试农具", max_use_count=20)
+        store = VillageStore.objects.get(store_code="GENERAL_STORE")
+        store.location_code = "GENERAL_STORE"
+        store.operator_npc = self.npcs["10015"]
+        store.display_name = "诺拉杂货铺"
+        store.status = "OPEN"
+        store.save()
+        VillageStoreAccount.objects.update_or_create(store=store, defaults={"balance": 12345})
+        listed_request = uuid.uuid4()
+        listing = VillageStoreListing.objects.create(
+            store=store,
+            item_id=45001,
+            price_mode="CUSTOM",
+            unit_price=65,
+            listed_by_npc=self.npcs["10015"],
+            created_request_id=listed_request,
+            listed_world_minute=self.time.world_minute - 20,
+        )
+        VillageStoreInventorySlot.objects.create(
+            store=store,
+            listing=listing,
+            item_id=45001,
+            item_amount=2,
+            remaining_uses=18,
+            item_attributes={
+                "dish_quality": 4,
+                "ingredient": "木材、铁",
+                "dish_metadata": {"private_batch": "never"},
+            },
+        )
+        EconomicLedgerEntry.objects.create(
+            request_id=listed_request,
+            entry_type="LIST_STORE_ITEM",
+            actor_npc=self.npcs["10015"],
+            changes={
+                "store_code": "GENERAL_STORE",
+                "listing_id": str(listing.listing_id),
+                "item_id": 45001,
+                "amount": 2,
+                "unit_price": 65,
+                "private_delta": 999,
+            },
+            world_minute=self.time.world_minute - 20,
+        )
+        VillageActionReceipt.objects.create(
+            request_id=listed_request,
+            npc=self.npcs["10015"],
+            action_kind="ECONOMY_LIST_STORE_ITEM",
+            success=True,
+            result_code="OK",
+            response_data={"data": {"amount": 2, "unit_price": 65, "secret": "never"}},
+            world_minute=self.time.world_minute - 20,
+            time_revision=self.time.time_revision,
+        )
+        buy_request = uuid.uuid4()
+        EconomicLedgerEntry.objects.create(
+            request_id=buy_request,
+            entry_type="BUY_FROM_STORE",
+            actor_npc=self.npcs["10011"],
+            changes={
+                "listing_id": str(listing.listing_id),
+                "gross_amount": 65,
+                "fee_amount": 3,
+                "store_net_amount": 62,
+                "buyer_private_balance": 500,
+            },
+            world_minute=self.time.world_minute - 5,
+        )
+        VillageActionReceipt.objects.create(
+            request_id=buy_request,
+            npc=self.npcs["10011"],
+            action_kind="ECONOMY_BUY_FROM_STORE",
+            success=True,
+            result_code="OK",
+            response_data={"data": {"amount": 1, "gross_amount": 65, "fee_amount": 3,
+                                     "store_net_amount": 62, "store_account_balance": 999}},
+            world_minute=self.time.world_minute - 5,
+            time_revision=self.time.time_revision,
+        )
+
+        client = self._client(self.player)
+        response = client.get("/api/village/public/stores/GENERAL_STORE")
+        self.assertEqual(response.status_code, 200)
+        data = response.data["data"]
+        self.assertEqual(data["display_name"], "诺拉杂货铺")
+        self.assertEqual(data["coin_balance"], 12345)
+        self.assertEqual(data["summary"], {
+            "active_listing_count": 1,
+            "available_amount": 2,
+            "today_transaction_count": 1,
+            "today_gross": 65,
+        })
+        self.assertEqual(data["listings"][0]["batches"][0]["remaining_uses"], 18)
+        tooltip = data["listings"][0]["batches"][0]["batch"]
+        self.assertEqual(tooltip["usage"], {"mode": "FINITE", "remaining": 18, "maximum": 20})
+        self.assertEqual(tooltip["quality"], 4)
+        self.assertEqual(tooltip["dish"]["ingredients"], "木材、铁")
+        self.assertEqual(tooltip["dish"]["metadata"], {})
+        self.assertEqual(tooltip["id"], "")
+        self.assertIsNone(tooltip["origin"])
+        self.assertEqual(tooltip["quantity"], 2)
+        self.assertEqual(data["listing_history"][0]["action"], "LIST")
+        self.assertEqual(data["transactions"][0]["amount"], 1)
+        serialized = json.dumps(data, ensure_ascii=False)
+        for forbidden in (
+            "private_batch", "private_delta", "buyer_private_balance", "store_account_balance",
+            "dish_metadata", "request_id", "decision_id",
+        ):
+            self.assertNotIn(forbidden, serialized)
+
+        store.status = "CLOSED"
+        store.save(update_fields=["status"])
+        self.assertEqual(client.get("/api/village/public/stores/GENERAL_STORE").status_code, 200)
+        self.assertEqual(client.get("/api/village/public/stores/UNKNOWN").status_code, 404)
+        self.assertEqual(client.get("/api/village/public/stores/GENERAL_STORE?limit=1").status_code, 400)
+        self.assertEqual(
+            self._client(self.env, env=True).get("/api/village/public/stores/GENERAL_STORE").status_code,
+            403,
+        )
+
+    def test_store_inventory_includes_unshelved_reserved_and_expired_stock_without_mutation(self):
+        store = VillageStore.objects.get(pk="GENERAL_STORE")
+        Item.objects.create(item_id=45001, item_name="库存农具", max_use_count=20)
+        Item.objects.create(item_id=45002, item_name="仅在库商品")
+        Item.objects.create(item_id=45003, item_name="仅在售商品")
+        listing = VillageStoreListing.objects.create(store=store, item_id=45001, unit_price=65,
+            price_mode="CUSTOM", listed_by_npc=self.npcs["10015"], created_request_id=uuid.uuid4(), listed_world_minute=self.time.world_minute)
+        inactive = VillageStoreListing.objects.create(store=store, item_id=45001, unit_price=70,
+            price_mode="CUSTOM", listed_by_npc=self.npcs["10015"], status="INACTIVE", created_request_id=uuid.uuid4(), listed_world_minute=0)
+        for amount, reserved, linked, expiry, attrs in (
+            (3, 1, listing, None, {}), (5, 1, None, None, {"private_note": "secret"}),
+            (2, 0, None, self.time.world_minute, {}),
+            (1, 0, None, None, {"freshness_unknown": True}), (4, 0, inactive, None, {}),
+        ):
+            VillageStoreInventorySlot.objects.create(store=store, item_id=45001, item_amount=amount,
+                reserved_amount=reserved, listing=linked, expires_world_minute=expiry,
+                remaining_uses=12, item_attributes=attrs)
+        VillageStoreInventorySlot.objects.create(store=store, item_id=45002, item_amount=7)
+        VillageStoreInventorySlot.objects.create(store=store, item_id=45002, item_amount=0)
+        VillageStoreInventorySlot.objects.create(store_id="RESTAURANT_STORE", item_id=45002, item_amount=99)
+        shelf_only = VillageStoreListing.objects.create(store=store, item_id=45003, unit_price=5,
+            price_mode="CUSTOM", listed_by_npc=self.npcs["10015"], created_request_id=uuid.uuid4(), listed_world_minute=self.time.world_minute)
+        VillageStoreInventorySlot.objects.create(store=store, item_id=45003, item_amount=6, listing=shelf_only)
+        before = list(store.inventory_slots.order_by("id").values())
+        client = self._client(self.player)
+        data = client.get("/api/village/public/stores/GENERAL_STORE").data["data"]
+        inventory = {row["item_id"]: row for row in data["inventory"]}
+        row = inventory[45001]
+        self.assertEqual({key: row[key] for key in ("total_amount", "available_amount", "listed_amount",
+            "unlisted_amount", "reserved_amount", "unavailable_amount")}, {
+            "total_amount": 15, "available_amount": 10, "listed_amount": 2,
+            "unlisted_amount": 8, "reserved_amount": 2, "unavailable_amount": 3})
+        self.assertEqual(len(row["batches"]), 5)
+        self.assertEqual(row["batches"][0]["batch"]["usage"]["remaining"], 12)
+        self.assertEqual(inventory[45002]["item_name"], "仅在库商品")
+        self.assertEqual(inventory[45002]["total_amount"], 7)
+        warehouse = {row["item_id"]: row for row in data["warehouse"]}
+        self.assertEqual({key: warehouse[45001][key] for key in ("total_amount", "available_amount", "listed_amount",
+            "unlisted_amount", "reserved_amount", "unavailable_amount")}, {
+            "total_amount": 12, "available_amount": 8, "listed_amount": 0,
+            "unlisted_amount": 8, "reserved_amount": 1, "unavailable_amount": 3})
+        self.assertEqual(len(warehouse[45001]["batches"]), 4)
+        self.assertTrue(all(not batch["is_listed"] for row in warehouse.values() for batch in row["batches"]))
+        self.assertEqual(warehouse[45002]["total_amount"], 7)
+        self.assertNotIn(45003, warehouse)
+        self.assertEqual(next(row for row in data["listings"] if row["item_id"] == 45001)["available_amount"], 2)
+        self.assertNotIn("secret", json.dumps(data))
+        self.assertEqual(before, list(store.inventory_slots.order_by("id").values()))
+        restaurant = client.get("/api/village/public/stores/RESTAURANT_STORE").data["data"]
+        self.assertNotIn("inventory", restaurant)
+        self.assertNotIn("warehouse", restaurant)
+
+    def test_general_store_balance_refreshes_and_missing_account_stays_unknown(self):
+        client = self._client(self.player)
+        url = "/api/village/public/stores/GENERAL_STORE"
+        account, _ = VillageStoreAccount.objects.update_or_create(
+            store_id="GENERAL_STORE", defaults={"balance": 72}
+        )
+        self.assertEqual(client.get(url).data["data"]["coin_balance"], 72)
+        account.balance = 0
+        account.save(update_fields=["balance"])
+        self.assertEqual(client.get(url).data["data"]["coin_balance"], 0)
+        account.delete()
+        self.assertIsNone(client.get(url).data["data"]["coin_balance"])
+        self.assertFalse(VillageStoreAccount.objects.filter(store_id="GENERAL_STORE").exists())
+        self.assertNotIn("coin_balance", client.get(
+            "/api/village/public/stores/RESTAURANT_STORE"
+        ).data["data"])
 
     def test_journal_privacy_filters_and_strict_reverse_cursor(self):
         public_old = self._event(
@@ -294,7 +493,7 @@ class Phase7PresentationTests(TestCase):
         })
         self.assertEqual(set(data["story"]), {
             "arc_code", "public_problem", "public_plan", "progress",
-            "player_contribution", "recent_transition_reason",
+            "player_contribution", "recent_transition_reason", "retired_plan",
         })
         self.assertEqual(set(data["story"]["progress"]), {
             "bridge_condition", "repair_fund", "repair_wood", "repair_metal",
@@ -320,8 +519,9 @@ class Phase7PresentationTests(TestCase):
         self.time.save(update_fields=["world_minute"])
         forest = self._client(self.player).get("/api/village/public/overview").data["data"]
         self.assertEqual(set(forest["story"]["progress"]), {
-            "forest_route_scouted", "forest_route_supply", "emergency_caravan_status",
+            "retired", "message", "emergency_caravan_status",
         })
+        self.assertTrue(forest["story"]["progress"]["retired"])
         self.assertEqual(forest["story"]["progress"]["emergency_caravan_status"], "FAILED")
         forest_locations = {
             row["location_code"]: row["is_open"] for row in forest["locations"]

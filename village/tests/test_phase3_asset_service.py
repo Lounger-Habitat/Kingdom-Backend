@@ -1,7 +1,8 @@
 """Tests for Phase 3 unified asset service: commit_economy_action.
 
-Covers feature flag, actor/location validation, idempotency, version
-conflict, replay, request conflict, and transaction rollback.
+Covers feature flag, actor validation, reported-location persistence,
+idempotency, version conflict, replay, request conflict, and transaction
+rollback.
 """
 
 import json
@@ -83,6 +84,11 @@ class Phase3AssetServiceBase(TestCase):
             npc=self.bill, defaults={"money": 200},
         )
 
+        # Production commands require the NPC runtime row that Unity seeds
+        # via checkpoints; the service rejects otherwise (Unity authority).
+        for npc in (self.bill, self.jack, self.lucy):
+            NpcRuntimeState.objects.get_or_create(npc=npc)
+
         # Clear migration-seeded slots for a clean test state
         NpcGlobalInventorySlot.objects.filter(bag=self.bill_inv).delete()
 
@@ -120,12 +126,29 @@ class ActorValidationTest(Phase3AssetServiceBase):
         self.assertEqual(resp["result_code"], ResultCode.P3_FORBIDDEN_ACTOR)
 
 
-class LocationValidationTest(Phase3AssetServiceBase):
-    def test_wrong_location_returns_wrong_location(self):
+class LocationAuthorityTest(Phase3AssetServiceBase):
+    """Unity owns location validation; Backend persists the reported location."""
+
+    def test_mismatched_location_is_persisted_not_rejected(self):
+        # PLANT's fixed requirement is BILL_FARM, but the location gate is
+        # Unity's preflight (VillageHubAdapter.ValidateUnityActionLocation).
+        # Give Bill seeds and a tool so the action succeeds and the reported
+        # location must be recorded as-is.
+        NpcGlobalInventorySlot.objects.create(
+            bag=self.bill_inv, slot_index=0, item_id=1051, item_amount=5,
+        )
+        NpcGlobalInventorySlot.objects.create(
+            bag=self.bill_inv, slot_index=1, item_id=4001, item_amount=1,
+            remaining_uses=20,
+        )
+        request_id = str(uuid.uuid4())
         resp = commit_economy_action(_base_payload(
-            current_location_code="VILLAGE_SQUARE",
+            request_id=request_id,
+            current_location_code="RESTAURANT",
         ))
-        self.assertEqual(resp["result_code"], ResultCode.P3_WRONG_LOCATION)
+        self.assertEqual(resp["result_code"], ResultCode.OK)
+        receipt = VillageActionReceipt.objects.get(request_id=request_id)
+        self.assertEqual(receipt.command.location_code, "RESTAURANT")
 
 
 class AssetVersionConflictTest(Phase3AssetServiceBase):
@@ -276,6 +299,49 @@ class PersistenceTest(Phase3AssetServiceBase):
         json.dumps(receipt.response_data, ensure_ascii=False)
         self.assertEqual(receipt.response_data["data"]["listing"]["price"], 9)
         self.assertEqual(receipt.response_data["data"]["asset_version"], 1)
+        self.assertEqual(resp["data"]["listing_id"], resp["data"]["listing"]["listingId"])
+        self.assertIsInstance(resp["data"]["listing_id"], int)
+        self.assertEqual(resp["data"]["amount"], 2)
+        self.assertEqual(resp["data"]["unit_price"], 9)
+
+        # The next action uses the returned ID without a listings query.
+        delist = _base_payload(command_name="DELIST_FROM_MARKETPLACE",
+            current_location_code="MARKET_STREET", npc_id=10011,
+            params={"listing_id": resp["data"]["listing_id"], "expected_asset_version": 1})
+        removed = commit_economy_action(delist)
+        self.assertEqual(removed["result_code"], ResultCode.OK)
+        self.assertEqual(removed["data"]["listing_id"], resp["data"]["listing_id"])
+        self.assertEqual(removed["data"]["listing_status"], "delisted")
+        self.assertEqual(sum(NpcGlobalInventorySlot.objects.filter(
+            bag=self.bill_inv, item_id=1051).values_list("item_amount", flat=True)), 5)
+
+    def test_marketplace_partial_purchase_receipt_reports_actual_settlement(self):
+        from marketplace.models import MarketTransaction
+        Item.objects.create(item_id=1051, item_name="玉米", item_type=ItemType.INGREDIENT)
+        slot = NpcGlobalInventorySlot.objects.get(bag=self.bill_inv, slot_index=0)
+        sold = commit_economy_action(_base_payload(command_name="SELL_ON_MARKETPLACE",
+            current_location_code="MARKET_STREET", npc_id=10011,
+            params={"instance_id": str(slot.instance_id), "amount": 4, "price": 9,
+                "expected_asset_version": self.bill_inv.asset_version}))
+        self.assertEqual(sold["result_code"], ResultCode.OK)
+        buyer, _ = NpcGlobalInventory.objects.get_or_create(npc=self.jack)
+        buyer.money = 200
+        buyer.save(update_fields=["money"])
+        bought = commit_economy_action(_base_payload(command_name="BUY_FROM_MARKETPLACE",
+            current_location_code="MARKET_STREET", npc_id=10012,
+            params={"listing_id": sold["data"]["listing_id"], "amount": 2,
+                "expected_buyer_asset_version": buyer.asset_version}))
+        self.assertEqual(bought["result_code"], ResultCode.OK)
+        data = bought["data"]
+        tx = MarketTransaction.objects.get(pk=data["transaction_id"])
+        self.assertEqual(data["amount"], 2)
+        self.assertEqual(data["remaining_amount"], 2)
+        self.assertEqual(data["unit_price"], 9)
+        self.assertEqual(data["total_price"], tx.total_price)
+        self.assertEqual(data["commission"], tx.commission)
+        self.assertEqual(data["seller_earnings"], tx.seller_earnings)
+        buyer.refresh_from_db()
+        self.assertEqual(buyer.money, 200 - data["total_price"])
 
     @patch("village.phase3_marketplace._service")
     def test_marketplace_missing_service_fails_closed(self, service_mock):
@@ -342,22 +408,18 @@ class PersistenceTest(Phase3AssetServiceBase):
         self.assertEqual(runtime.action_status, "IDLE")
         self.assertIsNone(runtime.active_command_id)
 
-    def test_failure_does_not_create_receipt(self):
-        """Failed dispatch should not write success receipt/ledger."""
-        resp = commit_economy_action(_base_payload(
-            params={"plot_code": "FARM_PLOT_A", "crop_code": "CORN",
-                    "expected_asset_version": 999},
-        ))
+    def test_failure_creates_stable_failure_receipt_without_success_ledger(self):
+        payload = _base_payload(params={"plot_code": "FARM_PLOT_A", "crop_code": "CORN", "expected_asset_version": 999})
+        resp = commit_economy_action(payload)
         self.assertEqual(resp["result_code"], ResultCode.P3_ASSET_VERSION_CONFLICT)
-
-        request_id = uuid.UUID(_base_payload()["request_id"])
-        # The _base_payload above has a DIFFERENT request_id; check no receipt
-        # was written for the conflict request_id
-        self.assertFalse(
-            VillageActionReceipt.objects.filter(
-                request_id=uuid.UUID(resp.get("request_id", str(uuid.uuid4())))
-            ).exists()
-        )
+        receipt = VillageActionReceipt.objects.get(request_id=payload["request_id"])
+        self.assertFalse(receipt.success)
+        self.assertEqual(receipt.command.status, "FAILED")
+        self.assertFalse(EconomicLedgerEntry.objects.filter(request_id=payload["request_id"]).exists())
+        replay = commit_economy_action(payload)
+        self.assertTrue(replay["replayed"])
+        replay["replayed"] = False
+        self.assertEqual(replay, resp)
 
 
 class InvalidPayloadTest(Phase3AssetServiceBase):

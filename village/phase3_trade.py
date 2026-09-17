@@ -22,6 +22,7 @@ from inventory.models import NpcGlobalInventory, NpcGlobalInventorySlot
 
 from .models import NpcTradeDelivery, NpcTradeOrder
 from .phase3_asset_service import (
+    BATCH_ITEM_ATTRIBUTES,
     _fail,
     _ok,
     add_batch,
@@ -474,6 +475,7 @@ def _do_start_delivery(
             seller_slot.expires_world_minute,
             request_id,
             remaining_uses=seller_slot.remaining_uses,
+            item_attributes={key: getattr(seller_slot, key) for key in BATCH_ITEM_ATTRIBUTES},
         )
 
         # Money transfer: buyer pays seller

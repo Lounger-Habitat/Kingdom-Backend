@@ -47,14 +47,30 @@ def load_command_catalog(path=CATALOG_PATH):
 
 COMMAND_CATALOG = load_command_catalog()
 AGENT_INSTRUCTION_ACTIONS = frozenset(COMMAND_CATALOG) | {"WAKE_UP", "UPDATE_SUBJECTIVE_GOAL"}
+# Receipt kinds for activities are not callable tools or NPC capabilities.
+RECORDED_ACTIVITY_ACTIONS = frozenset({"SPEECH"})
+_LONG_RUNNING_ACTIONS = frozenset({"MOVE", "GO_HOME", "WAIT"})
+_MOVEMENT_ACTIONS = frozenset({"MOVE", "GO_HOME"})
 
 
 def agent_tool(action):
+    # 只读查询标注 read 标签：Star Protocol 的 ActionSystem 依据该标签把查询
+    # 归类为 EXTERNAL_READ，从而在导航/动作在途时不进入“未确认写操作”门禁，
+    # 也不占用写操作的重放保护。只读集合以 CommandService.READ_QUERY_ACTIONS
+    # 为准（与 agent_queries.QUERY_NAMES 一致）；延迟导入避免模块级循环依赖。
+    from .runtime_services import CommandService
+
     command = COMMAND_CATALOG[action]
+    tags = ["read"] if action in CommandService.READ_QUERY_ACTIONS else []
+    if action in _LONG_RUNNING_ACTIONS:
+        tags.append("long_running")
+    if action in _MOVEMENT_ACTIONS:
+        tags.append("movement")
     return {
         "name": action,
         "description": command["description"],
         "parameters": deepcopy(command["parameters"]),
+        "tags": tags,
     }
 
 

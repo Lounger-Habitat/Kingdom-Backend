@@ -10,11 +10,9 @@ handlers::
 
     (npc_id, params, world_minute, request_id) -> dict
 
-Called by ``commit_economy_action`` after contract validation.  All mutations
-happen inside the outer ``transaction.atomic`` block, so returning a business
-failure leaves the transaction to commit only what the handler explicitly
-mutated (the handlers below mutate state only after every validation passes;
-the one deliberate exception is marking an expired offer EXPIRED on accept).
+Called by ``commit_economy_action`` after contract validation. Business errors
+roll back the handler savepoint. The caller separately records a failed
+receipt and the terminal EXPIRED status without retaining asset mutations.
 
 Lock order (stable, deadlock-free) -- always acquire in this sequence:
 
@@ -52,7 +50,7 @@ from typing import Any, Dict, List, Optional, Tuple
 from django.db import models, transaction
 
 from inventory.models import NpcDefinition, NpcGlobalInventory, NpcGlobalInventorySlot
-from items.models import Item
+from items.models import Item, ItemType
 
 from .models import (
     EconomicLedgerEntry,
@@ -69,6 +67,7 @@ from .models import (
     VillageWorldEvent,
 )
 from .phase3_asset_service import (
+    BATCH_ITEM_ATTRIBUTES,
     _fail,
     _ok,
     add_batch,
@@ -79,7 +78,9 @@ from .phase3_contract import (
     ListingStatus,
     PriceMode,
     ResultCode,
+    Side,
     StoreOperationalStatus,
+    StoreStatus,
     TradeOfferStatus,
 )
 
@@ -114,6 +115,12 @@ def _is_positive_int(value: Any) -> bool:
     return isinstance(value, int) and not isinstance(value, bool) and value > 0
 
 
+def _trade_item_name(item_id: int) -> str | None:
+    return Item.objects.filter(item_id=item_id, is_deleted=False).values_list(
+        "item_name", flat=True
+    ).first()
+
+
 def _get_buyer_available_money(inventory: NpcGlobalInventory) -> int:
     """Buyer-side available money (money minus ACTIVE-delivery reservations)."""
     reserved = (
@@ -125,11 +132,35 @@ def _get_buyer_available_money(inventory: NpcGlobalInventory) -> int:
     return max(0, inventory.money - reserved)
 
 
+def general_store_tool_sale_reason(item_type, max_use_count, remaining_uses):
+    """Fixed-price automatic buyback accepts only tools at configured full durability.
+
+    Negotiated personal trades and operator listings retain their own pricing.
+    """
+    if item_type not in {
+        ItemType.HOE_TOOL, ItemType.CHOP_TOOL, ItemType.BREAK_TOOL,
+        ItemType.REAP_TOOL, ItemType.WATER_TOOL, ItemType.COLLECT_TOOL,
+    }:
+        return None
+    if remaining_uses is None:
+        return "TOOL_DURABILITY_UNKNOWN"
+    if max_use_count == -1 and remaining_uses == -1:
+        return None
+    if max_use_count <= 0 or remaining_uses < 0 or remaining_uses > max_use_count:
+        return "TOOL_DURABILITY_INVALID"
+    if remaining_uses == 0:
+        return "TOOL_BROKEN"
+    if remaining_uses < max_use_count:
+        return "TOOL_NOT_FULL_DURABILITY"
+    return None
+
+
 def _consume_personal_fefo_available(
     inventory: NpcGlobalInventory,
     item_id: int,
     amount: int,
     world_minute: int,
+    *, store_purchase_item: Optional[Item] = None,
 ) -> List[Tuple[NpcGlobalInventorySlot, int]]:
     """Consume *amount* available items from an NPC inventory (FEFO).
 
@@ -149,21 +180,34 @@ def _consume_personal_fefo_available(
     # Validate before any mutation: compute total unreserved/unexpired amount
     # and fail early so a failed settlement never partially deducts items.
     total_available = 0
+    eligible_slots = []
+    tool_rejection = None
     for slot in slots:
         if slot.expires_world_minute is not None and slot.expires_world_minute <= world_minute:
             continue
-        total_available += get_available_slot_amount(slot)
+        available = get_available_slot_amount(slot, world_minute)
+        if available <= 0:
+            continue
+        if store_purchase_item is not None:
+            reason = general_store_tool_sale_reason(
+                store_purchase_item.item_type, store_purchase_item.max_use_count, slot.remaining_uses,
+            )
+            if reason:
+                tool_rejection = tool_rejection or reason
+                continue
+        eligible_slots.append(slot)
+        total_available += available
     if total_available < amount:
-        raise ValueError("INSUFFICIENT_ITEM")
+        raise ValueError(tool_rejection or "INSUFFICIENT_ITEM")
 
     consumed: List[Tuple[NpcGlobalInventorySlot, int]] = []
     remaining = amount
-    for slot in slots:
+    for slot in eligible_slots:
         if remaining <= 0:
             break
         if slot.expires_world_minute is not None and slot.expires_world_minute <= world_minute:
             continue
-        available = get_available_slot_amount(slot)
+        available = get_available_slot_amount(slot, world_minute)
         if available <= 0:
             continue
         take = min(available, remaining)
@@ -181,6 +225,7 @@ def _consume_store_fefo_available(
     world_minute: int,
 ) -> List[Tuple[VillageStoreInventorySlot, int]]:
     """Consume *amount* available items from a store listing's batches (FEFO)."""
+    from .lucy_restaurant import store_available
     slots = list(
         VillageStoreInventorySlot.objects.select_for_update()
         .filter(store=store, listing=listing, item_amount__gt=0)
@@ -195,7 +240,7 @@ def _consume_store_fefo_available(
     for slot in slots:
         if slot.expires_world_minute is not None and slot.expires_world_minute <= world_minute:
             continue
-        total_available += max(0, slot.item_amount - slot.reserved_amount)
+        total_available += store_available(slot, world_minute)
     if total_available < amount:
         raise ValueError("INSUFFICIENT_ITEM")
 
@@ -206,7 +251,7 @@ def _consume_store_fefo_available(
             break
         if slot.expires_world_minute is not None and slot.expires_world_minute <= world_minute:
             continue
-        available = max(0, slot.item_amount - slot.reserved_amount)
+        available = store_available(slot, world_minute)
         if available <= 0:
             continue
         take = min(available, remaining)
@@ -240,33 +285,42 @@ def _compute_fee(
     return fee_amount, store_net_amount
 
 
-def _store_inventory_status(store: VillageStore, world_minute: int) -> str:
-    """Compute NORMAL / LOW_STOCK / OUT_OF_STOCK from store-owned batches."""
-    from .phase3_contract import StoreStatus
+def store_inventory_status(store: VillageStore, world_minute: int) -> Tuple[str, Dict[int, int]]:
+    """(inventory_status, available_by_item)——商店库存告警的单一判定实现。
 
+    二跑复盘（R7）：OUT_OF_STOCK 必须表示"全店没有任何可售库存"；
+    有货但 SAFE_STOCKS 任一 SKU 低于安全线只记 LOW_STOCK（库存告警，不是关门）。
+    日间查询（query_store_inventory）与日结事件（phase3_day_close.get_store_status）
+    共用本函数，保证两个入口同语义，不再出现"白天 LOW_STOCK、晚上 OUT_OF_STOCK"。
+    """
     available_by_item: Dict[int, int] = {}
-    for slot in VillageStoreInventorySlot.objects.filter(
-        store=store, item_amount__gt=0
-    ):
+    slots = VillageStoreInventorySlot.objects.filter(store=store, item_amount__gt=0)
+    if store.store_code == "RESTAURANT_STORE":
+        slots = slots.filter(listing__status="ACTIVE")
+    for slot in slots:
+        if (slot.item_attributes or {}).get("freshness_unknown"):
+            continue
         if slot.expires_world_minute is not None and slot.expires_world_minute <= world_minute:
             continue
         available = max(0, slot.item_amount - slot.reserved_amount)
+        if available == 0:
+            continue
         available_by_item[slot.item_id] = available_by_item.get(slot.item_id, 0) + available
 
-    has_out = False
-    has_low = False
-    for item_id, safe in SAFE_STOCKS.items():
-        available = available_by_item.get(item_id, 0)
-        if available <= 0 and safe > 0:
-            has_out = True
-        elif 0 < available < safe:
-            has_low = True
+    if not available_by_item:
+        return StoreStatus.OUT_OF_STOCK.value, available_by_item
+    if store.store_code == "RESTAURANT_STORE":
+        return StoreStatus.NORMAL.value, available_by_item
+    shortfall = any(
+        available_by_item.get(item_id, 0) < safe and safe > 0
+        for item_id, safe in SAFE_STOCKS.items()
+    )
+    return (StoreStatus.LOW_STOCK.value if shortfall else StoreStatus.NORMAL.value), available_by_item
 
-    if has_out:
-        return StoreStatus.OUT_OF_STOCK
-    if has_low:
-        return StoreStatus.LOW_STOCK
-    return StoreStatus.NORMAL
+
+def _store_inventory_status(store: VillageStore, world_minute: int) -> str:
+    """状态标签（兼容入口；phase3_views 等仍按此名引用）。"""
+    return store_inventory_status(store, world_minute)[0]
 
 
 def _resolve_final_unit_price(
@@ -297,6 +351,121 @@ def _resolve_final_unit_price(
 # ── PROPOSE_TRADE ────────────────────────────────────────────────────────────
 
 
+def _do_sell_to_store(npc_id, params, world_minute, request_id):
+    """Immediate fixed-value sale; the store buys without an operator response.
+
+    Kept behind the existing SELL + store_code entry so existing NPC trade
+    permissions remain sufficient. No pending offer or personal buyer exists.
+    """
+    seller = NpcDefinition.objects.filter(
+        agent_id=str(npc_id), is_test_only=False,
+    ).first()
+    if (str(npc_id) not in {"10011", "10012", "10013", "10014"}
+            or seller is None or params.get("store_code") != "GENERAL_STORE"
+            or ("target_npc_id" in params and str(params["target_npc_id"]) != "10015")
+            or params.get("commitment_id")):
+        return _fail(ResultCode.TRADE_STORE_FORBIDDEN)
+    store = VillageStore.objects.select_for_update().filter(
+        store_code="GENERAL_STORE", operator_npc__agent_id="10015",
+        operator_npc__is_test_only=False,
+    ).first()
+    if store is None:
+        return _fail(ResultCode.TRADE_STORE_FORBIDDEN)
+    if store.status != StoreOperationalStatus.OPEN.value:
+        return _fail(ResultCode.TRADE_STORE_CLOSED)
+    runtime = NpcRuntimeState.objects.filter(npc=seller).first()
+    if (runtime is None or runtime.health_fp <= 300
+            or runtime.action_status in {"AWAY", "SLEEPING"}
+            or runtime.current_action == "SLEEP"
+            or (runtime.away_until_world_minute is not None
+                and runtime.away_until_world_minute > world_minute)):
+        return _fail(ResultCode.P3_FORBIDDEN_ACTOR)
+
+    if "items" in params:
+        rows = params["items"]
+        if ("item_id" in params or "amount" in params
+                or not isinstance(rows, list) or not rows):
+            return _fail(ResultCode.P3_INVALID_PARAMS)
+    else:
+        rows = [{"item_id": params.get("item_id"), "amount": params.get("amount")}]
+    quantities = {}
+    for row in rows:
+        if (not isinstance(row, dict) or set(row) != {"item_id", "amount"}
+                or not _is_positive_int(row["item_id"])
+                or not _is_positive_int(row["amount"])):
+            return _fail(ResultCode.P3_INVALID_PARAMS)
+        quantities[row["item_id"]] = quantities.get(row["item_id"], 0) + row["amount"]
+    priced_items = []
+    item_configs = {}
+    for item_id, amount in sorted(quantities.items()):
+        item = Item.objects.filter(item_id=item_id, is_deleted=False).first()
+        if item is None or not _is_positive_int(item.item_price):
+            return _fail(ResultCode.P3_INVALID_PARAMS, data={
+                "failure_kind": "ITEM_VALUE_UNAVAILABLE", "unavailable_item_id": item_id,
+            })
+        priced_items.append({"item_id": item_id, "item_name": item.item_name,
+                             "amount": amount, "unit_price": item.item_price,
+                             "gold_amount": item.item_price * amount})
+        item_configs[item_id] = item
+    # The canonical item value is authoritative, including when a legacy
+    # caller supplies gold_amount. Retail markups, ratings and sell_percentage
+    # do not change this fixed-value store purchase.
+    total = sum(row["gold_amount"] for row in priced_items)
+    account = VillageStoreAccount.objects.select_for_update().filter(store=store).first()
+    inventory = NpcGlobalInventory.objects.select_for_update().get(npc=seller)
+    expected = params.get("expected_seller_asset_version")
+    if expected is not None and expected != inventory.asset_version:
+        return _fail(ResultCode.TRADE_ASSET_VERSION_CONFLICT)
+    sale_data = {
+        "sale_mode": "IMMEDIATE_STORE", "store_code": store.pk,
+        "payment_source": "STORE", "seller_npc_id": str(npc_id),
+        "items": priced_items, "price_source": "ITEM_PRICE", "gold_amount": total,
+    }
+    # Preserve scalar result fields for existing single-item callers.
+    if len(priced_items) == 1:
+        sale_data.update(priced_items[0])
+    if account is None or account.balance < total:
+        return _fail(ResultCode.TRADE_INSUFFICIENT_MONEY, data={**sale_data,
+            "required_amount": total, "available_amount": account.balance if account else 0, "payer": "STORE"})
+    for row in priced_items:
+        item_id, amount = row["item_id"], row["amount"]
+        try:
+            consumed = _consume_personal_fefo_available(
+                inventory, item_id, amount, world_minute, store_purchase_item=item_configs[item_id],
+            )
+        except ValueError as exc:
+            # The asset-service savepoint rolls back every earlier item too.
+            tool_rejected = str(exc).startswith("TOOL_")
+            return _fail(ResultCode.TRADE_ITEM_NOT_FOR_SALE if tool_rejected else ResultCode.TRADE_INSUFFICIENT_ITEM, data={
+                **sale_data, "unavailable_item_id": item_id,
+                **({"failure_kind": str(exc), "tool_buyback_policy": "FULL_DURABILITY_ONLY"} if tool_rejected else {}),
+            })
+        for slot, taken in consumed:
+            VillageStoreInventorySlot.objects.create(
+                store=store, item_id=item_id, item_amount=taken,
+                produced_world_minute=slot.produced_world_minute,
+                expires_world_minute=slot.expires_world_minute, remaining_uses=slot.remaining_uses,
+                source_npc=seller, source_slot_instance_id=slot.instance_id,
+                item_attributes={key: getattr(slot, key) for key in BATCH_ITEM_ATTRIBUTES},
+            )
+    account.balance -= total
+    account.account_version += 1
+    account.save(update_fields=["balance", "account_version", "updated_at"])
+    inventory.money += total
+    inventory.asset_version += 1
+    inventory.save(update_fields=["money", "asset_version", "updated_at"])
+    store.inventory_version += 1
+    store.save(update_fields=["inventory_version", "updated_at"])
+    return _ok(
+        data={**sale_data, "status": "COMPLETED",
+              "personal_wallet": {"delta": total, "balance_after": inventory.money}},
+        effects={"STORE:" + store.pk: {"money": -total, **{str(k): v for k, v in quantities.items()}},
+                 str(npc_id): {"money": total, **{str(k): -v for k, v in quantities.items()}}},
+        asset_versions={str(npc_id): inventory.asset_version}, external_delta=0,
+        participant_npc_ids=[str(npc_id), "10015"],
+    )
+
+
 def _do_propose_trade(
     npc_id: int,
     params: Dict[str, Any],
@@ -304,6 +473,7 @@ def _do_propose_trade(
     request_id: uuid.UUID,
 ) -> Dict[str, Any]:
     target_npc_id = params.get("target_npc_id")
+    side = str(params.get("side", Side.BUY.value)).upper()
     item_id = params.get("item_id")
     amount = params.get("amount")
     gold_amount = params.get("gold_amount")
@@ -312,8 +482,15 @@ def _do_propose_trade(
     expires_world_minute = params.get("expires_world_minute")
     commitment_id = _parse_uuid(params.get("commitment_id"))
 
+    if params.get("store_code") and side == Side.SELL.value:
+        return _do_sell_to_store(npc_id, params, world_minute, request_id)
+
+    if "items" in params:
+        return _fail(ResultCode.P3_INVALID_PARAMS)
     if target_npc_id is None or str(target_npc_id) == str(npc_id):
         return _fail(ResultCode.TRADE_TARGET_NOT_FOUND)
+    if side not in {Side.BUY.value, Side.SELL.value}:
+        return _fail(ResultCode.P3_INVALID_PARAMS)
     if not _is_positive_int(item_id):
         return _fail(ResultCode.P3_INVALID_PARAMS)
     if not _is_positive_int(amount):
@@ -327,15 +504,15 @@ def _do_propose_trade(
     ):
         return _fail(ResultCode.P3_INVALID_PARAMS)
 
-    seller = NpcDefinition.objects.filter(agent_id=str(target_npc_id)).first()
-    if seller is None:
-        return _fail(ResultCode.TRADE_TARGET_NOT_FOUND)
-    buyer = NpcDefinition.objects.filter(agent_id=str(npc_id)).first()
-    if buyer is None:
+    target = NpcDefinition.objects.filter(agent_id=str(target_npc_id)).first()
+    proposer = NpcDefinition.objects.filter(agent_id=str(npc_id)).first()
+    if target is None or proposer is None:
         return _fail(ResultCode.TRADE_TARGET_NOT_FOUND)
 
-    buyer_rt = NpcRuntimeState.objects.filter(npc=buyer).first()
-    if buyer_rt is None:
+    buyer, seller = (proposer, target) if side == Side.BUY.value else (target, proposer)
+
+    proposer_rt = NpcRuntimeState.objects.filter(npc=proposer).first()
+    if proposer_rt is None:
         return _fail(ResultCode.TRADE_TARGET_NOT_FOUND)
 
     commitment = None
@@ -361,9 +538,22 @@ def _do_propose_trade(
         ):
             return _fail("COMMITMENT_TARGET_MISMATCH")
 
+    buying_store = None
+    if params.get("store_code"):
+        from .caravan import owned_store
+        store_buy = str(npc_id) == "10015" and side == Side.BUY.value
+        if not store_buy or commitment or params["store_code"] != "GENERAL_STORE":
+            return _fail(ResultCode.TRADE_STORE_FORBIDDEN)
+        buying_store = owned_store("10015", params["store_code"])
+        if buying_store is None:
+            return _fail(ResultCode.TRADE_STORE_FORBIDDEN)
+        if buying_store.status != StoreOperationalStatus.OPEN.value:
+            return _fail(ResultCode.TRADE_STORE_CLOSED)
     offer = VillageTradeOffer.objects.create(
+        buying_store=buying_store,
         buyer_npc=buyer,
         seller_npc=seller,
+        proposer_npc=proposer,
         commitment=commitment,
         item_id=item_id,
         amount=amount,
@@ -371,7 +561,7 @@ def _do_propose_trade(
         conversation_id=conversation_id,
         # Keep the Unity-synchronised location as offer metadata; do not use it
         # as a Backend-side authorization check.
-        location_code=buyer_rt.current_location_code,
+        location_code=proposer_rt.current_location_code,
         status=TradeOfferStatus.PENDING.value,
         expected_seller_asset_version=expected_seller_asset_version,
         expires_world_minute=expires_world_minute,
@@ -382,9 +572,13 @@ def _do_propose_trade(
     offer_data = {
         "offer_id": str(offer.offer_id),
         "status": TradeOfferStatus.PENDING.value,
+        "side": side,
+        "store_code": buying_store.pk if buying_store else None,
+        "proposer_npc_id": str(proposer.agent_id),
         "buyer_npc_id": str(buyer.agent_id),
         "seller_npc_id": str(seller.agent_id),
         "item_id": item_id,
+        "item_name": _trade_item_name(item_id),
         "amount": amount,
         "gold_amount": gold_amount,
         "expires_world_minute": expires_world_minute,
@@ -422,12 +616,15 @@ def _do_respond_trade(
         except VillageTradeOffer.DoesNotExist:
             return _fail(ResultCode.TRADE_OFFER_NOT_FOUND)
 
-        # Only the offer's seller may respond.
-        if str(offer.seller_npc.agent_id) != str(npc_id):
+        # Only the non-proposer counterparty may respond.
+        participant_ids = {
+            str(offer.buyer_npc.agent_id), str(offer.seller_npc.agent_id),
+        }
+        if str(offer.proposer_npc.agent_id) == str(npc_id) or str(npc_id) not in participant_ids:
             return _fail(ResultCode.TRADE_RESPONSE_FORBIDDEN)
 
         if offer.status != TradeOfferStatus.PENDING.value:
-            return _fail(ResultCode.TRADE_OFFER_ALREADY_RESOLVED)
+            return _resolved_offer_failure(offer)
 
         # DELIVERY commits use the same lock order as the asset settlement:
         # offer -> commitment -> inventories.
@@ -476,7 +673,18 @@ def _do_respond_trade(
                 ],
                 data={
                     "offer_id": str(offer.offer_id),
+                    "side": (
+                        Side.BUY.value
+                        if str(offer.proposer_npc.agent_id) == str(offer.buyer_npc.agent_id)
+                        else Side.SELL.value
+                    ),
+                    "proposer_npc_id": str(offer.proposer_npc.agent_id),
                     "buyer_npc_id": str(offer.buyer_npc.agent_id),
+                    "seller_npc_id": str(offer.seller_npc.agent_id),
+                    "item_id": offer.item_id,
+                    "item_name": _trade_item_name(offer.item_id),
+                    "amount": offer.amount,
+                    "gold_amount": offer.gold_amount,
                     "decision": "REJECT",
                     "status": TradeOfferStatus.REJECTED.value,
                     "commitment_id": str(offer.commitment_id) if offer.commitment_id else None,
@@ -484,6 +692,11 @@ def _do_respond_trade(
             )
 
         # ACCEPT
+        # Old seller-initiated shop quotations must not bypass fixed valuation.
+        # They may still be rejected/cancelled; a new seller action settles now.
+        if offer.buying_store_id and offer.proposer_npc_id == offer.seller_npc_id:
+            return _fail(ResultCode.TRADE_STORE_FORBIDDEN,
+                         data={"failure_kind": "LEGACY_STORE_SELL_OFFER"})
         if world_minute >= offer.expires_world_minute:
             # v1 recommendation (design 11.4): promote the stale PENDING offer
             # to EXPIRED so it can no longer be re-accepted.
@@ -498,6 +711,21 @@ def _do_respond_trade(
         buyer_id = str(offer.buyer_npc.agent_id)
         seller_id = str(offer.seller_npc.agent_id)
 
+        buying_store = None
+        store_account = None
+        if offer.buying_store_id:
+            buying_store = VillageStore.objects.select_for_update().get(pk=offer.buying_store_id)
+            if buying_store.operator_npc_id != offer.buyer_npc_id:
+                return _fail(ResultCode.TRADE_STORE_FORBIDDEN)
+            if buying_store.status != StoreOperationalStatus.OPEN.value:
+                return _fail(ResultCode.TRADE_STORE_CLOSED)
+            for participant in (offer.buyer_npc, offer.seller_npc):
+                state = NpcRuntimeState.objects.filter(npc=participant).first()
+                if state is None or state.health_fp <= 300 or state.action_status in {"AWAY", "SLEEPING"} or (
+                    state.away_until_world_minute is not None and state.away_until_world_minute > world_minute
+                ) or state.current_action == "SLEEP":
+                    return _fail(ResultCode.P3_FORBIDDEN_ACTOR, data={"failure_kind": "TRADE_PARTICIPANT_UNAVAILABLE"})
+            store_account = VillageStoreAccount.objects.select_for_update().get(store=buying_store)
         # Lock both inventories in stable order.
         nid_a, nid_b = sorted([buyer_id, seller_id])
         inv_a = NpcGlobalInventory.objects.select_for_update().get(npc__agent_id=nid_a)
@@ -526,8 +754,10 @@ def _do_respond_trade(
         # Re-validate resources under lock.  All checks run before any mutation:
         # buyer money first, then seller items (the consume helper also validates
         # its total before deducting anything).
-        if _get_buyer_available_money(buyer_inv) < gold_amount:
-            return _fail(ResultCode.TRADE_INSUFFICIENT_MONEY)
+        available_money = store_account.balance if store_account else _get_buyer_available_money(buyer_inv)
+        if available_money < gold_amount:
+            return _fail(ResultCode.TRADE_INSUFFICIENT_MONEY, data={"required_amount": gold_amount,
+                "available_amount": available_money, "payer": "STORE" if store_account else "PERSONAL"})
         try:
             consumed = _consume_personal_fefo_available(
                 seller_inv, item_id, amount, world_minute
@@ -537,19 +767,30 @@ def _do_respond_trade(
 
         # Transfer items (preserve batch attributes) and money.
         for slot, taken in consumed:
-            add_batch(
-                buyer_inv,
-                item_id,
-                taken,
-                slot.produced_world_minute or world_minute,
-                slot.expires_world_minute,
-                request_id,
-                remaining_uses=slot.remaining_uses,
-            )
+            if buying_store:
+                VillageStoreInventorySlot.objects.create(
+                    store=buying_store, item_id=item_id, item_amount=taken,
+                    produced_world_minute=slot.produced_world_minute,
+                    expires_world_minute=slot.expires_world_minute,
+                    remaining_uses=slot.remaining_uses, source_npc=offer.seller_npc,
+                    source_slot_instance_id=slot.instance_id,
+                    item_attributes={key: getattr(slot, key) for key in BATCH_ITEM_ATTRIBUTES},
+                )
+            else:
+                add_batch(buyer_inv, item_id, taken, slot.produced_world_minute,
+                          slot.expires_world_minute, slot.source_request_id, remaining_uses=slot.remaining_uses,
+                          item_attributes={key: getattr(slot, key) for key in BATCH_ITEM_ATTRIBUTES})
 
-        buyer_inv.money -= gold_amount
-        buyer_inv.asset_version += 1
-        buyer_inv.save(update_fields=["money", "asset_version", "updated_at"])
+        if store_account:
+            store_account.balance -= gold_amount
+            store_account.account_version += 1
+            store_account.save()
+            buying_store.inventory_version += 1
+            buying_store.save(update_fields=["inventory_version", "updated_at"])
+        else:
+            buyer_inv.money -= gold_amount
+            buyer_inv.asset_version += 1
+            buyer_inv.save(update_fields=["money", "asset_version", "updated_at"])
 
         seller_inv.money += gold_amount
         seller_inv.asset_version += 1
@@ -563,7 +804,7 @@ def _do_respond_trade(
         ])
 
     effects = {
-        buyer_id: {"money": -gold_amount, str(item_id): amount},
+        ("STORE:" + buying_store.pk if buying_store else buyer_id): {"money": -gold_amount, str(item_id): amount},
         seller_id: {"money": gold_amount, str(item_id): -amount},
         "offer_id": str(offer.offer_id),
         "status": TradeOfferStatus.ACCEPTED.value,
@@ -575,13 +816,24 @@ def _do_respond_trade(
         external_delta=0,
         data={
             "offer_id": str(offer.offer_id),
+            "side": (
+                Side.BUY.value
+                if str(offer.proposer_npc.agent_id) == str(offer.buyer_npc.agent_id)
+                else Side.SELL.value
+            ),
+            "proposer_npc_id": str(offer.proposer_npc.agent_id),
             "buyer_npc_id": buyer_id,
+            "seller_npc_id": seller_id,
             "status": TradeOfferStatus.ACCEPTED.value,
             "item_id": item_id,
+            "item_name": _trade_item_name(item_id),
             "amount": amount,
             "gold_amount": gold_amount,
             "commitment_id": str(offer.commitment_id) if offer.commitment_id else None,
             "emergency_supply": emergency_supply,
+            "settlement_completed": True,
+            "payment_source": "STORE" if buying_store else "PERSONAL",
+            "store_code": buying_store.pk if buying_store else None,
         },
         participant_npc_ids=[buyer_id, seller_id],
     )
@@ -606,12 +858,12 @@ def _do_cancel_trade_offer(
         except VillageTradeOffer.DoesNotExist:
             return _fail(ResultCode.TRADE_OFFER_NOT_FOUND)
 
-        # Only the original buyer (offer creator) may cancel.
-        if str(offer.buyer_npc.agent_id) != str(npc_id):
+        # Only the original proposer may cancel (it may be buyer or seller).
+        if str(offer.proposer_npc.agent_id) != str(npc_id):
             return _fail(ResultCode.TRADE_CANCEL_FORBIDDEN)
 
         if offer.status != TradeOfferStatus.PENDING.value:
-            return _fail(ResultCode.TRADE_OFFER_ALREADY_RESOLVED)
+            return _resolved_offer_failure(offer)
 
         offer.status = TradeOfferStatus.CANCELLED.value
         offer.resolved_request_id = request_id
@@ -621,7 +873,22 @@ def _do_cancel_trade_offer(
         ])
 
     return _ok(
-        data={"offer_id": str(offer.offer_id), "status": TradeOfferStatus.CANCELLED.value},
+        data={
+            "offer_id": str(offer.offer_id),
+            "side": (
+                Side.BUY.value
+                if str(offer.proposer_npc.agent_id) == str(offer.buyer_npc.agent_id)
+                else Side.SELL.value
+            ),
+            "proposer_npc_id": str(offer.proposer_npc.agent_id),
+            "buyer_npc_id": str(offer.buyer_npc.agent_id),
+            "seller_npc_id": str(offer.seller_npc.agent_id),
+            "item_id": offer.item_id,
+            "item_name": _trade_item_name(offer.item_id),
+            "amount": offer.amount,
+            "gold_amount": offer.gold_amount,
+            "status": TradeOfferStatus.CANCELLED.value,
+        },
         effects={
             "offer_id": str(offer.offer_id),
             "status": TradeOfferStatus.CANCELLED.value,
@@ -643,6 +910,11 @@ def _do_list_store_item(
     request_id: uuid.UUID,
 ) -> Dict[str, Any]:
     store_code = params.get("store_code")
+    if store_code == "RESTAURANT_STORE":
+        from .lucy_restaurant import list_meal
+        return list_meal(npc_id, params, world_minute, request_id)
+    if params.get("public_meal_code") or params.get("decision_id"):
+        return _fail("PUBLIC_MEAL_NOT_AUTHORIZED")
     item_id = params.get("item_id")
     amount = params.get("amount")
     price_mode = params.get("price_mode")
@@ -707,11 +979,15 @@ def _do_list_store_item(
             None,
         )
 
-        # Deduct from operator's personal inventory (preserve batches).
+        stock_source = params.get("stock_source", "PERSONAL")
+        if stock_source not in {"PERSONAL", "STORE"}:
+            return _fail(ResultCode.P3_INVALID_PARAMS)
         try:
-            consumed = _consume_personal_fefo_available(
-                operator_inv, item_id, amount, world_minute
-            )
+            if stock_source == "STORE":
+                from .caravan import consume_unlisted
+                consumed = consume_unlisted(store, item_id, amount, world_minute)
+            else:
+                consumed = _consume_personal_fefo_available(operator_inv, item_id, amount, world_minute)
         except ValueError:
             return _fail(ResultCode.TRADE_INSUFFICIENT_ITEM)
 
@@ -741,12 +1017,15 @@ def _do_list_store_item(
                 remaining_uses=slot.remaining_uses,
                 produced_world_minute=slot.produced_world_minute,
                 expires_world_minute=slot.expires_world_minute,
-                source_npc=operator_inv.npc,
-                source_slot_instance_id=slot.instance_id,
+                source_npc=slot.source_npc if stock_source == "STORE" else operator_inv.npc,
+                source_slot_instance_id=slot.source_slot_instance_id if stock_source == "STORE" else slot.instance_id,
+                item_attributes=slot.item_attributes if stock_source == "STORE" else
+                    {key: getattr(slot, key) for key in BATCH_ITEM_ATTRIBUTES},
             )
 
-        operator_inv.asset_version += 1
-        operator_inv.save(update_fields=["asset_version", "updated_at"])
+        if params.get("stock_source", "PERSONAL") == "PERSONAL":
+            operator_inv.asset_version += 1
+            operator_inv.save(update_fields=["asset_version", "updated_at"])
 
         store.inventory_version += 1
         store.save(update_fields=["inventory_version", "updated_at"])
@@ -822,6 +1101,8 @@ def _do_update_store_price(
         if listing.status != ListingStatus.ACTIVE.value:
             return _fail(ResultCode.TRADE_LISTING_NOT_ACTIVE)
 
+        if store.store_code == "RESTAURANT_STORE":
+            return _fail("RESTAURANT_FIXED_PRICE_REQUIRED")
         unit_price = _resolve_final_unit_price(
             price_mode, custom_unit_price, listing.item_id
         )
@@ -853,6 +1134,7 @@ def _do_update_store_price(
             "listing_id": str(listing.listing_id),
             "unit_price": unit_price,
             "price_mode": price_mode,
+            "store_code": store.store_code, "item_id": listing.item_id,
             "store_inventory_version": store.inventory_version,
         },
     )
@@ -922,39 +1204,13 @@ def _do_delist_store_item(
         ):
             return _fail(ResultCode.TRADE_STORE_VERSION_CONFLICT)
 
-        # Return remaining (unreserved) store batches to the operator.
+        # Delisting changes visibility; ownership stays with the store.
         returned = 0
-        store_slots = list(
-            VillageStoreInventorySlot.objects.select_for_update()
-            .filter(store=store, listing=listing, item_amount__gt=0)
-            .order_by("instance_id")
-        )
-        for slot in store_slots:
-            take = max(0, slot.item_amount - slot.reserved_amount)
-            if take > 0:
-                add_batch(
-                    operator_inv,
-                    slot.item_id,
-                    take,
-                    slot.produced_world_minute or world_minute,
-                    slot.expires_world_minute,
-                    request_id,
-                    remaining_uses=slot.remaining_uses,
-                )
-                returned += take
-            # Sold amounts are gone; drop the batch (keep reserved portion if any).
-            remaining_reserved = slot.reserved_amount
-            if remaining_reserved <= 0:
-                slot.delete()
-            else:
-                slot.item_amount = remaining_reserved
-                slot.save(update_fields=["item_amount"])
+        delisted_amount = sum(s.item_amount for s in VillageStoreInventorySlot.objects.filter(store=store, listing=listing))
+        VillageStoreInventorySlot.objects.filter(store=store, listing=listing).update(listing=None)
 
         listing.status = ListingStatus.DELISTED.value
         listing.save(update_fields=["status", "updated_at"])
-
-        operator_inv.asset_version += 1
-        operator_inv.save(update_fields=["asset_version", "updated_at"])
 
         store.inventory_version += 1
         store.save(update_fields=["inventory_version", "updated_at"])
@@ -970,12 +1226,22 @@ def _do_delist_store_item(
         data={
             "listing_id": str(listing.listing_id),
             "returned_amount": returned,
+            "delisted_amount": delisted_amount, "store_code": store.store_code, "item_id": listing.item_id,
+            "status": listing.status, "stock_destination": "STORE_UNLISTED",
             "store_inventory_version": store.inventory_version,
         },
     )
 
 
 # ── BUY_FROM_STORE ───────────────────────────────────────────────────────────
+
+
+def _resolved_offer_failure(offer):
+    data = {"offer_id": str(offer.offer_id), "offer_status": offer.status,
+            "resolved_world_minute": offer.resolved_world_minute}
+    if offer.status == TradeOfferStatus.CANCELLED.value:
+        data["cancelled_by_npc_id"] = str(offer.proposer_npc.agent_id)
+    return _fail(ResultCode.TRADE_OFFER_ALREADY_RESOLVED, data=data)
 
 
 def _do_buy_from_store(
@@ -988,6 +1254,9 @@ def _do_buy_from_store(
     amount = params.get("amount")
     expected_store_inventory_version = params.get("expected_store_inventory_version")
     expected_buyer_asset_version = params.get("expected_buyer_asset_version")
+    if listing_uuid and VillageStoreListing.objects.filter(pk=listing_uuid, store_id="RESTAURANT_STORE").exclude(public_meal_code="").exists():
+        from .lucy_restaurant import buy_public_meal
+        return buy_public_meal(npc_id, params, world_minute, request_id)
 
     if listing_uuid is None:
         return _fail(ResultCode.TRADE_LISTING_NOT_FOUND)
@@ -1022,7 +1291,7 @@ def _do_buy_from_store(
             return _fail(ResultCode.TRADE_LISTING_NOT_ACTIVE)
 
         from .phase5_story import get_store_purchase_limit
-        remaining_limit = get_store_purchase_limit(npc_id, listing.item_id, world_minute)
+        remaining_limit = get_store_purchase_limit(npc_id, listing.item_id, world_minute, store.store_code)
         if remaining_limit is not None and amount > remaining_limit:
             return _fail("STORY_RATION_LIMIT_REACHED", data={
                 "item_id": listing.item_id,
@@ -1069,6 +1338,15 @@ def _do_buy_from_store(
         except VillageAccount.DoesNotExist:
             return _fail(ResultCode.TRADE_PUBLIC_FUND_NOT_FOUND)
 
+        if store.store_code == "RESTAURANT_STORE":
+            from .lucy_cooking import fixed_price
+            try:
+                for batch in VillageStoreInventorySlot.objects.filter(listing=listing, item_amount__gt=0):
+                    if fixed_price(listing.item_id, batch.item_attributes) != listing.unit_price:
+                        return _fail("RESTAURANT_PRICE_STALE")
+            except ValueError as exc:
+                return _fail(str(exc))
+
         # Fee policy must be legal (rejected transaction, not a skipped fee).
         try:
             fee_amount, store_net_amount = _compute_fee(
@@ -1082,8 +1360,10 @@ def _do_buy_from_store(
         gross_amount = listing.unit_price * amount
 
         # Resource re-validation under lock.
-        if _get_buyer_available_money(buyer_inv) < gross_amount:
-            return _fail(ResultCode.TRADE_INSUFFICIENT_MONEY)
+        available_money = _get_buyer_available_money(buyer_inv)
+        if available_money < gross_amount:
+            return _fail(ResultCode.TRADE_INSUFFICIENT_MONEY, data={"required_amount": gross_amount,
+                "available_amount": available_money, "payer": "PERSONAL"})
         try:
             consumed = _consume_store_fefo_available(
                 store, listing, amount, world_minute
@@ -1092,16 +1372,28 @@ def _do_buy_from_store(
             return _fail(ResultCode.TRADE_INSUFFICIENT_ITEM)
 
         # Transfer items to the buyer (preserve batch attributes).
+        purchased_batches = []
+        from .phase3_public_economy import _get_eat_whitelist
+        edible_items = _get_eat_whitelist()
         for slot, taken in consumed:
-            add_batch(
+            personal_slot = add_batch(
                 buyer_inv,
                 slot.item_id,
                 taken,
-                slot.produced_world_minute or world_minute,
+                slot.produced_world_minute,
                 slot.expires_world_minute,
                 request_id,
                 remaining_uses=slot.remaining_uses,
+                item_attributes=slot.item_attributes,
             )
+            batch = {"instance_id": str(personal_slot.instance_id), "item_id": slot.item_id,
+                     "amount": taken, "source": "PERSONAL_INVENTORY",
+                     "expires_world_minute": slot.expires_world_minute}
+            if slot.item_id in edible_items:
+                batch["food_instance_id"] = str(personal_slot.instance_id)
+            if personal_slot.remaining_uses is not None:
+                batch["remaining_uses"] = personal_slot.remaining_uses
+            purchased_batches.append(batch)
 
         # Money: buyer pays gross, store keeps net, fee goes to PUBLIC_FUND.
         buyer_inv.money -= gross_amount
@@ -1142,6 +1434,7 @@ def _do_buy_from_store(
     }
 
     data = {
+        "store_code": store.store_code, "item_id": item_id, "unit_price": listing.unit_price,
         "listing_id": str(listing.listing_id),
         "amount": amount,
         "gross_amount": gross_amount,
@@ -1152,6 +1445,7 @@ def _do_buy_from_store(
         "store_inventory_version": store.inventory_version,
         "store_account_version": store_account.account_version,
         "public_fund_asset_version": public_fund.asset_version,
+        "purchased_batches": purchased_batches,
     }
 
     return _ok(
@@ -1166,7 +1460,7 @@ def _do_buy_from_store(
 
 
 def query_store_inventory(
-    store_code: str, world_minute: int
+    store_code: str, world_minute: int, viewer_npc_id=None
 ) -> Tuple[Optional[str], Optional[Dict[str, Any]]]:
     """Return ``(result_code_or_None, data)`` for the public store inventory.
 
@@ -1187,6 +1481,12 @@ def query_store_inventory(
         ).order_by("item_id", "unit_price", "listed_world_minute", "listing_id")
     )
     item_ids = {listing.item_id for listing in active_listings}
+    # Explicit type evidence lets Agent feedback omit legacy dish defaults on
+    # seeds/materials without dropping quality from an unrated, normal dish.
+    from recipes.models import Recipe
+    from .lucy_catalog import RELIEF_PACK
+    dish_item_ids = set(Recipe.objects.filter(item_id__in=item_ids)
+                        .exclude(item_id=RELIEF_PACK).values_list("item_id", flat=True))
     names: Dict[int, str] = {}
     if item_ids:
         from items.models import Item
@@ -1196,30 +1496,56 @@ def query_store_inventory(
 
     for listing in active_listings:
         available = 0
+        batches = []
+        from .lucy_restaurant import store_available, public_menu_info
         for slot in VillageStoreInventorySlot.objects.filter(
             store=store, listing=listing, item_amount__gt=0
         ):
             if slot.expires_world_minute is not None and slot.expires_world_minute <= world_minute:
                 continue
-            available += max(0, slot.item_amount - slot.reserved_amount)
+            available += store_available(slot, world_minute)
+            batches.append({**slot.item_attributes, "food_instance_id": str(slot.instance_id),
+                            "available_amount": store_available(slot, world_minute),
+                            "expires_world_minute": slot.expires_world_minute,
+                            "remaining_uses": slot.remaining_uses})
         items.append({
             "listing_id": str(listing.listing_id),
             "item_id": listing.item_id,
             "name": names.get(listing.item_id, str(listing.item_id)),
+            "is_dish": listing.item_id in dish_item_ids,
             "available_amount": available,
             "unit_price": listing.unit_price,
             "price_mode": listing.price_mode,
+            "batches": batches,
+            **public_menu_info(listing, world_minute, viewer_npc_id),
         })
 
     operator_id = (
         str(store.operator_npc.agent_id) if store.operator_npc is not None else None
     )
 
+    from .models import VillageStoryFact
+    from .phase5_story import get_store_purchase_limit, story_enabled
+    account = VillageStoreAccount.objects.filter(store=store).first()
+    fact = VillageStoryFact.objects.filter(arc_id="BROKEN_TRADE_ROUTE_V1").first() if store_code == "GENERAL_STORE" else None
+    public_active = story_enabled() and fact and fact.store_limits_enabled and (fact.ration_limits_until_world_minute is None or world_minute < fact.ration_limits_until_world_minute)
+    purchase_limits = {
+        "public_daily_limits": fact.ration_daily_limits if public_active else {},
+        "store_daily_limits": account.daily_limits if account and account.limits_until_world_minute and world_minute < account.limits_until_world_minute else {},
+        "store_expires_world_minute": account.limits_until_world_minute if account else None,
+        "public_expires_world_minute": fact.ration_limits_until_world_minute if fact else None,
+        "remaining_today": {str(i): get_store_purchase_limit(viewer_npc_id, i, world_minute, store_code) for i in item_ids} if viewer_npc_id else {},
+    }
+    inventory_status, available_by_item = store_inventory_status(store, world_minute)
     data = {
+        "purchase_limits": purchase_limits,
         "store_code": store.store_code,
         "location_code": store.location_code,
         "operator_npc_id": operator_id,
-        "store_status": _store_inventory_status(store, world_minute),
+        "operational_status": store.status,
+        "inventory_status": inventory_status,
+        "store_status": inventory_status,
+        "available_by_item": {str(item_id): amount for item_id, amount in available_by_item.items()},
         "inventory_version": store.inventory_version,
         "fee_policy": {
             "transaction_fee_bps": store.transaction_fee_bps,

@@ -300,7 +300,13 @@ class PhaseFourSocialTest(TestCase):
         self.assertEqual(NpcCommitment.objects.get(pk=commitment.pk).status, "COMPLETED")
         self.assertEqual(EconomicLedgerEntry.objects.filter(request_id=uuid.UUID(accepted["request_id"])).count(), 1)
         self.assertTrue(VillageActionReceipt.objects.filter(request_id=uuid.UUID(accepted["request_id"])).exists())
-        self.assertTrue(VillageDeliveryOutbox.objects.filter(event__event_id=accepted["event"]["event_id"]).exists())
+        # 交易事件通知对手方；执行者仍只收到自己的 OUTCOME 回执。
+        self.assertTrue(VillageWorldEvent.objects.filter(event_id=accepted["event"]["event_id"]).exists())
+        rows = VillageDeliveryOutbox.objects.filter(event__event_id=accepted["event"]["event_id"])
+        self.assertEqual(
+            {(row.message_kind, row.recipient) for row in rows},
+            {("OUTCOME", "10011"), ("EVENT", "10012")},
+        )
         self.assertEqual(sum(NpcGlobalInventorySlot.objects.filter(bag=buyer_inv, item_id=1030).values_list("item_amount", flat=True)), 1)
 
     def test_low_stock_low_price_delivery_keeps_trust_and_adds_emergency_gains(self):
@@ -412,3 +418,31 @@ class PhaseFourSocialTest(TestCase):
         reverse["giveItem"] = []
         reverse_response = client.post("/api/env/actions/character-trade", reverse, format="json")
         self.assertEqual(reverse_response.status_code, 409)
+
+
+    def test_discovered_commitment_examples_are_accepted_by_real_contract(self):
+        from village.command_catalog import agent_tool
+        from village.phase4_contract import validate_commitment_target
+        for code in ("RESTAURANT", "RECORD_HALL"):
+            VillageLocationDefinition.objects.create(location_code=code, display_name=code,
+                center_anchor_code=code, location_type="public")
+        schema = agent_tool("CREATE_COMMITMENT")["parameters"]
+        self.assertEqual(len(schema["oneOf"]), 6)
+        for example in schema["examples"]:
+            with self.subTest(kind=example["commitment_type"], target=example["target"]):
+                self.assertEqual(validate_commitment_target(example["commitment_type"], example["target"]), example["target"])
+                result = create_commitment("10014", example, 1000, uuid.uuid4())
+                self.assertEqual(result["result_code"], "OK", result)
+        self.assertIn("commitment_id", agent_tool("PROPOSE_TRADE")["parameters"]["properties"])
+
+    def test_bad_commitment_reports_specific_target_or_deadline_field(self):
+        base = dict(beneficiary_npc_id="10011", commitment_type="DONATION",
+            target={"asset_kind": "GOLD", "gold_amount": 2}, due_world_minute=2000)
+        for patch, field in (({"target": {"asset_kind": "GOLD"}}, "target.gold_amount"),
+                ({"target": {"asset_kind": "GOLD", "gold_amount": True}}, "target.gold_amount"),
+                ({"target": {"asset_kind": "GOLD", "gold_amount": 2, "amount": 1}}, "target.amount"),
+                ({"due_world_minute": 1000}, "due_world_minute"),
+                ({"commitment_type": "MEETING", "target": {"location_code": "MISSING_PLACE"}}, "target.location_code")):
+            result = create_commitment("10014", dict(base, **patch), 1000, uuid.uuid4())
+            self.assertEqual(result["result_code"], "SOCIAL_INVALID_PARAMS")
+            self.assertIn(field, [e["field"] for e in result["data"]["field_errors"]])

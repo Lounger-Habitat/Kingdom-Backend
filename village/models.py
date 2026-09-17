@@ -2,6 +2,7 @@ import uuid
 
 from django.core.exceptions import ValidationError
 from django.db import models
+from inventory.components import BatchComponents, UsageFields, DishFields, ReviewFields
 
 from .phase3_contract import (
     ListingStatus,
@@ -122,6 +123,16 @@ class NpcSubjectiveGoalState(models.Model):
         return f"{self.npc.agent_id}: {self.status} v{self.goal_version}"
 
 
+def default_caravan_import_items():
+    from .phase3_catalog import IMPORT_WHITELIST
+    return sorted(IMPORT_WHITELIST)
+
+
+def default_caravan_export_items():
+    from .phase3_catalog import EXPORT_WHITELIST
+    return sorted(EXPORT_WHITELIST)
+
+
 class VillageSimulationConfig(models.Model):
     """Phase-gated village configuration. Phase zero seeds every flag as off."""
 
@@ -150,11 +161,39 @@ class VillageSimulationConfig(models.Model):
     story_repair_labor_target = models.PositiveIntegerField(default=24)
     story_public_trust_minimum = models.SmallIntegerField(default=20)
     story_latest_day = models.PositiveIntegerField(default=25)
+    caravan_normal_capacity = models.PositiveIntegerField(default=60)
+    caravan_emergency_capacity = models.PositiveIntegerField(default=20)
+    caravan_item_ids = models.JSONField(default=default_caravan_import_items, blank=True, help_text="可登记进口物品；空目录表示不供货")
+    caravan_export_item_ids = models.JSONField(default=default_caravan_export_items, blank=True, verbose_name="出口收购物品")
+    caravan_export_capacity = models.PositiveIntegerField(default=60, verbose_name="每趟出口收购总量", help_text="所有收购物品共用的数量上限；0 表示停止收购")
+    caravan_import_price_min_percent = models.PositiveIntegerField(default=90, verbose_name="进口最低价格百分比")
+    caravan_import_price_max_percent = models.PositiveIntegerField(default=110, verbose_name="进口最高价格百分比")
+    caravan_export_price_min_percent = models.PositiveIntegerField(default=90, verbose_name="出口最低价格百分比")
+    caravan_export_price_max_percent = models.PositiveIntegerField(default=110, verbose_name="出口最高价格百分比")
+    caravan_contact_cost = models.PositiveIntegerField(default=100)
+    jack_repeat_hunt_energy = models.PositiveIntegerField("第二次及以后狩猎额外精力", default=4)
+    repair_metal_unit_price = models.PositiveIntegerField(default=50)
     updated_at = models.DateTimeField(auto_now=True)
 
     class Meta:
         verbose_name = "村庄模拟配置"
         verbose_name_plural = "村庄模拟配置"
+
+    def clean(self):
+        from items.models import Item
+        for field in ("caravan_item_ids", "caravan_export_item_ids"):
+            values = getattr(self, field)
+            if not isinstance(values, list) or any(type(i) is not int for i in values):
+                raise ValidationError({field: "请选择有效物品。"})
+            if Item.objects.filter(item_id__in=set(values), is_deleted=False).count() != len(set(values)):
+                raise ValidationError({field: "目录包含不存在或已删除的物品。"})
+        for side in ("import", "export"):
+            minimum = getattr(self, f"caravan_{side}_price_min_percent")
+            maximum = getattr(self, f"caravan_{side}_price_max_percent")
+            if not 1 <= minimum <= maximum:
+                raise ValidationError({f"caravan_{side}_price_max_percent": "价格百分比必须满足 1 ≤ 下限 ≤ 上限。"})
+        if min(self.caravan_normal_capacity, self.caravan_emergency_capacity, self.repair_metal_unit_price) < 1:
+            raise ValidationError("商队运力和修桥材料单价必须为正数。")
 
     def __str__(self):
         return self.config_key
@@ -175,10 +214,18 @@ class VillageActionDurationConfig(models.Model):
         "PLANT": ("阶段三", "播种", "在 Bill 农田播种；使用“时长（世界分钟）”。"),
         "HARVEST": ("阶段三", "收获", "在 Bill 农田收获；使用“时长（世界分钟）”。"),
         "HUNT": ("阶段三", "狩猎", "在狩猎入口狩猎；使用“时长（世界分钟）”。"),
+        "PROCESS_GAME": ("阶段三", "处理猎物", "Jack在屠宰棚处理一件猎物；时长必须由数据库配置。"),
         "COOK": ("阶段三", "烹饪", "在餐厅烹饪；使用“时长（世界分钟）”。"),
         "CREATE_ORDER": ("阶段三", "创建订单", "创建交易订单；使用“时长（世界分钟）”。"),
         "CANCEL_ORDER": ("阶段三", "取消订单", "取消自己的开放订单；使用“时长（世界分钟）”。"),
         "START_DELIVERY": ("阶段三", "开始配送", "开始已匹配订单的配送；使用“时长（世界分钟）”。"),
+        "CONTACT_CARAVAN": ("阶段三", "联络商队", "在杂货铺办理；使用世界分钟时长。"),
+        "WITHDRAW_STORE_FUNDS": ("阶段三", "商店提款", "经营者在本人商店办理；使用世界分钟时长。"),
+        "REQUEST_DISH_REVIEW": ("阶段三", "提交菜品品鉴", "Lucy在品鉴处提交具体一份菜。"),
+        "CANCEL_DISH_REVIEW": ("阶段三", "取消菜品品鉴", "Lucy取消本人待评请求并解锁样品。"),
+        "DEPOSIT_STORE_FUNDS": ("阶段三", "商店存款", "个人资金转入商店；使用世界分钟时长。"),
+        "WITHDRAW_STORE_ITEM": ("阶段三", "商店取货", "未上架库存转入个人背包；使用世界分钟时长。"),
+        "SET_STORE_LIMITS": ("阶段三", "设置商店限购", "在杂货铺办理；使用世界分钟时长。"),
         "IMPORT_GOODS": ("阶段三", "外部进货", "在贸易道路向商队进货；使用“时长（世界分钟）”。"),
         "EXPORT_GOODS": ("阶段三", "外部出货", "在贸易道路向商队出货；使用“时长（世界分钟）”。"),
         "RATE_DISH": ("阶段三", "菜品评分", "在档案馆为菜品评分；使用“时长（世界分钟）”。"),
@@ -215,13 +262,19 @@ class VillageActionDurationConfig(models.Model):
         "WORK_PLACEHOLDER": 30,
         "PLANT": 60,
         "HARVEST": 90,
-        "HUNT": 120,
         "COOK": 90,
         "CREATE_ORDER": 1,
         "CANCEL_ORDER": 1,
         "START_DELIVERY": 1,
-        "IMPORT_GOODS": 120,
-        "EXPORT_GOODS": 120,
+        "CONTACT_CARAVAN": 1,
+        "WITHDRAW_STORE_FUNDS": 1,
+        "REQUEST_DISH_REVIEW": 1,
+        "CANCEL_DISH_REVIEW": 1,
+        "DEPOSIT_STORE_FUNDS": 1,
+        "WITHDRAW_STORE_ITEM": 1,
+        "SET_STORE_LIMITS": 1,
+        "IMPORT_GOODS": 10,
+        "EXPORT_GOODS": 10,
         "RATE_DISH": 30,
         "PUBLISH_PRICE_INDEX": 30,
         "AUDIT_PUBLIC_FUND": 30,
@@ -250,6 +303,12 @@ class VillageActionDurationConfig(models.Model):
         "GO_HOME": 180,
     }
 
+    DATABASE_ONLY_DURATIONS = frozenset({"HUNT", "PROCESS_GAME"})
+
+    @classmethod
+    def timed_actions(cls):
+        return set(cls.DEFAULT_DURATIONS) | cls.DATABASE_ONLY_DURATIONS
+
     action_name = models.CharField("动作", max_length=32, unique=True, choices=ACTION_CHOICES)
     duration_minutes = models.PositiveIntegerField("时长（世界分钟）", null=True, blank=True)
     navigation_timeout_seconds = models.PositiveIntegerField("导航超时（秒）", null=True, blank=True)
@@ -277,6 +336,8 @@ class VillageActionDurationConfig(models.Model):
     @classmethod
     def configured_duration(cls, action_name):
         value = cls.objects.filter(action_name=action_name).values_list("duration_minutes", flat=True).first()
+        if action_name in cls.DATABASE_ONLY_DURATIONS:
+            return value if isinstance(value, int) and value > 0 else None
         return value if value is not None else cls.DEFAULT_DURATIONS[action_name]
 
     @classmethod
@@ -365,6 +426,8 @@ class NpcRuntimeState(models.Model):
     social_remainder = models.IntegerField("社交余数", default=0)
     stress_remainder = models.IntegerField("压力余数", default=0)
     needs_world_minute = models.BigIntegerField("需求推进世界分钟", default=0)
+    continuous_sleep_minutes = models.PositiveIntegerField("当前连续睡眠分钟", default=0)
+    last_sleep_end_world_minute = models.BigIntegerField("最近睡眠结束世界分钟", null=True, blank=True)
     away_until_world_minute = models.BigIntegerField("撤离返回世界分钟", null=True, blank=True)
     updated_at = models.DateTimeField("更新时间", auto_now=True)
 
@@ -422,6 +485,10 @@ class NpcNeedsDaySummary(models.Model):
     )
     day_index = models.BigIntegerField()
     sleep_minutes = models.PositiveIntegerField(default=0)
+    longest_continuous_sleep_minutes = models.PositiveIntegerField(default=0)
+    core_night_sleep_minutes = models.PositiveIntegerField(default=0)
+    core_night_evaluated = models.BooleanField(default=False)
+    core_night_penalized = models.BooleanField(default=False)
     successful_meals = models.PositiveIntegerField(default=0)
     severe_hunger_minutes = models.PositiveIntegerField(default=0)
     injured = models.BooleanField(default=False)
@@ -543,6 +610,7 @@ class NpcCommandState(models.Model):
     target_id = models.CharField("目标ID", max_length=64, blank=True, default="")
     location_code = models.CharField("地点码", max_length=64, blank=True, default="")
     sanitized_parameters = models.JSONField("清洗后参数", default=dict, blank=True)
+    production_state = models.JSONField("后台生产规则与占用快照", default=dict, blank=True)
     payload_sha256 = models.CharField("Payload SHA256", max_length=64)
     queue_mode = models.CharField("队列模式", max_length=16, choices=QUEUE_MODE_CHOICES, default="STRICT")
     status = models.CharField("状态", max_length=16, choices=STATUS_CHOICES, default="RECEIVED")
@@ -895,6 +963,9 @@ class VillageAccount(models.Model):
     asset_version = models.BigIntegerField("资产版本", default=0)
     last_caravan_day = models.IntegerField("上次商队日", null=True, blank=True)
     last_closed_day_index = models.IntegerField("上次关闭日索引", default=-1)
+    audit_opening_balance = models.IntegerField("对账基准余额", default=0)
+    audit_after_ledger_id = models.BigIntegerField("对账起点账目ID", default=0)
+    audit_baseline_kind = models.CharField("对账基准来源", max_length=24, default="INITIAL")
     updated_at = models.DateTimeField("更新时间", auto_now=True)
 
     class Meta:
@@ -1106,6 +1177,41 @@ TRADE_OFFER_STATUS_CHOICES = [
 ]
 
 
+class VillageCaravanConfig(VillageSimulationConfig):
+    class Meta:
+        proxy = True
+        verbose_name = "商队配置"
+        verbose_name_plural = "商队配置"
+
+
+class VillageCaravanRequest(models.Model):
+    day_index = models.BigIntegerField(primary_key=True)
+    item_ids = models.JSONField(default=list)
+    submitted_world_minute = models.BigIntegerField()
+
+    class Meta:
+        verbose_name = "下趟商队需求"
+        verbose_name_plural = "下趟商队需求"
+
+
+class VillageCaravanVisit(models.Model):
+    day_index = models.BigIntegerField(primary_key=True)
+    route = models.CharField(max_length=16)
+    location_code = models.CharField(max_length=64, blank=True)
+    stock = models.JSONField(default=dict)
+    initial_stock = models.JSONField(default=dict)
+    import_prices = models.JSONField(default=dict)
+    export_prices = models.JSONField(default=dict)
+    export_capacity = models.PositiveIntegerField(default=60)
+    exported_amount = models.PositiveIntegerField(default=0)
+    requested_items = models.JSONField(default=list)
+    error_code = models.CharField(max_length=64, blank=True)
+
+    class Meta:
+        verbose_name = "每日商队到访"
+        verbose_name_plural = "每日商队到访"
+
+
 class VillageStore(models.Model):
     """Independent store entity with its own inventory, listing and account."""
 
@@ -1159,6 +1265,9 @@ class VillageStoreAccount(models.Model):
         related_name="account",
     )
     balance = models.IntegerField("余额", default=0)
+    minimum_operating_balance = models.PositiveIntegerField("最低经营储备", default=200)
+    daily_limits = models.JSONField("店内每日限购", default=dict, blank=True)
+    limits_until_world_minute = models.BigIntegerField("限购到期时间", null=True, blank=True)
     account_version = models.BigIntegerField("账户版本", default=0)
     updated_at = models.DateTimeField("更新时间", auto_now=True)
 
@@ -1176,7 +1285,7 @@ class VillageStoreAccount(models.Model):
         return f"{self.store.store_code} balance={self.balance}"
 
 
-class VillageStoreInventorySlot(models.Model):
+class VillageStoreInventorySlot(BatchComponents):
     """A store-owned item batch, preserving batch attributes on list/delist."""
 
     instance_id = models.UUIDField("批次ID", unique=True, default=uuid.uuid4)
@@ -1194,7 +1303,7 @@ class VillageStoreInventorySlot(models.Model):
     )
     item_id = models.IntegerField("物品ID")
     item_amount = models.IntegerField("数量", default=0)
-    remaining_uses = models.IntegerField("剩余使用次数", null=True, blank=True)
+    quality = models.IntegerField(default=3)
     produced_world_minute = models.BigIntegerField("生产世界分钟", null=True, blank=True)
     expires_world_minute = models.BigIntegerField("过期世界分钟", null=True, blank=True)
     source_npc = models.ForeignKey(
@@ -1206,6 +1315,31 @@ class VillageStoreInventorySlot(models.Model):
     )
     source_slot_instance_id = models.UUIDField("来源批次ID", null=True, blank=True)
     reserved_amount = models.IntegerField("预留数量", default=0)
+    common_attributes = models.JSONField("批次公共属性及扩展", default=dict, blank=True)
+
+    @property
+    def item_attributes(self):
+        # Legacy wire/transfer shape, assembled from the authoritative components.
+        from inventory.components import COMPONENT_FIELDS
+        return dict(self.common_attributes or {}, dish_quality=self.quality, **{
+            name: getattr(self, name) for name in COMPONENT_FIELDS if name != "remaining_uses"
+        })
+
+    @item_attributes.setter
+    def item_attributes(self, value):
+        from inventory.components import COMPONENT_FIELDS
+        value = value or {}
+        self.quality = value.get("dish_quality", 3)
+        self.common_attributes = {key: val for key, val in value.items() if key not in COMPONENT_FIELDS and key != "dish_quality"}
+        for name, (_, _, default) in COMPONENT_FIELDS.items():
+            if name != "remaining_uses":
+                setattr(self, name, value.get(name, default))
+
+    def save(self, *args, **kwargs):
+        if kwargs.get("update_fields") is not None and "item_attributes" in kwargs["update_fields"]:
+            from inventory.components import COMPONENT_FIELDS
+            kwargs["update_fields"] = (set(kwargs["update_fields"]) - {"item_attributes"}) | {"common_attributes", "quality"} | (COMPONENT_FIELDS.keys() - {"remaining_uses"})
+        return super().save(*args, **kwargs)
 
     class Meta:
         verbose_name = "商店库存批次"
@@ -1226,6 +1360,8 @@ class VillageStoreInventorySlot(models.Model):
 
 
 class VillageStoreListing(models.Model):
+    public_meal_code = models.CharField(max_length=2, blank=True, default="")
+    subsidy_decision = models.ForeignKey("VillagePublicDecision", null=True, blank=True, on_delete=models.PROTECT)
     """A store's authoritative price listing for one item/price tier."""
 
     listing_id = models.UUIDField("上架ID", primary_key=True, default=uuid.uuid4)
@@ -1262,8 +1398,9 @@ class VillageStoreListing(models.Model):
         verbose_name_plural = "商店上架记录"
         constraints = [
             models.CheckConstraint(
-                name="village_store_listing_unit_price_positive",
-                condition=models.Q(unit_price__gt=0),
+                name="village_store_listing_valid_price",
+                condition=(models.Q(unit_price__gt=0, public_meal_code="", subsidy_decision__isnull=True)
+                           | models.Q(unit_price=0, public_meal_code__in=["C1", "C2", "R1"], subsidy_decision__isnull=False)),
             ),
         ]
 
@@ -1275,6 +1412,7 @@ class VillageTradeOffer(models.Model):
     """Immutable directed NPC-to-NPC trade offer."""
 
     offer_id = models.UUIDField("报价ID", primary_key=True, default=uuid.uuid4)
+    buying_store = models.ForeignKey(VillageStore, on_delete=models.PROTECT, null=True, blank=True)
     buyer_npc = models.ForeignKey(
         "inventory.NpcDefinition",
         on_delete=models.CASCADE,
@@ -1284,6 +1422,11 @@ class VillageTradeOffer(models.Model):
         "inventory.NpcDefinition",
         on_delete=models.CASCADE,
         related_name="trade_offers_as_seller",
+    )
+    proposer_npc = models.ForeignKey(
+        "inventory.NpcDefinition",
+        on_delete=models.CASCADE,
+        related_name="trade_offers_proposed",
     )
     commitment = models.ForeignKey(
         "NpcCommitment",
@@ -1623,6 +1766,7 @@ class VillageStoryFact(models.Model):
     bill_warning_revealed = models.BooleanField(default=False)
     mark_budget_delay_revealed = models.BooleanField(default=False)
     ration_rules_published = models.BooleanField(default=False)
+    ration_limits_until_world_minute = models.BigIntegerField(null=True, blank=True)
     store_limits_enabled = models.BooleanField(default=False)
     ration_daily_limits = models.JSONField(default=dict, blank=True)
     community_meals = models.PositiveIntegerField(default=0)
@@ -1639,6 +1783,8 @@ class VillageStoryMeeting(models.Model):
     opened_day = models.PositiveIntegerField()
     closes_day = models.PositiveIntegerField()
     candidate_plans = models.JSONField(default=list)
+    proposals = models.JSONField("已登记提案条款", default=dict, blank=True)
+    starts_world_minute = models.BigIntegerField(null=True, blank=True)
     retry_count = models.PositiveSmallIntegerField(default=0)
     status = models.CharField(max_length=16, choices=STATUS_CHOICES, default="OPEN")
     selected_plan = models.CharField(max_length=32, blank=True, default="")
@@ -1653,6 +1799,38 @@ class VillageStoryMeeting(models.Model):
             fields=["arc", "meeting_type", "opened_day"],
             name="village_story_meeting_day_unique",
         )]
+
+
+class VillagePublicDecision(models.Model):
+    """An immutable copy of the proposal actually approved by a meeting."""
+
+    decision_id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
+    meeting = models.OneToOneField(VillageStoryMeeting, on_delete=models.PROTECT, related_name="decision")
+    plan_code = models.CharField(max_length=32)
+    terms = models.JSONField(default=dict)
+    approved_world_minute = models.BigIntegerField()
+    published_world_minute = models.BigIntegerField(null=True, blank=True)
+    spent_gold = models.PositiveIntegerField(default=0)
+    revoked_world_minute = models.BigIntegerField(null=True, blank=True)
+
+
+class MarkDailySalary(models.Model):
+    """One frozen daily entitlement; only real public funds can settle it."""
+
+    day_index = models.PositiveIntegerField(unique=True)
+    amount_due = models.PositiveIntegerField()
+    amount_paid = models.PositiveIntegerField(default=0)
+    reference = models.JSONField(default=dict)
+    earned_request_id = models.UUIDField(unique=True)
+    earned_world_minute = models.BigIntegerField()
+    paid_world_minute = models.BigIntegerField(null=True, blank=True)
+
+
+class VillageProjectReview(models.Model):
+    entry = models.OneToOneField(EconomicLedgerEntry, on_delete=models.PROTECT, related_name="project_review")
+    request_id = models.UUIDField(unique=True)
+    reviewed_world_minute = models.BigIntegerField()
+    reviewer = models.ForeignKey("inventory.NpcDefinition", on_delete=models.PROTECT)
 
 
 class VillageStoryVote(models.Model):
@@ -1701,3 +1879,39 @@ class VillageRouteAttempt(models.Model):
     progress = models.JSONField(default=dict, blank=True)
     created_world_minute = models.BigIntegerField()
     created_at = models.DateTimeField(auto_now_add=True)
+
+
+class NpcCookingCounter(models.Model):
+    npc = models.OneToOneField("inventory.NpcDefinition", on_delete=models.CASCADE)
+    count_4 = models.PositiveIntegerField(default=0)
+    count_5 = models.PositiveIntegerField(default=0)
+    count_6 = models.PositiveIntegerField(default=0)
+
+
+class VillageDishReview(models.Model):
+    review_id = models.UUIDField(primary_key=True, default=uuid.uuid4)
+    owner = models.ForeignKey("inventory.NpcDefinition", on_delete=models.PROTECT)
+    slot = models.ForeignKey("inventory.NpcGlobalInventorySlot", on_delete=models.PROTECT)
+    target_npc_id = models.CharField(max_length=32, default="10013")
+    request_id = models.UUIDField(unique=True)
+    status = models.CharField(max_length=16, default="PENDING")
+    snapshot = models.JSONField(default=dict)
+    scores = models.JSONField(default=dict)
+    comment = models.TextField(blank=True)
+    customer_feedback = models.TextField(blank=True)
+    created_world_minute = models.BigIntegerField()
+    expires_world_minute = models.BigIntegerField()
+    completed_world_minute = models.BigIntegerField(null=True, blank=True)
+    completed_request_id = models.UUIDField(null=True, blank=True, unique=True)
+
+
+class VillageStoreInventorySlotUsage(UsageFields):
+    owner = models.OneToOneField(VillageStoreInventorySlot, on_delete=models.CASCADE, primary_key=True, related_name="usage")
+
+
+class VillageStoreInventorySlotDish(DishFields):
+    owner = models.OneToOneField(VillageStoreInventorySlot, on_delete=models.CASCADE, primary_key=True, related_name="dish")
+
+
+class VillageStoreInventorySlotReview(ReviewFields):
+    owner = models.OneToOneField(VillageStoreInventorySlot, on_delete=models.CASCADE, primary_key=True, related_name="review")

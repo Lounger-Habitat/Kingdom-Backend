@@ -38,8 +38,12 @@ NEEDS_FIELDS = ("hunger", "energy", "health", "social", "stress")
 NEEDS_SCALE = 10
 MINUTES_PER_DAY = 1440
 HEALTHY_SLEEP_MINUTES = 360
+SLEEP_FULL_MINUTES = 8 * 60
+SLEEP_MAX_MINUTES = 10 * 60
+SLEEP_CONTINUATION_GAP_MINUTES = 10
 MAX_INTERVALS = 64
 ACTIVITIES = {"IDLE", "MOVE", "WORK", "SOCIALIZE", "REST", "SLEEP"}
+URGENT_NEEDS = {"hunger", "social", "stress", "energy"}
 
 # Rates are fixed-point units per 30 minutes.  The activity values already
 # include the awake base values from the frozen contract.
@@ -68,14 +72,18 @@ ACTION_DELTA_ACTIVITIES = {
     "MOVE": "MOVE", "GO_HOME": "MOVE",
     "WORK_PLACEHOLDER": "WORK",
     "PLANT": "WORK", "HARVEST": "WORK", "HUNT": "WORK", "COOK": "WORK",
+    "REPAIR_LABOR": "WORK",
+    "PROCESS_GAME": "WORK",
 }
 
 
 def settle_action_needs_locked(
     runtime: NpcRuntimeState, action: str, started: Optional[int], ended: Optional[int],
-    *, base_until: Optional[int] = None,
+    *, base_until: Optional[int] = None, changed_fields: Optional[set] = None,
 ) -> Optional[str]:
     """Catch up fixed base and append one action delta for a settled action."""
+    if action != "SLEEP" and started is not None and ended is not None and ended > started:
+        NeedsService._reset_sleep_state(runtime)
     activity = ACTION_DELTA_ACTIVITIES.get(action)
     if not activity or started is None or ended is None or ended <= started:
         return None
@@ -83,11 +91,56 @@ def settle_action_needs_locked(
         error = NeedsService.advance_base_locked(runtime, base_until, finalize_days=False)
         if error:
             return error
-    return NeedsService.apply_behavior_delta_locked(runtime, started, ended, activity)
+    before = public_needs(runtime) if changed_fields is not None else None
+    error = NeedsService.apply_behavior_delta_locked(runtime, started, ended, activity)
+    if not error and changed_fields is not None:
+        changed_fields.update(name for name, value in public_needs(runtime).items() if value != before[name])
+    return error
+
+
+def sleep_receipt_details(start: int, end: int, planned_end: int, reason: str) -> dict:
+    """Only this sleep session; calendar conversion belongs to the wire projection."""
+    days = []
+    cursor = start
+    while cursor < end:
+        day_end = min(end, (cursor // MINUTES_PER_DAY + 1) * MINUTES_PER_DAY)
+        days.append({"day_world_minute": cursor // MINUTES_PER_DAY * MINUTES_PER_DAY,
+                     "minutes": day_end - cursor})
+        cursor = day_end
+    return {"slept_minutes": end - start, "planned_duration_minutes": planned_end - start,
+            "remaining_minutes": max(0, planned_end - end), "end_reason": reason,
+            "sleep_status": "INTERRUPTED" if reason == "VOLUNTARY_WAKE" else "COMPLETED",
+            "sleep_minutes_by_day": days}
 
 
 def _hash(payload: Dict[str, Any]) -> str:
     return hashlib.sha256(json.dumps(payload, sort_keys=True, separators=(",", ":")).encode()).hexdigest()
+
+
+def settle_repair_needs_locked(runtime, command, world_minute):
+    """Persist a server-owned cursor; ticks, cancellation and retries share it."""
+    from .phase5_story import repair_labor_unavailable
+    from .phase5_contract import REPAIR_LABOR_MINUTES
+    started = command.started_world_minute
+    if started is None:
+        return None
+    params = dict(command.sanitized_parameters)
+    params.pop("expected_story_version", None)
+    cursor = int(params.get("_repair_needs_until", started))
+    error = repair_labor_unavailable(runtime, world_minute, params)
+    if runtime.active_command_id != command.command_id or runtime.current_action != "STORY_ACT":
+        error = error or ResultCode.ACTION_NOT_ALLOWED
+    end = min(world_minute, started + REPAIR_LABOR_MINUTES)
+    # At most 60 minutes. Stop at the first work threshold, even after reconnect.
+    while cursor < end and not error:
+        error = settle_action_needs_locked(runtime, "REPAIR_LABOR", cursor, cursor + 1, base_until=cursor + 1)
+        cursor += 1
+        error = error or repair_labor_unavailable(runtime, cursor, params)
+    params["_repair_needs_until"] = cursor
+    command.sanitized_parameters = params
+    command.save(update_fields=["sanitized_parameters", "updated_at"])
+    runtime.save()
+    return error
 
 
 def _trunc_div(numerator: int, denominator: int) -> int:
@@ -110,6 +163,14 @@ def need_bands(runtime: NpcRuntimeState) -> Dict[str, str]:
         "social": band(runtime.social_fp),
         "stress": band(runtime.stress_fp),
     }
+
+
+def _critical_band_crossed(before: Dict[str, str], after: Dict[str, str]) -> Iterable[str]:
+    """Return needs that entered CRITICAL during one authoritative update."""
+    return (
+        name for name in ("hunger", "social", "stress", "energy")
+        if before.get(name) != "CRITICAL" and after.get(name) == "CRITICAL"
+    )
 
 
 def needs_rules() -> Dict[str, Any]:
@@ -151,8 +212,18 @@ def needs_rules() -> Dict[str, Any]:
         "socialize_daily_effect_percent": [100, 50, 25],
         "daily_health": {
             "minimum_sleep_minutes": HEALTHY_SLEEP_MINUTES,
+            "minimum_continuous_sleep_minutes": HEALTHY_SLEEP_MINUTES,
             "severe_hunger_all_day": -8,
             "ate_and_slept_at_least_360_minutes_and_not_injured": 2,
+        },
+        "sleep": {
+            "full_effect_minutes": SLEEP_FULL_MINUTES,
+            "low_gain_after_minutes": SLEEP_FULL_MINUTES,
+            "no_gain_after_minutes": SLEEP_MAX_MINUTES,
+            "continuation_gap_minutes": SLEEP_CONTINUATION_GAP_MINUTES,
+            "curve": "F(t)=(t/480)^2 for t<=480; then +10% through 600; capped at 110%",
+            "core_night_window": {"start": "23:00", "end": "04:00"},
+            "core_night_penalty_if_zero_minutes": {"health": -5},
         },
     }
 
@@ -226,6 +297,115 @@ class NeedsService:
         setattr(runtime, remainder_name, residue)
         setattr(runtime, value_name, max(0, min(1000, getattr(runtime, value_name) + delta)))
 
+    @staticmethod
+    def _sleep_curve_percent(minutes: int) -> int:
+        """Cumulative sleep effect, rounded to whole percentage points."""
+        minutes = max(0, int(minutes))
+        if minutes <= SLEEP_FULL_MINUTES:
+            return (minutes * minutes * 100 + (SLEEP_FULL_MINUTES ** 2) // 2) // (SLEEP_FULL_MINUTES ** 2)
+        if minutes <= SLEEP_MAX_MINUTES:
+            return 100 + ((minutes - SLEEP_FULL_MINUTES) * 10 + 60) // 120
+        return 110
+
+    @staticmethod
+    def _reset_sleep_state(runtime: NpcRuntimeState) -> None:
+        runtime.continuous_sleep_minutes = 0
+        runtime.last_sleep_end_world_minute = None
+
+    @staticmethod
+    def _summary_update_fields() -> list[str]:
+        return [
+            "sleep_minutes", "severe_hunger_minutes", "longest_continuous_sleep_minutes",
+            "core_night_sleep_minutes", "core_night_evaluated", "core_night_penalized", "updated_at",
+        ]
+
+    @classmethod
+    def _emit_needs_urgent(cls, runtime: NpcRuntimeState, need: str, world_minute: int) -> None:
+        """Wake one NPC once when a need crosses into CRITICAL."""
+        dedupe_key = f"needs-urgent:{runtime.npc.agent_id}:{need}:{world_minute}"[:128]
+        event, created = VillageWorldEvent.objects.get_or_create(
+            dedupe_key=dedupe_key,
+            defaults={
+                "event_type": "NPC_NEEDS_URGENT",
+                "world_minute": world_minute,
+                "time_revision": GlobalGameTimeState.objects.filter(pk=1).values_list(
+                    "time_revision", flat=True
+                ).first() or 0,
+                "actor_npc": runtime.npc,
+                "participant_npc_ids": [str(runtime.npc.agent_id)],
+                "location_code": runtime.current_location_code,
+                "request_id": uuid.uuid5(uuid.NAMESPACE_URL, dedupe_key),
+                "effects": {},
+                "visibility": "PARTICIPANTS",
+                "public_data": {
+                    "need": need,
+                    "value": getattr(runtime, f"{need}_fp") / NEEDS_SCALE,
+                    "reason": "ENTERED_CRITICAL",
+                },
+                "player_summary": f"{runtime.npc.name}的{need}需求已进入危急状态。",
+                "hub_summary": f"你的{need}需求已进入危急状态，请优先处理。",
+            },
+        )
+        if created:
+            from .phase4_visibility import enqueue_event_deliveries
+            enqueue_event_deliveries(event)
+
+    @classmethod
+    def _notify_critical_transitions(
+        cls, runtime: NpcRuntimeState, before: Dict[str, str], world_minute: int,
+    ) -> None:
+        after = need_bands(runtime)
+        for need in _critical_band_crossed(before, after):
+            cls._emit_needs_urgent(runtime, need, world_minute)
+
+    @staticmethod
+    def _night_index_for_minute(world_minute: int) -> Optional[int]:
+        minute_of_day = world_minute % MINUTES_PER_DAY
+        day_index = world_minute // MINUTES_PER_DAY
+        if minute_of_day >= 23 * 60:
+            return day_index + 1
+        if minute_of_day < 4 * 60:
+            return day_index
+        return None
+
+    @classmethod
+    def _pending_sleep_overlaps_night(
+        cls, runtime: NpcRuntimeState, night_index: int, through_minute: int,
+    ) -> bool:
+        if runtime.action_status != "SLEEPING" or runtime.current_action != "SLEEP":
+            return False
+        start = runtime.action_started_world_minute
+        end = runtime.action_ends_world_minute
+        if start is None or end is None:
+            return False
+        night_start = night_index * MINUTES_PER_DAY - 60
+        night_end = night_index * MINUTES_PER_DAY + 4 * 60
+        return max(start, night_start) < min(end, night_end, through_minute)
+
+    @classmethod
+    def evaluate_core_nights_locked(cls, runtime: NpcRuntimeState, through_minute: int) -> None:
+        """Apply the 23:00-04:00 penalty for each night reached by a cursor."""
+        last_night = through_minute // MINUTES_PER_DAY
+        existing_indices = NpcNeedsDaySummary.objects.filter(
+            npc=runtime.npc, day_index__gte=0, day_index__lte=last_night,
+            core_night_evaluated=False,
+        ).values_list("day_index", flat=True)
+        for night_index in existing_indices:
+            night_end = night_index * MINUTES_PER_DAY + 4 * 60
+            if night_end > through_minute:
+                continue
+            summary = cls._summary(runtime, night_index)
+            if summary.core_night_evaluated:
+                continue
+            slept = summary.core_night_sleep_minutes > 0 or cls._pending_sleep_overlaps_night(
+                runtime, night_index, through_minute
+            )
+            if not slept:
+                runtime.health_fp = max(0, runtime.health_fp - 50)
+            summary.core_night_evaluated = True
+            summary.core_night_penalized = not slept
+            summary.save(update_fields=cls._summary_update_fields())
+
     @classmethod
     def advance_social_scaled_locked(
         cls, runtime: NpcRuntimeState, start: int, end: int, percent: int,
@@ -264,12 +444,17 @@ class NeedsService:
 
     @classmethod
     def _apply_segment(cls, runtime: NpcRuntimeState, activity: str, start: int, end: int) -> None:
+        if activity == "SLEEP":
+            cls._apply_sleep_segment(runtime, start, end, RATES["SLEEP"])
+            return
+        cls._reset_sleep_state(runtime)
         day_index = start // MINUTES_PER_DAY
         summary = cls._summary(runtime, day_index)
         # A one-minute loop makes the severe-hunger boundary exact even when a
         # segment crosses 90.0 halfway through a 30-minute fixed-point rate.
         # ponytail: one-minute iteration; batch at hunger thresholds if long spans become costly.
         for _minute in range(start, end):
+            before_bands = need_bands(runtime)
             severe = runtime.hunger_fp >= 900
             if severe:
                 summary.severe_hunger_minutes += 1
@@ -279,24 +464,35 @@ class NeedsService:
                 cls._apply_rate(runtime, name, rate, 1)
             if severe:
                 cls._apply_rate(runtime, "stress", 20, 1)
+            cls._notify_critical_transitions(runtime, before_bands, _minute + 1)
         summary.save(update_fields=["sleep_minutes", "severe_hunger_minutes", "updated_at"])
 
     @classmethod
     def _apply_base_segment(cls, runtime: NpcRuntimeState, start: int, end: int) -> None:
         """Apply only the fixed world-time Needs base for one day segment."""
+        last_sleep_end = runtime.last_sleep_end_world_minute
+        if (
+            runtime.action_status != "SLEEPING"
+            and last_sleep_end is not None
+            and end - last_sleep_end > SLEEP_CONTINUATION_GAP_MINUTES
+        ):
+            cls._reset_sleep_state(runtime)
         summary = cls._summary(runtime, start // MINUTES_PER_DAY)
         for _minute in range(start, end):
+            before_bands = need_bands(runtime)
             severe = runtime.hunger_fp >= 900
             if severe:
                 summary.severe_hunger_minutes += 1
                 cls._apply_rate(runtime, "stress", 20, 1)
             for name, rate in BASE_RATES.items():
                 cls._apply_rate(runtime, name, rate, 1)
+            cls._notify_critical_transitions(runtime, before_bands, _minute + 1)
         summary.save(update_fields=["severe_hunger_minutes", "updated_at"])
 
     @classmethod
     def advance_base_locked(
         cls, runtime: NpcRuntimeState, target: int, *, finalize_days: bool = True,
+        evaluate_core_nights: bool = True,
     ) -> Optional[str]:
         """Advance a runtime to target using only the fixed base rates."""
         if target < runtime.needs_world_minute:
@@ -308,10 +504,17 @@ class NeedsService:
             next_day = ((cursor // MINUTES_PER_DAY) + 1) * MINUTES_PER_DAY
             segment_end = min(target, next_day)
             cls._apply_base_segment(runtime, cursor, segment_end)
-            if finalize_days and segment_end == next_day:
+            sleep_still_running = (
+                runtime.action_status == "SLEEPING"
+                and runtime.action_ends_world_minute is not None
+                and runtime.action_ends_world_minute >= segment_end
+            )
+            if finalize_days and segment_end == next_day and not sleep_still_running:
                 cls._finalize_day(runtime, cursor // MINUTES_PER_DAY)
             cursor = segment_end
         runtime.needs_world_minute = target
+        if evaluate_core_nights:
+            cls.evaluate_core_nights_locked(runtime, target)
         return None
 
     @classmethod
@@ -319,9 +522,14 @@ class NeedsService:
         cls, runtime: NpcRuntimeState, activity: str, start: int, end: int,
         multiplier_percent: int = 100,
     ) -> None:
+        if activity == "SLEEP":
+            cls._apply_sleep_segment(runtime, start, end, ACTION_DELTAS["SLEEP"])
+            return
+        cls._reset_sleep_state(runtime)
         summary = cls._summary(runtime, start // MINUTES_PER_DAY)
         deltas = ACTION_DELTAS[activity]
         for _minute in range(start, end):
+            before_bands = need_bands(runtime)
             if activity == "SLEEP":
                 summary.sleep_minutes += 1
             for name, rate in deltas.items():
@@ -329,7 +537,53 @@ class NeedsService:
                     cls._apply_rate(runtime, name, rate, 1)
                 else:
                     cls._apply_scaled_rate(runtime, name, rate, 1, multiplier_percent)
+            cls._notify_critical_transitions(runtime, before_bands, _minute + 1)
         summary.save(update_fields=["sleep_minutes", "updated_at"])
+
+    @classmethod
+    def _apply_sleep_segment(
+        cls, runtime: NpcRuntimeState, start: int, end: int, rates: Dict[str, int],
+    ) -> None:
+        """Apply a sleep span using one cumulative curve.
+
+        ``rates`` is either the full activity rate (Needs.advance) or only the
+        action delta (life-action settlement, whose base was already applied).
+        """
+        if end <= start:
+            return
+        last_end = runtime.last_sleep_end_world_minute
+        continuous = runtime.continuous_sleep_minutes
+        if last_end is None or start < last_end or start - last_end > SLEEP_CONTINUATION_GAP_MINUTES:
+            continuous = 0
+        summaries: Dict[int, NpcNeedsDaySummary] = {}
+        for world_minute in range(start, end):
+            before_bands = need_bands(runtime)
+            old_percent = cls._sleep_curve_percent(continuous)
+            continuous += 1
+            new_percent = cls._sleep_curve_percent(continuous)
+            percent_delta = new_percent - old_percent
+            for name, rate in rates.items():
+                # 480 minutes at 100% represents one complete sleep effect;
+                # the existing 3000-denominator remainder keeps this additive.
+                if percent_delta:
+                    cls._apply_scaled_rate(runtime, name, rate, SLEEP_FULL_MINUTES, percent_delta)
+
+            day_index = world_minute // MINUTES_PER_DAY
+            summary = summaries.setdefault(day_index, cls._summary(runtime, day_index))
+            summary.sleep_minutes += 1
+            summary.longest_continuous_sleep_minutes = max(
+                summary.longest_continuous_sleep_minutes, continuous
+            )
+            night_index = cls._night_index_for_minute(world_minute)
+            if night_index is not None:
+                night_summary = summaries.setdefault(night_index, cls._summary(runtime, night_index))
+                night_summary.core_night_sleep_minutes += 1
+            cls._notify_critical_transitions(runtime, before_bands, world_minute + 1)
+
+        runtime.continuous_sleep_minutes = continuous
+        runtime.last_sleep_end_world_minute = end
+        for summary in summaries.values():
+            summary.save(update_fields=cls._summary_update_fields())
 
     @classmethod
     def apply_behavior_delta_locked(
@@ -353,7 +607,11 @@ class NeedsService:
             return
         if summary.severe_hunger_minutes >= MINUTES_PER_DAY:
             runtime.health_fp = max(0, runtime.health_fp - 80)
-        elif summary.successful_meals >= 1 and summary.sleep_minutes >= HEALTHY_SLEEP_MINUTES and not summary.injured:
+        elif (
+            summary.successful_meals >= 1
+            and summary.longest_continuous_sleep_minutes >= HEALTHY_SLEEP_MINUTES
+            and not summary.injured
+        ):
             runtime.health_fp = min(1000, runtime.health_fp + 20)
         summary.finalized = True
         summary.save(update_fields=["finalized", "updated_at"])
@@ -385,6 +643,7 @@ class NeedsService:
                     cls._finalize_day(runtime, cursor // MINUTES_PER_DAY)
                 cursor = segment_end
         runtime.needs_world_minute = target
+        cls.evaluate_core_nights_locked(runtime, target)
         return None
 
     @classmethod
@@ -532,6 +791,9 @@ class TickService:
         if not success:
             raise _TickRejected(_result(False, code))
 
+        from .caravan import sync_visit
+        sync_visit(state.world_minute)
+
         receipt = VillageActionReceipt.objects.create(
             request_id=request_id,
             action_kind="VILLAGE_TICK",
@@ -553,6 +815,25 @@ class TickService:
         npc_results = {}
         for runtime in runtimes:
             npc_id = str(runtime.npc.agent_id)
+            interrupted_command_id = None
+            if runtime.active_command_id:
+                from .phase5_contract import is_repair_labor
+                from .runtime_services import ActionService
+                command = NpcCommandState.objects.select_for_update().filter(
+                    command_id=runtime.active_command_id, status="RUNNING").first()
+                from .jack_production import is_jack_work, settle_work_needs
+                if command and (is_repair_labor(command.kind, command.sanitized_parameters) or is_jack_work(command)):
+                    settle = settle_work_needs if is_jack_work(command) else settle_repair_needs_locked
+                    error = settle(runtime, command, state.world_minute)
+                    if error:
+                        was_away = runtime.action_status == "AWAY" or (runtime.away_until_world_minute is not None and runtime.away_until_world_minute > state.world_minute)
+                        ok, _, _ = ActionService.complete_action(command.command_id, command.request_id, False, error)
+                        if ok:
+                            interrupted_command_id = str(command.command_id)
+                            runtime.refresh_from_db()
+                            if was_away:
+                                runtime.action_status = "AWAY"
+                                runtime.save(update_fields=["action_status"])
             if npc_id in legacy_versions and runtime.state_version != legacy_versions[npc_id]:
                 raise _TickRejected(_result(
                     False, ResultCode.STALE_STATE_VERSION, npc_id=npc_id,
@@ -560,6 +841,7 @@ class TickService:
                 ))
             if runtime.needs_world_minute >= payload["world_minute"]:
                 npc_results[npc_id] = {
+                    "interrupted_command_id": interrupted_command_id,
                     "public_needs": public_needs(runtime),
                     "needs_world_minute": runtime.needs_world_minute,
                     "state_version": runtime.state_version,
@@ -568,16 +850,25 @@ class TickService:
             error = NeedsService.advance_base_locked(runtime, payload["world_minute"])
             if error:
                 raise _TickRejected(_result(False, error, npc_id=npc_id))
+            # A clock-only needs update is expected between accept and start.
+            # Rebase only commands validated against exactly this prior version;
+            # intervening action/checkpoint mutations still fail STRICT checks.
+            NpcCommandState.objects.filter(npc=runtime.npc, status__in=["RECEIVED", "QUEUED"],
+                validated_at_state_version=runtime.state_version).update(validated_at_state_version=runtime.state_version + 1)
             runtime.state_version += 1
             runtime.time_revision = state.time_revision
             runtime.save()
             npc_results[npc_id] = {
+                "interrupted_command_id": interrupted_command_id,
                 "public_needs": public_needs(runtime),
                 "needs_world_minute": runtime.needs_world_minute,
                 "state_version": runtime.state_version,
             }
 
+        from .caravan import projection
+        caravan = projection(state.world_minute)
         data = {
+            "caravan": caravan,
             "request_payload_sha256": payload_hash,
             "world_minute": receipt.world_minute,
             "time_revision": receipt.time_revision,
@@ -588,7 +879,7 @@ class TickService:
         receipt.save(update_fields=["action_kind", "response_data"])
         return _result(True, ResultCode.COMMAND_ACCEPTED, receipt=receipt,
                        world_minute=receipt.world_minute, time_revision=receipt.time_revision,
-                       npc_results=npc_results)
+                       npc_results=npc_results, caravan=caravan)
 
 
 class LifeActionService:
@@ -685,23 +976,8 @@ class LifeActionService:
             dedupe_key=f"outcome:{receipt.request_id}", recipient=command.sender_id,
             message_kind="OUTCOME", command=receipt.command, receipt=receipt, event=event, payload=payload, priority=10, status="PENDING",
         )
-        VillageDeliveryOutbox.objects.create(
-            dedupe_key=f"event:{event.event_id}", recipient=command.sender_id,
-            message_kind="EVENT", command=receipt.command, receipt=receipt, event=event,
-            payload={
-                "schema_version": "village.event.v1", "event_id": str(event.event_id),
-                "event_sequence": event.event_sequence, "event_type": event.event_type,
-                "world_minute": event.world_minute, "time_revision": event.time_revision,
-                "actor_npc_id": str(runtime.npc.agent_id),
-                "participant_npc_ids": event.participant_npc_ids,
-                "location_code": event.location_code, "point_code": event.point_code,
-                "command_id": str(command.command_id), "request_id": str(receipt.request_id),
-                "cause_event_id": None, "visibility": event.visibility,
-                "public_status_code": runtime.action_status,
-                "public_data": {"public_needs": public_needs(runtime), "reason_code": reason_code},
-                "summary": event.hub_summary,
-            }, priority=5, status="PENDING",
-        )
+        # 二跑复盘（R1）：不再为生命动作事件手建 EVENT 投递行；事件已落库存档，
+        # 动作类事件的广播投递由 phase4_visibility.SUPPRESS_ACTION_EVENT_DELIVERY 控制。
 
     @classmethod
     def _terminal_failure(cls, *, runtime: NpcRuntimeState, command: NpcCommandState, request_id: uuid.UUID, payload_hash: str, action: str, code: str, time_state: GlobalGameTimeState, location: str = "") -> Dict[str, Any]:
@@ -832,6 +1108,8 @@ class LifeActionService:
                 return terminal(ResultCode.INVALID_ACTION_DURATION)
         if action == "EAT":
             source = payload["params"].get("source")
+            if source == "COMMUNITY_MEAL":
+                return terminal("PUBLIC_MEAL_USE_STORE")
             if source not in {"PERSONAL_INVENTORY", "COMMUNITY_MEAL"}:
                 return terminal(ResultCode.FOOD_NOT_ALLOWED)
             if not fast_integration and source == "COMMUNITY_MEAL" and not cls._location_open(location):
@@ -877,7 +1155,8 @@ class LifeActionService:
                 item = Item.objects.filter(item_id=slot.item_id, item_type=ItemType.FOOD, is_deleted=False).first()
                 if item is None:
                     return terminal(ResultCode.FOOD_NOT_ALLOWED)
-                if slot.item_amount < 1:
+                from .phase3_asset_service import get_available_slot_amount
+                if get_available_slot_amount(slot, time_state.world_minute) < 1:
                     return terminal(ResultCode.FOOD_NOT_AVAILABLE)
                 prepared.update(food_id=food_id, inventory=inventory, slot=slot)
             else:
@@ -913,13 +1192,18 @@ class LifeActionService:
         # its only special needs effect is the committed completion effect.
         activity = "WORK" if action == "WORK_PLACEHOLDER" else "IDLE" if action == "EAT" else action
         if action != "SOCIALIZE" and runtime.needs_world_minute < end:
-            error = NeedsService.advance_base_locked(runtime, end, finalize_days=False)
+            error = NeedsService.advance_base_locked(
+                runtime, end, finalize_days=False, evaluate_core_nights=action != "SLEEP"
+            )
             if error:
                 return terminal(error)
         if action != "SOCIALIZE":
+            direct_needs_before = public_needs(runtime)
             error = NeedsService.apply_behavior_delta_locked(runtime, start, end, activity)
             if error:
                 return terminal(error)
+            if action == "SLEEP":
+                NeedsService.evaluate_core_nights_locked(runtime, end)
         effects: Dict[str, Any] = {}
         if action == "SOCIALIZE":
             other = runtime_by_id[target_id]
@@ -945,6 +1229,7 @@ class LifeActionService:
             counter, _ = NpcSocialDailyCounter.objects.select_for_update().get_or_create(low_npc=low.npc, high_npc=high.npc, day_index=day_index)
             multiplier = 100 if counter.socialize_count == 0 else 50 if counter.socialize_count == 1 else 25
             counter.socialize_count += 1; counter.save(update_fields=["socialize_count", "updated_at"])
+            direct_needs_before = public_needs(runtime)
             actor_error = NeedsService.apply_behavior_delta_locked(runtime, start, end, "SOCIALIZE", multiplier)
             other_error = NeedsService.apply_behavior_delta_locked(other, start, end, "SOCIALIZE", multiplier)
             if actor_error or other_error:
@@ -972,8 +1257,10 @@ class LifeActionService:
                 usage.npc_usage = {**usage.npc_usage, key: 1}
                 usage.save(update_fields=["total_meals", "npc_usage", "updated_at"])
                 effects = {"items": [], "money": [], "needs": {}, "relationships": [], "community_meal": True}
-            runtime.hunger_fp = max(0, runtime.hunger_fp - 450)
-            runtime.energy_fp = min(1000, runtime.energy_fp + 50)
+            from .lucy_catalog import food_recovery
+            recovery = food_recovery(prepared["slot"].item_id)
+            runtime.hunger_fp = max(0, runtime.hunger_fp + recovery["hunger_fp"])
+            runtime.energy_fp = min(1000, runtime.energy_fp + recovery["energy_fp"])
             summary = NeedsService._summary(runtime, (end - 1) // MINUTES_PER_DAY)
             summary.successful_meals += 1; summary.save(update_fields=["successful_meals", "updated_at"])
         elif action == "REST":
@@ -1003,6 +1290,8 @@ class LifeActionService:
             participant.state_version += 1
             participant.time_revision = time_state.time_revision
             if participant.pk == runtime.pk:
+                if action == "SLEEP" and time_state.world_minute - end > SLEEP_CONTINUATION_GAP_MINUTES:
+                    NeedsService._reset_sleep_state(participant)
                 participant.current_action = ""
                 participant.action_status = "IDLE"
                 participant.action_started_world_minute = None
@@ -1011,7 +1300,7 @@ class LifeActionService:
             participant.save()
         actor_end_needs = action_end_needs
         if action == "EAT":
-            effects["needs"] = {"hunger": -45.0, "energy": 5.0}
+            effects["needs"] = {"hunger": recovery["hunger_fp"] / 10, "energy": recovery["energy_fp"] / 10}
         else:
             effects["needs"] = {
                 name: round(actor_end_needs[name] - action_start_needs[name], 1)
@@ -1035,8 +1324,14 @@ class LifeActionService:
             "public_needs": public_needs(runtime), "public_status": runtime.action_status,
             "effects": effects,
         }
+        sleep_details = sleep_receipt_details(start, end, end, "PLANNED_END") if action == "SLEEP" else {}
+        sleep_details["needs_after"] = {
+            name: response_data["public_needs"][name] for name in NEEDS_FIELDS
+            if action_end_needs[name] != direct_needs_before[name]
+        }
+        response_data.update(sleep_details)
         receipt = VillageActionReceipt.objects.create(request_id=request_id, command=command, npc=runtime.npc, action_kind=action, success=True, result_code=ResultCode.LIFE_ACTION_COMPLETED, response_data=response_data, world_minute=time_state.world_minute, time_revision=time_state.time_revision, state_version=runtime.state_version, world_event=event)
-        cls._outbox(runtime, receipt, event, action, ResultCode.LIFE_ACTION_COMPLETED, effects, time_state, command_id)
+        cls._outbox(runtime, receipt, event, action, ResultCode.LIFE_ACTION_COMPLETED, effects, time_state, command_id, data=sleep_details)
         public_response = {key: value for key, value in response_data.items() if key != "request_payload_sha256"}
         return _result(True, ResultCode.LIFE_ACTION_COMPLETED, receipt=receipt, world_event=event, **public_response)
 
@@ -1079,12 +1374,17 @@ class LifeActionService:
         end = max(start, min(time_state.world_minute, planned_end))
         before = public_needs(runtime)
         if runtime.needs_world_minute < end:
-            error = NeedsService.advance_base_locked(runtime, end, finalize_days=False)
+            error = NeedsService.advance_base_locked(
+                runtime, end, finalize_days=False, evaluate_core_nights=False
+            )
             if error:
                 return _result(False, error)
+        direct_needs_before = public_needs(runtime)
         error = NeedsService.apply_behavior_delta_locked(runtime, start, end, "SLEEP")
         if error:
             return _result(False, error)
+        direct_needs_after = public_needs(runtime)
+        NeedsService.evaluate_core_nights_locked(runtime, end)
         for day_index in range(start // MINUTES_PER_DAY, end // MINUTES_PER_DAY):
             NeedsService._finalize_day(runtime, day_index)
 
@@ -1103,6 +1403,8 @@ class LifeActionService:
         runtime.action_started_world_minute = None
         runtime.action_ends_world_minute = None
         runtime.active_command_id = None
+        if time_state.world_minute - end > SLEEP_CONTINUATION_GAP_MINUTES:
+            NeedsService._reset_sleep_state(runtime)
         runtime.save()
 
         command.status = "CANCELLED"
@@ -1110,9 +1412,10 @@ class LifeActionService:
         command.completed_world_minute = end
         command.state_version = runtime.state_version
         command.save()
-        details = {
-            "slept_minutes": end - start,
-            "remaining_minutes": max(0, planned_end - end),
+        details = sleep_receipt_details(start, end, planned_end, "VOLUNTARY_WAKE")
+        details["needs_after"] = {
+            name: after[name] for name in NEEDS_FIELDS
+            if direct_needs_after[name] != direct_needs_before[name]
         }
         event = VillageWorldEvent.objects.create(
             dedupe_key=f"sleep-interrupted:{command.request_id}",
@@ -1121,7 +1424,18 @@ class LifeActionService:
             participant_npc_ids=[str(runtime.npc.agent_id)],
             location_code=runtime.current_location_code, command_id=command.command_id,
             request_id=command.request_id, effects=effects, visibility="PUBLIC",
-            public_data={"public_needs": after, **details},
+            public_data={
+                "public_needs": after,
+                "action": "SLEEP",
+                "interruption_reason": "ACTOR_REQUESTED_WAKE_UP",
+                **details,
+            },
+            player_summary=(
+                f"{runtime.npc.name}提前起床，实际睡了{end - start}分钟。"
+            )[:256],
+            hub_summary=(
+                f"{runtime.npc.name}主动结束睡眠，实际执行{end - start}分钟。"
+            )[:256],
         )
         response_data = {
             "request_id": str(command.request_id), "command_id": str(command.command_id),
@@ -1157,7 +1471,7 @@ def runtime_summary(npc_id: str) -> Dict[str, Any]:
     if not _fast_integration_enabled():
         config = VillageSimulationConfig.objects.filter(config_key="default").first()
         if not config or not config.village_needs_enabled:
-            actions -= CommandService.PHASE2_ACTIONS | CommandService.DIALOGUE_ACTIONS
+            actions -= CommandService.PHASE2_ACTIONS
         if not config or not config.village_economy_enabled:
             actions -= CommandService.PHASE3_ACTIONS
         elif not config.village_direct_trade_enabled:
@@ -1176,9 +1490,7 @@ def runtime_summary(npc_id: str) -> Dict[str, Any]:
             available.append(action)
             continue
         if active_dialogue:
-            reason = None if action == "SPEAK" else ResultCode.NPC_BUSY
-        elif action == "SPEAK":
-            reason = ResultCode.DIALOGUE_NOT_ACTIVE
+            reason = ResultCode.NPC_BUSY
         else:
             reason = ResultCode.NPC_BUSY if runtime.action_status != "IDLE" else CommandService.unavailable_reason(action, runtime)
         if reason:

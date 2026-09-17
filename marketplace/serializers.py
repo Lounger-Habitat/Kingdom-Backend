@@ -2,8 +2,13 @@ from rest_framework import serializers
 from .models import MarketListing, MarketTransaction
 
 
-def serialize_listing(listing, viewer=None):
+def serialize_listing(listing, viewer=None, *, context=None):
     """Serialize a MarketListing to a camelCase dict."""
+    from .services import _listing_batch
+    batch = _listing_batch(listing)
+    if context is None:
+        context = _tooltip_context([listing])
+    from inventory.batches import project_public_batch
     seller_name = ""
     if listing.source_type == "system":
         seller_name = "系统"
@@ -15,7 +20,7 @@ def serialize_listing(listing, viewer=None):
     is_own = (
         viewer is not None
         and (
-            (hasattr(viewer, "id") and listing.seller_id is not None and listing.seller_id == viewer.id)
+            (not hasattr(viewer, "agent_id") and hasattr(viewer, "id") and listing.seller_id is not None and listing.seller_id == viewer.id)
             or (hasattr(viewer, "agent_id") and listing.seller_npc_id is not None and listing.seller_npc_id == viewer.id)
         )
     )
@@ -40,12 +45,35 @@ def serialize_listing(listing, viewer=None):
         "dishQuality": listing.dish_quality,
         "cookTime": listing.cook_time,
         "remainingUses": listing.remaining_uses,
+        "producedWorldMinute": batch.get("producedWorldMinute"),
+        "expiresWorldMinute": batch.get("expiresWorldMinute"),
+        "freshnessUnknown": bool(batch.get("freshnessUnknown")),
         "reviewComment": listing.review_comment,
         "itemBagName": listing.item_bag_name,
         "createdAt": listing.created_at.isoformat() if listing.created_at else None,
         "expiresAt": listing.expires_at.isoformat() if listing.expires_at else None,
+        "batch": project_public_batch(
+            listing, context[0].get(listing.item_id), context[1], listing.remaining_amount,
+            expires_world_minute=batch.get("expiresWorldMinute"),
+            freshness_unknown=bool(batch.get("freshnessUnknown")),
+        ),
     }
     return data
+
+
+def _tooltip_context(listings):
+    from items.models import Item
+    from game_time.models import GlobalGameTimeState
+    items = {item.item_id: item for item in Item.objects.filter(
+        item_id__in={listing.item_id for listing in listings})}
+    minute = GlobalGameTimeState.objects.filter(pk=1).values_list("world_minute", flat=True).first()
+    return items, minute
+
+
+def serialize_listings(listings, viewer=None):
+    listings = list(listings)
+    context = _tooltip_context(listings)
+    return [serialize_listing(listing, viewer, context=context) for listing in listings]
 
 
 def serialize_transaction(tx):

@@ -1,5 +1,6 @@
 from django.contrib import admin
 from django.shortcuts import redirect
+from .forms import BatchComponentForm
 from .models import (
     InventoryBag, InventorySlot, BagTemplate, BagTemplateSlot,
     CollectionPoint, CollectionPointLevel, CollectionPointLevelItem,
@@ -36,8 +37,9 @@ class InventoryBagManagerAdmin(admin.ModelAdmin):
 
 class InventorySlotInline(admin.TabularInline):
     model = InventorySlot
+    form = BatchComponentForm
     extra = 0
-    fields = ["slot_index", "item_id", "item_amount", "rated", "rating_price", "overall_score", "ingredient", "item_bag_name", "cook_time", "dish_quality", "hide_in_shop"]
+    fields = ["slot_index", "item_id", "item_amount", "quality", "rated", "rating_price", "overall_score", "ingredient", "item_bag_name", "cook_time", "hide_in_shop", "remaining_uses"]
     ordering = ["slot_index"]
 
 
@@ -192,8 +194,9 @@ class AiConfigAdmin(admin.ModelAdmin):
 
 class NpcGlobalInventorySlotInline(admin.TabularInline):
     model = NpcGlobalInventorySlot
+    form = BatchComponentForm
     extra = 0
-    fields = ["slot_index", "item_id", "item_amount", "rated", "rating_price", "overall_score", "ingredient", "item_bag_name", "cook_time", "dish_quality", "hide_in_shop"]
+    fields = ["slot_index", "item_id", "item_amount", "quality", "rated", "rating_price", "overall_score", "ingredient", "item_bag_name", "cook_time", "hide_in_shop", "remaining_uses"]
     ordering = ["slot_index"]
 
     @staticmethod

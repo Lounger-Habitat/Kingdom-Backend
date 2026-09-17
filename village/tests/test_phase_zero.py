@@ -63,7 +63,7 @@ class SeedVillageTests(PhaseZeroTestCase):
         self.seed()
         self.assertEqual(
             first_counts,
-            (5, 5, 15, 5),
+            (5, 5, 16, 5),
         )
         self.assertEqual(
             first_counts,

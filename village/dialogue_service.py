@@ -24,8 +24,14 @@ def _result(success: bool, code: str, **data: Any) -> Dict[str, Any]:
 
 
 class DialogueService:
-    MAX_DURATION_MINUTES = 120
+    MAX_DURATION_MINUTES = 480
+    MIN_CREDITED_DURATION_MINUTES = 30
     MAX_TEXT_LENGTH = 100
+
+    # Unity DialogueSettings_SO.MaxChatDistance 的镜像值，用于规则文本与失败指引。
+    # ponytail: 双端常量无法自动同步；改 Unity 资产（Assets/Scripts/Agent/DialogueSettings_SO.cs）
+    # 时必须同步这里，否则 GET_RULE 会教错距离。
+    MAX_CHAT_DISTANCE_METERS = 4
 
     @staticmethod
     def _summary(session: NpcDialogueSession) -> Dict[str, Any]:
@@ -88,7 +94,8 @@ class DialogueService:
             # 历史已结束会话不可复活；会话 id 也不可被其他 NPC 对占用
             return _result(False, ResultCode.INVALID_COMMAND_SCHEMA)
 
-        # 已在与任何人进行 ACTIVE 对话的一方视为“正忙”（含同对以新 id 重开）。
+        # 已在与任何人进行 ACTIVE 对话的一方视为“正忙”。Unity 在调用这里前
+        # 已把同一对 NPC 的并发首句归并到先创建的 conversation_id。
         active_session = NpcDialogueSession.objects.select_for_update().select_related(
             "initiator", "target", "reservation"
         ).filter(
@@ -98,7 +105,13 @@ class DialogueService:
             | Q(target__agent_id=target_npc_id, status="ACTIVE"),
         ).first()
         if active_session:
-            return _result(False, ResultCode.SOCIAL_TARGET_BUSY, **cls._summary(active_session))
+            busy_npc_id = npc_id if npc_id in {
+                str(active_session.initiator.agent_id), str(active_session.target.agent_id)
+            } else target_npc_id
+            return _result(
+                False, ResultCode.SOCIAL_TARGET_BUSY,
+                busy_npc_id=busy_npc_id, **cls._summary(active_session)
+            )
 
         runtimes = list(NpcRuntimeState.objects.select_for_update().select_related("npc").filter(
             npc__agent_id__in=[npc_id, target_npc_id], npc__is_test_only=False,
@@ -106,9 +119,16 @@ class DialogueService:
         ).order_by("npc__agent_id"))
         if {str(row.npc.agent_id) for row in runtimes} != {npc_id, target_npc_id}:
             return _result(False, ResultCode.DIALOGUE_PARTICIPANT_INVALID)
-        # 除睡觉外，做菜/狩猎/移动/配给等工作状态都不阻止对话（对话预约与动作预约共存）。
-        if any(row.action_status == "SLEEPING" for row in runtimes):
-            return _result(False, ResultCode.SOCIAL_TARGET_BUSY)
+        # 对话只与移动/睡眠互斥；做菜、吃饭、工作等状态仍可边做边聊。
+        unavailable = next(
+            (row for row in runtimes if row.action_status in {"MOVING", "SLEEPING"}),
+            None,
+        )
+        if unavailable:
+            return _result(
+                False, ResultCode.SOCIAL_TARGET_BUSY,
+                busy_npc_id=str(unavailable.npc.agent_id)
+            )
         start = time_state.world_minute
         expires = min(start + cls.MAX_DURATION_MINUTES, (start // MINUTES_PER_DAY + 1) * MINUTES_PER_DAY)
         for runtime in runtimes:
@@ -209,7 +229,22 @@ class DialogueService:
         ).order_by("npc__agent_id"))
         speakers = {str(message.get("speaker_npc_id")) for message in (session.messages or [])}
         participant_ids = {str(session.initiator.agent_id), str(session.target.agent_id)}
-        valid = not force_invalid and end > session.started_world_minute and participant_ids.issubset(speakers)
+        valid = not force_invalid and participant_ids.issubset(speakers)
+        message_minutes = [
+            int(message["world_minute"])
+            for message in (session.messages or [])
+            if isinstance(message, dict) and isinstance(message.get("world_minute"), int)
+        ]
+        last_message_minute = max(message_minutes, default=session.started_world_minute)
+        # A conversation is valid based on both sides speaking, while its need
+        # reward stops at the last message (with a small floor for same-minute
+        # exchanges). This prevents a stale ACTIVE row from farming SOCIALIZE.
+        credited_end = min(
+            end,
+            max(session.started_world_minute + cls.MIN_CREDITED_DURATION_MINUTES, last_message_minute),
+        )
+        if credited_end < session.started_world_minute:
+            credited_end = session.started_world_minute
         multiplier = None
         if valid:
             low, high = runtimes
@@ -222,13 +257,13 @@ class DialogueService:
 
         participant_needs = {}
         for runtime in runtimes:
-            if runtime.needs_world_minute < end:
-                error = NeedsService.advance_base_locked(runtime, end, finalize_days=False)
+            if runtime.needs_world_minute < credited_end:
+                error = NeedsService.advance_base_locked(runtime, credited_end, finalize_days=False)
                 if error:
                     return _result(False, error)
-            if valid:
+            if valid and credited_end > session.started_world_minute:
                 error = NeedsService.apply_behavior_delta_locked(
-                    runtime, session.started_world_minute, end, "SOCIALIZE", multiplier
+                    runtime, session.started_world_minute, credited_end, "SOCIALIZE", multiplier
                 )
                 if error:
                     return _result(False, error)
@@ -247,6 +282,40 @@ class DialogueService:
             runtime.save()
             participant_needs[str(runtime.npc.agent_id)] = public_needs(runtime)
 
+        # Keep the settlement as one auditable participant event and apply the
+        # small symmetric relationship change through the existing reducer.
+        from .phase4_social import reduce_relationship, _event
+        event = _event(
+            event_type="DIALOGUE_SETTLED",
+            world_minute=end,
+            time_revision=int(time_state.time_revision),
+            request_id=None,
+            command_id=None,
+            actor=session.initiator,
+            participants=sorted(participant_ids),
+            location_code=session.reservation.location_code,
+            visibility="PARTICIPANTS",
+            public_data={
+                "conversation_id": str(session.conversation_id),
+                "valid": valid,
+                "credited_duration_minutes": max(0, credited_end - session.started_world_minute),
+                "hub_summary": "NPC dialogue settled.",
+            },
+            private_data={
+                "message_count": len(session.messages or []),
+                "social_multiplier_percent": multiplier,
+            },
+        )
+        if valid:
+            for from_npc_id, to_npc_id in (
+                (session.initiator.agent_id, session.target.agent_id),
+                (session.target.agent_id, session.initiator.agent_id),
+            ):
+                reduce_relationship(
+                    event, from_npc_id, to_npc_id, "DIALOGUE",
+                    {"affinity": 4, "trust": 4},
+                )
+
         reservation = session.reservation
         expired = force_invalid or reason == "EXPIRED"
         reservation.status = "EXPIRED" if expired else "COMMITTED"
@@ -260,7 +329,10 @@ class DialogueService:
         session.social_multiplier_percent = multiplier
         session.save()
         return _result(
-            True, ResultCode.DIALOGUE_COMPLETED, **cls._summary(session), participant_needs=participant_needs
+            True, ResultCode.DIALOGUE_COMPLETED, **cls._summary(session),
+            credited_end_world_minute=credited_end,
+            credited_duration_minutes=max(0, credited_end - session.started_world_minute),
+            world_event_id=str(event.event_id), participant_needs=participant_needs
         )
 
     @classmethod

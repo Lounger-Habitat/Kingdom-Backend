@@ -5,6 +5,7 @@ from __future__ import annotations
 import hashlib
 import json
 import uuid
+from datetime import datetime, timedelta
 from decimal import Decimal
 from typing import Any, Mapping
 
@@ -36,6 +37,8 @@ from .models import (
     VillageStoryVote,
     VillageWorldEvent,
 )
+from .public_governance import (ADMIN_ACTIONS, actor_error, authorized_decision, approve_decision,
+                                handle_admin, review_project, decision_data, meeting_state_error)
 from .phase4_social import grant_npc_fact, reduce_relationship
 from .phase4_visibility import enqueue_event_deliveries
 from .phase5_contract import (
@@ -109,6 +112,37 @@ def _event(*, event_type, request_id, world_minute, time_revision, actor=None,
         )
         event_data.setdefault("change_type", event_type)
         event_data.setdefault("summary", event_type)
+        if event_type in {"STORY_CALL_MEETING", "STORY_REGISTER_PROPOSAL", "STORY_VOTE_CAST",
+                          "STORY_MEETING_SETTLED", "STORY_PUBLISH_DECISION", "STORY_PUBLISH_RATION_RULES"}:
+            decision = event_data.get("decision") or {}
+            event_data.setdefault("meeting_id", decision.get("meeting_id"))
+            event_data.setdefault("location_code", location)
+            if decision.get("decision_id"):
+                event_data["decision_id"] = decision["decision_id"]
+            meeting = VillageStoryMeeting.objects.filter(pk=_uuid(event_data.get("meeting_id"))).first()
+            if meeting:
+                event_data.update({"starts_world_minute": meeting.starts_world_minute,
+                                   "closes_day": meeting.closes_day, "meeting_status": meeting.status})
+            labels = {"BRIDGE_REPAIR": "修桥采购", "RATION_AND_WAIT": "配给与等待"}
+            plan = event_data.get("plan_code") or decision.get("plan_code") or (event_data.get("proposal") or {}).get("plan_code")
+            plan_label = labels.get(plan, plan or "公共议题")
+            if event_type == "STORY_CALL_MEETING":
+                start = event_data.get("starts_world_minute")
+                try:
+                    start_text = (datetime.min + timedelta(minutes=start)).strftime("%m月%d日%H:%M")
+                except (TypeError, OverflowError):
+                    start_text = "请查询会议详情"
+                summary = f"Mark召集记录厅公共会议，开会时间{start_text}；会议编号{event_data.get('meeting_id')}。请查看提案，自行安排到场和投票。"
+            elif event_type == "STORY_REGISTER_PROPOSAL":
+                terms = event_data.get("proposal") or {}
+                summary = f"会议{event_data.get('meeting_id')}已登记{plan_label}提案：预算{terms.get('budget_gold', 0)}金，执行人{terms.get('executor_npc_id', '')}；尚未表决生效。"
+            elif event_type == "STORY_VOTE_CAST":
+                summary = f"会议{event_data.get('meeting_id')}收到一张{plan_label}投票；请查询有效票数和结算条件，尚不能视为方案通过。"
+            elif event_type == "STORY_MEETING_SETTLED":
+                summary = f"会议{event_data.get('meeting_id')}已结算，选中{plan_label}；决定{decision.get('decision_id')}尚待正式公布，不能据此执行采购。"
+            else:
+                summary = f"会议{event_data.get('meeting_id')}的{plan_label}决定已正式公布；决定编号{decision.get('decision_id')}。执行前核对批准条款、预算及期限。"
+            event_data["summary"] = summary
     event = VillageWorldEvent.objects.create(
         dedupe_key=f"phase5:{request_id}:{suffix}"[:128],
         event_type=event_type,
@@ -129,7 +163,51 @@ def _event(*, event_type, request_id, world_minute, time_revision, actor=None,
     return event
 
 
+# 二跑复盘（R3）：AFTERMATH 无开放行动时，每世界日至多一条"自主安排"通报。
+# 措辞必须是"通报"而不是"指令"，否则会被 agent 当成新任务执行（回声教训）。
+STORY_IDLE_NOTICE_TEXT = (
+    "剧情通报：断掉的商路当前没有开放行动，等待日结评估自动推进"
+    "（距起始日满 1 天、或粮食/工具告急时进入下一阶段）。这段时间由你自己安排："
+    "符合职责的日常事项（照看农田、备货、烹饪、休息、与村民交谈）都可以做，什么都不做也可以。"
+)
+
+
+def _maybe_notify_story_idle(arc, day, world_minute, time, request_id):
+    """剧情空窗兜底通报；幂等（dedupe_key 按世界日）。"""
+    if arc.is_completed or arc.current_phase != StoryPhase.AFTERMATH.value:
+        return None
+    summary = STORY_IDLE_NOTICE_TEXT
+    data = {
+        "story_id": ARC_CODE,
+        "story_version": arc.story_version,
+        "change_type": "STORY_IDLE_NOTICE",
+        "phase": arc.current_phase,
+        "hub_summary": summary,
+        "player_summary": summary,
+    }
+    event, created = VillageWorldEvent.objects.get_or_create(
+        dedupe_key=f"story-idle-notice:{day}",
+        defaults=dict(
+            event_type="STORY_IDLE_NOTICE",
+            world_minute=world_minute,
+            time_revision=time.time_revision,
+            participant_npc_ids=list(FORMAL_NPC_IDS),
+            location_code="VILLAGE_SQUARE",
+            request_id=request_id,
+            effects={},
+            visibility="PUBLIC",
+            public_data=data,
+            hub_summary=summary,
+            player_summary=summary,
+        ),
+    )
+    if created:
+        enqueue_event_deliveries(event)
+    return event
+
+
 def _snapshot(arc, fact, meeting=None):
+    minute = GlobalGameTimeState.objects.filter(pk=1).values_list("world_minute", flat=True).first() or 0
     facts = {
         "bridge_condition": fact.bridge_condition,
         "tool_stock_coverage_days": float(fact.tool_stock_coverage_days),
@@ -147,11 +225,11 @@ def _snapshot(arc, fact, meeting=None):
         "ration_rules_published": fact.ration_rules_published,
         "store_limits_enabled": fact.store_limits_enabled,
         "ration_daily_limits": fact.ration_daily_limits,
+        "ration_limits_until_world_minute": fact.ration_limits_until_world_minute,
         "community_meals": fact.community_meals,
         "rationing_enabled": bool(
-            arc.current_plan == StoryPlan.RATION_AND_WAIT.value
-            and arc.current_phase == StoryPhase.EXECUTION.value
-            and not arc.is_completed
+            fact.store_limits_enabled and
+            (fact.ration_limits_until_world_minute is None or minute < fact.ration_limits_until_world_minute)
         ),
         "evacuation_active": arc.outcome == StoryOutcome.PARTIAL_EVACUATION.value,
         "plan_progress": {
@@ -159,10 +237,9 @@ def _snapshot(arc, fact, meeting=None):
             "repair_wood": fact.repair_wood,
             "repair_metal": fact.repair_metal,
             "repair_labor_hours": fact.repair_labor_hours,
-            "forest_route_scouted": fact.forest_route_scouted,
-            "forest_route_supply": fact.forest_route_supply,
             "community_meals": fact.community_meals,
             "ration_daily_limits": fact.ration_daily_limits,
+            "ration_limits_until_world_minute": fact.ration_limits_until_world_minute,
         },
     }
     meeting_data = None if meeting is None else {
@@ -178,7 +255,7 @@ def _snapshot(arc, fact, meeting=None):
     }
     available_actions = [
         action for action, plans in STORY_ACTION_PLANS.items()
-        if arc.current_plan and arc.current_plan in plans
+        if arc.current_plan in plans
     ]
     away_npc_ids = NpcRuntimeState.objects.filter(
         away_until_world_minute__isnull=False,
@@ -191,6 +268,12 @@ def _snapshot(arc, fact, meeting=None):
         "outcome": arc.outcome or None,
         "current_phase": arc.current_phase,
         "current_plan": arc.current_plan or None,
+        "retired_plan": arc.current_plan == "FOREST_ROUTE",
+        "historical_forest_progress": {
+            "forest_route_known": fact.forest_route_known,
+            "forest_route_scouted": fact.forest_route_scouted,
+            "forest_route_supply": fact.forest_route_supply,
+        },
         "start_day": arc.start_day,
         "phase_entered_day": arc.phase_entered_day,
         "story_version": arc.story_version,
@@ -226,9 +309,6 @@ def _project_facts(fact, arc, day):
     food_amount = sum(row.item_amount for row in slots.filter(item_id__in=food_ids))
     fact.tool_stock_coverage_days = Decimal(str(round(tool_uses / 2, 2)))
     fact.food_stock_coverage_days = Decimal(str(round(food_amount / 5, 2)))
-    fact.forest_route_known = fact.forest_route_known or NpcStoryFactAccess.objects.filter(
-        fact_code="FOREST_OLD_ROUTE", is_public=True
-    ).exists()
     if fact.bridge_condition != "REPAIRED":
         if fact.repair_wood >= (_config().story_repair_wood_target if _config() else 10) and fact.repair_metal >= (_config().story_repair_metal_target if _config() else 4):
             fact.bridge_condition = "MATERIALS_READY"
@@ -238,8 +318,6 @@ def _project_facts(fact, arc, day):
 
 def _candidate_plans(fact):
     plans = [StoryPlan.BRIDGE_REPAIR.value, StoryPlan.RATION_AND_WAIT.value]
-    if fact.forest_route_known:
-        plans.insert(1, StoryPlan.FOREST_ROUTE.value)
     return plans
 
 
@@ -261,6 +339,7 @@ def _get_arc_locked(world_minute, request_id=None):
                "change_type": "INITIALIZED", "summary": "断掉的商路主线已开始，旧桥处于损坏状态",
                "snapshot": _snapshot(arc, fact),
            }, suffix="bootstrap")
+    _maybe_notify_story_idle(arc, day, world_minute, time, rid)
     return arc, fact
 
 
@@ -304,7 +383,9 @@ def _existing_request(request_id, payload_hash):
 
 def _record(request_id, payload_hash, action, result, *, actor=None, players=None,
             world_minute, time_revision, event_type, data=None, ledger=None):
-    event_data = dict(data or result.get("data", {}))
+    from .agent_feedback import add_item_names
+    add_item_names(result)
+    event_data = add_item_names(dict(data or result.get("data", {})))
     if event_type.startswith("STORY_"):
         event_data.setdefault("story_id", ARC_CODE)
         event_data.setdefault("story_version", result.get("data", {}).get("story_version"))
@@ -329,7 +410,10 @@ def _record(request_id, payload_hash, action, result, *, actor=None, players=Non
             changes=ledger.get("changes", {}), external_delta=ledger.get("external_delta", 0),
             world_minute=world_minute, event=event,
         )
-    if actor is not None:
+    if actor is not None and event_type in {
+        "STORY_DONATE_REPAIR_RESOURCES", "STORY_REPAIR_LABOR", "STORY_PROVIDE_REPAIR_MEAL",
+        "STORY_TRANSPORT_REPAIR_MATERIALS",
+    }:
         for other_id in FORMAL_NPC_IDS - {str(actor.agent_id)}:
             reduce_relationship(
                 event, str(actor.agent_id), other_id, "JOINT_WORK",
@@ -338,11 +422,15 @@ def _record(request_id, payload_hash, action, result, *, actor=None, players=Non
     return result
 
 
-def _attendees():
-    rows = NpcRuntimeState.objects.select_for_update().select_related("npc").filter(
+def _attendees(world_minute=None, *, lock=True):
+    rows = NpcRuntimeState.objects.select_related("npc").filter(
         npc__agent_id__in=FORMAL_NPC_IDS, current_location_code="RECORD_HALL",
-    ).exclude(action_status="SLEEPING")
-    return {str(row.npc.agent_id): row.npc for row in rows if not row.away_until_world_minute}
+    ).exclude(action_status__in=["SLEEPING", "AWAY"])
+    if lock:
+        rows = rows.select_for_update()
+    minute = GlobalGameTimeState.objects.get(pk=1).world_minute if world_minute is None else world_minute
+    return {str(row.npc.agent_id): row.npc for row in rows if row.health_fp > 300 and
+            (row.away_until_world_minute is None or row.away_until_world_minute <= minute)}
 
 
 @transaction.atomic
@@ -366,21 +454,27 @@ def submit_story_vote(payload: Mapping[str, Any], *, player_id=None):
     digest = _hash(payload)
     with transaction.atomic():
         time = GlobalGameTimeState.objects.select_for_update().get(pk=1)
+        from .caravan import sync_visit
+        sync_visit(time.world_minute)
         arc, fact = _get_arc_locked(time.world_minute, request_id)
         replay = _existing_request(request_id, digest)
         if replay:
             return replay
-        if arc.is_completed:
-            return _result(StoryResultCode.ARC_COMPLETED)
         if expected is not None and arc.story_version != expected:
             return _result(StoryResultCode.VERSION_CONFLICT, current_story_version=arc.story_version)
         meeting = VillageStoryMeeting.objects.select_for_update().filter(meeting_id=meeting_id, arc=arc).first()
-        if not meeting or meeting.status != "OPEN":
-            return _result(StoryResultCode.MEETING_ALREADY_SETTLED)
-        if time.world_minute // 1440 > meeting.closes_day:
-            return _result(StoryResultCode.MEETING_NOT_OPEN)
-        if plan not in meeting.candidate_plans:
+        error = meeting_state_error(meeting, time.world_minute, check_vote_deadline=True)
+        if error:
+            return _result(error, data={"meeting_id": str(meeting_id),
+                "meeting_status": meeting.status if meeting else None,
+                "starts_world_minute": meeting.starts_world_minute if meeting else None,
+                "closes_day": meeting.closes_day if meeting else None})
+        if plan not in PLAN_REQUIRED_FACT or plan not in meeting.candidate_plans:
             return _result(StoryResultCode.FACT_NOT_UNLOCKED if plan == StoryPlan.FOREST_ROUTE.value else StoryResultCode.VOTE_INVALID)
+        if plan not in (meeting.proposals or {}):
+            return _result("PUBLIC_PROPOSAL_REQUIRED")
+        if int(meeting.proposals[plan].get("expires_world_minute", 0)) <= time.world_minute:
+            return _result("PUBLIC_AUTHORIZATION_EXPIRED")
         voter_type = "PLAYER" if player_id is not None or str(payload.get("actor_type", "")).upper() == "PLAYER" else "NPC"
         voter_id = str(player_id if player_id is not None else payload.get("npc_id", ""))
         if voter_type == "NPC" and voter_id not in FORMAL_NPC_IDS:
@@ -403,16 +497,20 @@ def submit_story_vote(payload: Mapping[str, Any], *, player_id=None):
                 player_support=voter_type == "PLAYER", request_id=request_id,
                 payload_hash=digest, submitted_world_minute=time.world_minute,
             )
-        result = _result(data={"meeting_id": str(meeting_id), "plan_code": plan, "story_version": arc.story_version})
+        readiness = meeting_readiness(meeting, time.world_minute, actor_id=voter_id if voter_type == "NPC" else None)
+        result = _result(data={"meeting_id": str(meeting_id), "plan_code": plan, "story_version": arc.story_version,
+            "vote_recorded": True, "replaced_previous_vote": previous is not None,
+            **{key: readiness[key] for key in ("own_vote", "valid_npc_vote_count", "npc_vote_counts") if key in readiness}})
         return _record(request_id, digest, "STORY_VOTE", result,
                        actor=NpcDefinition.objects.filter(agent_id=voter_id).first() if voter_type == "NPC" else None,
                        players=[voter_id] if voter_type == "PLAYER" else [], world_minute=time.world_minute,
                        time_revision=time.time_revision, event_type="STORY_VOTE_CAST")
 
 
-def _pick_plan(meeting, attendees):
-    votes = {row.voter_id: row for row in meeting.votes.filter(voter_type="NPC", is_valid=True)}
-    counts = {plan: 0 for plan in meeting.candidate_plans}
+def _pick_plan(meeting, attendees, all_votes=None):
+    all_votes = list(meeting.votes.all()) if all_votes is None else all_votes
+    votes = {row.voter_id: row for row in all_votes if row.voter_type == "NPC" and row.is_valid}
+    counts = {plan: 0 for plan in meeting.candidate_plans if plan in PLAN_REQUIRED_FACT}
     for npc_id in attendees:
         row = votes.get(npc_id)
         if row and row.plan_code in counts:
@@ -424,8 +522,9 @@ def _pick_plan(meeting, attendees):
     if len(winners) == 1:
         return winners[0]
     support = {plan: 0 for plan in winners}
-    for row in meeting.votes.filter(voter_type="PLAYER", player_support=True, plan_code__in=winners):
-        support[row.plan_code] += 1
+    for row in all_votes:
+        if row.voter_type == "PLAYER" and row.player_support and row.plan_code in winners:
+            support[row.plan_code] += 1
     if support:
         supported = max(support.values())
         if supported:
@@ -433,64 +532,145 @@ def _pick_plan(meeting, attendees):
     return next((plan for plan in SAFE_PLAN_PRIORITY if plan in winners), sorted(winners)[0])
 
 
+def meeting_readiness(meeting, world_minute, *, actor_id=None, attendees=None):
+    """Read-only view of the exact conditions used by settlement, not a decision.
+
+    The caller doing settlement supplies locked attendees. Queries use ordinary
+    reads, so inspecting progress cannot extend a meeting or require a write lock.
+    """
+    attendees = _attendees(world_minute, lock=False) if attendees is None else attendees
+    votes = list(meeting.votes.all()) if meeting else []
+    counts = {plan: 0 for plan in (meeting.candidate_plans if meeting else [])}
+    for vote in votes:
+        if vote.voter_type == "NPC" and vote.is_valid and vote.voter_id in attendees and vote.plan_code in counts:
+            counts[vote.plan_code] += 1
+    valid_count = sum(counts.values())
+    plan = _pick_plan(meeting, attendees, votes) if meeting else None
+    state_error = meeting_state_error(meeting, world_minute)
+    reasons = []
+    enabled = story_enabled()
+    if not enabled:
+        reasons.append("STORY_FEATURE_DISABLED")
+    if state_error:
+        reasons.append(state_error)
+    if "10013" not in attendees:
+        reasons.append("MARK_NOT_PRESENT")
+    if len(attendees) < 3:
+        reasons.append("NOT_ENOUGH_ATTENDEES")
+    if valid_count < 3:
+        reasons.append("NOT_ENOUGH_VALID_NPC_VOTES")
+    if plan is None:
+        reasons.append("NO_VOTED_PLAN")
+    terms = (meeting.proposals or {}).get(plan) if meeting and plan else None
+    if plan and not terms:
+        reasons.append("PUBLIC_PROPOSAL_REQUIRED")
+    elif terms and int(terms.get("expires_world_minute", 0)) <= world_minute:
+        reasons.append("PUBLIC_AUTHORIZATION_EXPIRED")
+    if not enabled:
+        result_code = "STORY_FEATURE_DISABLED"
+    elif state_error:
+        result_code = state_error
+    elif any(code in reasons for code in ("MARK_NOT_PRESENT", "NOT_ENOUGH_ATTENDEES", "NOT_ENOUGH_VALID_NPC_VOTES", "NO_VOTED_PLAN")):
+        result_code = "STORY_NOT_ENOUGH_ATTENDANCE"
+    else:
+        result_code = reasons[0] if reasons else "OK"
+    own = next((v for v in votes if v.voter_type == "NPC" and v.voter_id == str(actor_id)), None)
+    data = {
+        "meeting_id": str(meeting.pk) if meeting else None,
+        "meeting_status": meeting.status if meeting else None,
+        "location_code": "RECORD_HALL",
+        "starts_world_minute": meeting.starts_world_minute if meeting else None,
+        "closes_day": meeting.closes_day if meeting else None,
+        "voting_open": meeting_state_error(meeting, world_minute, check_vote_deadline=True) is None,
+        "voting_unavailable_reason": meeting_state_error(meeting, world_minute, check_vote_deadline=True),
+        "mark_present": "10013" in attendees,
+        "attendee_count": len(attendees), "required_attendee_count": 3,
+        "valid_npc_vote_count": valid_count, "required_npc_vote_count": 3,
+        "npc_vote_counts": counts,
+        "leading_plan": plan,
+        "can_settle": not reasons, "settlement_result_code": result_code,
+        "unavailable_reasons": reasons,
+    }
+    if actor_id is not None:
+        data["own_vote"] = None if own is None else {"plan_code": own.plan_code, "is_valid": own.is_valid,
+            "counted": own.is_valid and own.voter_id in attendees and own.plan_code in counts,
+            "submitted_world_minute": own.submitted_world_minute}
+    return data
+
+
 @transaction.atomic
-def settle_story_meeting(meeting_id, expected_story_version=None, request_id=None, world_minute=None):
+def settle_story_meeting(meeting_id, expected_story_version=None, request_id=None, world_minute=None, *, record_failed_attempt=True, actor_id=None):
     if not story_enabled():
         return _result(StoryResultCode.FEATURE_DISABLED)
     time = GlobalGameTimeState.objects.select_for_update().get(pk=1)
     world_minute = time.world_minute if world_minute is None else world_minute
     rid = _uuid(request_id) or uuid.uuid5(uuid.NAMESPACE_URL, f"phase5:meeting:{meeting_id}:{world_minute // 1440}")
-    arc = VillageStoryArc.objects.select_for_update().get(arc_code=ARC_CODE)
+    arc = VillageStoryArc.objects.select_for_update().filter(arc_code=ARC_CODE).first()
+    if arc is None:
+        return _result(StoryResultCode.MEETING_NOT_FOUND, data={"meeting_id": str(meeting_id)})
     fact = VillageStoryFact.objects.select_for_update().get(arc=arc)
-    meeting = VillageStoryMeeting.objects.select_for_update().get(meeting_id=meeting_id, arc=arc)
-    if meeting.status != "OPEN":
-        return _result(StoryResultCode.MEETING_ALREADY_SETTLED, data=_snapshot(arc, fact, meeting))
+    meeting = VillageStoryMeeting.objects.select_for_update().filter(meeting_id=_uuid(meeting_id), arc=arc).first()
+    error = meeting_state_error(meeting, world_minute)
+    if error:
+        data = meeting_readiness(meeting, world_minute, actor_id=actor_id)
+        data["meeting_id"] = str(meeting_id)
+        return _result(error, data=data)
     if expected_story_version is not None and arc.story_version != expected_story_version:
         return _result(StoryResultCode.VERSION_CONFLICT, current_story_version=arc.story_version)
-    attendees = _attendees()
+    attendees = _attendees(world_minute)
+    readiness = meeting_readiness(meeting, world_minute, actor_id=actor_id, attendees=attendees)
     meeting.attendance_count = len(attendees)
-    plan = _pick_plan(meeting, attendees)
-    valid_votes = sum(1 for row in meeting.votes.filter(voter_type="NPC", is_valid=True) if row.voter_id in attendees and row.plan_code in meeting.candidate_plans)
-    if len(attendees) < 3 or valid_votes < 3 or plan is None:
+    plan = readiness["leading_plan"]
+    if readiness["settlement_result_code"] == StoryResultCode.NOT_ENOUGH_ATTENDANCE.value:
+        # A rejected Mark action rolls back its transaction. Return the actual
+        # unchanged state rather than announcing a retry extension that won't persist.
+        if not record_failed_attempt:
+            return _result(StoryResultCode.NOT_ENOUGH_ATTENDANCE, data=readiness)
         meeting.failure_code = StoryResultCode.NOT_ENOUGH_ATTENDANCE.value
         if meeting.retry_count == 0:
             meeting.retry_count = 1
             meeting.closes_day += 1
-            meeting.save()
-            return _result(StoryResultCode.NOT_ENOUGH_ATTENDANCE, data={"retry_count": 1, "retry_day": meeting.closes_day})
-        meeting.status = "SETTLED"
-        meeting.selected_plan = StoryPlan.RATION_AND_WAIT.value
-        meeting.settled_day = world_minute // 1440
+        else:
+            # No new public decision without the required meeting. Existing
+            # approved finite rules keep their original expiry.
+            meeting.status = "FAILED"
         meeting.save()
-        plan = StoryPlan.RATION_AND_WAIT.value
-        retry = True
-    else:
-        meeting.status = "SETTLED"
-        meeting.selected_plan = plan
-        meeting.settled_day = world_minute // 1440
-        meeting.save()
-        retry = False
+        return _result(StoryResultCode.NOT_ENOUGH_ATTENDANCE, data={**readiness,
+            "retry_count": meeting.retry_count, "retry_day": meeting.closes_day, "status": meeting.status,
+            "meeting_status": meeting.status, "closes_day": meeting.closes_day, "mark_required": True})
+    if not readiness["can_settle"]:
+        return _result(readiness["settlement_result_code"], data=readiness)
+    terms = meeting.proposals[plan]
+    meeting.status = "SETTLED"
+    meeting.selected_plan = plan
+    meeting.settled_day = world_minute // 1440
+    meeting.save()
+    decision = approve_decision(meeting, plan, world_minute)
+    retry = False
     from_phase = arc.current_phase
-    arc.current_phase = StoryPhase.EXECUTION.value
-    arc.current_plan = plan
+    if not arc.is_completed:
+        arc.current_phase = StoryPhase.EXECUTION.value
+        arc.current_plan = plan
     arc.phase_entered_day = world_minute // 1440
     fact.last_progress_day = world_minute // 1440
     fact.save(update_fields=["last_progress_day", "updated_at"])
     if plan == StoryPlan.RATION_AND_WAIT.value:
-        arc.ration_until_day = world_minute // 1440 + (2 if retry else 3)
+        arc.ration_until_day = int(terms["expires_world_minute"]) // 1440
     else:
         arc.ration_until_day = None
     arc.story_version += 1
     arc.save()
     event = _event(event_type="STORY_MEETING_SETTLED", request_id=rid, world_minute=world_minute,
                    time_revision=time.time_revision, participants=list(attendees),
-                   data={"plan_code": plan, "retry_fallback": retry}, suffix="meeting")
+                   data={"meeting_id": str(meeting.pk), "plan_code": plan, "retry_fallback": retry,
+                         "valid_npc_vote_count": readiness["valid_npc_vote_count"], "npc_vote_counts": readiness["npc_vote_counts"],
+                         "attendee_count": readiness["attendee_count"], "decision": decision_data(decision)}, suffix="meeting")
     VillageStoryTransitionReceipt.objects.create(
-        request_id=rid, arc=arc, from_phase=from_phase, to_phase=StoryPhase.EXECUTION.value,
+        request_id=rid, arc=arc, from_phase=from_phase, to_phase=arc.current_phase,
         selected_plan=plan, source_day=world_minute // 1440, world_event=event,
-        response_data={"retry_fallback": retry},
+        response_data={"retry_fallback": retry, "decision": decision_data(decision)},
     )
-    return _result(data={"plan_code": plan, "retry_fallback": retry, "story_version": arc.story_version,
+    return _result(data={"plan_code": plan, "decision": decision_data(decision), "retry_fallback": retry, "story_version": arc.story_version,
                          "snapshot": _snapshot(arc, fact, meeting)}, event={"event_id": str(event.event_id)})
 
 
@@ -507,11 +687,21 @@ def _consume(npc_id, item_id, amount, player_id=None):
         if not bag:
             return False
         slots = list(NpcGlobalInventorySlot.objects.select_for_update().filter(bag=bag, item_id=item_id, item_amount__gt=0).order_by("slot_index"))
-    if sum(row.item_amount for row in slots) < amount:
+    from .phase3_asset_service import get_available_slot_amount
+    minute = GlobalGameTimeState.objects.get(pk=1).world_minute
+    def available(row):
+        if not player_id:
+            return get_available_slot_amount(row, minute)
+        if row.freshness_unknown or (row.expires_world_minute is not None and row.expires_world_minute <= minute):
+            return 0
+        return row.item_amount
+    if sum(available(row) for row in slots) < amount:
         return False
     remaining = amount
     for row in slots:
-        take = min(remaining, row.item_amount)
+        take = min(remaining, available(row))
+        if not take:
+            continue
         row.item_amount -= take
         row.save(update_fields=["item_amount"])
         remaining -= take
@@ -538,7 +728,8 @@ def _money(npc_id, amount, player_id=None):
         bag = InventoryBag.objects.select_for_update().filter(character_id=str(player_id)).first()
     else:
         bag = NpcGlobalInventory.objects.select_for_update().filter(npc__agent_id=str(npc_id)).first()
-    if not bag or bag.money < amount:
+    from .phase3_asset_service import get_available_money
+    if not bag or (bag.money if player_id else get_available_money(bag)) < amount:
         return None
     bag.money -= amount
     if player_id:
@@ -549,8 +740,44 @@ def _money(npc_id, amount, player_id=None):
     return bag
 
 
-@transaction.atomic
-def complete_story_action(payload: Mapping[str, Any], *, player_id=None):
+def repair_labor_unavailable(runtime, world_minute, params):
+    from .runtime_services import CommandService
+    if not story_enabled():
+        return StoryResultCode.FEATURE_DISABLED.value
+    hours = params.get("labor_hours", 1)
+    if type(hours) is not int or hours != 1:
+        return StoryResultCode.ACTION_INVALID.value
+    if runtime.action_status == "AWAY" or (
+        runtime.away_until_world_minute is not None and runtime.away_until_world_minute > world_minute
+    ):
+        return StoryResultCode.FORBIDDEN_ACTOR.value
+    error = CommandService.unavailable_reason("WORK_PLACEHOLDER", runtime)
+    if error:
+        return error
+    arc = VillageStoryArc.objects.filter(arc_code=ARC_CODE).first()
+    if not arc or arc.is_completed or arc.current_plan != "BRIDGE_REPAIR" or arc.current_phase != "EXECUTION":
+        return StoryResultCode.PLAN_INVALID.value
+    expected = params.get("expected_story_version")
+    if expected is not None and expected != arc.story_version:
+        return StoryResultCode.VERSION_CONFLICT.value
+    if runtime.current_location_code not in STORY_ACTION_LOCATIONS["REPAIR_LABOR"]:
+        return StoryResultCode.LOCATION_INVALID.value
+    _, error = authorized_decision(params, "BRIDGE_REPAIR", world_minute)
+    if error:
+        return error
+    return None
+
+
+def complete_story_action(payload: Mapping[str, Any], *, player_id=None, _labor_command=None):
+    # A normal returned business error must not commit a partial donation.
+    with transaction.atomic():
+        result = _complete_story_action(payload, player_id=player_id, _labor_command=_labor_command)
+        if result.get("result_code") != "OK":
+            transaction.set_rollback(True)
+    return result
+
+
+def _complete_story_action(payload: Mapping[str, Any], *, player_id=None, _labor_command=None):
     if not story_enabled():
         return _result(StoryResultCode.FEATURE_DISABLED)
     request_id = _uuid(payload.get("request_id"))
@@ -560,6 +787,12 @@ def complete_story_action(payload: Mapping[str, Any], *, player_id=None):
     params = dict(payload.get("params") or payload)
     action = str(payload.get("action_code", params.get("action_code", ""))).upper()
     expected = payload.get("expected_story_version", params.get("expected_story_version"))
+    # Historical completed requests remain replayable after an action is retired.
+    replay = _existing_request(request_id, digest)
+    if replay:
+        return replay
+    if action in {"SCOUT_FOREST_ROUTE", "SUPPLY_FOREST_ROUTE"}:
+        return _result("STORY_ACTION_RETIRED")
     if action not in ALL_STORY_ACTIONS or (expected is not None and
                                            (isinstance(expected, bool) or not isinstance(expected, int))):
         return _result(StoryResultCode.ACTION_INVALID)
@@ -570,24 +803,28 @@ def complete_story_action(payload: Mapping[str, Any], *, player_id=None):
         return _result(StoryResultCode.ACTION_INVALID)
     with transaction.atomic():
         time = GlobalGameTimeState.objects.select_for_update().get(pk=1)
+        from .caravan import sync_visit
+        sync_visit(time.world_minute)
         arc, fact = _get_arc_locked(time.world_minute, request_id)
         replay = _existing_request(request_id, digest)
         if replay:
             return replay
-        if arc.is_completed:
+        if arc.is_completed and action not in ADMIN_ACTIONS | {"PUBLISH_RATION_RULES", "ENABLE_STORE_LIMITS", "CONTACT_EMERGENCY_CARAVAN", "PROVIDE_COMMUNITY_MEAL"}:
             return _result(StoryResultCode.ARC_COMPLETED)
         if expected is not None and arc.story_version != expected:
             return _result(StoryResultCode.VERSION_CONFLICT, current_story_version=arc.story_version)
         plan = arc.current_plan
-        if plan not in STORY_ACTION_PLANS.get(action, set()):
+        administrative = action in ADMIN_ACTIONS or action in {"PUBLISH_RATION_RULES", "ENABLE_STORE_LIMITS", "CONTACT_EMERGENCY_CARAVAN", "PROVIDE_COMMUNITY_MEAL"}
+        continuing_authorized_work = action in {"PURCHASE_REPAIR_MATERIALS", "MANAGE_REPAIR_LEDGER"} and arc.current_phase == "PLAN_REVIEW"
+        if not administrative and not continuing_authorized_work and arc.current_phase != StoryPhase.EXECUTION.value:
+            return _result(StoryResultCode.PHASE_INVALID)
+        if not administrative and plan not in STORY_ACTION_PLANS.get(action, set()):
             return _result(StoryResultCode.PLAN_INVALID)
         actor_id = str(payload.get("npc_id", params.get("npc_id", "")))
         actor = NpcDefinition.objects.filter(agent_id=actor_id, is_test_only=False).first() if actor_id else None
         player_actions = {
             StoryActionCode.DONATE_REPAIR_RESOURCES.value,
-            StoryActionCode.SUPPLY_FOREST_ROUTE.value,
             StoryActionCode.PROVIDE_REPAIR_MEAL.value,
-            StoryActionCode.PROVIDE_COMMUNITY_MEAL.value,
         }
         if player_id is not None and action not in player_actions:
             return _result(StoryResultCode.FORBIDDEN_ACTOR)
@@ -595,37 +832,88 @@ def complete_story_action(payload: Mapping[str, Any], *, player_id=None):
             return _result(StoryResultCode.FORBIDDEN_ACTOR)
         location = str(payload.get("current_location_code", params.get("location_code", "")))
         if player_id is None and location not in STORY_ACTION_LOCATIONS.get(action, set()):
+            if action == "CONTACT_EMERGENCY_CARAVAN":
+                return _result(StoryResultCode.LOCATION_INVALID,
+                               action_code=action, message="请回杂货铺开通")
             return _result(StoryResultCode.LOCATION_INVALID)
+        if action in {"DONATE_REPAIR_RESOURCES", "REPAIR_LABOR"}:
+            if arc.current_phase != StoryPhase.EXECUTION.value:
+                return _result(StoryResultCode.PLAN_INVALID)
+            if player_id is None:
+                runtime = NpcRuntimeState.objects.select_for_update().filter(npc=actor).first()
+                if runtime is None or runtime.health_fp <= 300 or runtime.action_status == "AWAY" or (
+                    runtime.away_until_world_minute is not None and runtime.away_until_world_minute > time.world_minute
+                ):
+                    return _result(StoryResultCode.FORBIDDEN_ACTOR)
+        if player_id is None:
+            error = actor_error(actor_id, time.world_minute, dangerous=action in {"REPAIR_LABOR", "TRANSPORT_REPAIR_MATERIALS"},
+                                active_command_id=_labor_command.command_id if _labor_command else None)
+            if error:
+                return _result(error)
+        decision = None
+        if action in {"PURCHASE_REPAIR_MATERIALS", "DONATE_REPAIR_RESOURCES", "REPAIR_LABOR", "PROVIDE_REPAIR_MEAL", "MANAGE_REPAIR_LEDGER"}:
+            decision, error = authorized_decision(params, "BRIDGE_REPAIR", time.world_minute,
+                                                   actor_id if action == "PURCHASE_REPAIR_MATERIALS" else None)
+            if error:
+                return _result(error)
         cost = {"gold": 0}
         changes = {"action_code": action}
-        if action == StoryActionCode.SCOUT_FOREST_ROUTE.value:
-            fact.forest_route_scouted += 1
-            fact.forest_route_known = True
-            access = grant_npc_fact(actor_id, "FOREST_OLD_ROUTE", time.world_minute)
-            if access and not access.is_public:
-                access.is_public = True
-                access.save(update_fields=["is_public"])
-        elif action == StoryActionCode.PUBLISH_RATION_RULES.value:
-            fact.ration_rules_published = True
+        if decision:
+            changes["decision_id"] = str(decision.pk)
+        if action in ADMIN_ACTIONS or action == "PUBLISH_RATION_RULES":
+            error, admin_changes = handle_admin(action, actor, arc, fact, params, time, request_id)
+            if error:
+                transaction.set_rollback(True)
+                return _result(error, data={"action_code": action, **admin_changes})
+            changes.update(admin_changes)
         elif action == StoryActionCode.ENABLE_STORE_LIMITS.value:
+            decision, error = authorized_decision(params, "RATION_AND_WAIT", time.world_minute, actor_id)
+            if error:
+                return _result(error)
+            if not fact.ration_rules_published:
+                return _result("PUBLIC_DECISION_NOT_PUBLISHED")
+            limits = dict(decision.terms["ration_daily_limits"])
             item_id = _int_value(params.get("limit_item_id"), 1)
             daily_limit = _int_value(params.get("daily_limit"), 1)
-            if item_id is None or daily_limit is None:
-                return _result(StoryResultCode.ACTION_INVALID)
+            expiry = int(decision.terms["expires_world_minute"])
+            if item_id is None or daily_limit != limits.get(str(item_id)) or params.get("expires_world_minute", expiry) != expiry:
+                return _result("PUBLIC_LIMIT_OUTSIDE_AUTHORIZATION")
+            fact.ration_limits_until_world_minute = expiry
             fact.store_limits_enabled = True
-            limits = dict(fact.ration_daily_limits or {})
-            limits[str(item_id)] = daily_limit
             fact.ration_daily_limits = limits
-            changes["ration_limit"] = {"item_id": item_id, "daily_limit": daily_limit}
+            changes.update({"decision_id": str(decision.pk), "ration_limit": {"item_id": item_id, "daily_limit": daily_limit}, "expires_world_minute": expiry})
         elif action == StoryActionCode.REPAIR_LABOR.value:
-            hours = _int_value(params.get("labor_hours", 1), 1)
-            if hours is None:
+            from .phase5_contract import REPAIR_LABOR_MINUTES, is_repair_labor
+            command = _labor_command
+            if command is None or not is_repair_labor(command.kind, command.sanitized_parameters) or (
+                command.npc_id != actor.pk or command.request_id != request_id or command.status != "RUNNING"
+                or command.started_world_minute is None or command.duration_minutes != REPAIR_LABOR_MINUTES
+                or runtime.active_command_id != command.command_id
+                or time.world_minute < command.started_world_minute + REPAIR_LABOR_MINUTES
+            ):
+                return _result(StoryResultCode.ACTION_INVALID, data={"reason": "修桥劳动必须通过已开始的60分钟命令完成"})
+            error = repair_labor_unavailable(runtime, time.world_minute, params)
+            if error:
+                return _result(error)
+            hours = params.get("labor_hours", 1)
+            if type(hours) is not int or hours != 1:
                 return _result(StoryResultCode.ACTION_INVALID)
             fact.repair_labor_hours += hours
             fact.bridge_condition = "REPAIRING"
             fact.public_trust = min(100, fact.public_trust + 1)
             changes["labor_hours"] = hours
-        elif action == StoryActionCode.PROVIDE_REPAIR_MEAL.value or action == StoryActionCode.PROVIDE_COMMUNITY_MEAL.value:
+        elif action == StoryActionCode.PROVIDE_COMMUNITY_MEAL.value:
+            from .lucy_restaurant import list_meal
+            result = list_meal(actor_id, {"store_code": "RESTAURANT_STORE", "item_id": params.get("meal_item_id"),
+                "amount": params.get("meal_amount", 1), "price_mode": "ORIGINAL",
+                "food_instance_id": params.get("food_instance_id"), "public_meal_code": params.get("public_meal_code"),
+                "decision_id": params.get("decision_id"), "stock_source": params.get("stock_source", "PERSONAL")},
+                time.world_minute, request_id)
+            if result["result_code"] != "OK":
+                transaction.set_rollback(True)
+                return _result(result["result_code"])
+            changes["public_meal_listing"] = result["data"]
+        elif action == StoryActionCode.PROVIDE_REPAIR_MEAL.value:
             item_id = _int_value(params.get("meal_item_id", 29001), 1)
             amount = _int_value(params.get("meal_amount", 1), 1)
             if item_id is None or amount is None:
@@ -635,6 +923,7 @@ def complete_story_action(payload: Mapping[str, Any], *, player_id=None):
             if player_id is not None and not _consume("", item_id, amount, player_id):
                 return _result(StoryResultCode.RESOURCE_INSUFFICIENT)
             fact.community_meals += amount
+            changes["meals"] = {"item_id": item_id, "amount": amount}
         elif action == StoryActionCode.DONATE_REPAIR_RESOURCES.value:
             item_id = params.get("item_id")
             item_id = None if item_id is None else _int_value(item_id, 1)
@@ -644,18 +933,20 @@ def complete_story_action(payload: Mapping[str, Any], *, player_id=None):
                 return _result(StoryResultCode.ACTION_INVALID)
             if item_id is None and gold <= 0:
                 return _result(StoryResultCode.ACTION_INVALID)
-            if item_id is not None and item_id not in (1003, 4003):
+            from .phase3_catalog import REPAIR_WOOD_ITEM_ID, REPAIR_METAL_ITEM_ID
+            if item_id is not None and item_id not in (REPAIR_WOOD_ITEM_ID, REPAIR_METAL_ITEM_ID):
                 return _result(StoryResultCode.ACTION_INVALID)
             if item_id is not None and (amount <= 0 or not _consume(actor_id, item_id, amount, player_id)):
                 return _result(StoryResultCode.RESOURCE_INSUFFICIENT)
             if item_id is not None:
-                if item_id == 1003:
+                if item_id == REPAIR_WOOD_ITEM_ID:
                     fact.repair_wood += amount
                 else:
                     fact.repair_metal += amount
                 changes["item"] = {"item_id": item_id, "amount": amount}
             if gold:
                 if not _money(actor_id, gold, player_id):
+                    transaction.set_rollback(True)
                     return _result(StoryResultCode.RESOURCE_INSUFFICIENT)
                 fund = VillageAccount.objects.select_for_update().get(account_code="PUBLIC_FUND")
                 fund.balance += gold
@@ -663,13 +954,18 @@ def complete_story_action(payload: Mapping[str, Any], *, player_id=None):
                 fund.save(update_fields=["balance", "asset_version"])
                 fact.repair_fund += gold
                 changes["gold"] = gold
+                changes["PUBLIC_FUND"] = {"money": gold}
+                changes[actor_id if player_id is None else "PLAYER:" + str(player_id)] = {"money": -gold}
             fact.public_trust = min(100, fact.public_trust + 2)
         elif action == StoryActionCode.PURCHASE_REPAIR_MATERIALS.value:
-            gold = _int_value(params.get("gold_amount", 50), 1)
             amount = _int_value(params.get("amount", 1), 1)
             item_id = _int_value(params.get("item_id", 4003), 1)
-            if gold is None or amount is None or item_id != 4003:
+            if amount is None or item_id != 4003:
                 return _result(StoryResultCode.ACTION_INVALID)
+            cfg = _config()
+            gold = amount * (cfg.repair_metal_unit_price if cfg else 50)
+            if gold > int(decision.terms.get("budget_gold", 0)) - decision.spent_gold:
+                return _result("PUBLIC_BUDGET_EXCEEDED", data={"remaining_budget": max(0, int(decision.terms.get("budget_gold", 0))-decision.spent_gold)})
             fund = VillageAccount.objects.select_for_update().get(account_code="PUBLIC_FUND")
             if fund.balance < gold:
                 return _result(StoryResultCode.FUND_INSUFFICIENT)
@@ -677,11 +973,18 @@ def complete_story_action(payload: Mapping[str, Any], *, player_id=None):
             fund.asset_version += 1
             fund.save(update_fields=["balance", "asset_version"])
             fact.repair_metal += amount
-            changes.update({"gold": -gold, "item": {"item_id": 4003, "amount": amount}})
+            decision.spent_gold += gold
+            decision.save(update_fields=["spent_gold"])
+            changes.update({"remaining_budget": int(decision.terms["budget_gold"])-decision.spent_gold, "gold": -gold, "item": {"item_id": 4003, "amount": amount},
+                            "stock_destination": "REPAIR_PROJECT", "PUBLIC_FUND": {"money": -gold}, "REPAIR_PROJECT": {"4003": amount}})
         elif action == StoryActionCode.CONTACT_EMERGENCY_CARAVAN.value:
             attempt_id = _uuid(params.get("route_attempt_id"))
             if not attempt_id:
-                return _result(StoryResultCode.ACTION_INVALID)
+                return _result(StoryResultCode.ACTION_INVALID, data={
+                    "failure_kind": "MISSING_ARGUMENT" if not params.get("route_attempt_id") else "INVALID_ARGUMENT",
+                    "invalid_field": "route_attempt_id", "action_code": action,
+                    "expected": "新的UUID；同一次业务尝试的重投须复用该UUID",
+                })
             old = VillageRouteAttempt.objects.select_for_update().filter(route_attempt_id=attempt_id).first()
             if old:
                 return _result(StoryResultCode.ROUTE_ATTEMPT_REPLAY, data={
@@ -689,47 +992,45 @@ def complete_story_action(payload: Mapping[str, Any], *, player_id=None):
                     "route_attempt_id": str(attempt_id),
                     "progress": old.progress,
                 })
-            if fact.forest_route_scouted < 2 or fact.forest_route_supply < 1:
-                return _result(StoryResultCode.NOT_READY)
-            frozen = {
-                "scouted": fact.forest_route_scouted,
-                "supply": fact.forest_route_supply,
-                "companion_npc_id": str(params.get("companion_npc_id", "")),
-                "segment_code": str(params.get("segment_code", "")),
-                "health": NpcRuntimeState.objects.filter(npc__agent_id="10012").values_list("health_fp", flat=True).first() or 1000,
-            }
+            frozen = {"rule": "NORA_FEE_ONLY_V1"}
             cfg = _config()
-            seed = f"{cfg.story_fixed_seed if cfg else 'village-story-v1'}:{attempt_id}:{json.dumps(frozen, sort_keys=True)}"
-            roll = int(hashlib.sha256(seed.encode()).hexdigest()[:8], 16) % 100
-            success = roll < 65
-            gold = _int_value(params.get("gold_amount", 100), 1)
+            seed = f"guaranteed-contact:{attempt_id}"
+            success = True
+            gold = cfg.caravan_contact_cost if cfg else 100
+            from .caravan import validate_demand, save_demand
+            demand = params.get("item_ids")
+            if demand is not None:
+                error = validate_demand(demand, cfg)
+                if error:
+                    return _result(error)
+            already_open = fact.emergency_caravan_succeeded
+            if already_open:
+                gold = 0
             if gold is None:
                 return _result(StoryResultCode.ACTION_INVALID)
-            cost = {"gold": gold, "supply": 1}
-            if not _money(actor_id, cost["gold"]):
+            cost = {"gold": gold}
+            if cost["gold"] and not _money(actor_id, cost["gold"]):
                 return _result(StoryResultCode.RESOURCE_INSUFFICIENT)
-            fact.forest_route_supply -= 1
+            if demand is not None:
+                save_demand(demand, time.world_minute)
             fact.emergency_caravan_contacted = True
             fact.emergency_caravan_succeeded = success
-            attempt_result = "SUCCESS" if success else "FAILED"
-            changes.update({"route_attempt_id": str(attempt_id), "route_result": attempt_result})
-            injury = {} if success else {"npc_id": "10012", "health_delta": -50}
-            if not success:
-                NpcRuntimeState.objects.filter(npc__agent_id="10012").update(health_fp=0 if frozen["health"] < 50 else frozen["health"] - 50)
+            attempt_result = "SUCCESS"
+            from .caravan import projection
+            visit = projection(time.world_minute)
+            changes.update({"route_attempt_id": str(attempt_id), "route_result": attempt_result,
+                "contact_cost": cost["gold"], "already_open": already_open, "route_open": success,
+                "route_frozen": visit["route_frozen"], "arrival_world_minute": visit["next_arrival_world_minute"],
+                "arrival_conditional": False})
+            if demand is not None:
+                changes["requested_items"] = [{"item_id": item_id} for item_id in sorted(set(demand))]
+            injury = {}
             VillageRouteAttempt.objects.create(
                 route_attempt_id=attempt_id, arc=arc, request_id=request_id,
                 frozen_input=frozen, seed=seed, result_code=attempt_result,
-                cost=cost, injury=injury, progress={"supply_spent": 1, "succeeded": success},
+                cost=cost, injury=injury, progress={"succeeded": success, "already_open": already_open},
                 created_world_minute=time.world_minute,
             )
-        elif action == StoryActionCode.SUPPLY_FOREST_ROUTE.value:
-            item_id = _int_value(params.get("supply_item_id", params.get("item_id", 29001)), 1)
-            amount = _int_value(params.get("supply_amount", params.get("amount", 1)), 1)
-            if item_id is None or amount is None:
-                return _result(StoryResultCode.ACTION_INVALID)
-            if not _consume(actor_id, item_id, amount, player_id):
-                return _result(StoryResultCode.RESOURCE_INSUFFICIENT)
-            fact.forest_route_supply += amount
         elif action == StoryActionCode.TRANSPORT_REPAIR_MATERIALS.value:
             if actor_id != "10012":
                 return _result(StoryResultCode.FORBIDDEN_ACTOR)
@@ -738,8 +1039,18 @@ def complete_story_action(payload: Mapping[str, Any], *, player_id=None):
                 return _result(StoryResultCode.NOT_READY)
             fact.bridge_condition = "MATERIALS_READY"
         elif action == StoryActionCode.MANAGE_REPAIR_LEDGER.value:
+            error, review = review_project(actor, arc, params, time.world_minute, request_id)
+            if error:
+                return _result(error)
+            changes.update(review)
             fact.public_trust = min(100, fact.public_trust + 1)
-        fact.last_progress_day = time.world_minute // 1440
+        if action in {"MANAGE_REPAIR_LEDGER", "PUBLISH_DECISION", "PUBLISH_RATION_RULES", "REVEAL_STORY_FACT"}:
+            from .public_finance import pay_daily_salary
+            fund = VillageAccount.objects.select_for_update().get(account_code="PUBLIC_FUND")
+            mark_inv = NpcGlobalInventory.objects.select_for_update().get(npc__agent_id="10013")
+            pay_daily_salary(fund, mark_inv, changes, time.world_minute, request_id)
+        if action not in ADMIN_ACTIONS:
+            fact.last_progress_day = time.world_minute // 1440
         fact = _project_facts(fact, arc, time.world_minute // 1440)
         arc.story_version += 1
         arc.save(update_fields=["story_version", "updated_at"])
@@ -747,10 +1058,22 @@ def complete_story_action(payload: Mapping[str, Any], *, player_id=None):
         if fact.repair_fund >= (cfg.story_repair_fund_target if cfg else 500) and fact.repair_wood >= (cfg.story_repair_wood_target if cfg else 10) and fact.repair_metal >= (cfg.story_repair_metal_target if cfg else 4) and fact.repair_labor_hours >= (cfg.story_repair_labor_target if cfg else 24):
             fact.bridge_condition = "REPAIRED"
             fact.save(update_fields=["bridge_condition", "updated_at"])
-        result = _result(data={"action_code": action, "story_version": arc.story_version, "snapshot": _snapshot(arc, fact)})
+        snapshot = _snapshot(arc, fact)
+        result = _result(data={"action_code": action, "story_version": arc.story_version, "snapshot": snapshot,
+            "story_phase": arc.current_phase, "bridge_condition": fact.bridge_condition})
+        if action in {"DONATE_REPAIR_RESOURCES", "PURCHASE_REPAIR_MATERIALS", "REPAIR_LABOR", "PROVIDE_REPAIR_MEAL", "TRANSPORT_REPAIR_MATERIALS"}:
+            result["data"]["progress"] = snapshot["plan_progress"]
+        result["data"].update({key: value for key, value in changes.items() if key in {
+            "salary", "mark_salary", "remaining_budget", "decision", "meeting_id", "proposal", "starts_world_minute", "closes_day", "candidate_plans", "public_meal_listing", "stock_destination",
+            "decision_id", "reviewed_entry_id", "evidence_request_id", "fact_code", "ration_limit", "expires_world_minute",
+            "item", "gold", "labor_hours", "meals", "route_attempt_id", "route_result", "contact_cost", "already_open",
+            "route_open", "route_frozen", "arrival_world_minute", "arrival_conditional", "requested_items",
+        }})
         ledger = {"changes": changes}
         if action == StoryActionCode.CONTACT_EMERGENCY_CARAVAN.value:
             ledger["external_delta"] = -cost["gold"]
+        elif action == StoryActionCode.PURCHASE_REPAIR_MATERIALS.value:
+            ledger["external_delta"] = -gold
         return _record(request_id, digest, "STORY_ACT", result, actor=actor,
                        players=[str(player_id)] if player_id else [], world_minute=time.world_minute,
                        time_revision=time.time_revision, event_type=f"STORY_{action}", ledger=ledger)
@@ -814,16 +1137,9 @@ def process_day_close(day_index: int, world_minute: int, source_request_id=None)
             arc.ration_until_day = day + 2
             arc.story_version += 1
             arc.save(update_fields=["current_phase", "ration_until_day", "story_version", "last_crisis_day", "updated_at"])
-    if arc.current_phase == StoryPhase.AFTERMATH.value and (day - arc.start_day >= 3 or fact.food_stock_coverage_days < 4 or fact.tool_stock_coverage_days < 7):
+    if arc.current_phase == StoryPhase.AFTERMATH.value and (day - arc.start_day >= 1 or fact.food_stock_coverage_days < 4 or fact.tool_stock_coverage_days < 7):
         _advance(arc, fact, StoryPhase.SHORTAGE_VISIBLE.value, day, time, uuid.uuid5(uuid.NAMESPACE_URL, f"phase5:{day}:shortage"))
     elif arc.current_phase == StoryPhase.SHORTAGE_VISIBLE.value and day >= arc.phase_entered_day + 1:
-        # Jack's private route knowledge is explicitly shared when the first
-        # council is called; private facts never unlock a candidate directly.
-        NpcStoryFactAccess.objects.filter(
-            fact_code="FOREST_OLD_ROUTE", is_public=False,
-        ).update(is_public=True)
-        fact.forest_route_known = True
-        fact.save(update_fields=["forest_route_known", "updated_at"])
         _advance(arc, fact, StoryPhase.FIRST_COUNCIL.value, day, time, uuid.uuid5(uuid.NAMESPACE_URL, f"phase5:{day}:council"))
     if arc.current_phase in (StoryPhase.FIRST_COUNCIL.value, StoryPhase.PLAN_REVIEW.value):
         meeting = arc.meetings.filter(status="OPEN").order_by("opened_day").first()
@@ -841,15 +1157,6 @@ def process_day_close(day_index: int, world_minute: int, source_request_id=None)
         if arc.current_plan == StoryPlan.BRIDGE_REPAIR.value and fact.bridge_condition == "REPAIRED" and fact.public_trust >= (_config().story_public_trust_minimum if _config() else 20):
             rid = uuid.uuid5(uuid.NAMESPACE_URL, f"phase5:{day}:recovered")
             _finish(arc, fact, StoryOutcome.RECOVERED.value, day, time, rid)
-        elif (
-            arc.current_plan == StoryPlan.FOREST_ROUTE.value
-            and fact.emergency_caravan_succeeded
-            and (
-                fact.public_trust < (_config().story_public_trust_minimum if _config() else 20)
-                or fact.repair_fund < (_config().story_repair_fund_target if _config() else 500)
-            )
-        ):
-            _finish(arc, fact, StoryOutcome.CONTROLLED_TRADE.value, day, time, uuid.uuid5(uuid.NAMESPACE_URL, f"phase5:{day}:controlled"))
         elif arc.current_plan == StoryPlan.RATION_AND_WAIT.value and day >= (arc.ration_until_day or day + 3):
             arc.current_phase = StoryPhase.CRISIS_CHECK.value
             arc.save(update_fields=["current_phase", "updated_at"])
@@ -866,21 +1173,27 @@ def process_day_close(day_index: int, world_minute: int, source_request_id=None)
         arc.save(update_fields=["current_phase", "updated_at"])
         outcome = StoryOutcome.PARTIAL_EVACUATION.value if fact.food_stock_coverage_days < 1 and fact.public_trust < 10 else StoryOutcome.LONG_SHORTAGE.value
         _finish(arc, fact, outcome, day, time, uuid.uuid5(uuid.NAMESPACE_URL, f"phase5:{day}:deadline"))
+    # 二跑复盘（R3）：仍在 AFTERMATH 且无行动时，发一条"自主安排"通报（每世界日一条）。
+    _maybe_notify_story_idle(arc, day, world_minute, time, source_request_id)
     return _result(data=_snapshot(arc, fact, arc.meetings.filter(status="OPEN").first()))
 
 
-def get_store_purchase_limit(npc_id, item_id, world_minute):
-    """Return remaining daily units, or None when the story does not limit buys."""
-    if not story_enabled():
-        return None
-    arc = VillageStoryArc.objects.filter(
-        arc_code=ARC_CODE, is_completed=False, current_plan=StoryPlan.RATION_AND_WAIT.value,
-    ).first()
-    if not arc:
-        return None
-    fact = VillageStoryFact.objects.filter(arc=arc, store_limits_enabled=True).first()
-    limit = (fact.ration_daily_limits or {}).get(str(item_id)) if fact else None
-    if limit is None:
+def get_store_purchase_limit(npc_id, item_id, world_minute, store_code="GENERAL_STORE"):
+    """Combine active public rationing and the store's own daily limits."""
+    from .models import VillageStoreAccount
+    limits = []
+    account = VillageStoreAccount.objects.filter(store_id=store_code).first()
+    if account and account.limits_until_world_minute and world_minute < account.limits_until_world_minute:
+        limit = (account.daily_limits or {}).get(str(item_id))
+        if limit is not None:
+            limits.append(int(limit))
+    if story_enabled() and store_code == "GENERAL_STORE":
+        fact = VillageStoryFact.objects.filter(arc_id=ARC_CODE, store_limits_enabled=True).first()
+        active = fact and (fact.ration_limits_until_world_minute is None or world_minute < fact.ration_limits_until_world_minute)
+        limit = (fact.ration_daily_limits or {}).get(str(item_id)) if active else None
+        if limit is not None:
+            limits.append(int(limit))
+    if not limits:
         return None
     start = (int(world_minute) // 1440) * 1440
     used = 0
@@ -888,8 +1201,10 @@ def get_store_purchase_limit(npc_id, item_id, world_minute):
         entry_type="BUY_FROM_STORE", actor_npc__agent_id=str(npc_id),
         world_minute__gte=start, world_minute__lt=start + 1440,
     ).values_list("changes", flat=True):
-        used += int((changes or {}).get(str(npc_id), {}).get(str(item_id), 0) or 0)
-    return max(0, int(limit) - used)
+        changes = changes or {}
+        if "STORE:" + store_code in changes:
+            used += int(changes.get(str(npc_id), {}).get(str(item_id), 0) or 0)
+    return max(0, min(limits) - used)
 
 
 def _advance(arc, fact, to_phase, day, time, request_id, plan=""):

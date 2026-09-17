@@ -2,6 +2,8 @@ from django.db import models
 
 
 class Recipe(models.Model):
+    output_quantity = models.PositiveIntegerField(default=1)
+    village_only = models.BooleanField(default=False)
     item_id = models.IntegerField()
     recipe_name = models.CharField(max_length=100)
 

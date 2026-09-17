@@ -111,10 +111,13 @@ class PublicEconomyTestBase(TestCase):
             defaults={"current_location_code": "RECORD_HALL", "health_fp": 1000},
         )
 
+        self.mark_inv, _ = NpcGlobalInventory.objects.get_or_create(npc=self.mark, defaults={"money": 0})
+        Item.objects.get_or_create(item_id=1053, defaults={"item_name":"辣子鸡丁", "item_type":ItemType.FOOD, "item_price":27, "sell_percentage":1})
+
         # PUBLIC_FUND
         self.account, _ = VillageAccount.objects.get_or_create(
             account_code="PUBLIC_FUND",
-            defaults={"balance": 500, "last_closed_day_index": -1},
+            defaults={"balance": 500, "audit_opening_balance": 500, "last_closed_day_index": -1},
         )
 
         # Recipes
@@ -152,7 +155,23 @@ class PublicEconomyTestBase(TestCase):
 # ============================================================================
 
 
-class ImportGoodsTest(PublicEconomyTestBase):
+class CaravanTradeTestBase(PublicEconomyTestBase):
+    def setUp(self):
+        super().setUp()
+        from village.models import VillageCaravanVisit
+        from village.phase3_catalog import IMPORT_WHITELIST, EXPORT_WHITELIST
+        from village.phase3_public_economy import _get_published_price
+        self.time.world_minute = 2100  # day 1, 11:00
+        self.time.save()
+        for item in IMPORT_WHITELIST:
+            Item.objects.update_or_create(item_id=item, defaults={"item_name": str(item), "is_deleted": False})
+        self.visit = VillageCaravanVisit.objects.create(day_index=1, route="NORMAL", location_code="TRADE_ROAD",
+            stock={str(i): 12 for i in IMPORT_WHITELIST}, initial_stock={str(i): 12 for i in IMPORT_WHITELIST},
+            import_prices={str(i): _get_published_price(i) for i in IMPORT_WHITELIST},
+            export_prices={str(i): _get_published_price(i) for i in EXPORT_WHITELIST})
+
+
+class ImportGoodsTest(CaravanTradeTestBase):
     def test_import_success(self):
         """Nora imports items from caravan."""
         resp = commit_economy_action(_payload(
@@ -180,10 +199,42 @@ class ImportGoodsTest(PublicEconomyTestBase):
 
         # last_caravan_day updated
         self.account.refresh_from_db()
-        self.assertEqual(self.account.last_caravan_day, 2000 // 1440)
+        self.visit.refresh_from_db()
+        self.assertEqual(self.visit.stock["1040"], 6)
 
-    def test_import_cooldown_check(self):
-        """Cannot import within 3 days of last caravan."""
+    def test_import_multiple_items_without_safe_stock_cap(self):
+        """One caravan call can buy multiple whitelisted items without a stock cap."""
+        resp = commit_economy_action(_payload(
+            "IMPORT_GOODS", 10015, "TRADE_ROAD",
+            {"items": [
+                {"item_id": 1040, "amount": 10},
+                {"item_id": 1026, "amount": 7},
+            ]},
+        ))
+        self.assertEqual(resp["result_code"], ResultCode.OK)
+        self.assertEqual(
+            resp["data"]["imports"],
+            [
+                {"item_id": 1040, "amount": 10, "unit_price": 8, "total_cost": 80},
+                {"item_id": 1026, "amount": 7, "unit_price": 10, "total_cost": 70},
+            ],
+        )
+        self.assertEqual(resp["external_delta"], -150)
+        self.assertEqual(
+            sum(NpcGlobalInventorySlot.objects.filter(
+                bag=self.nora_inv, item_id=1040,
+            ).values_list("item_amount", flat=True)),
+            10,
+        )
+        self.assertEqual(
+            sum(NpcGlobalInventorySlot.objects.filter(
+                bag=self.nora_inv, item_id=1026,
+            ).values_list("item_amount", flat=True)),
+            7,
+        )
+
+    def test_import_ignores_legacy_cooldown(self):
+        """The retired account cooldown does not control daily visits."""
         self.account.last_caravan_day = 2000 // 1440  # today
         self.account.save(update_fields=["last_caravan_day"])
 
@@ -191,21 +242,20 @@ class ImportGoodsTest(PublicEconomyTestBase):
             "IMPORT_GOODS", 10015, "TRADE_ROAD",
             {"item_id": 1040, "amount": 6},
         ))
-        self.assertEqual(resp["result_code"], ResultCode.P3_CARAVAN_COOLDOWN)
+        self.assertEqual(resp["result_code"], ResultCode.OK)
 
-    def test_import_max_to_safe_stock(self):
-        """Import amount capped at safe_stock - available."""
+    def test_import_ignores_safe_stock_cap(self):
+        """Import amount is not capped by safe_stock."""
         # Nora already has 3 peppers
         NpcGlobalInventorySlot.objects.create(
             bag=self.nora_inv, slot_index=0, item_id=1040, item_amount=3,
         )
-        # safe_stock for 1040 = 6, so max import = 3
         resp = commit_economy_action(_payload(
             "IMPORT_GOODS", 10015, "TRADE_ROAD",
             {"item_id": 1040, "amount": 10},
         ))
         self.assertEqual(resp["result_code"], ResultCode.OK)
-        self.assertEqual(resp["effects"]["import"]["amount"], 3)
+        self.assertEqual(resp["effects"]["import"]["amount"], 10)
 
     def test_import_owner_payment(self):
         """Import costs come from Nora, not PUBLIC_FUND."""
@@ -270,7 +320,7 @@ class ImportGoodsTest(PublicEconomyTestBase):
 # ============================================================================
 
 
-class ExportGoodsTest(PublicEconomyTestBase):
+class ExportGoodsTest(CaravanTradeTestBase):
     def test_export_success(self):
         """Nora exports surplus items."""
         # Give Nora corn above safe_stock (safe_stock=10)
@@ -293,7 +343,9 @@ class ExportGoodsTest(PublicEconomyTestBase):
 
         # PUBLIC_FUND received money
         self.account.refresh_from_db()
-        self.assertEqual(self.account.balance, 500 + 8 * 5)  # 8 is published price
+        self.assertEqual(self.account.balance, 500)
+        self.nora_inv.refresh_from_db()
+        self.assertEqual(self.nora_inv.money, 450 + 8 * 5)
 
         # external_delta positive
         self.assertEqual(resp["external_delta"], 40)
@@ -310,7 +362,7 @@ class ExportGoodsTest(PublicEconomyTestBase):
             {"item_id": 1030, "amount": 5,
              "expected_asset_version": self.nora_inv.asset_version},
         ))
-        self.assertEqual(resp["result_code"], ResultCode.P3_INSUFFICIENT_ITEM)
+        self.assertEqual(resp["result_code"], "EXPORT_SAFETY_STOCK_REQUIRED")
 
     def test_export_wrong_item(self):
         """Only export whitelist items allowed."""
@@ -341,6 +393,11 @@ class ExportGoodsTest(PublicEconomyTestBase):
 
 
 class RateDishTest(PublicEconomyTestBase):
+    def reply(self, dish, score):
+        request = commit_economy_action(_payload("REQUEST_DISH_REVIEW",10014,"RECORD_HALL",{"food_instance_id":str(dish.instance_id)}))
+        self.assertEqual(request["result_code"],ResultCode.OK,request)
+        return {"review_id":request["data"]["review_id"], "scores":{k:score*2 for k in ("color","aroma","taste","presentation")}, "comment":"依据实际菜品给出点评。"}
+
     def test_rate_invalid_instance_id_is_business_failure(self):
         """Malformed user input must not escape as a UUIDField exception."""
         resp = commit_economy_action(_payload(
@@ -360,18 +417,19 @@ class RateDishTest(PublicEconomyTestBase):
 
         resp = commit_economy_action(_payload(
             "RATE_DISH", 10013, "RECORD_HALL",
-            {"owner_npc_id": 10014, "food_instance_id": str(dish.instance_id),
-             "score": 4},
+            self.reply(dish, 4),
         ))
         self.assertEqual(resp["result_code"], ResultCode.OK)
 
         dish.refresh_from_db()
         self.assertTrue(dish.rated)
-        self.assertEqual(dish.overall_score, 4)
+        self.assertGreaterEqual(dish.overall_score, 75)
+        self.assertLessEqual(dish.overall_score, 85)
+        self.assertGreater(dish.rating_price,0)
 
         # Mark salary paid
         self.account.refresh_from_db()
-        self.assertEqual(self.account.balance, 500 - 1)  # 1 gold salary
+        self.assertEqual(self.account.balance, 500 - 22)  # One basic meal reference per worked day
 
     def test_rate_already_rated_fails(self):
         """Cannot rate an already rated dish."""
@@ -389,7 +447,7 @@ class RateDishTest(PublicEconomyTestBase):
         self.assertEqual(resp["result_code"], ResultCode.P3_INVALID_PARAMS)
 
     def test_rate_mark_salary(self):
-        """Mark receives 1 gold from PUBLIC_FUND."""
+        """Mark earns one daily meal-reference salary from PUBLIC_FUND."""
         dish = NpcGlobalInventorySlot.objects.create(
             bag=self.lucy_inv, slot_index=0, item_id=1053, item_amount=1,
             produced_world_minute=1000, expires_world_minute=4000,
@@ -399,12 +457,11 @@ class RateDishTest(PublicEconomyTestBase):
         balance_before = self.account.balance
         commit_economy_action(_payload(
             "RATE_DISH", 10013, "RECORD_HALL",
-            {"owner_npc_id": 10014, "food_instance_id": str(dish.instance_id),
-             "score": 3},
+            self.reply(dish, 3),
         ))
 
         self.account.refresh_from_db()
-        self.assertEqual(self.account.balance, balance_before - 1)
+        self.assertEqual(self.account.balance, balance_before - 22)
 
     def test_rate_salary_skipped_when_fund_empty(self):
         """Salary skipped when PUBLIC_FUND is empty."""
@@ -419,8 +476,7 @@ class RateDishTest(PublicEconomyTestBase):
 
         resp = commit_economy_action(_payload(
             "RATE_DISH", 10013, "RECORD_HALL",
-            {"owner_npc_id": 10014, "food_instance_id": str(dish.instance_id),
-             "score": 3},
+            self.reply(dish, 3),
         ))
         # Action still succeeds
         self.assertEqual(resp["result_code"], ResultCode.OK)
@@ -436,18 +492,18 @@ class PublishPriceIndexTest(PublicEconomyTestBase):
     def test_publish_success(self):
         """Mark publishes daily price index."""
         DailyPriceSnapshot.objects.create(
-            day_index=5,
+            day_index=1,
             prices={"1030": 8, "1056": 12},
             status=DaySnapshotStatus.DRAFT,
         )
 
         resp = commit_economy_action(_payload(
             "PUBLISH_PRICE_INDEX", 10013, "RECORD_HALL",
-            {"day_index": 5},
+            {"day_index": 1},
         ))
         self.assertEqual(resp["result_code"], ResultCode.OK)
 
-        snapshot = DailyPriceSnapshot.objects.get(day_index=5)
+        snapshot = DailyPriceSnapshot.objects.get(day_index=1)
         self.assertEqual(snapshot.status, DaySnapshotStatus.PUBLISHED)
         self.assertEqual(snapshot.published_by_npc_id, 10013)
 
@@ -455,14 +511,14 @@ class PublishPriceIndexTest(PublicEconomyTestBase):
         """Cannot publish if no DRAFT exists."""
         resp = commit_economy_action(_payload(
             "PUBLISH_PRICE_INDEX", 10013, "RECORD_HALL",
-            {"day_index": 999},
+            {"day_index": 1},
         ))
         self.assertEqual(resp["result_code"], ResultCode.P3_PRICE_UNAVAILABLE)
 
     def test_publish_mark_salary(self):
         """Mark receives salary for publishing."""
         DailyPriceSnapshot.objects.create(
-            day_index=5,
+            day_index=1,
             prices={"1030": 8},
             status=DaySnapshotStatus.DRAFT,
         )
@@ -470,11 +526,11 @@ class PublishPriceIndexTest(PublicEconomyTestBase):
         balance_before = self.account.balance
         commit_economy_action(_payload(
             "PUBLISH_PRICE_INDEX", 10013, "RECORD_HALL",
-            {"day_index": 5},
+            {"day_index": 1},
         ))
 
         self.account.refresh_from_db()
-        self.assertEqual(self.account.balance, balance_before - 1)
+        self.assertEqual(self.account.balance, balance_before - 22)
 
 
 # ============================================================================
@@ -487,7 +543,7 @@ class AuditPublicFundTest(PublicEconomyTestBase):
         """Mark audits public fund successfully."""
         resp = commit_economy_action(_payload(
             "AUDIT_PUBLIC_FUND", 10013, "RECORD_HALL",
-            {"day_index": 0},
+            {"day_index": 1},
         ))
         self.assertEqual(resp["result_code"], ResultCode.OK)
 
@@ -500,11 +556,11 @@ class AuditPublicFundTest(PublicEconomyTestBase):
         balance_before = self.account.balance
         commit_economy_action(_payload(
             "AUDIT_PUBLIC_FUND", 10013, "RECORD_HALL",
-            {"day_index": 0},
+            {"day_index": 1},
         ))
 
         self.account.refresh_from_db()
-        self.assertEqual(self.account.balance, balance_before - 1)
+        self.assertEqual(self.account.balance, balance_before - 22)
 
 
 # ============================================================================
@@ -640,73 +696,18 @@ class EatPersonalTest(PublicEconomyTestBase):
 
 
 class EatCommunityTest(PublicEconomyTestBase):
-    def test_community_meal_success(self):
-        """Community meal: consume Lucy's dish, PUBLIC_FUND pays."""
-        # Lucy has a dish
-        NpcGlobalInventorySlot.objects.create(
-            bag=self.lucy_inv, slot_index=0, item_id=1053, item_amount=2,
-            produced_world_minute=1000, expires_world_minute=4000,
-            dish_quality=3, rated=False,
-        )
+    def test_old_direct_meal_endpoint_cannot_pay_or_consume(self):
+        dish=NpcGlobalInventorySlot.objects.create(bag=self.lucy_inv,slot_index=0,item_id=1053,item_amount=2,
+            produced_world_minute=1000,expires_world_minute=4000)
+        lucy_money,fund=self.lucy_inv.money,self.account.balance
+        for command,npc,params in (("EAT",10011,{"source":"COMMUNITY_MEAL"}),
+            ("COMMUNITY_MEAL",10012,{"expected_asset_version":self.jack_inv.asset_version})):
+            with self.subTest(command=command):
+                result=commit_economy_action(_payload(command,npc,"RESTAURANT",params))
+                self.assertEqual(result["result_code"],"PUBLIC_MEAL_USE_STORE")
+        dish.refresh_from_db();self.lucy_inv.refresh_from_db();self.account.refresh_from_db()
+        self.assertEqual((dish.item_amount,self.lucy_inv.money,self.account.balance),(2,lucy_money,fund))
 
-        lucy_money_before = self.lucy_inv.money
-        fund_balance_before = self.account.balance
-
-        resp = commit_economy_action(_payload(
-            "EAT", 10011, "RESTAURANT",
-            {"source": "COMMUNITY_MEAL"},
-        ))
-        self.assertEqual(resp["result_code"], ResultCode.OK)
-
-        # Lucy received payment
-        self.lucy_inv.refresh_from_db()
-        self.assertEqual(self.lucy_inv.money, lucy_money_before + 25)
-
-        # PUBLIC_FUND deducted
-        self.account.refresh_from_db()
-        self.assertEqual(self.account.balance, fund_balance_before - 25)
-
-        # Dish consumed
-        dish = NpcGlobalInventorySlot.objects.get(bag=self.lucy_inv, item_id=1053)
-        self.assertEqual(dish.item_amount, 1)
-
-    def test_community_meal_insufficient_fund(self):
-        """Community meal fails when PUBLIC_FUND cannot pay."""
-        self.account.balance = 0
-        self.account.save(update_fields=["balance"])
-
-        NpcGlobalInventorySlot.objects.create(
-            bag=self.lucy_inv, slot_index=0, item_id=1053, item_amount=1,
-            produced_world_minute=1000, expires_world_minute=4000,
-        )
-
-        resp = commit_economy_action(_payload(
-            "EAT", 10011, "RESTAURANT",
-            {"source": "COMMUNITY_MEAL"},
-        ))
-        self.assertEqual(resp["result_code"], ResultCode.P3_INSUFFICIENT_MONEY)
-
-    def test_community_meal_no_dishes(self):
-        """Community meal fails when Lucy has no dishes."""
-        resp = commit_economy_action(_payload(
-            "EAT", 10011, "RESTAURANT",
-            {"source": "COMMUNITY_MEAL"},
-        ))
-        self.assertEqual(resp["result_code"], ResultCode.P3_INSUFFICIENT_ITEM)
-
-    def test_community_meal_via_handler(self):
-        """COMMUNITY_MEAL action also works."""
-        NpcGlobalInventorySlot.objects.create(
-            bag=self.lucy_inv, slot_index=0, item_id=1067, item_amount=1,
-            produced_world_minute=1000, expires_world_minute=4000,
-            dish_quality=3, rated=False,
-        )
-
-        resp = commit_economy_action(_payload(
-            "COMMUNITY_MEAL", 10012, "RESTAURANT",
-            {"expected_asset_version": self.jack_inv.asset_version},
-        ))
-        self.assertEqual(resp["result_code"], ResultCode.OK)
 
 
 # ============================================================================
@@ -714,9 +715,9 @@ class EatCommunityTest(PublicEconomyTestBase):
 # ============================================================================
 
 
-class CaravanCooldownTest(PublicEconomyTestBase):
-    def test_cooldown_3_days(self):
-        """Cannot import again within 3 days."""
+class CaravanCooldownTest(CaravanTradeTestBase):
+    def test_multiple_purchases_same_visit(self):
+        """Stock can be purchased in separate transactions during one visit."""
         # First import
         resp1 = commit_economy_action(_payload(
             "IMPORT_GOODS", 10015, "TRADE_ROAD",
@@ -724,16 +725,16 @@ class CaravanCooldownTest(PublicEconomyTestBase):
         ))
         self.assertEqual(resp1["result_code"], ResultCode.OK)
 
-        # Second import same day should fail
+        # Second import consumes the same visit stock
         resp2 = commit_economy_action(_payload(
             "IMPORT_GOODS", 10015, "TRADE_ROAD",
             {"item_id": 1026, "amount": 1},
         ))
-        self.assertEqual(resp2["result_code"], ResultCode.P3_CARAVAN_COOLDOWN)
+        self.assertEqual(resp2["result_code"], ResultCode.OK)
 
-    def test_cooldown_resets_after_3_days(self):
-        """Import allowed after 3 days."""
-        self.account.last_caravan_day = (2000 // 1440) - 3
+    def test_legacy_cooldown_does_not_block_daily_visit(self):
+        """Import allowed after 2 days."""
+        self.account.last_caravan_day = (2000 // 1440) - 2
         self.account.save(update_fields=["last_caravan_day"])
 
         resp = commit_economy_action(_payload(

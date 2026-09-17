@@ -41,12 +41,19 @@ class Item(models.Model):
     use_effect_type = models.CharField(max_length=50, blank=True, default="", help_text="使用效果类型，如 unlock_recipe")
     use_effect_data = models.JSONField(default=dict, blank=True, help_text="使用效果数据，如 {\"recipeName\": \"红烧肉\"}")
     max_use_count = models.IntegerField(default=1, help_text="最大使用次数，-1 表示无限次")
+    quality_enabled = models.BooleanField(default=False, help_text="普通物品是否区分品质；菜品始终保留品质")
+    stackable = models.BooleanField(default=True, help_text="允许跨批次展示堆叠；菜品和有次数的道具仍独立展示")
+    max_stack_size = models.PositiveIntegerField(null=True, blank=True, help_text="每个展示格的数量上限，留空表示不限；不改变实际库存批次")
     is_deleted = models.BooleanField(default=False)
     updated_at = models.DateTimeField(auto_now=True)
     created_at = models.DateTimeField(auto_now_add=True)
 
     class Meta:
         ordering = ["item_id"]
+        constraints = [models.CheckConstraint(
+            condition=models.Q(max_stack_size__isnull=True) | models.Q(max_stack_size__gt=0),
+            name="item_positive_stack_size",
+        )]
         verbose_name = "道具"
         verbose_name_plural = "道具"
 
