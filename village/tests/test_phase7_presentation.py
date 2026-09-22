@@ -493,11 +493,11 @@ class Phase7PresentationTests(TestCase):
         })
         self.assertEqual(set(data["story"]), {
             "arc_code", "public_problem", "public_plan", "progress",
-            "player_contribution", "recent_transition_reason", "retired_plan",
+            "player_contribution", "recent_transition_reason", "retired_plan", "affairs",
         })
         self.assertEqual(set(data["story"]["progress"]), {
             "bridge_condition", "repair_fund", "repair_wood", "repair_metal",
-            "repair_labor_hours", "community_meals",
+            "repair_labor_hours", "community_meals", "ration_rules_published", "store_limits_enabled",
         })
         serialized = json.dumps(data).lower()
         for forbidden in (
@@ -518,10 +518,9 @@ class Phase7PresentationTests(TestCase):
         self.time.world_minute = 3 * 1440 + 1380
         self.time.save(update_fields=["world_minute"])
         forest = self._client(self.player).get("/api/village/public/overview").data["data"]
-        self.assertEqual(set(forest["story"]["progress"]), {
-            "retired", "message", "emergency_caravan_status",
-        })
-        self.assertTrue(forest["story"]["progress"]["retired"])
+        self.assertTrue(forest["story"]["retired_plan"])
+        self.assertIn("bridge_condition", forest["story"]["progress"])
+        self.assertIn("affairs", forest["story"])
         self.assertEqual(forest["story"]["progress"]["emergency_caravan_status"], "FAILED")
         forest_locations = {
             row["location_code"]: row["is_open"] for row in forest["locations"]

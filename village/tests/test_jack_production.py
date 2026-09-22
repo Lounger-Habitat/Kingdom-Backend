@@ -17,6 +17,17 @@ from village.phase3_catalog import PREY_RECIPES, PREY_ITEM_IDS, BYPRODUCT_ITEM_I
 from village.jack_production import production_info, settle_work_needs
 
 
+def bind_wildlife(case, cmd):
+    from village.wildlife import execute
+    prey_id, attempt_id = str(uuid.uuid4()), str(uuid.uuid4())
+    registered=execute(dict(action='register',request_id=str(uuid.uuid4()),prey_id=prey_id,
+        species='CHICKEN',region_id='HUNTING_GROUNDS',position=dict(x=0,y=0,z=0)))
+    case.assertTrue(registered['success'], registered)
+    begun=execute(dict(action='begin',request_id=str(uuid.uuid4()),prey_id=prey_id,
+        attempt_id=attempt_id,actor_type='NPC',actor_id='10012',command_id=str(cmd.pk)))
+    case.assertTrue(begun['success'], begun)
+
+
 class JackProductionTests(ProductionTestBase):
     def setUp(self):
         super().setUp()
@@ -47,11 +58,27 @@ class JackProductionTests(ProductionTestBase):
         self.jack_rt.refresh_from_db()
         ok,code,cmd=CommandService.start_command(cmd.command_id)
         self.assertTrue(ok,code)
+        if action == 'HUNT':
+            bind_wildlife(self, cmd)
         return cmd
 
     def finish(self,cmd,minute=None):
+        from village.models import VillageHuntAttempt
+        if cmd.kind == 'HUNT' and cmd.sanitized_parameters.get('hunt_code') == 'HUNT_ANIMALS':
+            if not VillageHuntAttempt.objects.filter(command=cmd).exists():
+                bind_wildlife(self, cmd)
         self.time.world_minute = minute if minute is not None else cmd.started_world_minute+cmd.duration_minutes
         self.time.save()
+        if cmd.kind == 'HUNT' and cmd.sanitized_parameters.get('hunt_code') == 'HUNT_ANIMALS':
+            from village.wildlife import execute
+            from village.models import VillageHuntAttempt
+            attempt=VillageHuntAttempt.objects.get(command=cmd,status='ACTIVE')
+            result=execute(dict(action='complete',request_id=str(uuid.uuid4()),prey_id=str(attempt.prey_id),
+                attempt_id=str(attempt.pk),death_world_minute=self.time.world_minute))
+            if not result['success']:
+                ActionService.complete_action(cmd.pk,cmd.request_id,False,result['result_code'])
+                return result
+            return result['data']['economy_result']
         return commit_economy_action(self.payload(cmd))
 
     def payload(self,cmd):
@@ -68,7 +95,7 @@ class JackProductionTests(ProductionTestBase):
         hunt=self.start()
         self.assertEqual(get_available_slot_amount(self.jack_hunt_tool,700),0)
         early=commit_economy_action(self.payload(hunt))
-        self.assertEqual(early['result_code'],'PRODUCTION_NOT_FINISHED')
+        self.assertEqual(early['result_code'],'HUNT_KILL_REQUIRED')
         self.assertFalse(VillageActionReceipt.objects.filter(request_id=hunt.request_id).exists())
         result=self.finish(hunt)
         self.assertEqual(result['result_code'],'OK',result)
@@ -114,8 +141,8 @@ class JackProductionTests(ProductionTestBase):
         VillageActionDurationConfig.objects.filter(action_name='HUNT').delete()
         ok,code,cmd=CommandService.start_command(current[2].command_id)
         self.assertTrue(ok,code);self.assertEqual(cmd.duration_minutes,7)
-        self.assertEqual(self.finish(cmd,cmd.started_world_minute+6)['result_code'],'PRODUCTION_NOT_FINISHED')
-        self.assertEqual(self.finish(cmd)['result_code'],'OK')
+        self.assertEqual(self.finish(cmd,cmd.started_world_minute+6)['result_code'],'OK')
+        self.assertTrue(commit_economy_action(self.payload(cmd))['replayed'])
         VillageActionDurationConfig.objects.filter(action_name='PROCESS_GAME').delete()
         missing,_=self.accept('PROCESS_GAME',{'prey_instance_id':str(uuid.uuid4())})
         self.assertEqual(missing[1],'INVALID_ACTION_DURATION')
@@ -268,10 +295,10 @@ class JackProductionTests(ProductionTestBase):
         returned=self.jack_inv.slots.get(item_id=29101,item_amount=1)
         self.assertTrue(returned.freshness_unknown)
 
-    def test_legacy_accepted_hunt_keeps_meat_rules(self):
+    def test_legacy_accepted_hunt_cannot_mint_timer_meat(self):
         cmd=self.start()
         cmd.production_state={};cmd.sanitized_parameters={'hunt_code':'HUNT_CHICKEN'};cmd.save()
         result=self.finish(cmd)
-        self.assertEqual(result['result_code'],'OK',result)
+        self.assertEqual(result['result_code'],'HUNT_KILL_REQUIRED',result)
         self.assertFalse(self.jack_inv.slots.filter(item_id__in=PREY_ITEM_IDS,item_amount__gt=0).exists())
-        self.assertTrue(self.jack_inv.slots.filter(item_id=1056).exists() or result['effects']['items_added'])
+        self.assertFalse(self.jack_inv.slots.filter(item_id=1056).exists())

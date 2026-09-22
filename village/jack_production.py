@@ -120,11 +120,9 @@ def start_work(runtime, command, minute):
         extra = config.jack_repeat_hunt_energy * 10 if previous else 0
         if runtime.energy_fp - extra <= 100:
             return "ENERGY_TOO_LOW"
-        from .phase3_asset_service import deterministic_rng
-        rng = deterministic_rng(command.request_id, "HUNT_ANIMALS", day)
-        animal = rng.choices(list(PREY_RECIPES), [r["weight"] for r in PREY_RECIPES.values()], k=1)[0]
-        state.update(hunt_day=day, hunt_ordinal=previous + 1, extra_energy_fp=extra,
-                     prey_item_id=animal)
+        # HUNT duration is a frozen pursuit budget, never a reward timer.
+        # Species is supplied by the durable animal life only after an Env kill.
+        state.update(hunt_day=day, hunt_ordinal=previous + 1, extra_energy_fp=extra)
         runtime.energy_fp -= extra
     command.production_state = state
     return None
@@ -140,6 +138,8 @@ def settle_work_needs(runtime, command, minute):
     changed_fields = set(state.get("needs_changed_fields", []))
     cursor = int(state.get("needs_until", started))
     end = min(minute, started + command.duration_minutes)
+    if command.kind == "HUNT" and state.get("death_world_minute") is not None:
+        end = min(end, state["death_world_minute"])
     error = work_unavailable(runtime, command, cursor)
     if runtime.active_command_id != command.command_id:
         error = error or "ACTION_NOT_ALLOWED"
@@ -163,7 +163,7 @@ def finish_work(npc_id, params, minute, request_id):
     command = NpcCommandState.objects.select_for_update().filter(request_id=request_id).first()
     if command is None or not is_jack_work(command) or command.status != "RUNNING":
         return _fail("PRODUCTION_COMMAND_REQUIRED")
-    if command.started_world_minute is None or minute < command.started_world_minute + command.duration_minutes:
+    if command.started_world_minute is None or (command.kind != "HUNT" and minute < command.started_world_minute + command.duration_minutes):
         return _fail("PRODUCTION_NOT_FINISHED")
     inventory = NpcGlobalInventory.objects.select_for_update().get(npc__agent_id=str(npc_id))
     expected = params.get("expected_asset_version")
@@ -177,9 +177,16 @@ def finish_work(npc_id, params, minute, request_id):
     if error:
         return _fail(error)
     if command.kind == "HUNT":
-        outputs = {int(state["prey_item_id"]): 1}
-        produced = end
-        expires = end + HUNT_MEAT_SPOILAGE_MINUTES
+        from .wildlife import confirmed_kill
+        kill = confirmed_kill(command)
+        if kill is None:
+            return _fail("HUNT_KILL_REQUIRED")
+        if kill.death_world_minute > end:
+            return _fail("HUNT_TIMEOUT")
+        from .wildlife import SPECIES
+        outputs = {SPECIES[kill.species]: 1}
+        produced = kill.death_world_minute
+        expires = produced + HUNT_MEAT_SPOILAGE_MINUTES
         consumed = []
     else:
         prey = NpcGlobalInventorySlot.objects.select_for_update().get(instance_id=state["prey_instance_id"])
@@ -200,7 +207,7 @@ def finish_work(npc_id, params, minute, request_id):
         slot = add_batch(inventory, item_id, amount, produced, expiry, request_id)
         added.append({"item_id": item_id, "item_name": item_names.get(item_id, str(item_id)),
                       "amount": amount, "instance_id": str(slot.instance_id),
-                      "expires_world_minute": expiry})
+                      "produced_world_minute": produced, "expires_world_minute": expiry})
     inventory.asset_version += 1
     inventory.save(update_fields=["asset_version", "updated_at"])
     return _ok(asset_versions={str(npc_id): inventory.asset_version}, effects={

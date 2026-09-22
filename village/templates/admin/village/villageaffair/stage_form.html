@@ -1,0 +1,9 @@
+<section class="module affair-stage" data-stage>
+  {{ stage_form.non_field_errors }}
+  {% for hidden in stage_form.hidden_fields %}{{ hidden }}{{ hidden.errors }}{% endfor %}
+  <h2><span data-stage-number>阶段</span><span class="stage-actions"><button type="button" class="button" data-move-stage="up" hidden>上移</button><button type="button" class="button" data-move-stage="down" hidden>下移</button><button type="button" class="button" data-remove-stage hidden>移除阶段</button></span></h2>
+  <div class="stage-name">{{ stage_form.title.errors }}{{ stage_form.title.label_tag }}{{ stage_form.title }}<label class="delete-field">{{ stage_form.DELETE }} 移除此阶段</label></div>
+  <div class="stage-name">{{ stage_form.location_code.errors }}{{ stage_form.location_code.label_tag }}{{ stage_form.location_code }}<p class="help">{{ stage_form.location_code.help_text }}</p></div><p class="help">本阶段全部条件完成后才开放下一阶段。</p>
+  <div data-condition-list>{% for row in conditions %}{% include "admin/village/villageaffair/condition_form.html" %}{% endfor %}</div>
+  <button type="button" class="button" data-add-condition hidden>添加完成条件</button>
+</section>

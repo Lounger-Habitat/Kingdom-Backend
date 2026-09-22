@@ -104,6 +104,8 @@ class Command(BaseCommand):
             self._seed_phase3_grants(summary)
             from village.lucy_configuration import configure_lucy
             summary["lucy_definitions"] = configure_lucy()
+            from village.farm_irrigation import ensure_irrigation_affair
+            ensure_irrigation_affair(GlobalGameTimeState.get_instance().world_minute)
             if dry_run:
                 transaction.set_rollback(True)
 
@@ -184,10 +186,13 @@ class Command(BaseCommand):
             summary["locations"] += 1
 
     def _seed_config(self):
-        VillageSimulationConfig.objects.update_or_create(
+        config, created = VillageSimulationConfig.objects.update_or_create(
             config_key="default",
             defaults=SIMULATION_DEFAULTS,
         )
+        if created:
+            config.mark_employed_from_minute = GlobalGameTimeState.get_instance().world_minute
+            config.save(update_fields=["mark_employed_from_minute"])
 
     def _seed_npcs(self, summary, reset_demo):
         required_item_ids = {
@@ -511,7 +516,7 @@ class Command(BaseCommand):
         for seed in FARM_PLOT_SEEDS:
             VillageFarmPlot.objects.get_or_create(
                 plot_code=seed["plot_code"],
-                defaults={"status": "EMPTY"},
+                defaults={"status": "EMPTY", "lease_enabled": seed["plot_code"].startswith("FARM_PLOT_D_")},
             )
             summary["farm_plots"] += 1
 

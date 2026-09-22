@@ -732,6 +732,10 @@ def grant_player_fact(player_id: Any, fact_code: str, world_minute: int, event: 
 
 
 def complete_social_action(payload: Mapping[str, Any]) -> dict[str, Any]:
+    if str(payload.get("action", "")).strip().upper() in {
+        "CREATE_COMMITMENT", "CANCEL_COMMITMENT", "PERFORM_COMMITMENT",
+    }:
+        return _result("ACTION_RETIRED")
     if not social_enabled():
         return _result("VILLAGE_SOCIAL_DISABLED")
     try:

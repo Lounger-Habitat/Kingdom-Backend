@@ -71,7 +71,7 @@ ACTION_DELTAS = {
 ACTION_DELTA_ACTIVITIES = {
     "MOVE": "MOVE", "GO_HOME": "MOVE",
     "WORK_PLACEHOLDER": "WORK",
-    "PLANT": "WORK", "HARVEST": "WORK", "HUNT": "WORK", "COOK": "WORK",
+    "PLANT": "WORK", "HARVEST": "WORK", "HUNT": "WORK", "CHOP_TREE": "WORK", "COOK": "WORK",
     "REPAIR_LABOR": "WORK",
     "PROCESS_GAME": "WORK",
 }
@@ -119,8 +119,7 @@ def _hash(payload: Dict[str, Any]) -> str:
 
 def settle_repair_needs_locked(runtime, command, world_minute):
     """Persist a server-owned cursor; ticks, cancellation and retries share it."""
-    from .phase5_story import repair_labor_unavailable
-    from .phase5_contract import REPAIR_LABOR_MINUTES
+    from .affair_commands import labor_unavailable as repair_labor_unavailable
     started = command.started_world_minute
     if started is None:
         return None
@@ -128,10 +127,10 @@ def settle_repair_needs_locked(runtime, command, world_minute):
     params.pop("expected_story_version", None)
     cursor = int(params.get("_repair_needs_until", started))
     error = repair_labor_unavailable(runtime, world_minute, params)
-    if runtime.active_command_id != command.command_id or runtime.current_action != "STORY_ACT":
+    if runtime.active_command_id != command.command_id or runtime.current_action != "CONTRIBUTE_TO_AFFAIR":
         error = error or ResultCode.ACTION_NOT_ALLOWED
-    end = min(world_minute, started + REPAIR_LABOR_MINUTES)
-    # At most 60 minutes. Stop at the first work threshold, even after reconnect.
+    end = min(world_minute, started + command.duration_minutes)
+    # Stop at the first work threshold, even after reconnect.
     while cursor < end and not error:
         error = settle_action_needs_locked(runtime, "REPAIR_LABOR", cursor, cursor + 1, base_until=cursor + 1)
         cursor += 1
@@ -727,9 +726,17 @@ class TickService:
     def advance(cls, payload: Dict[str, Any]) -> Dict[str, Any]:
         allowed = {"world_minute", "time_revision", "request_id"}
         legacy_allowed = {"world_minute", "expected_time_revision", "request_id"}
-        if not any(set(payload) == candidate for candidate in (
-                allowed, allowed | {"needs_requests"}, legacy_allowed,
-                legacy_allowed | {"needs_requests"})):
+        optional = {"needs_requests", "deferred_hunt_command_ids"}
+        if not any(set(payload) - optional == candidate for candidate in (allowed, legacy_allowed)):
+            return _result(False, ResultCode.INVALID_COMMAND_SCHEMA)
+        deferred = payload.get("deferred_hunt_command_ids", [])
+        if not isinstance(deferred, list) or len(deferred) > 32:
+            return _result(False, ResultCode.INVALID_COMMAND_SCHEMA)
+        try:
+            parsed_deferred = [uuid.UUID(value) for value in deferred if isinstance(value, str)]
+            if len(parsed_deferred) != len(deferred) or len(set(parsed_deferred)) != len(deferred):
+                return _result(False, ResultCode.INVALID_COMMAND_SCHEMA)
+        except (ValueError, TypeError, AttributeError):
             return _result(False, ResultCode.INVALID_COMMAND_SCHEMA)
         try:
             request_id = uuid.UUID(str(payload["request_id"]))
@@ -813,6 +820,7 @@ class TickService:
             .order_by("npc__agent_id")
         )
         npc_results = {}
+        deferred_hunts = {uuid.UUID(value) for value in payload.get("deferred_hunt_command_ids", [])}
         for runtime in runtimes:
             npc_id = str(runtime.npc.agent_id)
             interrupted_command_id = None
@@ -821,6 +829,26 @@ class TickService:
                 from .runtime_services import ActionService
                 command = NpcCommandState.objects.select_for_update().filter(
                     command_id=runtime.active_command_id, status="RUNNING").first()
+                if command and command.kind == "HUNT" and command.pk in deferred_hunts:
+                    from .models import VillageHuntAttempt
+                    if VillageHuntAttempt.objects.filter(command=command, status="ACTIVE", prey__status="CLAIMED").exists():
+                        # Env has a durable death waiting for clock/settlement.
+                        # Keep this NPC's exact needs cursor until complete;
+                        # advance world time and every other NPC normally.
+                        npc_results[npc_id] = {
+                            "interrupted_command_id": None, "deferred_hunt": True,
+                            "public_needs": public_needs(runtime),
+                            "needs_world_minute": runtime.needs_world_minute,
+                            "state_version": runtime.state_version,
+                        }
+                        continue
+                if command and command.kind == "CHOP_TREE" and command.pk in deferred_hunts:
+                    from .models import VillageChopAttempt
+                    if VillageChopAttempt.objects.filter(command=command, status="ACTIVE", node__status="CLAIMED").exists():
+                        npc_results[npc_id] = {"interrupted_command_id": None, "deferred_hunt": True,
+                            "public_needs": public_needs(runtime), "needs_world_minute": runtime.needs_world_minute,
+                            "state_version": runtime.state_version}
+                        continue
                 from .jack_production import is_jack_work, settle_work_needs
                 if command and (is_repair_labor(command.kind, command.sanitized_parameters) or is_jack_work(command)):
                     settle = settle_work_needs if is_jack_work(command) else settle_repair_needs_locked
@@ -867,8 +895,13 @@ class TickService:
 
         from .caravan import projection
         caravan = projection(state.world_minute)
+        from .player_farm import project_plot
+        from .models import VillageFarmPlot
+        farm_plots = [project_plot(plot, state.world_minute) for plot in
+            VillageFarmPlot.objects.select_related("lessee_player").order_by("plot_code")]
         data = {
             "caravan": caravan,
+            "farm_plots": farm_plots,
             "request_payload_sha256": payload_hash,
             "world_minute": receipt.world_minute,
             "time_revision": receipt.time_revision,
@@ -879,7 +912,7 @@ class TickService:
         receipt.save(update_fields=["action_kind", "response_data"])
         return _result(True, ResultCode.COMMAND_ACCEPTED, receipt=receipt,
                        world_minute=receipt.world_minute, time_revision=receipt.time_revision,
-                       npc_results=npc_results, caravan=caravan)
+                       npc_results=npc_results, caravan=caravan, farm_plots=farm_plots)
 
 
 class LifeActionService:
@@ -910,6 +943,8 @@ class LifeActionService:
                 (fast_integration and not required.issubset(payload)) or
                 not isinstance(payload.get("params"), dict)):
             return ResultCode.INVALID_COMMAND_SCHEMA
+        if payload["action"] in {"WORK_PLACEHOLDER", "SOCIALIZE"}:
+            return "ACTION_RETIRED"
         if payload["action"] not in LifeActionService.ACTIONS:
             return ResultCode.UNKNOWN_ACTION
         if any(isinstance(payload[name], bool) or not isinstance(payload[name], int) for name in ("start_world_minute", "completion_world_minute", "expected_state_version")):
@@ -957,6 +992,7 @@ class LifeActionService:
 
     @staticmethod
     def _outbox(runtime: NpcRuntimeState, receipt: VillageActionReceipt, event: VillageWorldEvent, action: str, code: str, effects: Dict[str, Any], time_state: GlobalGameTimeState, command_id: uuid.UUID, *, success: bool = True, data: Optional[Dict[str, Any]] = None) -> None:
+        from .runtime_services import _with_command_timing
         command = receipt.command
         reason_code = "" if success else code
         payload = {
@@ -970,7 +1006,7 @@ class LifeActionService:
             "current_location_code": runtime.current_location_code,
             "duration_minutes": command.duration_minutes,
             "public_needs": public_needs(runtime), "public_status": runtime.action_status,
-            "retryable": False, "effects": effects, "data": data or {},
+            "retryable": False, "effects": effects, "data": _with_command_timing(data, command),
         }
         VillageDeliveryOutbox.objects.create(
             dedupe_key=f"outcome:{receipt.request_id}", recipient=command.sender_id,
@@ -1486,7 +1522,7 @@ def runtime_summary(npc_id: str) -> Dict[str, Any]:
     unavailable_reasons = {}
     available = []
     for action in sorted(actions):
-        if action in CommandService.READ_QUERY_ACTIONS:
+        if action in CommandService.READ_QUERY_ACTIONS or action in {"WRITE_SCHEDULE", "UPDATE_SCHEDULE", "WRITE_DIARY", "UPDATE_DIARY"}:
             available.append(action)
             continue
         if active_dialogue:

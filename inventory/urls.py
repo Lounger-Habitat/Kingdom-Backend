@@ -26,6 +26,7 @@ urlpatterns = [
 
     # Env Server 内部动作 API（service token only）
     path("api/env/actions/character-trade", views.character_trade, name="character-trade"),
+    path("api/env/actions/character-trade/receipt", views.character_trade_receipt, name="character-trade-receipt"),
 
     # NPC 全局库存 API
     path("api/npc-inventory/restock", views.npc_global_inventory_restock, name="npc-global-inventory-restock"),

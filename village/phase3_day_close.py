@@ -266,7 +266,10 @@ def handle_day_close(
         all_changes["store_available_by_item"] = store_available_by_item
 
         # ── Step 6: Update account and save receipt ──────────────────────────
-        account.refresh_from_db(fields=["asset_version"])
+        # Traveler sales can change this account through another model instance.
+        account.refresh_from_db(fields=["balance", "asset_version"])
+        from .public_finance import settle_mark_daily_salary
+        salary = settle_mark_daily_salary(account, day_index, world_minute, request_id)
         account.last_closed_day_index = day_index
         account.asset_version += 1
         account.save(update_fields=["last_closed_day_index", "asset_version", "updated_at"])
@@ -286,6 +289,7 @@ def handle_day_close(
                 "expired": expire_result,
                 "price_snapshot_day": day_index + 1,
                 "ledger_summaries": ledger_summaries,
+                "salary": salary,
             },
         )
 
@@ -358,7 +362,9 @@ def handle_day_close(
                 "spoilage_count": spoilage_result.get("count", 0),
                 "traveler_sales": sales_result.get("sold", 0),
                 "traveler_revenue": sales_result.get("revenue", 0),
-                "PUBLIC_FUND": {"money": sales_result.get("fee_amount", 0)},
+                "PUBLIC_FUND": {"money": sales_result.get("fee_amount", 0) - salary["paid"]},
+                "10013": {"money": salary["paid"]},
+                "salary": salary,
                 "STORE:RESTAURANT_STORE": {"money": sales_result.get("store_net_amount", 0)},
             },
             external_delta=total_external_delta,

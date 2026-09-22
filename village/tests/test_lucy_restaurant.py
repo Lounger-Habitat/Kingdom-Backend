@@ -116,12 +116,12 @@ class LucyRestaurantTests(TestCase):
 
     def test_shared_quota_survives_new_decision_and_resets_at_midnight(self):
         self.fund_with(200); first=self.decision(budget=200)
-        listings=[self.listing(self.cook(),2,public_meal_code="C1",decision_id=str(first.pk)) for _ in range(3)]
+        listings=[self.listing(self.cook(),2,public_meal_code="C1") for _ in range(3)]
         for index,npc in enumerate(self.npcs):
             self.act("BUY_FROM_STORE",{"listing_id":listings[index//2],"amount":1},npc=npc)
         self.assertEqual(VillageCommunityMealDailyUsage.objects.get(day_index=0).total_meals,5)
         second=self.decision(budget=200)
-        new_listing=self.listing(self.cook(),2,public_meal_code="C1",decision_id=str(second.pk))
+        new_listing=self.listing(self.cook(),2,public_meal_code="C1")
         self.act("BUY_FROM_STORE",{"listing_id":new_listing,"amount":1},npc="10011",expect="PUBLIC_MEAL_DAILY_LIMIT_REACHED")
         self.clock.world_minute=1440;self.clock.save()
         payload=_payload("BUY_FROM_STORE",10011,"RESTAURANT",{"listing_id":new_listing,"amount":1})
@@ -130,17 +130,59 @@ class LucyRestaurantTests(TestCase):
         self.assertEqual(VillageCommunityMealDailyUsage.objects.get(day_index=1).total_meals,1)
         self.account.refresh_from_db();self.assertEqual(self.account.balance,54)
 
-    def test_expired_or_revoked_authorization_never_moves_food_or_funds(self):
-        self.fund_with(100);decision=self.decision(expiry=650)
-        listing=self.listing(self.cook(),2,public_meal_code="C1",decision_id=str(decision.pk))
-        self.clock.world_minute=650;self.clock.save()
-        self.act("BUY_FROM_STORE",{"listing_id":listing,"amount":1},npc="10011",expect="PUBLIC_AUTHORIZATION_EXPIRED")
-        self.clock.world_minute=620;self.clock.save()
-        decision.revoked_world_minute=610;decision.save()
-        self.act("BUY_FROM_STORE",{"listing_id":listing,"amount":1},npc="10011",expect="PUBLIC_AUTHORIZATION_EXPIRED")
-        self.assertEqual(VillageStoreInventorySlot.objects.get(listing_id=listing).item_amount,2)
-        self.assertFalse(VillageCommunityMealDailyUsage.objects.exists())
-        self.fund.refresh_from_db();self.assertEqual(self.fund.balance,100)
+    def test_living_options_reports_public_meal_eligibility_without_private_accounts(self):
+        from village.agent_queries import execute_agent_query
+        from village.models import VillageLocationDefinition
+        self.fund_with(100)
+        decision = self.decision()
+        listing = self.listing(self.cook(), 2, public_meal_code="C1")
+        NpcProfile.objects.filter(npc=self.npcs["10011"]).update(capabilities=["INSPECT_LIVING_OPTIONS", "BUY_FROM_STORE"])
+        VillageLocationDefinition.objects.update_or_create(location_code="RESTAURANT",
+            defaults={"display_name": "Lucy饭店", "center_anchor_code": "RESTAURANT", "is_public": True})
+        ok, code, data = execute_agent_query("10011", "INSPECT_LIVING_OPTIONS")
+        self.assertTrue(ok, code)
+        food = data["food_sources"][0]["foods"][0]
+        self.assertTrue(food["public_meal"])
+        self.assertTrue(food["available"])
+        self.assertEqual(food["unit_price"], 0)
+        self.assertNotIn("budget", str(data))
+        self.assertNotIn("account_balance", str(data))
+        self.act("BUY_FROM_STORE", {"listing_id": listing, "amount": 1}, npc="10011")
+        ok, code, data = execute_agent_query("10011", "INSPECT_LIVING_OPTIONS")
+        food = data["food_sources"][0]["foods"][0]
+        self.assertFalse(food["available"])
+        self.assertIn("PUBLIC_MEAL_DAILY_LIMIT_REACHED", food["blocked_reasons"])
+
+    def test_low_health_public_meal_ignores_old_authorization_and_keeps_daily_limit(self):
+        self.fund_with(100)
+        decision = self.decision()
+        listing = self.listing(self.cook(), 2, public_meal_code="C1")
+        NpcRuntimeState.objects.filter(npc=self.npcs["10011"]).update(health_fp=0)
+        self.bags["10011"].money = 0
+        self.bags["10011"].save(update_fields=["money"])
+        first = self.act("BUY_FROM_STORE", {"listing_id": listing, "amount": 1}, npc="10011")
+        self.assertEqual(first["data"]["gross_amount"], 0)
+        self.assertIn("food_instance_id", first["data"])
+        self.act("BUY_FROM_STORE", {"listing_id": listing, "amount": 1}, npc="10011",
+                 expect="PUBLIC_MEAL_DAILY_LIMIT_REACHED")
+        decision.revoked_world_minute = 600
+        decision.save(update_fields=["revoked_world_minute"])
+        NpcRuntimeState.objects.filter(npc=self.npcs["10012"]).update(health_fp=0)
+        self.act("BUY_FROM_STORE", {"listing_id": listing, "amount": 1}, npc="10012")
+
+    def test_old_expired_revoked_listing_authorization_does_not_block_or_change_history(self):
+        self.fund_with(100)
+        decision = self.decision(expiry=600)
+        decision.revoked_world_minute = 590
+        decision.spent_gold = 100
+        decision.save()
+        listing = self.listing(self.cook(), 2, public_meal_code="C1")
+        VillageStoreListing.objects.filter(pk=listing).update(subsidy_decision=decision)
+        self.act("BUY_FROM_STORE", {"listing_id": listing, "amount": 1}, npc="10011")
+        self.act("BUY_FROM_STORE", {"listing_id": listing, "amount": 1}, npc="10012")
+        decision.refresh_from_db(); self.fund.refresh_from_db()
+        self.assertEqual((decision.spent_gold, self.fund.balance), (100, 82))
+        self.assertEqual(VillageCommunityMealDailyUsage.objects.get(day_index=0).total_meals, 2)
 
     def test_unlisted_or_unknown_freshness_store_food_is_not_sellable_stock(self):
         from village.phase3_direct_trade import store_inventory_status
@@ -188,6 +230,52 @@ class LucyRestaurantTests(TestCase):
         scored=formal("RATE_DISH",{"review_id":requested["review_id"],"scores":{"color":8,"aroma":7,"taste":9,"presentation":8},"comment":"真实样品的四项评价"},"10013")
         self.assertGreater(scored["rating_price"],0)
         self.assertEqual(VillageDishReview.objects.get(pk=requested["review_id"]).status,"COMPLETED")
+
+    def test_cook_shortage_rejects_before_start_until_usable_ingredients_arrive(self):
+        import time
+        from village.models import NpcCommandState, VillageActionDurationConfig, VillageDeliveryOutbox
+        from village.runtime_services import CommandService
+        NpcProfile.objects.filter(npc=self.npcs["10014"]).update(capabilities=["COOK"])
+        VillageActionDurationConfig.objects.update_or_create(action_name="COOK", defaults={"duration_minutes": 5})
+        # Expired salt is not usable, even though the bag's raw quantity is ample.
+        self.lucy.slots.filter(item_id=1049).update(expires_world_minute=600)
+        before_items = list(self.lucy.slots.order_by("pk").values())
+        before_needs = NpcRuntimeState.objects.get(npc=self.npcs["10014"])
+
+        def accept():
+            runtime = NpcRuntimeState.objects.get(npc=self.npcs["10014"])
+            content = {"schema_version": "village.command.v1", "id": str(uuid.uuid4()),
+                "request_id": str(uuid.uuid4()), "name": "COOK", "params": {"recipe_id": 29211},
+                "queue_mode": "STRICT", "expected_state_version": runtime.state_version, "ttl_ms": 86400000}
+            ok, code, command = CommandService.accept_command(str(uuid.uuid4()), "10014", "env", content, int(time.time() * 1000))
+            self.assertTrue(ok, code)
+            return command
+
+        for _ in range(2):
+            command = accept()
+            ok, code, _ = CommandService.start_command(command.pk)
+            self.assertFalse(ok)
+            self.assertEqual(code, "P3_INSUFFICIENT_ITEM")
+            command.refresh_from_db()
+            self.assertIsNone(command.started_world_minute)
+            self.assertEqual(command.status, "FAILED")
+            data = VillageDeliveryOutbox.objects.get(command=command, message_kind="OUTCOME").payload["data"]
+            self.assertEqual(data["actual_duration_minutes"], 0)
+            self.assertEqual(data["planned_duration_minutes"], 5)
+            self.assertFalse(data["tool_error"]["executed"])
+            self.assertEqual(data["missing_items"][0]["item_id"], 1049)
+            self.assertEqual(data["missing_items"][0]["available"], 0)
+            self.assertIn("补齐", data["retry_condition"])
+        self.assertFalse(NpcCommandState.objects.filter(npc=self.npcs["10014"], status="RUNNING").exists())
+        self.assertEqual(list(self.lucy.slots.order_by("pk").values()), before_items)
+        after_needs = NpcRuntimeState.objects.get(npc=self.npcs["10014"])
+        self.assertEqual((after_needs.energy_fp, after_needs.hunger_fp), (before_needs.energy_fp, before_needs.hunger_fp))
+        self.assertEqual(GlobalGameTimeState.get_instance().world_minute, 600)
+        add_batch(self.lucy, 1049, 10, 600, 3500, uuid.uuid4())
+        command = accept()
+        ok, code, started = CommandService.start_command(command.pk)
+        self.assertTrue(ok, code)
+        self.assertEqual(started.status, "RUNNING")
 
     def test_cook_replay_does_not_reroll_or_consume_twice(self):
         payload = _payload("COOK",10014,"RESTAURANT",{"recipe_id":29201})
@@ -256,7 +344,37 @@ class LucyRestaurantTests(TestCase):
         received=self.bags["10011"].slots.get(item_id=slot.item_id,item_amount=1)
         self.assertEqual(received.dish_metadata["review_id"],str(review.pk))
         self.act("RATE_DISH",reply,npc="10013",expect="DISH_REVIEW_NOT_PENDING")
-        self.assertEqual(MarkDailySalary.objects.count(),1)
+        self.assertEqual(MarkDailySalary.objects.count(),0)
+
+    def test_rating_does_not_earn_or_pay_salary_even_with_funded_debt(self):
+        self.fund_with(100)
+        debt = MarkDailySalary.objects.create(day_index=0, amount_due=9,
+            earned_request_id=uuid.uuid4(), earned_world_minute=0)
+        review_id = self.act("REQUEST_DISH_REVIEW", {
+            "food_instance_id": str(self.cook().instance_id)})["data"]["review_id"]
+        mark = self.bags["10013"]
+        mark.refresh_from_db()
+        before = (mark.money, mark.asset_version)
+        self.act("RATE_DISH", {"review_id": review_id,
+            "scores": {"color": 8, "aroma": 8, "taste": 8, "presentation": 8},
+            "comment": "玉米清甜，火候适中。"}, npc="10013")
+        mark.refresh_from_db()
+        self.fund.refresh_from_db()
+        debt.refresh_from_db()
+        self.assertEqual((mark.money, mark.asset_version), before)
+        self.assertEqual(self.fund.balance, 100)
+        self.assertEqual((debt.amount_due, debt.amount_paid), (9, 0))
+        self.assertEqual(MarkDailySalary.objects.count(), 1)
+
+    def test_rating_succeeds_without_public_fund_account(self):
+        review_id = self.act("REQUEST_DISH_REVIEW", {
+            "food_instance_id": str(self.cook().instance_id)})["data"]["review_id"]
+        self.fund.delete()
+        self.act("RATE_DISH", {"review_id": review_id,
+            "scores": {"color": 8, "aroma": 8, "taste": 8, "presentation": 8},
+            "comment": "玉米清甜，火候适中。"}, npc="10013")
+        self.assertEqual(VillageDishReview.objects.get(pk=review_id).status, "COMPLETED")
+        self.assertFalse(MarkDailySalary.objects.exists())
 
     def test_invalid_score_and_cancel_leave_sample_usable(self):
         review_id=self.act("REQUEST_DISH_REVIEW",{"food_instance_id":str(self.cook().instance_id)})["data"]["review_id"]
@@ -276,7 +394,7 @@ class LucyRestaurantTests(TestCase):
 
     def test_public_purchase_pays_store_not_customer_and_eat_does_not_pay_again(self):
         self.fund_with(12); decision=self.decision()
-        listing=self.listing(self.cook(29211),public_meal_code="C2",decision_id=str(decision.pk))
+        listing=self.listing(self.cook(29211),public_meal_code="C2")
         result=self.act("BUY_FROM_STORE",{"listing_id":listing,"amount":1},npc="10011")
         self.account.refresh_from_db();self.fund.refresh_from_db();self.bags["10011"].refresh_from_db()
         self.assertEqual((self.account.balance,self.fund.balance,self.bags["10011"].money),(12,0,100))
@@ -289,37 +407,37 @@ class LucyRestaurantTests(TestCase):
 
     def test_free_quota_shared_across_menus_and_lucy_can_claim_once(self):
         self.fund_with(100); decision=self.decision()
-        a=self.listing(self.cook(),2,public_meal_code="C1",decision_id=str(decision.pk))
-        b=self.listing(self.cook(29241),2,public_meal_code="R1",decision_id=str(decision.pk))
+        a=self.listing(self.cook(),2,public_meal_code="C1")
+        b=self.listing(self.cook(29241),2,public_meal_code="R1")
         self.act("BUY_FROM_STORE",{"listing_id":a,"amount":1})
         self.act("BUY_FROM_STORE",{"listing_id":b,"amount":1},expect="PUBLIC_MEAL_DAILY_LIMIT_REACHED")
         self.act("BUY_FROM_STORE",{"listing_id":a,"amount":1},npc="10011")
         self.act("BUY_FROM_STORE",{"listing_id":b,"amount":1},npc="10011",expect="PUBLIC_MEAL_DAILY_LIMIT_REACHED")
 
-    def test_missing_fund_or_budget_fails_before_any_assets_or_quota_change(self):
-        decision=self.decision(budget=8)
-        listing=self.listing(self.cook(),public_meal_code="C1",decision_id=str(decision.pk))
-        self.fund_with(100)
-        self.act("BUY_FROM_STORE",{"listing_id":listing,"amount":1},npc="10011",expect="PUBLIC_MEAL_BUDGET_EXHAUSTED")
-        decision.terms["budget_gold"]=100;decision.save()
-        self.fund_with(0)
-        self.act("BUY_FROM_STORE",{"listing_id":listing,"amount":1},npc="10011",expect="PUBLIC_MEAL_FUND_INSUFFICIENT")
-        self.assertEqual(VillageStoreInventorySlot.objects.get(listing_id=listing).item_amount,1)
+    def test_missing_fund_fails_before_any_assets_or_quota_change(self):
+        listing = self.listing(self.cook(), public_meal_code="C1")
+        self.act("BUY_FROM_STORE", {"listing_id": listing, "amount": 1}, npc="10011", expect="PUBLIC_MEAL_FUND_INSUFFICIENT")
+        self.fund.delete()
+        self.act("BUY_FROM_STORE", {"listing_id": listing, "amount": 1}, npc="10011", expect="PUBLIC_MEAL_FUND_INSUFFICIENT")
+        self.assertEqual(VillageStoreInventorySlot.objects.get(listing_id=listing).item_amount, 1)
         self.assertFalse(VillageCommunityMealDailyUsage.objects.exists())
 
-    def test_no_authorization_cannot_list_public_meal(self):
-        slot=self.cook()
-        self.act("LIST_STORE_ITEM",dict(store_code="RESTAURANT_STORE",item_id=slot.item_id,amount=1,food_instance_id=str(slot.instance_id),price_mode="ORIGINAL",public_meal_code="C1"),expect="PUBLIC_AUTHORIZATION_REQUIRED")
+    def test_no_authorization_needed_to_list_and_claim_public_meal(self):
+        self.fund_with(100)
+        listing = self.listing(self.cook(), public_meal_code="C1")
+        self.assertIsNone(VillageStoreListing.objects.get(pk=listing).subsidy_decision_id)
+        self.assertFalse(VillagePublicDecision.objects.exists())
+        self.act("BUY_FROM_STORE", {"listing_id": listing, "amount": 1}, npc="10011")
 
     def test_claim_marker_survives_market_snapshot_and_cannot_earn_subsidy_twice(self):
         from marketplace.services import snapshot_slot, _add_snapshot_item_to_bag
         self.fund_with(100);decision=self.decision()
-        listing=self.listing(self.cook(),public_meal_code="C1",decision_id=str(decision.pk))
+        listing=self.listing(self.cook(),public_meal_code="C1")
         response=self.act("BUY_FROM_STORE",{"listing_id":listing,"amount":1},npc="10011")
         received=self.bags["10011"].slots.get(instance_id=response["data"]["food_instance_id"])
         returned=_add_snapshot_item_to_bag(self.lucy,snapshot_slot(received),1)
         self.assertIn("public_meal_claim",returned.dish_metadata)
-        self.act("LIST_STORE_ITEM",dict(store_code="RESTAURANT_STORE",item_id=returned.item_id,amount=1,food_instance_id=str(returned.instance_id),price_mode="ORIGINAL",public_meal_code="C1",decision_id=str(decision.pk)),expect="PUBLIC_MEAL_INVALID_BATCH")
+        self.act("LIST_STORE_ITEM",dict(store_code="RESTAURANT_STORE",item_id=returned.item_id,amount=1,food_instance_id=str(returned.instance_id),price_mode="ORIGINAL",public_meal_code="C1"),expect="PUBLIC_MEAL_INVALID_BATCH")
 
     def test_relief_food_has_lower_recovery_and_no_pity_or_rating(self):
         slot=self.cook(29241)
@@ -335,7 +453,7 @@ class LucyRestaurantTests(TestCase):
         self.fund_with(100);decision=self.decision()
         personal=self.cook()
         self.listing(self.cook(),2)
-        self.listing(self.cook(),2,public_meal_code="C1",decision_id=str(decision.pk))
+        self.listing(self.cook(),2,public_meal_code="C1")
         result,external=_traveler_sales(0,700,uuid.uuid4())
         personal.refresh_from_db(); self.lucy.refresh_from_db(); self.account.refresh_from_db()
         self.assertEqual(personal.item_amount,2)
@@ -347,7 +465,7 @@ class LucyRestaurantTests(TestCase):
     def test_menu_and_queries_have_actual_price_attributes_and_fund_reason(self):
         from village.agent_queries import _restaurant_state, _rateable_dishes
         decision=self.decision()
-        self.listing(self.cook(),public_meal_code="C1",decision_id=str(decision.pk))
+        self.listing(self.cook(),public_meal_code="C1")
         error,data=query_store_inventory("RESTAURANT_STORE",600,"10011")
         self.assertIsNone(error)
         self.assertEqual(data["items"][0]["unit_price"],0)
@@ -356,7 +474,8 @@ class LucyRestaurantTests(TestCase):
         from village.agent_queries import _cooking_recipes
         self.assertNotIn("recipes", _restaurant_state(self.npcs["10014"]))
         self.assertEqual(len(_cooking_recipes()), 13)
-        self.assertEqual(_rateable_dishes(self.npcs["10013"]),{"reviews":[]})
+        self.assertEqual(_rateable_dishes(self.npcs["10013"]), {
+            "filter": {"review_status": "PENDING_UNEXPIRED"}, "reviews": [], "total_count": 0, "has_more": False})
 
     def test_old_community_eat_no_longer_pays_personal_wallet(self):
         self.act("EAT",{"source":"COMMUNITY_MEAL"},npc="10011",expect="PUBLIC_MEAL_USE_STORE")
@@ -376,22 +495,20 @@ class LucyRestaurantTests(TestCase):
         terms["meal_service"]["subsidies"]["C1"]=999
         self.assertEqual(register_proposal(meeting.arc,meeting.arc.facts,terms,600)[0],"PUBLIC_MEAL_INVALID_TERMS")
 
-    def test_story_supply_lists_real_food_without_counting_or_impersonation_after_arc_end(self):
-        from village.phase5_story import complete_story_action
-        self.fund_with(100);decision=self.decision()
-        arc=decision.meeting.arc;arc.is_completed=True;arc.current_phase="COMPLETED";arc.save()
+    def test_system_authorized_meal_uses_regular_listing_without_story(self):
+        from village.phase5_story import dispatch_story_command
+        self.fund_with(100)
+        decision=self.decision()
+        decision.meeting=None
+        decision.save(update_fields=["meeting"])
+        VillageStoryArc.objects.all().delete()
         slot=self.cook()
-        payload={"request_id":str(uuid.uuid4()),"npc_id":"10014","current_location_code":"RESTAURANT",
-            "params":{"action_code":"PROVIDE_COMMUNITY_MEAL","food_instance_id":str(slot.instance_id),
-                "meal_item_id":29201,"meal_amount":1,"public_meal_code":"C1","decision_id":str(decision.pk)}}
-        spoofed=complete_story_action(payload,player_id=999)
-        self.assertEqual(spoofed["result_code"],"STORY_FORBIDDEN_ACTOR")
-        result=complete_story_action(payload)
-        self.assertEqual(result["result_code"],"OK",result)
-        listing=result["data"]["public_meal_listing"]["listing_id"]
-        self.assertEqual(VillageStoryFact.objects.get().community_meals,0)
+        self.assertEqual(dispatch_story_command({"command":"STORY_ACT", "params":{"action_code":"PROVIDE_COMMUNITY_MEAL"}})["result_code"],"ACTION_RETIRED")
+        listing=self.listing(slot, public_meal_code="C1")
         self.act("BUY_FROM_STORE",{"listing_id":listing,"amount":1},npc="10011")
-        self.assertEqual(VillageStoryFact.objects.get().community_meals,1)
+        self.assertFalse(VillageStoryArc.objects.exists())
+        decision.refresh_from_db()
+        self.assertEqual(decision.spent_gold,0)
 
 
     def agent_query(self, name, actor="10014"):
@@ -465,10 +582,10 @@ class LucyRestaurantTests(TestCase):
                 summary = self.meal_summary()
         self.assertTrue(all(q["sql"].lstrip().upper().startswith("SELECT") for q in queries), list(queries))
         self.assertFalse(summary["can_prepare_and_serve"])
-        self.assertEqual(summary["unavailable_reasons"], ["PUBLIC_AUTHORIZATION_REQUIRED"])
+        self.assertEqual(summary["unavailable_reasons"], ["PUBLIC_MEAL_FUND_INSUFFICIENT"])
         self.assertFalse(VillageCommunityMealDailyUsage.objects.exists())
         self.assertFalse(VillagePublicDecision.objects.exists())
-        self.assertEqual(execute_agent_query("10014", "INSPECT_PUBLIC_ECONOMY_STATE")[:2], (False, "ACTION_NOT_ALLOWED"))
+        self.assertEqual(execute_agent_query("10014", "INSPECT_PUBLIC_ECONOMY_STATE")[:2], (False, "UNKNOWN_QUERY"))
 
     def test_general_store_sale_flag_respects_existing_tool_durability_rules(self):
         from items.models import ItemType
@@ -492,38 +609,45 @@ class LucyRestaurantTests(TestCase):
         self.assertEqual(summary["public_fund_balance"], 100)
         self.assertTrue(summary["can_prepare_and_serve"])
         self.assertEqual(summary["unavailable_reasons"], [])
-        policy = summary["authorizations"][0]
-        self.assertEqual(policy["decision_id"], str(decision.pk))
-        self.assertEqual(policy["remaining_budget"], 100)
+        policy = summary
+        self.assertNotIn("authorizations", summary)
         self.assertEqual(policy["remaining_by_npc_today"]["10014"], 1)
-        self.assertEqual(policy["remaining_village_today"], 5)
-        self.assertEqual(policy["approved_menu_codes"], ["C1", "C2", "R1"])
+        self.assertEqual(policy["remaining_village_today"], 10)
+        self.assertEqual([m["public_meal_code"] for m in summary["menu"]], ["C1", "C2", "R1"])
 
-    def test_public_meal_summary_distinguishes_unpublished_future_expired_and_revoked(self):
+    def test_public_meal_summary_ignores_unpublished_future_expired_and_revoked(self):
         self.fund_with(100); decision = self.decision()
         baseline = copy.deepcopy(decision.terms)
         for change, reason in (("unpublished", "PUBLIC_DECISION_NOT_PUBLISHED"),
                 ("future", "PUBLIC_MEAL_NOT_STARTED"), ("expired", "PUBLIC_AUTHORIZATION_EXPIRED"),
-                ("revoked", "PUBLIC_AUTHORIZATION_EXPIRED"), ("wrong_meeting", "PUBLIC_AUTHORIZATION_REQUIRED")):
+                ("revoked", "PUBLIC_AUTHORIZATION_EXPIRED")):
             with self.subTest(state=change):
                 decision.terms = copy.deepcopy(baseline)
                 decision.published_world_minute = None if change == "unpublished" else 560
                 decision.revoked_world_minute = 590 if change == "revoked" else None
                 if change == "future": decision.terms["meal_service"]["starts_world_minute"] = 700
                 if change == "expired": decision.terms["expires_world_minute"] = 600
-                if change == "wrong_meeting":
-                    decision.meeting.status = "OPEN"; decision.meeting.save()
                 decision.save()
                 summary = self.meal_summary()
-                self.assertFalse(summary["can_prepare_and_serve"])
-                self.assertIn(reason, summary["unavailable_reasons"])
+                self.assertTrue(summary["can_prepare_and_serve"])
+                self.assertEqual(summary["unavailable_reasons"], [])
 
-    def test_public_meal_summary_distinguishes_funds_budget_and_missing_ingredients(self):
+    def test_system_meal_authorization_is_independent_of_historical_meeting(self):
+        self.fund_with(100)
+        decision = self.decision()
+        decision.meeting.status = "OPEN"
+        decision.meeting.save()
+        self.assertTrue(self.meal_summary()["can_prepare_and_serve"])
+        decision.meeting = None
+        decision.save(update_fields=["meeting"])
+        self.assertTrue(self.meal_summary()["can_prepare_and_serve"])
+
+    def test_public_meal_summary_ignores_budget_but_checks_funds_and_ingredients(self):
         self.fund_with(100); decision = self.decision()
         self.fund_with(0)
         self.assertIn("PUBLIC_MEAL_FUND_INSUFFICIENT", self.meal_summary()["unavailable_reasons"])
         self.fund_with(100); decision.spent_gold = 100; decision.save()
-        self.assertIn("PUBLIC_MEAL_BUDGET_EXHAUSTED", self.meal_summary()["unavailable_reasons"])
+        self.assertTrue(self.meal_summary()["can_prepare_and_serve"])
         decision.spent_gold = 0; decision.save()
         self.lucy.slots.filter(item_id=1030).update(item_amount=0)
         summary = self.meal_summary()
@@ -532,17 +656,16 @@ class LucyRestaurantTests(TestCase):
         corn = summary["menu"][0]["recipes"][0]["missing_ingredients"][0]
         self.assertEqual((corn["item_id"], corn["missing_quantity"]), (1030, 2))
 
-    def test_public_meal_summary_updates_shared_quotas_and_actual_budget_after_purchase(self):
+    def test_public_meal_summary_updates_shared_quotas_and_actual_fund_after_purchase(self):
         self.fund_with(100); decision = self.decision()
-        listing = self.listing(self.cook(), 2, public_meal_code="C1", decision_id=str(decision.pk))
+        listing = self.listing(self.cook(), 2, public_meal_code="C1")
         self.act("BUY_FROM_STORE", {"listing_id": listing, "amount": 1}, npc="10011")
-        summary = self.meal_summary(); policy = summary["authorizations"][0]
+        summary = self.meal_summary(); policy = summary
         self.assertEqual(summary["public_fund_balance"], 91)
-        self.assertEqual(policy["remaining_budget"], 91)
         self.assertEqual(policy["remaining_by_npc_today"]["10011"], 0)
         self.assertEqual(policy["remaining_by_npc_today"]["10014"], 1)
-        self.assertEqual(policy["remaining_village_today"], 4)
-        VillageCommunityMealDailyUsage.objects.update(total_meals=5)
+        self.assertEqual(policy["remaining_village_today"], 9)
+        VillageCommunityMealDailyUsage.objects.update(total_meals=10)
         self.assertIn("PUBLIC_MEAL_DAILY_LIMIT_REACHED", self.meal_summary()["unavailable_reasons"])
 
     def test_public_meal_summary_can_serve_existing_food_without_new_ingredients(self):
@@ -550,11 +673,11 @@ class LucyRestaurantTests(TestCase):
         dish = self.cook()
         self.lucy.slots.filter(item_id=1030).update(item_amount=0)
         summary = self.meal_summary()
-        self.assertTrue(summary["authorizations"][0]["menu"][0]["can_list_existing"])
-        listing = self.listing(dish, 2, public_meal_code="C1", decision_id=str(decision.pk))
+        self.assertTrue(summary["menu"][0]["can_list_existing"])
+        listing = self.listing(dish, 2, public_meal_code="C1")
         summary = self.meal_summary()
         self.assertFalse(summary["menu"][0]["can_cook"])
-        self.assertEqual(summary["authorizations"][0]["menu"][0]["listed_portions"], 2)
+        self.assertEqual(summary["menu"][0]["listed_portions"], 2)
         self.assertTrue(summary["can_prepare_and_serve"])
         VillageStoreInventorySlot.objects.filter(listing_id=listing).update(expires_world_minute=600)
         self.assertFalse(self.meal_summary()["can_prepare_and_serve"])

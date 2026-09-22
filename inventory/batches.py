@@ -18,8 +18,9 @@ def item_rules(item):
                 "hasUsage": False, "isDish": False}
     dish = item.item_type == ItemType.FOOD
     usage = item.item_type in TOOL_TYPES or item.item_type == ItemType.USABLE
+    single_use = item.item_type == ItemType.USABLE and item.max_use_count == 1
     return {
-        "stackable": item.stackable and not dish and not usage,
+        "stackable": item.stackable and not dish and (not usage or single_use),
         "maxPerSlot": item.max_stack_size,
         "hasQuality": dish or item.quality_enabled,
         "hasUsage": usage,
@@ -35,6 +36,8 @@ def project_batch(slot, item, world_minute):
     is_dish = rules["isDish"] or bool(metadata) or slot.rated or bool(slot.ingredient)
     remaining = slot.remaining_uses
     has_usage = rules["hasUsage"] or remaining is not None
+    single_use = (item is not None and item.item_type == ItemType.USABLE
+                  and item.max_use_count == 1 and remaining == 1)
     usage = None
     if has_usage:
         mode = "UNKNOWN" if remaining is None else "UNLIMITED" if remaining == -1 else "FINITE" if remaining >= 0 else "INVALID"
@@ -57,8 +60,8 @@ def project_batch(slot, item, world_minute):
         "schemaVersion": 1,
         "id": str(slot.instance_id), "itemId": slot.item_id, "quantity": slot.item_amount,
         "quality": slot.dish_quality if rules["hasQuality"] or is_dish else None,
-        "stacking": {"stackable": rules["stackable"] and not is_dish and not has_usage,
-                     "maxPerSlot": rules["maxPerSlot"]},
+        "stacking": {"stackable": rules["stackable"] and not is_dish and (not has_usage or single_use),
+                     "maxPerSlot": rules["maxPerSlot"], **({"singleUse": True} if single_use else {})},
         "usage": usage, "dish": dish, "freshness": freshness,
         "origin": {"producedWorldMinute": produced,
                    "requestId": str(slot.source_request_id) if getattr(slot, "source_request_id", None) else None},

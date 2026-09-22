@@ -116,7 +116,7 @@ STORY_COMMAND_PARAM_WHITELIST = {
         "supply_item_id", "supply_amount", "limit_item_id", "daily_limit",
         "meal_item_id", "meal_amount", "meal_service", "food_instance_id", "public_meal_code", "stock_source", "item_ids", "expires_world_minute",
         "meeting_id", "plan_code", "budget_gold", "executor_npc_id", "ration_daily_limits",
-        "starts_world_minute", "decision_id", "evidence_request_id", "fact_code",
+        "starts_world_minute", "decision_id", "evidence_request_id", "fact_code", "affair_id", "condition_id",
     }),
 }
 
@@ -139,7 +139,7 @@ STORY_ACTION_ACTORS = {
     StoryActionCode.DONATE_REPAIR_RESOURCES.value: FORMAL_NPC_IDS,
     StoryActionCode.TRANSPORT_REPAIR_MATERIALS.value: {"10012"},
     StoryActionCode.REPAIR_LABOR.value: FORMAL_NPC_IDS,
-    StoryActionCode.PROVIDE_REPAIR_MEAL.value: {"10014"},
+    StoryActionCode.PROVIDE_REPAIR_MEAL.value: FORMAL_NPC_IDS,
     StoryActionCode.CONTACT_EMERGENCY_CARAVAN.value: {"10015"},
     StoryActionCode.PUBLISH_RATION_RULES.value: {"10013"},
     StoryActionCode.ENABLE_STORE_LIMITS.value: {"10015"},
@@ -152,7 +152,7 @@ STORY_ACTION_LOCATIONS = {
     StoryActionCode.DONATE_REPAIR_RESOURCES.value: {"REPAIR_YARD", "RECORD_HALL"},
     StoryActionCode.TRANSPORT_REPAIR_MATERIALS.value: {"REPAIR_YARD", "OLD_BRIDGE"},
     StoryActionCode.REPAIR_LABOR.value: {"REPAIR_YARD", "OLD_BRIDGE"},
-    StoryActionCode.PROVIDE_REPAIR_MEAL.value: {"RESTAURANT"},
+    StoryActionCode.PROVIDE_REPAIR_MEAL.value: {"REPAIR_YARD", "OLD_BRIDGE", "RESTAURANT"},
     StoryActionCode.CONTACT_EMERGENCY_CARAVAN.value: {"MARKET_STREET", "GENERAL_STORE"},
     StoryActionCode.PUBLISH_RATION_RULES.value: {"RECORD_HALL"},
     StoryActionCode.ENABLE_STORE_LIMITS.value: {"GENERAL_STORE"},
@@ -170,7 +170,7 @@ REPAIR_LABOR_MINUTES = 60
 
 
 def is_repair_labor(action, params):
-    return str(action).upper() == "STORY_ACT" and str((params or {}).get("action_code", "")).upper() == "REPAIR_LABOR"
+    return str(action).upper() == "CONTRIBUTE_TO_AFFAIR" and (params or {}).get("kind") == "labor"
 
 
 ALL_STORY_RESULT_CODES = frozenset(item.value for item in StoryResultCode)

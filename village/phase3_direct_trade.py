@@ -913,8 +913,8 @@ def _do_list_store_item(
     if store_code == "RESTAURANT_STORE":
         from .lucy_restaurant import list_meal
         return list_meal(npc_id, params, world_minute, request_id)
-    if params.get("public_meal_code") or params.get("decision_id"):
-        return _fail("PUBLIC_MEAL_NOT_AUTHORIZED")
+    if params.get("public_meal_code"):
+        return _fail("PUBLIC_MEAL_INVALID_BATCH")
     item_id = params.get("item_id")
     amount = params.get("amount")
     price_mode = params.get("price_mode")
@@ -1244,6 +1244,15 @@ def _resolved_offer_failure(offer):
     return _fail(ResultCode.TRADE_OFFER_ALREADY_RESOLVED, data=data)
 
 
+def is_edible_store_listing(listing_id):
+    """Use the same configured FOOD type as EAT, never a caller's item claim."""
+    listing_uuid = _parse_uuid(listing_id)
+    return bool(listing_uuid and VillageStoreListing.objects.filter(
+        pk=listing_uuid,
+        item_id__in=Item.objects.filter(item_type=ItemType.FOOD, is_deleted=False).values("item_id"),
+    ).exists())
+
+
 def _do_buy_from_store(
     npc_id: int,
     params: Dict[str, Any],
@@ -1254,6 +1263,14 @@ def _do_buy_from_store(
     amount = params.get("amount")
     expected_store_inventory_version = params.get("expected_store_inventory_version")
     expected_buyer_asset_version = params.get("expected_buyer_asset_version")
+    # Recheck at settlement, including the zero-price public-meal branch and
+    # callers that bypass the command lifecycle. The economy transaction owns time.
+    buyer_runtime = NpcRuntimeState.objects.select_for_update().filter(npc__agent_id=str(npc_id)).first()
+    if buyer_runtime is not None:
+        from .runtime_services import CommandService
+        reason = CommandService.unavailable_reason("BUY_FROM_STORE", buyer_runtime, params)
+        if reason:
+            return _fail(reason)
     if listing_uuid and VillageStoreListing.objects.filter(pk=listing_uuid, store_id="RESTAURANT_STORE").exclude(public_meal_code="").exists():
         from .lucy_restaurant import buy_public_meal
         return buy_public_meal(npc_id, params, world_minute, request_id)

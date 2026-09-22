@@ -21,6 +21,9 @@ class CommandDurationTests(TestCase):
             config_key="default", defaults={"village_needs_enabled": True, "command_queue_limit": 100},
         )
         self.clock = GlobalGameTimeState.get_instance()
+        self.clock.world_minute = 0
+        self.clock.time_revision = 0
+        self.clock.save(update_fields=["world_minute", "time_revision"])
 
     def content(self, action, **values):
         return {
@@ -51,7 +54,7 @@ class CommandDurationTests(TestCase):
                         ok, code, command = self.accept(self.content(action, params=params, duration_minutes=30))
                         self.assertTrue(ok, code)
                         self.assertEqual(command.duration_minutes, 7)
-                for action in ("WAIT", "REST", "SLEEP", "WORK_PLACEHOLDER"):
+                for action in ("REST", "SLEEP", "WORK_PLACEHOLDER"):
                     self.configure(action, 45)
                     for params, expected in (({}, 45), ({"duration_minutes": 75}, 75), ({"duration_minutes": 7}, 7)):
                         with self.subTest(fast=fast, action=action, params=params):
@@ -74,10 +77,10 @@ class CommandDurationTests(TestCase):
     def test_retry_and_start_keep_accepted_duration_after_config_change(self):
         for fast in (False, True):
             with self.settings(VILLAGE_FAST_COMMAND_INTEGRATION=fast):
-                self.configure("WAIT", 7)
-                content, envelope = self.content("WAIT"), str(uuid.uuid4())
+                self.configure("REST", 7)
+                content, envelope = self.content("REST"), str(uuid.uuid4())
                 command = self.accept(content, envelope)[2]
-                self.configure("WAIT", 45)
+                self.configure("REST", 45)
                 replay = self.accept(content, envelope)
                 self.assertEqual((replay[0], replay[1], replay[2].duration_minutes), (True, ResultCode.COMMAND_REPLAYED, 7))
                 ok, code, started = CommandService.start_command(command.command_id, 0)
@@ -107,17 +110,17 @@ class CommandDurationTests(TestCase):
                     self.assertEqual(command.duration_minutes, minutes)
 
     def test_accept_and_start_api_return_authoritative_timing(self):
-        self.configure("WAIT", 7)
+        self.configure("REST", 7)
         factory = APIRequestFactory()
         request = factory.post("/", {
             "envelope_id": str(uuid.uuid4()), "sender": "10011", "recipient": "env",
-            "content": self.content("WAIT"), "timestamp": int(time.time() * 1000),
+            "content": self.content("REST"), "timestamp": int(time.time() * 1000),
         }, format="json")
         force_authenticate(request, user=type("Env", (), {"is_authenticated": True})())
         accepted = commands_accept(request)
         self.assertEqual(accepted.status_code, 200)
         self.assertEqual(accepted.data["data"]["duration_minutes"], 7)
-        self.configure("WAIT", 45)
+        self.configure("REST", 45)
         request = factory.post("/", {"start_world_minute": 0}, format="json")
         force_authenticate(request, user=type("Env", (), {"is_authenticated": True})())
         started = commands_start(request, accepted.data["data"]["command_id"])

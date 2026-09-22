@@ -145,7 +145,7 @@ class NpcObservationTests(TestCase):
             total_amount=10, remaining_amount=8, price=8,
         )
         command_rows = [
-            ("WAIT", {"duration_minutes": 10}, 10),
+            ("SLEEP", {"duration_minutes": 10}, 10),
             ("REST", {"duration_minutes": 20}, 20),
             ("EAT", {"source": "PERSONAL_INVENTORY", "food_instance_id": str(food.instance_id)}, None),
             ("BUY_FROM_MARKETPLACE", {"listing_id": listing.pk, "amount": 2}, None),
@@ -200,12 +200,17 @@ class NpcObservationTests(TestCase):
             [row["name"] for row in data["recent_commands"][:5]],
             ["HARVEST", "INSPECT_INVENTORY", "UPDATE_SUBJECTIVE_GOAL", "MOVE", "BUY_FROM_MARKETPLACE"],
         )
-        self.assertEqual(data["recent_commands"][7]["name"], "WAIT")
+        self.assertEqual(data["recent_commands"][7]["name"], "SLEEP")
         self.assertEqual(data["recent_commands"][0]["status"], "WAITING")
         self.assertIn("已等待", data["recent_commands"][0]["detail"])
         self.assertEqual(data["recent_commands"][0]["received_world_minute"], 502)
         self.assertIsNone(data["recent_commands"][0]["completed_world_minute"])
         self.assertEqual(data["recent_commands"][1]["summary"], "查看背包")
+        self.assertEqual(data["recent_commands"][1]["category"], "QUERY")
+        for row in data["recent_commands"]:
+            self.assertTrue(row["summary"].strip(), row["name"])
+            if row["name"] != "INSPECT_INVENTORY":
+                self.assertEqual(row["category"], "EXECUTION", row["name"])
         self.assertEqual(data["recent_commands"][1]["detail"], "金币18，物品2种/5件。")
         self.assertEqual(data["recent_commands"][3]["summary"], "移动至市场街")
         self.assertEqual(data["recent_commands"][3]["status"], "RUNNING")
@@ -230,12 +235,12 @@ class NpcObservationTests(TestCase):
         command = NpcCommandState.objects.create(
             command_id=uuid.uuid4(), message_id=uuid.uuid4(), request_id=uuid.uuid4(),
             npc=self.npcs["10011"], sender_id="10011", recipient_id="WuxiVillage",
-            kind="WAIT", sanitized_parameters={}, payload_sha256="d" * 64,
+            kind="REST", sanitized_parameters={}, payload_sha256="d" * 64,
             status="FAILED", received_world_minute=minute, completed_world_minute=minute,
         )
         VillageActionReceipt.objects.create(
             request_id=command.request_id, command=command, npc=self.npcs["10011"],
-            action_kind="WAIT", success=False, result_code="UNCLASSIFIED_RESULT",
+            action_kind="REST", success=False, result_code="UNCLASSIFIED_RESULT",
             world_minute=minute, time_revision=7,
         )
 

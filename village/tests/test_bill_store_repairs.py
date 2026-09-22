@@ -3,7 +3,7 @@ import time
 import uuid
 from unittest.mock import patch
 
-from django.test import TestCase, TransactionTestCase
+from django.test import TestCase, TransactionTestCase, override_settings
 from game_time.models import GlobalGameTimeState
 from inventory.models import NpcGlobalInventory, NpcGlobalInventorySlot, InventoryBag, InventorySlot
 from account.models import GameAccount
@@ -229,6 +229,12 @@ class RepairWorkRegression(TestCase):
             "work_location_code":"BILL_FARM","social_location_code":"VILLAGE_SQUARE","capabilities":["STORY_ACT"]})
 
     def accept(self, **params):
+        from village.affairs import ensure_bridge_affair
+        affair = ensure_bridge_affair(self.clock.world_minute)
+        if affair.status == "PREPARING":
+            affair.progress = {"materials": {"1002": 100}, "meals": 20, "gold": 500, "labor": 0}
+            affair.status = "READY"
+            affair.save()
         rid=str(uuid.uuid4())
         ok,code,command=CommandService.accept_command(envelope_id=str(uuid.uuid4()), sender="10011",
             recipient="WuxiVillage",timestamp_ms=int(time.time()*1000),content={
@@ -285,14 +291,16 @@ class RepairWorkRegression(TestCase):
         self.assertEqual(self.rt.energy_fp,energy); self.assertEqual(energy,960)
         self.assertEqual(self.fact.repair_labor_hours,0)
 
-    def test_expired_decision_and_low_energy_cannot_start_work(self):
+    def test_expired_decision_does_not_block_personal_work_but_low_energy_does(self):
         self.decision.terms={**self.decision.terms,"expires_world_minute":0}; self.decision.save()
-        c=self.accept(); self.assertFalse(CommandService.start_command(c.command_id)[0])
+        c=self.accept(); self.assertTrue(CommandService.start_command(c.command_id)[0])
+        CommandService.cancel_command(c.command_id)
         self.decision.terms={**self.decision.terms,"expires_world_minute":1000}; self.decision.save()
         NpcRuntimeState.objects.filter(pk=self.rt.pk).update(energy_fp=100)
         c=self.accept(); self.assertFalse(CommandService.start_command(c.command_id)[0])
         self.fact.refresh_from_db(); self.assertEqual(self.fact.repair_labor_hours,0)
 
+    @override_settings(VILLAGE_FAST_COMMAND_INTEGRATION=False)
     def test_tick_between_accept_and_start_is_allowed_but_real_state_change_is_not(self):
         c=self.accept(); self.tick(1)
         self.assertTrue(CommandService.start_command(c.command_id, start_world_minute=1)[0])
@@ -302,14 +310,16 @@ class RepairWorkRegression(TestCase):
         self.tick(2)
         self.assertEqual(CommandService.start_command(c.command_id)[1],"STALE_STATE_VERSION")
 
-    def test_plan_change_and_away_stop_work(self):
+    def test_plan_change_does_not_stop_work_but_away_does(self):
         for change in ["AWAY","PLAN"]:
             c=self.accept(); self.assertTrue(CommandService.start_command(c.command_id)[0])
             if change=="AWAY": NpcRuntimeState.objects.filter(pk=self.rt.pk).update(action_status="AWAY")
             else:
                 self.arc.current_plan="FOREST_ROUTE"; self.arc.save()
             self.tick(1 if change=="AWAY" else 2)
-            c.refresh_from_db(); self.assertEqual(c.status,"FAILED")
+            c.refresh_from_db(); self.assertEqual(c.status,"FAILED" if change == "AWAY" else "RUNNING")
+            if change == "PLAN":
+                CommandService.cancel_command(c.command_id)
             NpcRuntimeState.objects.filter(pk=self.rt.pk).update(action_status="IDLE")
         self.fact.refresh_from_db(); self.assertEqual(self.fact.repair_labor_hours,0)
 

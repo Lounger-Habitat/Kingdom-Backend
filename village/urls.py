@@ -5,9 +5,25 @@ from . import phase3_views
 from . import phase4_views
 from . import phase5_views
 from . import phase7_views
+from . import player_views
+from . import wildlife_views
+from . import forestry_views
+from . import daily_record_views
+from . import action_lifecycle
 
 
 urlpatterns = [
+    path("api/village/npcs/<str:npc_id>/operation", action_lifecycle.runtime_operation),
+    path("api/village/npcs/<str:npc_id>/resources", action_lifecycle.runtime_resources),
+    path("api/village/runtime/daily-record", daily_record_views.write_record, name="village-daily-record-write"),
+    path("api/village/public/npcs/<str:npc_id>/daily-records/<str:kind>", daily_record_views.public_records, name="village-daily-records-public"),
+    path("api/village/forestry/action/", forestry_views.forestry_action, name="village-forestry-action"),
+    path("api/village/forestry/bootstrap", forestry_views.forestry_bootstrap, name="village-forestry-bootstrap"),
+    path("api/village/wildlife/action/", wildlife_views.wildlife_action, name="village-wildlife-action"),
+    path("api/village/wildlife/bootstrap", wildlife_views.wildlife_bootstrap, name="village-wildlife-bootstrap"),
+    path("api/village/player/labor/tick/", player_views.player_labor_tick, name="village-player-labor-tick"),
+    path("api/village/player/action/", player_views.player_action, name="village-player-action"),
+    path("api/village/player/action", player_views.player_action),
     path("api/village/public/journal", phase7_views.journal, name="village-public-journal"),
     path("api/village/public/overview", phase7_views.overview, name="village-public-overview"),
     path("api/village/public/stores/<str:store_code>", phase7_views.store, name="village-public-store"),

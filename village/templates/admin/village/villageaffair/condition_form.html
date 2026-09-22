@@ -1,0 +1,8 @@
+<div class="affair-condition" data-condition>
+  {{ row.non_field_errors }}
+  {% for hidden in row.hidden_fields %}{{ hidden }}{{ hidden.errors }}{% endfor %}
+  <div class="condition-heading"><strong>完成条件</strong><label class="delete-field">{{ row.DELETE }} 移除此条件</label><button type="button" class="button" data-remove-condition hidden>移除条件</button></div>
+  {% for field in row.visible_fields %}{% if field.name != 'DELETE' %}
+  <div class="condition-field" data-field="{{ field.name }}">{{ field.errors }}{{ field.label_tag }}{{ field }}{% if field.help_text %}<div class="help">{{ field.help_text }}</div>{% endif %}</div>
+  {% endif %}{% endfor %}
+</div>

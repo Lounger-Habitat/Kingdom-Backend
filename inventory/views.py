@@ -360,11 +360,27 @@ def inventory_money(request, character_id):
     return Response(success_response(bag))
 
 
+def _consume_item_use(slot, item):
+    """Use one copy; the remaining copies in this batch retain their full uses."""
+    if slot.remaining_uses is None or slot.remaining_uses == -1:
+        return
+    slot.remaining_uses -= 1
+    if slot.remaining_uses <= 0:
+        if slot.item_amount <= 1:
+            slot.delete()
+            return
+        slot.item_amount -= 1
+        slot.remaining_uses = item.max_use_count
+    slot.save()
+
+
 @extend_schema(responses={200: InventoryResponseSerializer, 400: ErrorResponseSerializer})
 @api_view(["POST"])
+@transaction.atomic
 def inventory_use(request, character_id):
     """使用背包中的可使用物品。"""
     bag = get_or_create_bag(request.user, character_id)
+    bag = InventoryBag.objects.select_for_update().get(pk=bag.pk)
     instance_id = request.data.get("instanceId")
 
     if not instance_id:
@@ -410,18 +426,7 @@ def inventory_use(request, character_id):
                 # 已解锁但未显示数量，使用菜谱解锁数量显示
                 existing_recipe.show_ingredient_count = True
                 existing_recipe.save(update_fields=["show_ingredient_count"])
-                # 消耗物品
-                if slot.remaining_uses is not None and slot.remaining_uses != -1:
-                    slot.remaining_uses -= 1
-                    if slot.remaining_uses <= 0:
-                        slot.delete()
-                        return Response({
-                            "success": True,
-                            "message": f"菜谱「{recipe_name}」数量显示已解锁",
-                            "data": serialize_bag(bag),
-                        })
-                    else:
-                        slot.save()
+                _consume_item_use(slot, item)
                 return Response({
                     "success": True,
                     "message": f"菜谱「{recipe_name}」数量显示已解锁",
@@ -440,18 +445,7 @@ def inventory_use(request, character_id):
                 show_ingredient_count=True,
             )
 
-            # 消耗（None / -1 均视为无限次，不消耗）
-            if slot.remaining_uses is not None and slot.remaining_uses != -1:
-                slot.remaining_uses -= 1
-                if slot.remaining_uses <= 0:
-                    slot.delete()
-                    return Response({
-                        "success": True,
-                        "message": f"菜谱「{recipe_name}」已解锁",
-                        "data": serialize_bag(bag),
-                    })
-                else:
-                    slot.save()
+            _consume_item_use(slot, item)
 
             return Response({
                 "success": True,
@@ -503,23 +497,7 @@ def inventory_use(request, character_id):
             target_slot.save()
         recipe_name = recipe_item.item_name if recipe_item else f"菜谱#{item_id}"
 
-        # Consume the box
-        if slot.remaining_uses is not None and slot.remaining_uses != -1:
-            slot.remaining_uses -= 1
-            if slot.remaining_uses <= 0:
-                if slot.item_amount > 1:
-                    slot.item_amount -= 1
-                    slot.remaining_uses = item.max_use_count
-                    slot.save()
-                else:
-                    slot.delete()
-                return Response({
-                    "success": True,
-                    "message": f"获得了「{recipe_name}」",
-                    "data": serialize_bag(bag),
-                })
-            else:
-                slot.save()
+        _consume_item_use(slot, item)
 
         return Response({
             "success": True,
@@ -552,23 +530,7 @@ def inventory_use(request, character_id):
 
         recipe_name = recipe_item.item_name if recipe_item else f"菜谱#{item_id}"
 
-        # Consume the box (slot is the box slot)
-        if slot.remaining_uses is not None and slot.remaining_uses != -1:
-            slot.remaining_uses -= 1
-            if slot.remaining_uses <= 0:
-                if slot.item_amount > 1:
-                    slot.item_amount -= 1
-                    slot.remaining_uses = item.max_use_count
-                    slot.save()
-                else:
-                    slot.delete()
-                return Response({
-                    "success": True,
-                    "message": f"获得了「{recipe_name}」",
-                    "data": serialize_bag(bag),
-                })
-            else:
-                slot.save()
+        _consume_item_use(slot, item)
 
         return Response({
             "success": True,
@@ -715,6 +677,10 @@ def inventory_collect(request, character_id):
     from player.models import PlayerState
 
     collect_type = request.data.get("collectType", "")
+    if collect_type == "采集肉类":
+        from village.models import VillageSimulationConfig
+        if VillageSimulationConfig.objects.filter(config_key="default", village_economy_enabled=True).exists():
+            return Response({"code": "REAL_HUNT_REQUIRED", "message": "请在猎场攻击真实动物，击杀后自动获得猎物。"}, status=403)
     try:
         collection_point = CollectionPoint.objects.get(collect_type=collect_type)
     except CollectionPoint.DoesNotExist:
@@ -1641,6 +1607,10 @@ def character_trade(request):
         and str(other_raw.get("type") or "").strip().lower() == "npc"
         and str(other_raw.get("id") or other_raw.get("characterId") or "").strip() in FORMAL_VILLAGE_NPC_IDS
     )
+    # This marker is set only by Env's authenticated, distance-checked NPC meeting route.
+    dialogue_gift = player_to_formal_npc and request.data.get("giftContext") == "npc_dialogue"
+    if dialogue_gift and not str(request.data.get("conversationId") or "").strip():
+        return Response(error_response("缺少 NPC 会话编号"), status=400)
     blocked_ids = sorted(participant_ids & FORMAL_VILLAGE_NPC_IDS)
     if blocked_ids and not player_to_formal_npc:
         return Response(
@@ -1770,7 +1740,7 @@ def character_trade(request):
 
     if player_to_formal_npc:
         if get_items or get_money:
-            return Response(error_response("正式 NPC 只接受玩家单向救急赠予"), status=409)
+            return Response(error_response("正式 NPC 只接受玩家单向赠予"), status=409)
         from village.phase3_catalog import SAFE_STOCKS
         from village.phase3_asset_service import get_available_slot_amount
         from game_time.models import GlobalGameTimeState
@@ -1781,7 +1751,7 @@ def character_trade(request):
                 for slot in other["bag"].slots.filter(item_id=gift["item_id"], item_amount__gt=0)
                 if slot.expires_world_minute is None or slot.expires_world_minute > world_minute
             )
-            if gift["item_id"] not in SAFE_STOCKS or stock >= SAFE_STOCKS[gift["item_id"]]:
+            if not dialogue_gift and (gift["item_id"] not in SAFE_STOCKS or stock >= SAFE_STOCKS[gift["item_id"]]):
                 return Response(error_response("该正式 NPC 当前不符合救急缺货条件"), status=409)
 
     def resolve_all(owner, items, label):
@@ -1790,6 +1760,12 @@ def character_trade(request):
             slot, slot_error = _character_trade_find_slot(owner, item)
             if slot_error:
                 return None, f"{label}: {slot_error}"
+            if dialogue_gift:
+                if not item["instance_id"]:
+                    return None, f"{label}: 请选择明确的物品批次"
+                expiry = getattr(slot, "expires_world_minute", None)
+                if slot.freshness_unknown or (expiry is not None and expiry <= world_minute):
+                    return None, f"{label}: 物品已经过期"
             if slot.item_amount < item["amount"]:
                 return None, f"{label}: 物品数量不足"
             item_config = Item.objects.filter(item_id=item["item_id"]).first()
@@ -1805,7 +1781,8 @@ def character_trade(request):
             resolved[key]["amount"] += item["amount"]
 
         for entry in resolved.values():
-            if entry["slot"].item_amount < entry["amount"]:
+            available = entry["slot"].item_amount
+            if available < entry["amount"]:
                 return None, f"{label}: 物品数量不足"
         return list(resolved.values()), None
 
@@ -1861,7 +1838,7 @@ def character_trade(request):
     if player_to_formal_npc:
         from game_time.models import GlobalGameTimeState
         from village.models import NpcRuntimeState, VillageWorldEvent
-        from village.phase4_visibility import enqueue_event_deliveries, resolve_witnesses
+        from village.phase4_visibility import enqueue_event_deliveries
 
         clock = GlobalGameTimeState.objects.filter(pk=1).values("world_minute", "time_revision").first() or {}
         runtime = NpcRuntimeState.objects.filter(npc_id=other["bag"].npc_id).first()
@@ -1870,18 +1847,47 @@ def character_trade(request):
             event_request_id = uuid.UUID(request_id)
         except (ValueError, TypeError, AttributeError):
             event_request_id = uuid.uuid5(uuid.NAMESPACE_URL, request_id)
+        # Use the validated item definitions: transferring an entire batch may
+        # already have cleared its source slot by this point.
+        gift_items = {}
+        for entry in resolved_give:
+            item = entry["item"]
+            detail = gift_items.setdefault(item.item_id, {
+                "item_id": item.item_id, "item_name": item.item_name, "amount": 0,
+            })
+            detail["amount"] += entry["amount"]
+        gift_items = list(gift_items.values())
+        gift_description = [f"{item['item_name']}×{item['amount']}" for item in gift_items]
+        if give_money:
+            gift_description.append(f"{give_money} 金币")
+        gift_description = "、".join(gift_description)
+        # Summaries are capped at 256 characters; the structured receipt keeps
+        # every item even when the readable list must be shortened.
+        if len(gift_description) > 180:
+            gift_description = gift_description[:177] + "…"
+        gift_summary = f"玩家{initiator['account'].username}赠送给你：{gift_description}。已到账。"
         event = VillageWorldEvent.objects.create(
-            dedupe_key=f"player-rescue-gift:{request_id}",
-            event_type="PLAYER_RESCUE_GIFT",
+            dedupe_key=f"player-gift:{request_id}" if dialogue_gift else f"player-rescue-gift:{request_id}",
+            event_type="PLAYER_GIFT" if dialogue_gift else "PLAYER_RESCUE_GIFT",
             world_minute=int(clock.get("world_minute", 0)),
             time_revision=int(clock.get("time_revision", 0)),
             participant_npc_ids=[str(other["id"])],
-            witness_npc_ids=resolve_witnesses(location, [str(other["id"])]),
+            witness_npc_ids=[],
             player_ids=[requester_id],
             location_code=location,
             request_id=event_request_id,
-            visibility="PRESENT",
-            public_data={"hub_summary": "A player delivered emergency supplies.", "player_summary": "Emergency supplies delivered."},
+            visibility="PARTICIPANTS",
+            hub_summary=gift_summary,
+            player_summary="Gift delivered.",
+            private_data={
+                "npc_id": str(other["id"]),
+                "player_id": str(initiator["account"].pk),
+                "player_name": initiator["account"].username,
+                "items": gift_items,
+                "gold": give_money,
+                "request_id": request_id,
+                "conversation_id": str(request.data.get("conversationId") or "") if dialogue_gift else "",
+            },
         )
         enqueue_event_deliveries(event)
     if requester is not None:
@@ -1894,6 +1900,27 @@ def character_trade(request):
     # _trade_elapsed = _time.monotonic() - _trade_start
     # print(f"[TradePerf] character_trade 完成: requestId={request_id}, elapsed={_trade_elapsed:.3f}s")
     return Response(response_data)
+
+
+@api_view(["POST"])
+@authentication_classes([EnvServerJWTAuthentication])
+@permission_classes([IsAuthenticated])
+def character_trade_receipt(request):
+    """Read only: resolve an uncertain transfer without submitting a new one."""
+    request_id = str(request.data.get("requestId") or "").strip()
+    requester_id = str(request.data.get("requesterId") or "").strip()
+    try:
+        uuid.UUID(request_id)
+        account = GameAccount.objects.get(id=requester_id, is_active=True)
+    except (ValueError, TypeError, GameAccount.DoesNotExist):
+        return Response(error_response("回执查询参数无效"), status=400)
+    receipt = EnvActionReceipt.objects.filter(
+        player=account, request_id=request_id, action="character_trade"
+    ).first()
+    bag = InventoryBag.objects.filter(player=account, character_id=account.username).first() if receipt else None
+    return Response({"success": True, "found": bool(receipt and receipt.response_data),
+                     "receipt": receipt.response_data if receipt else None,
+                     "currentInventory": serialize_bag(bag) if bag else None})
 
 
 # ─────────────── NPC 全局库存 API ───────────────

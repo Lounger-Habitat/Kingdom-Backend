@@ -12,7 +12,6 @@ from .models import (EconomicLedgerEntry, NpcRuntimeState, NpcStoryFactAccess,
                      VillageAccount, VillageProjectReview, VillagePublicDecision,
                      VillageStoryMeeting, VillageActionReceipt)
 from .phase5_contract import FORMAL_NPC_IDS
-from .public_finance import pay_daily_salary
 
 ADMIN_ACTIONS = {"CALL_MEETING", "REGISTER_PROPOSAL", "PUBLISH_DECISION", "REVEAL_STORY_FACT", "CLAIM_PUBLIC_SALARY"}
 PUBLIC_ACTIONS = ADMIN_ACTIONS | {"MANAGE_REPAIR_LEDGER", "PUBLISH_RATION_RULES", "ENABLE_STORE_LIMITS", "PURCHASE_REPAIR_MATERIALS"}
@@ -53,11 +52,11 @@ def decision_data(row):
 
 def authorized_decision(params, plan, world_minute, actor_id=None, *, lock=True):
     key = as_uuid(params.get("decision_id"))
-    rows = VillagePublicDecision.objects.select_related("meeting")
+    rows = VillagePublicDecision.objects.all()
     if lock:
         rows = rows.select_for_update()
     row = rows.filter(pk=key).first() if key else None
-    if not row or row.plan_code != plan or row.meeting.status != "SETTLED" or row.meeting.selected_plan != row.plan_code:
+    if not row or row.plan_code != plan:
         return None, "PUBLIC_AUTHORIZATION_REQUIRED"
     if row.published_world_minute is None:
         return None, "PUBLIC_DECISION_NOT_PUBLISHED"
@@ -114,7 +113,7 @@ def register_proposal(arc, fact, params, world_minute):
             return "PUBLIC_MEAL_INVALID_TERMS", {}
         terms["meal_service"] = meal_terms
     if plan == "BRIDGE_REPAIR":
-        terms["purchase_item_ids"] = [4003]
+        terms["purchase_item_ids"] = [1002]
     if plan == "RATION_AND_WAIT":
         limits = params.get("ration_daily_limits")
         if not isinstance(limits, dict) or not limits:
@@ -149,21 +148,15 @@ def handle_admin(action, actor, arc, fact, params, time, request_id):
             return "PUBLIC_MEETING_ALREADY_OPEN", {}
         if arc.meetings.filter(meeting_type="PUBLIC_COUNCIL", opened_day=minute//1440).exists():
             return "PUBLIC_MEETING_ALREADY_OPEN", {}
-        if not arc.is_completed and arc.current_phase == "AFTERMATH":
-            return "STORY_PHASE_INVALID", {}
         start = integer(params.get("starts_world_minute", minute))
         if start is None or start < minute:
             return "STORY_ACTION_INVALID", {}
         from .phase5_story import _candidate_plans
-        candidates = ["RATION_AND_WAIT"] if arc.is_completed else _candidate_plans(fact)
+        candidates = _candidate_plans(fact)
         meeting = VillageStoryMeeting.objects.create(
             arc=arc, meeting_type="PUBLIC_COUNCIL", opened_day=minute//1440,
             closes_day=start//1440, starts_world_minute=start, candidate_plans=candidates,
         )
-        if not arc.is_completed:
-            arc.current_phase = "PLAN_REVIEW" if arc.current_plan else "FIRST_COUNCIL"
-            arc.phase_entered_day = minute//1440
-            arc.save(update_fields=["current_phase", "phase_entered_day", "updated_at"])
         changes.update({"meeting_id": str(meeting.pk), "starts_world_minute": start, "closes_day": meeting.closes_day, "candidate_plans": candidates})
     elif action == "REGISTER_PROPOSAL":
         error, data = register_proposal(arc, fact, params, minute)
@@ -191,14 +184,15 @@ def handle_admin(action, actor, arc, fact, params, time, request_id):
         if row.published_world_minute is not None:
             return "PUBLIC_DECISION_ALREADY_PUBLISHED", {}
         # A newer settled decision cannot be replaced by publishing an older one.
-        newest = VillagePublicDecision.objects.filter(meeting__arc=arc).order_by(
+        newest = VillagePublicDecision.objects.filter(meeting__arc=arc, plan_code=row.plan_code).order_by(
             "-approved_world_minute", "-meeting__created_at",
         ).first()
         if newest.pk != row.pk:
             return "PUBLIC_AUTHORIZATION_EXPIRED", {}
         row.published_world_minute = minute
         row.save(update_fields=["published_world_minute"])
-        VillagePublicDecision.objects.filter(meeting__arc=arc, revoked_world_minute__isnull=True).exclude(pk=row.pk).update(revoked_world_minute=minute)
+        VillagePublicDecision.objects.filter(meeting__arc=arc, plan_code=row.plan_code,
+            revoked_world_minute__isnull=True).exclude(pk=row.pk).update(revoked_world_minute=minute)
         if row.plan_code == "RATION_AND_WAIT":
             fact.ration_rules_published = True
             # An announced public restriction is immediately the legal floor;
@@ -206,9 +200,6 @@ def handle_admin(action, actor, arc, fact, params, time, request_id):
             fact.ration_daily_limits = dict(row.terms["ration_daily_limits"])
             fact.ration_limits_until_world_minute = int(row.terms["expires_world_minute"])
             fact.store_limits_enabled = True
-        else:
-            fact.ration_rules_published = False
-            fact.store_limits_enabled = False
         changes["decision"] = decision_data(row)
     elif action == "REVEAL_STORY_FACT":
         code = str(params.get("fact_code", ""))
@@ -222,30 +213,32 @@ def handle_admin(action, actor, arc, fact, params, time, request_id):
         fact.mark_budget_delay_revealed = True
         changes["fact_code"] = code
     elif action == "CLAIM_PUBLIC_SALARY":
-        account = VillageAccount.objects.select_for_update().get(account_code="PUBLIC_FUND")
-        inv = NpcGlobalInventory.objects.select_for_update().get(npc=actor)
-        pay_daily_salary(account, inv, changes, minute, request_id, earn=False)
-        if not changes["mark_salary"]:
-            return ("STORY_FUND_INSUFFICIENT" if changes["salary"]["outstanding"] else "PUBLIC_NO_SALARY_DUE"), changes
+        return "ACTION_RETIRED", {}
     return None, changes
 
 
 def review_project(actor, arc, params, world_minute, request_id):
-    decision, error = authorized_decision(params, "BRIDGE_REPAIR", world_minute)
-    if error:
-        return error, {}
     entry = EconomicLedgerEntry.objects.select_for_update().filter(request_id=as_uuid(params.get("evidence_request_id"))).first()
     allowed = {"DONATE_REPAIR_RESOURCES", "PURCHASE_REPAIR_MATERIALS", "REPAIR_LABOR", "PROVIDE_REPAIR_MEAL"}
     if not entry or (entry.changes or {}).get("action_code") not in allowed:
         return "PUBLIC_EVIDENCE_INVALID", {}
-    if str((entry.changes or {}).get("decision_id", "")) != str(decision.pk):
+    changes = entry.changes or {}
+    decision = None
+    if changes.get("decision_id"):
+        decision, error = authorized_decision(params, "BRIDGE_REPAIR", world_minute)
+        if error:
+            return error, {}
+        if str(changes["decision_id"]) != str(decision.pk):
+            return "PUBLIC_EVIDENCE_INVALID", {}
+    elif not changes.get("affair_id"):
         return "PUBLIC_EVIDENCE_INVALID", {}
     if not VillageActionReceipt.objects.filter(request_id=entry.request_id, success=True).exists():
         return "PUBLIC_EVIDENCE_INVALID", {}
     if VillageProjectReview.objects.filter(entry=entry).exists():
         return "PUBLIC_EVIDENCE_ALREADY_REVIEWED", {}
     VillageProjectReview.objects.create(entry=entry, reviewer=actor, request_id=request_id, reviewed_world_minute=world_minute)
-    return None, {"decision_id": str(decision.pk), "reviewed_entry_id": entry.id, "evidence_request_id": str(entry.request_id)}
+    return None, {"decision_id": str(decision.pk) if decision else None, "affair_id": changes.get("affair_id"),
+                  "reviewed_entry_id": entry.id, "evidence_request_id": str(entry.request_id)}
 
 
 def governance_query(arc, actor_id, world_minute):

@@ -1,0 +1,17 @@
+#affair-form [hidden] { display: none !important; }
+#affair-form .stage-name { padding: 14px; }
+#affair-form label { display: block; font-weight: 600; margin: 0 0 6px; }
+#affair-form input[type=text] { width: min(34em, 90%); }
+.affair-stage { padding-bottom: 16px; margin-top: 20px; }
+.affair-stage h2 { display: flex; align-items: center; justify-content: space-between; gap: 12px; }
+.stage-actions { display: flex; gap: 6px; }
+.stage-actions .button { background: var(--body-bg); color: var(--body-fg); }
+.affair-stage > .help, .affair-stage > button { margin-left: 14px; }
+.affair-condition { border: 1px solid var(--hairline-color); border-radius: 4px; margin: 12px 14px; padding: 14px; display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 14px 22px; }
+.condition-heading { grid-column: 1 / -1; display: flex; justify-content: space-between; align-items: center; }
+.condition-field select[multiple] { width: 100%; box-sizing: border-box; }
+.condition-field input[type=number] { width: 10em; }
+.condition-field .help { margin-top: 6px; line-height: 1.6; }
+.affair-notes { margin-top: 24px; }
+.affair-notes ul { padding: 8px 28px 18px; line-height: 1.8; }
+@media (max-width: 767px) { .affair-condition { grid-template-columns: 1fr; } .stage-actions { flex-wrap: wrap; } }

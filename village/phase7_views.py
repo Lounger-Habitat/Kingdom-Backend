@@ -137,7 +137,7 @@ def market(request):
         return _disabled()
     from .market_presentation import public_market
     try:
-        data = public_market(request.query_params)
+        data = public_market(request.query_params, viewer=request.user)
     except ValueError:
         return Response({"success": False, "resultCode": "INVALID_QUERY_PARAMETER"}, status=400)
     return Response({"success": True, "data": data})

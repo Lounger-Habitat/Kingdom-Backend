@@ -47,11 +47,11 @@ class ActionNameTest(TestCase):
     """All 24 action names must be present and stable."""
 
     def test_all_action_names_count(self):
-        self.assertEqual(len(ActionName), 32)
+        self.assertEqual(len(ActionName), 33)
 
     def test_action_name_values(self):
         expected = {
-            "PLANT", "HARVEST", "HUNT", "PROCESS_GAME", "COOK",
+            "PLANT", "HARVEST", "HUNT", "CHOP_TREE", "PROCESS_GAME", "COOK",
             "REQUEST_DISH_REVIEW", "CANCEL_DISH_REVIEW",
             "CREATE_ORDER", "CANCEL_ORDER", "START_DELIVERY",
             "IMPORT_GOODS", "EXPORT_GOODS", "CONTACT_CARAVAN", "WITHDRAW_STORE_FUNDS", "DEPOSIT_STORE_FUNDS", "WITHDRAW_STORE_ITEM", "SET_STORE_LIMITS",
@@ -265,7 +265,7 @@ class DurationTest(TestCase):
 
     def test_all_actions_have_duration(self):
         for an in ActionName:
-            if an in {ActionName.HUNT, ActionName.PROCESS_GAME}:
+            if an in {ActionName.HUNT, ActionName.PROCESS_GAME, ActionName.CHOP_TREE}:
                 self.assertNotIn(an, ACTION_DURATION)
             else:
                 self.assertIn(an, ACTION_DURATION)

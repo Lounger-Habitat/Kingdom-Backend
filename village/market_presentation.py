@@ -11,7 +11,7 @@ TOOL_TYPES = ("Usable", "HoeTool", "ChopTool", "BreakTool", "ReapTool", "WaterTo
 SORTS = {"price_asc": ("price", "pk"), "price_desc": ("-price", "pk"), "newest": ("-created_at", "-pk")}
 
 
-def public_market(params):
+def public_market(params, *, viewer=None):
     if set(params) - {"keyword", "category", "sort", "page"}:
         raise ValueError("Unknown parameter")
     keyword = params.get("keyword", "").strip()
@@ -44,10 +44,11 @@ def public_market(params):
     paginator = Paginator(qs, 20)
     current = paginator.get_page(int(page))
     rows = []
-    for item in serialize_listings(current):
+    for item in serialize_listings(current, viewer):
         rows.append({
             "listing_id": item["listingId"], "item_id": item["itemId"],
             "item_name": item["itemName"], "seller_name": item["sellerName"],
+            "is_own_listing": item["isOwnListing"], "source_type": item["sourceType"],
             "available_amount": item["remainingAmount"], "unit_price": item["price"],
             "listed_at": item["createdAt"], "batch": item["batch"],
         })

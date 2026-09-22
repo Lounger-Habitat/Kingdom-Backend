@@ -74,6 +74,11 @@ def _fail(result_code: str, **overrides: Any) -> Dict[str, Any]:
 
 
 def _payload_hash(payload: Dict[str, Any]) -> str:
+    if payload.get("command_name") in {"HUNT", "CHOP_TREE"}:
+        # A delayed Env confirmation and the standard command completion can
+        # carry different observation times/locations for the same real kill.
+        payload = {key: value for key, value in payload.items()
+                   if key not in {"completed_world_minute", "time_revision", "current_location_code"}}
     encoded = json.dumps(payload, sort_keys=True, separators=(",", ":"), default=str).encode()
     return hashlib.sha256(encoded).hexdigest()
 
@@ -88,6 +93,7 @@ def _feature_enabled() -> bool:
 # ``village_direct_trade_enabled`` flag so the legacy order path can be
 # retired independently of the rest of the economy loop.
 _DIRECT_TRADE_COMMANDS = frozenset({
+    "GIVE_ITEMS",
     "PROPOSE_TRADE",
     "RESPOND_TRADE",
     "CANCEL_TRADE_OFFER",
@@ -162,7 +168,9 @@ def _economy_event_summary(
             if isinstance(unit_price, int) and not isinstance(unit_price, bool):
                 chunk += f"，单价{unit_price}金"
             details.append(chunk)
-    summary = f"{name}{label}"
+    summary = f"{name}赠送给{data.get('target_name', '对方')}" if command_name == "GIVE_ITEMS" else f"{name}{label}"
+    if command_name == "GIVE_ITEMS" and data.get("gold_amount", 0) > 0:
+        details.append(f"金币×{data['gold_amount']}")
     if details:
         summary += "：" + "；".join(details)
     return summary[:256]
@@ -376,13 +384,12 @@ def _ensure_handlers() -> None:
         return
     from .phase3_production import _do_plant, _do_harvest, _do_hunt, _do_cook
     from .jack_production import finish_work
+    from .forestry import settle_npc_wood
     from .phase3_trade import _do_create_order, _do_cancel_order, _do_start_delivery
     from .phase3_public_economy import (
         handle_import_goods,
         handle_export_goods,
         handle_rate_dish,
-        handle_publish_price_index,
-        handle_audit_public_fund,
         handle_eat,
         handle_community_meal,
     )
@@ -400,9 +407,11 @@ def _ensure_handlers() -> None:
         _do_delist_from_marketplace,
         _do_sell_on_marketplace,
     )
+    from .npc_gifts import give_items
     from .caravan import handle_contact, handle_withdraw, handle_limits, handle_deposit, handle_withdraw_item
     from .lucy_cooking import request_review, cancel_review
     _ACTION_HANDLERS.update({
+        "GIVE_ITEMS": give_items,
         "REQUEST_DISH_REVIEW": request_review,
         "CANCEL_DISH_REVIEW": cancel_review,
         "CONTACT_CARAVAN": handle_contact,
@@ -413,6 +422,7 @@ def _ensure_handlers() -> None:
         "PLANT": _do_plant,
         "HARVEST": _do_harvest,
         "HUNT": _do_hunt,
+        "CHOP_TREE": settle_npc_wood,
         "PROCESS_GAME": finish_work,
         "COOK": _do_cook,
         "CREATE_ORDER": _do_create_order,
@@ -421,8 +431,6 @@ def _ensure_handlers() -> None:
         "IMPORT_GOODS": handle_import_goods,
         "EXPORT_GOODS": handle_export_goods,
         "RATE_DISH": handle_rate_dish,
-        "PUBLISH_PRICE_INDEX": handle_publish_price_index,
-        "AUDIT_PUBLIC_FUND": handle_audit_public_fund,
         "EAT": handle_eat,
         "COMMUNITY_MEAL": handle_community_meal,
         "PROPOSE_TRADE": _do_propose_trade,
@@ -466,10 +474,13 @@ def commit_economy_action(payload: Dict[str, Any]) -> Dict[str, Any]:
     # 3. Check idempotency
     request_id = uuid.UUID(str(payload["request_id"]))
     payload_hash = _payload_hash(payload)
+    # Preserve exact replays of receipts minted before HUNT's canonical hash.
+    payload_hashes = {payload_hash, hashlib.sha256(json.dumps(
+        payload, sort_keys=True, separators=(",", ":"), default=str).encode()).hexdigest()}
     existing = VillageActionReceipt.objects.filter(request_id=request_id).first()
     if existing:
         stored_hash = (existing.response_data or {}).get("request_payload_sha256")
-        if stored_hash == payload_hash:
+        if stored_hash in payload_hashes:
             response_data = dict(existing.response_data or {})
             response_data.pop("request_payload_sha256", None)
             response_data["replayed"] = True
@@ -479,6 +490,8 @@ def commit_economy_action(payload: Dict[str, Any]) -> Dict[str, Any]:
     # 4. Validate actor/params against contract. Unity owns NPC location
     # validation; current_location_code is retained below as reported state.
     command_name = str(payload.get("command_name", "")).upper()
+    if command_name in {"CREATE_ORDER", "CANCEL_ORDER", "START_DELIVERY", "PUBLISH_PRICE_INDEX", "AUDIT_PUBLIC_FUND", "CLAIM_PUBLIC_SALARY"}:
+        return _fail("ACTION_RETIRED")
     npc_id = int(payload["npc_id"])
     location = str(payload.get("current_location_code", ""))
     params = payload["params"]
@@ -520,7 +533,7 @@ def commit_economy_action(payload: Dict[str, Any]) -> Dict[str, Any]:
             existing = VillageActionReceipt.objects.filter(request_id=request_id).first()
             if existing:
                 stored_hash = (existing.response_data or {}).get("request_payload_sha256")
-                if stored_hash == payload_hash:
+                if stored_hash in payload_hashes:
                     response_data = dict(existing.response_data or {})
                     response_data.pop("request_payload_sha256", None)
                     response_data["replayed"] = True
@@ -554,6 +567,32 @@ def commit_economy_action(payload: Dict[str, Any]) -> Dict[str, Any]:
                 if runtime is None:
                     return _fail(ResultCode.P3_INVALID_PARAMS)
 
+            gift_replay = None
+            gift_event_key = None
+            gift_error = None
+            if command_name == "GIVE_ITEMS":
+                if command is None:
+                    return _fail("GIFT_COMMAND_REQUIRED")
+                if params != command.sanitized_parameters:
+                    return _fail(ResultCode.P3_REQUEST_CONFLICT, status="CONFLICT")
+                if command.started_world_minute is None or world_minute < command.started_world_minute + (command.duration_minutes or 0):
+                    return _fail("GIFT_NOT_FINISHED")
+                from .runtime_services import CommandService
+                if command_name not in CommandService.allowed_actions_for(command.npc):
+                    return _fail(ResultCode.P3_FORBIDDEN_ACTOR)
+                from .npc_gifts import exchange_key, same_gift, validate_gift
+                gift_error = validate_gift(params, npc_id)
+                if not gift_error:
+                    gift_event_key = exchange_key(npc_id, params)
+                    original = VillageWorldEvent.objects.filter(dedupe_key=gift_event_key).first()
+                    if original is not None:
+                        prior = VillageActionReceipt.objects.select_related("command", "world_event").get(
+                            request_id=original.request_id)
+                        if same_gift(params, prior.command.sanitized_parameters):
+                            gift_replay = prior
+                        else:
+                            gift_error = "GIFT_EXCHANGE_CONFLICT"
+
             if command is not None and command_name in {"COOK", "REQUEST_DISH_REVIEW", "CANCEL_DISH_REVIEW", "RATE_DISH"}:
                 if any(params.get(key) != command.sanitized_parameters.get(key) for key in PARAM_WHITELIST[action_enum]):
                     return _fail(ResultCode.P3_REQUEST_CONFLICT, status="CONFLICT")
@@ -568,9 +607,19 @@ def commit_economy_action(payload: Dict[str, Any]) -> Dict[str, Any]:
                 accepted = command.sanitized_parameters
                 if any(params.get(key) != accepted.get(key) for key in PARAM_WHITELIST[action_enum]):
                     return _fail(ResultCode.P3_REQUEST_CONFLICT, status="CONFLICT")
-                if command.started_world_minute is None or world_minute < command.started_world_minute + (command.duration_minutes or 0):
+                if command.started_world_minute is None or (command_name != "HUNT" and world_minute < command.started_world_minute + (command.duration_minutes or 0)):
                     return _fail("PRODUCTION_NOT_FINISHED")
+                if command_name == "HUNT":
+                    from .wildlife import confirmed_kill
+                    if confirmed_kill(command) is None:
+                        return _fail("HUNT_KILL_REQUIRED")
             needs_error = settle_work_needs(runtime, command, world_minute) if jack_work else None
+            if command_name == "CHOP_TREE":
+                from .forestry import confirmed_felling
+                if command is None or confirmed_felling(command) is None:
+                    return _fail("TREE_FELL_REQUIRED")
+                if params != command.sanitized_parameters:
+                    return _fail(ResultCode.P3_REQUEST_CONFLICT)
 
             # Dispatch to production handler
             settlement_minute = world_minute
@@ -590,13 +639,29 @@ def commit_economy_action(payload: Dict[str, Any]) -> Dict[str, Any]:
             # A handler may return a business error after earlier mutations.
             # Roll its entire write set back before recording the failure.
             with transaction.atomic():
-                result = _fail(needs_error) if needs_error else handler(npc_id, params, settlement_minute, request_id)
+                if gift_replay is not None:
+                    # Reuse the durable delivery, but finish this new command with
+                    # its own receipt. Never emit another transfer/event/ledger row.
+                    from copy import deepcopy
+                    result = deepcopy(gift_replay.response_data)
+                    result.pop("request_payload_sha256", None)
+                    result.update(replayed=True, effects={}, asset_versions={})
+                    result["data"]["already_delivered"] = True
+                    result["data"]["original_request_id"] = str(gift_replay.request_id)
+                else:
+                    error = gift_error or needs_error
+                    result = _fail(error) if error else handler(npc_id, params, settlement_minute, request_id)
                 if result.get("result_code") != ResultCode.OK:
                     transaction.set_rollback(True)
             from .agent_feedback import add_item_names
             add_item_names(result)
 
             if result.get("result_code") != ResultCode.OK:
+                if command_name == "GIVE_ITEMS" and result["result_code"] != "GIFT_EXCHANGE_CONFLICT":
+                    # The nested transfer transaction above has rolled back.
+                    result.setdefault("data", {})["tool_error"] = {
+                        "executed": False, "automatic_retry_safe": False,
+                    }
                 # Expiration is a terminal offer status, not an asset transfer.
                 if command_name == "RESPOND_TRADE" and result["result_code"] == ResultCode.TRADE_OFFER_EXPIRED:
                     from .models import VillageTradeOffer
@@ -644,7 +709,7 @@ def commit_economy_action(payload: Dict[str, Any]) -> Dict[str, Any]:
                 summary.successful_meals += 1
                 summary.save(update_fields=["successful_meals", "updated_at"])
 
-            if runtime is not None and command is not None and not jack_work:
+            if runtime is not None and command is not None and not jack_work and gift_replay is None:
                 from .phase2_services import settle_action_needs_locked
                 started = command.started_world_minute
                 ended = (
@@ -690,7 +755,7 @@ def commit_economy_action(payload: Dict[str, Any]) -> Dict[str, Any]:
             )
             event_participants = result.get("participant_npc_ids") or [str(npc_id)]
             event_private_data = result.get("data", {}) if command_name in {
-                "REQUEST_DISH_REVIEW", "CANCEL_DISH_REVIEW", "RATE_DISH"
+                "REQUEST_DISH_REVIEW", "CANCEL_DISH_REVIEW", "RATE_DISH", "GIVE_ITEMS"
             } else {}
             if command_name == "BUY_FROM_STORE":
                 # The buyer already receives OUTCOME. Notify only the operator,
@@ -712,8 +777,8 @@ def commit_economy_action(payload: Dict[str, Any]) -> Dict[str, Any]:
                 event_summary = (f"{listing.store.store_code}售出物品{listing.item_id}×{event_private_data['amount']}；"
                     f"店款净入账{event_private_data['store_net_amount']}金币，"
                     f"该上架记录剩余{event_private_data['remaining_amount']}份。")
-            event = VillageWorldEvent.objects.create(
-                dedupe_key=f"economy:{request_id}",
+            event = gift_replay.world_event if gift_replay is not None else VillageWorldEvent.objects.create(
+                dedupe_key=gift_event_key or f"economy:{request_id}",
                 event_type=f"ECONOMY_{command_name}",
                 world_minute=world_minute,
                 time_revision=int(payload.get("time_revision", world_minute)),
@@ -742,7 +807,8 @@ def commit_economy_action(payload: Dict[str, Any]) -> Dict[str, Any]:
                 player_summary=event_summary,
                 hub_summary=event_summary,
             )
-            enqueue_event_deliveries(event)
+            if gift_replay is None:
+                enqueue_event_deliveries(event)
             if command_name == "RESPOND_TRADE" and result.get("data", {}).get("status") == "ACCEPTED":
                 commitment_id = result.get("data", {}).get("commitment_id")
                 if commitment_id:
@@ -823,6 +889,8 @@ def commit_economy_action(payload: Dict[str, Any]) -> Dict[str, Any]:
             OutboxService.ensure_outcome(receipt)
 
             # EconomicLedgerEntry
+            if gift_replay is not None:
+                return result
             EconomicLedgerEntry.objects.create(
                 request_id=request_id,
                 entry_type=command_name,

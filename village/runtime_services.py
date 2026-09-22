@@ -45,6 +45,8 @@ from .models import (
 from game_time.models import GlobalGameTimeState
 from .phase3_contract import ResultCode as Phase3ResultCode
 from .phase5_contract import is_repair_labor, REPAIR_LABOR_MINUTES
+from .affair_commands import MUTATIONS as AFFAIR_ACTIONS
+from .personal_commission_commands import MUTATIONS as COMMISSION_ACTIONS
 from inventory.models import NpcDefinition
 
 from .command_catalog import COMMAND_CATALOG
@@ -73,7 +75,6 @@ class ResultCode:
     COMMAND_ACCEPTED = "COMMAND_ACCEPTED"
     COMMAND_REPLAYED = "COMMAND_REPLAYED"
     MOVE_COMPLETED = "MOVE_COMPLETED"
-    WAIT_COMPLETED = "WAIT_COMPLETED"
     GO_HOME_COMPLETED = "GO_HOME_COMPLETED"
     COMMAND_CANCELLED_ON_RECOVERY = "COMMAND_CANCELLED_ON_RECOVERY"
     LIFE_ACTION_COMPLETED = "LIFE_ACTION_COMPLETED"
@@ -161,14 +162,15 @@ class ResultCode:
 
 
 _OUTCOME_ACTION_LABELS = {
-    "MOVE": "移动", "WAIT": "等待", "GO_HOME": "回家", "EAT": "进食",
+    "MOVE": "移动", "GO_HOME": "回家", "EAT": "进食",
     "REST": "休息", "SLEEP": "睡眠", "SOCIALIZE": "社交",
     "WORK_PLACEHOLDER": "工作", "PLANT": "播种", "HARVEST": "收获",
-    "HUNT": "狩猎", "PROCESS_GAME": "处理猎物", "COOK": "烹饪", "CREATE_ORDER": "创建订单",
+    "HUNT": "狩猎", "CHOP_TREE": "砍树", "PROCESS_GAME": "处理猎物", "COOK": "烹饪", "CREATE_ORDER": "创建订单",
     "CANCEL_ORDER": "取消订单", "START_DELIVERY": "配送",
     "IMPORT_GOODS": "进货", "EXPORT_GOODS": "出货", "RATE_DISH": "菜品评分",
     "REQUEST_DISH_REVIEW": "提交菜品品鉴", "CANCEL_DISH_REVIEW": "取消菜品品鉴",
     "PUBLISH_PRICE_INDEX": "发布价格指数", "AUDIT_PUBLIC_FUND": "公共资金审计",
+    "GIVE_ITEMS": "赠送物品或金币",
     "PROPOSE_TRADE": "发起交易", "RESPOND_TRADE": "响应交易",
     "CANCEL_TRADE_OFFER": "取消交易报价", "LIST_STORE_ITEM": "商品上架",
     "UPDATE_STORE_PRICE": "修改商品价格", "DELIST_STORE_ITEM": "商品下架",
@@ -190,6 +192,10 @@ _OUTCOME_ACTION_LABELS = {
     "CREATE_COMMITMENT": "创建承诺", "CANCEL_COMMITMENT": "取消承诺",
     "PERFORM_COMMITMENT": "履行承诺", "STORY_VOTE": "剧情投票",
     "STORY_ACT": "剧情行动", "UPDATE_SUBJECTIVE_GOAL": "更新主观目标",
+    "INSPECT_AFFAIRS": "查询村庄事务", "CONTRIBUTE_TO_AFFAIR": "贡献事务资源或劳动",
+    "CONTACT_EMERGENCY_CARAVAN": "联系应急商队", "CLAIM_PUBLIC_SALARY": "领取公共岗位工资",
+    "PUBLISH_PERSONAL_COMMISSION": "发布个人委托", "WITHDRAW_PERSONAL_COMMISSION": "撤回个人委托",
+    "INSPECT_PERSONAL_COMMISSIONS": "查询个人委托",
 }
 
 _OUTCOME_REASONS = {
@@ -205,15 +211,25 @@ _OUTCOME_REASONS = {
     "PUBLIC_MEAL_BUDGET_EXHAUSTED": "已批准的供餐预算不足，餐食和额度均未扣除",
     "PUBLIC_MEAL_INVALID_BATCH": "只能使用Lucy新制作且未领取过补贴的真实餐食",
     "LUCY_ACTION_NOT_FINISHED": "尚未达到动作配置的完成时间",
-    "HUNT_CODE_RETIRED": "旧狩猎规则已退役，请使用HUNT_ANIMALS获取待处理猎物",
+    "HUNT_CODE_RETIRED": "旧计时狩猎已停用，请通过真实猎物狩猎",
     "PREY_UNAVAILABLE": "指定猎物不存在、已过期或正在被占用，请刷新库存",
     "PREY_FRESHNESS_UNKNOWN": "猎物缺少可靠鲜期记录，不能加工",
     "PRODUCTION_RESOURCE_UNAVAILABLE": "工作预留的猎物或工具已不可用，工作已停止",
     "PRODUCTION_NOT_FINISHED": "尚未达到数据库配置的完成时间",
     "PRODUCTION_COMMAND_REQUIRED": "必须通过正式狩猎或加工命令开工后才能结算",
     "PRODUCTION_SETTLEMENT_REQUIRED": "生产必须由Backend结算钱货，不能仅上报动作成功",
+    "HUNT_KILL_REQUIRED": "必须击杀真实猎物后才能获得狩猎产物",
+    "HUNT_TIMEOUT": "本次追猎超过数据库配置的狩猎期限",
+    "PREY_BUSY": "这只动物正在被其他人狩猎",
+    "ATTEMPT_NOT_ACTIVE": "本次狩猎归属已结束，请选择可用目标",
     "INVALID_ACTION_DURATION": "动作时长配置缺失或不是正数，请检查数据库配置",
     "NPC_AWAY": "NPC当前缺席，不能执行工作",
+    "ACTION_RETIRED": "此指令已停用，请刷新工具列表",
+    "AFFAIR_LOCATION_INVALID": "请到事务条件指定的地点执行",
+    "AFFAIR_RESOURCE_INSUFFICIENT": "合格且未占用的物品或金币不足",
+    "AFFAIR_LABOR_NOT_FINISHED": "尚未完成该事务要求的劳动时长",
+    "PUBLIC_FUND_INSUFFICIENT": "公共资金不足，暂时无法支付工资",
+    "ROUTE_ATTEMPT_REPLAY": "本次商队联系已处理，请查询商队状态",
     "STORY_ACTION_RETIRED": "森林旧路侦察和补给已经退役；Nora付费即可开通应急商队",
     "BACKEND_UNAVAILABLE": "Backend 暂不可用，尚未确认最终结果",
     "INVALID_ENVELOPE": "消息信封格式无效", "INVALID_COMMAND_SCHEMA": "命令字段或参数格式无效",
@@ -221,6 +237,22 @@ _OUTCOME_REASONS = {
     "QUEUE_FULL": "命令队列已满", "NPC_BUSY": "NPC 正在执行其他动作",
     "NPC_NOT_SLEEPING": "NPC 当前没有睡眠", "SLEEP_COMMAND_MISMATCH": "唤醒请求与睡眠命令不匹配",
     "STALE_STATE_VERSION": "客户端状态版本已过期", "STALE_TIME_REVISION": "时间版本已过期",
+    "GIFT_INVALID_PARAMS": "赠送参数无效，请指定exchange_id、目标和不重复的物品批次及正整数数量",
+    "GIFT_EXCHANGE_CONFLICT": "这笔交换已经完成，不能更改原赠送内容再次交付",
+    "GIFT_TARGET_INVALID": "赠送目标无效，不能赠送给自己",
+    "GIFT_TARGET_UNAVAILABLE": "赠送目标当前不在线或不可交互",
+    "GIFT_BRIDGE_UNAVAILABLE": "赠送服务尚未加载，请等待服务端就绪",
+    "GIFT_SENDER_UNAVAILABLE": "赠送方NPC当前不在场景中或不可交互",
+    "GIFT_PLAYER_SERVICE_UNAVAILABLE": "玩家连接服务尚未就绪",
+    "GIFT_PLAYER_OFFLINE": "接收玩家当前不在线",
+    "GIFT_PLAYER_NOT_PARTICIPATING": "接收玩家当前处于观察模式，请切换到玩家模式后再赠送",
+    "GIFT_PLAYER_NOT_READY": "接收玩家的角色尚未就绪，请等待角色加载完成",
+    "GIFT_TOO_FAR": "请靠近赠送对象至4米内",
+    "GIFT_ITEM_NOT_OWNED": "赠送批次不在自己的背包中",
+    "GIFT_ITEM_INVALID": "赠送物品配置无效",
+    "GIFT_INSUFFICIENT_ITEM": "可赠送数量不足，过期或已预留物品不能赠送",
+    "GIFT_COMMAND_REQUIRED": "赠送必须通过正式NPC指令执行",
+    "GIFT_NOT_FINISHED": "赠送动作尚未完成",
     "WORLD_TIME_REGRESSION": "世界时间不能倒退", "INVALID_LOCATION": "当前位置不满足动作要求",
     "INVALID_ACTION_LOCATION": "当前位置不满足动作要求", "P3_WRONG_LOCATION": "当前位置不满足动作要求",
     "TRADE_WRONG_LOCATION": "当前位置不满足交易要求", "TARGET_UNREACHABLE": "目标地点不可达",
@@ -309,6 +341,14 @@ def _outcome_message(
     data = data or {}
     prefix = _world_time_text(world_minute)
     prefix = f"世界时间：{prefix}；" if prefix else ""
+    if action in COMMISSION_ACTIONS:
+        if not success and data.get("message"):
+            return f"{prefix}{data['message']}"
+        if success:
+            title = data.get("title") or "个人委托"
+            earned = int(data.get("earned_gold") or 0)
+            result = f"{prefix}{label}成功：{title}。"
+            return result + (f"委托已完成，获得{earned}金币报酬。" if earned else "")
 
     trade_action = action.removeprefix("ECONOMY_")
     detail = data.get("data") or data
@@ -454,6 +494,10 @@ class TimeService:
         state.save()
         from .dialogue_service import DialogueService
         DialogueService.expire_active(state.world_minute)
+        from .personal_commissions import expire_commissions
+        expire_commissions(state.world_minute)
+        from .player_farm import maintain_leases
+        maintain_leases(state.world_minute, state.time_revision)
 
         # 创建 Receipt
         receipt = VillageActionReceipt.objects.create(
@@ -497,6 +541,10 @@ class TimeService:
             state.save()
             from .dialogue_service import DialogueService
             DialogueService.expire_active(state.world_minute)
+            from .personal_commissions import expire_commissions
+            expire_commissions(state.world_minute)
+            from .player_farm import maintain_leases
+            maintain_leases(state.world_minute, state.time_revision)
         return True, ResultCode.COMMAND_ACCEPTED, state
 
 
@@ -522,6 +570,10 @@ class BootstrapService:
         # has the same lock order as TimeService.advance_time (time first).
         GlobalGameTimeState.get_instance()
         time_state = GlobalGameTimeState.objects.select_for_update().get(pk=1)
+        from .personal_commissions import expire_commissions
+        expire_commissions(time_state.world_minute)
+        from .player_farm import maintain_leases
+        maintain_leases(time_state.world_minute, time_state.time_revision)
         from .dialogue_service import DialogueService
         DialogueService.expire_active(
             time_state.world_minute,
@@ -605,6 +657,7 @@ class BootstrapService:
                     "name": command.kind.lower(),
                     "target_id": command.target_id,
                     "params": command.sanitized_parameters,
+                    "agent_execution": command.agent_execution,
                     "expected_state_version": command.validated_at_state_version,
                     "queue_mode": command.queue_mode,
                     "not_before_world_minute": command.not_before_world_minute,
@@ -671,6 +724,7 @@ class BootstrapService:
             "season": time_state.season,
             "npcs": npc_data,
             "commands": [serialize_command(command) for command in active_commands],
+            "action_epoch": str(config.action_epoch) if config else "",
             "config": {
                 "tick_interval_seconds": config.tick_interval_seconds if config else 5,
                 "hub_command_timeout_seconds": config.hub_command_timeout_seconds if config else 30,
@@ -904,32 +958,32 @@ class CommandService:
 
     ALLOWED_ACTIONS = frozenset(COMMAND_CATALOG)
     READ_QUERY_ACTIONS = frozenset({
-        "GET_RULE", "OBSERVE", "INSPECT_NEARBY", "INSPECT_INVENTORY",
-        "INSPECT_TRADE_OFFERS", "INSPECT_STORY_STATE", "INSPECT_RELEVANT_STORIES",
-        "INSPECT_STORY_DETAIL", "INSPECT_ORDERS",
+        "INSPECT_SCHEDULE", "INSPECT_DIARIES",
+        "GET_RULE", "INSPECT_LIVING_OPTIONS", "OBSERVE", "INSPECT_NEARBY", "INSPECT_INVENTORY",
+        "INSPECT_TRADE_OFFERS", "INSPECT_AFFAIRS",
         "INSPECT_MARKET_STATE", "INSPECT_CARAVAN_REQUESTS", "INSPECT_FARM_STATE",
         "INSPECT_RESTAURANT_STATE", "INSPECT_RATEABLE_DISHES",
-        "INSPECT_PUBLIC_ECONOMY_STATE",
         "BROWSE_MARKETPLACE", "CHECK_MY_MARKETPLACE_LISTINGS",
         "CHECK_MARKETPLACE_HISTORY",
         "INSPECT_STORE_INVENTORY", "INSPECT_SOCIAL_STATE",
+        "INSPECT_PERSONAL_COMMISSIONS",
     })
-    STORY_ACTIONS = {"STORY_VOTE", "STORY_ACT"}
+    STORY_ACTIONS = set()  # Retired; historical receipts remain readable.
     MAX_QUEUE_SIZE = 10
     MAX_CLOCK_SKEW_MS = 5 * 60 * 1000
     PHASE2_ACTIONS = {"EAT", "REST", "SLEEP", "SOCIALIZE", "WORK_PLACEHOLDER"}
     PHASE3_ACTIONS = {
-        "PLANT", "HARVEST", "HUNT", "PROCESS_GAME", "COOK", "CREATE_ORDER", "CANCEL_ORDER",
+        "PLANT", "HARVEST", "HUNT", "CHOP_TREE", "PROCESS_GAME", "COOK", "CREATE_ORDER", "CANCEL_ORDER",
         "START_DELIVERY", "IMPORT_GOODS", "EXPORT_GOODS", "RATE_DISH", "REQUEST_DISH_REVIEW", "CANCEL_DISH_REVIEW",
         "CONTACT_CARAVAN", "WITHDRAW_STORE_FUNDS", "DEPOSIT_STORE_FUNDS", "WITHDRAW_STORE_ITEM", "SET_STORE_LIMITS",
-        "PUBLISH_PRICE_INDEX", "AUDIT_PUBLIC_FUND", "PROPOSE_TRADE",
+        "GIVE_ITEMS", "PROPOSE_TRADE",
         "RESPOND_TRADE", "CANCEL_TRADE_OFFER", "LIST_STORE_ITEM",
         "UPDATE_STORE_PRICE", "DELIST_STORE_ITEM", "BUY_FROM_STORE",
         "BUY_FROM_MARKETPLACE", "SELL_ON_MARKETPLACE", "DELIST_FROM_MARKETPLACE",
         "INSPECT_STORE_INVENTORY",
     }
     DIRECT_TRADE_ACTIONS = {
-        "PROPOSE_TRADE", "RESPOND_TRADE", "CANCEL_TRADE_OFFER",
+        "GIVE_ITEMS", "PROPOSE_TRADE", "RESPOND_TRADE", "CANCEL_TRADE_OFFER",
         "LIST_STORE_ITEM", "UPDATE_STORE_PRICE", "DELIST_STORE_ITEM",
         "BUY_FROM_STORE", "BUY_FROM_MARKETPLACE", "SELL_ON_MARKETPLACE",
         "DELIST_FROM_MARKETPLACE", "BROWSE_MARKETPLACE",
@@ -937,15 +991,16 @@ class CommandService:
         "INSPECT_STORE_INVENTORY",
     }
     PHASE4_ACTIONS = {
-        "INSPECT_SOCIAL_STATE", "CREATE_COMMITMENT", "CANCEL_COMMITMENT",
-        "PERFORM_COMMITMENT",
+        "INSPECT_SOCIAL_STATE",
     }
     NEEDS_FIELDS = {"hunger", "energy", "health", "social", "stress"}
     WORK_ACTIONS = {
-        "WORK_PLACEHOLDER", "PLANT", "HARVEST", "HUNT", "PROCESS_GAME", "COOK", "START_DELIVERY",
+        "WORK_PLACEHOLDER", "PLANT", "HARVEST", "HUNT", "CHOP_TREE", "PROCESS_GAME", "COOK", "START_DELIVERY",
     }
-    LOW_HEALTH_ACTIONS = READ_QUERY_ACTIONS | {"MOVE", "GO_HOME", "WAIT", "EAT", "REST", "SLEEP"}
-    VARIABLE_DURATION_ACTIONS = {"WAIT", "REST", "SLEEP", "SOCIALIZE", "WORK_PLACEHOLDER"}
+    # BUY_FROM_STORE is conditional: only edible food passes the parameter gate.
+    LOW_HEALTH_ACTIONS = READ_QUERY_ACTIONS | {"MOVE", "GO_HOME", "EAT", "REST", "SLEEP", "BUY_FROM_STORE",
+        "WRITE_SCHEDULE", "UPDATE_SCHEDULE", "WRITE_DIARY", "UPDATE_DIARY"}
+    VARIABLE_DURATION_ACTIONS = {"REST", "SLEEP", "SOCIALIZE", "WORK_PLACEHOLDER"}
     NEED_GATE_LIMITS = {"hunger": 900, "energy": 100, "health": 300}
 
     @staticmethod
@@ -957,18 +1012,28 @@ class CommandService:
             # Formal village bootstrap requires a profile. Keep isolated legacy
             # and test NPC definitions compatible outside that runtime.
             return set(CommandService.ALLOWED_ACTIONS)
-        return {
+        actions = {
             str(action).strip().upper()
             for action in configured
             if str(action).strip().upper() in CommandService.ALLOWED_ACTIONS
         }
+        from .phase5_contract import FORMAL_NPC_IDS
+        if str(npc.agent_id) in FORMAL_NPC_IDS and not npc.is_test_only:
+            # Rules remain discoverable even if an old/admin-edited profile omits them.
+            actions.add("GET_RULE")
+        return actions
 
     @staticmethod
-    def unavailable_reason(action_name: str, runtime: NpcRuntimeState) -> Optional[str]:
+    def unavailable_reason(action_name: str, runtime: NpcRuntimeState, parameters=None) -> Optional[str]:
         action_name = str(action_name).upper()
+        if (runtime.health_fp <= CommandService.NEED_GATE_LIMITS["health"]
+                and action_name == "BUY_FROM_STORE" and parameters is not None):
+            from .phase3_direct_trade import is_edible_store_listing
+            if not is_edible_store_listing(parameters.get("listing_id")):
+                return ResultCode.HEALTH_TOO_LOW
         if runtime.health_fp <= CommandService.NEED_GATE_LIMITS["health"] and action_name not in CommandService.LOW_HEALTH_ACTIONS:
             return ResultCode.HEALTH_TOO_LOW
-        if action_name in CommandService.WORK_ACTIONS:
+        if action_name in CommandService.WORK_ACTIONS or is_repair_labor(action_name, parameters):
             if runtime.hunger_fp >= CommandService.NEED_GATE_LIMITS["hunger"]:
                 return ResultCode.HUNGER_TOO_HIGH
             if runtime.energy_fp <= CommandService.NEED_GATE_LIMITS["energy"]:
@@ -980,20 +1045,21 @@ class CommandService:
         """Resolve one timer; only variable-duration actions accept a caller override."""
         if is_repair_labor(action_name, content.get("params")):
             content["duration_minutes"] = REPAIR_LABOR_MINUTES
+            from .affairs import AffairError, resolve_condition
+            from .models import VillageAffair
+            params = content.get("params", {})
+            affair = VillageAffair.objects.filter(pk=params.get("affair_id")).first()
+            if affair:
+                try:
+                    content["duration_minutes"] = resolve_condition(affair, params.get("condition_id"), "labor")["unit_minutes"]
+                except AffairError:
+                    pass  # Authoritative start validates readiness and rejects locked conditions.
             return
         if action_name not in VillageActionDurationConfig.timed_actions():
             content.pop("duration_minutes", None)
             return
         if action_name in CommandService.VARIABLE_DURATION_ACTIONS and content.get("duration_minutes") is not None:
             return
-        if action_name == "PERFORM_COMMITMENT":
-            try:
-                commitment_id = uuid.UUID(str(content.get("params", {}).get("commitment_id")))
-            except (ValueError, TypeError):
-                commitment_id = None
-            kind = NpcCommitment.objects.filter(commitment_id=commitment_id).values_list("commitment_type", flat=True).first()
-            if kind in {"JOINT_WORK", "MEETING"}:
-                action_name = kind
         content["duration_minutes"] = VillageActionDurationConfig.configured_duration(action_name)
 
     @staticmethod
@@ -1159,8 +1225,23 @@ class CommandService:
             return False, ResultCode.UNKNOWN_ACTION, None
         if action_name not in CommandService.allowed_actions_for(npc):
             return False, ResultCode.ACTION_NOT_ALLOWED, None
-        if action_name in CommandService.READ_QUERY_ACTIONS:
+        if action_name in CommandService.READ_QUERY_ACTIONS or action_name in {"WRITE_SCHEDULE", "UPDATE_SCHEDULE", "WRITE_DIARY", "UPDATE_DIARY"}:
             return False, ResultCode.ACTION_NOT_ALLOWED, None
+        if action_name in COMMISSION_ACTIONS:
+            from .personal_commission_commands import validate_intent
+            error = validate_intent(action_name, content["params"])
+            if error:
+                return False, error, None
+        if action_name in AFFAIR_ACTIONS:
+            from .affair_commands import validate_intent
+            error = validate_intent(action_name, content["params"])
+            if error:
+                return False, error, None
+        if action_name == "GIVE_ITEMS":
+            from .npc_gifts import validate_gift
+            error = validate_gift(content["params"], sender)
+            if error:
+                return False, error, None
         if action_name == "MOVE":
             params = content.get("params")
             if (not isinstance(params, dict) or set(params) not in (
@@ -1178,6 +1259,24 @@ class CommandService:
                 config_key="default", village_needs_enabled=True
             ).exists():
                 return False, ResultCode.VILLAGE_NEEDS_DISABLED, None
+
+        # Operation identity is transport metadata, never a model business parameter.
+        # The authority lock serializes replay/admission, including two different
+        # command IDs submitted concurrently for the same NPC/operation key.
+        GlobalGameTimeState.get_instance()
+        time_state = GlobalGameTimeState.objects.select_for_update().get(pk=1)
+        execution = content.get("agent_execution") or {}
+        if execution:
+            from .action_lifecycle import current_epoch, valid_execution
+            if not valid_execution(execution) or execution["epoch"] != current_epoch() or execution["request"]["name"].upper() != action_name:
+                return False, ResultCode.INVALID_COMMAND_SCHEMA, None
+            prior = NpcCommandState.objects.filter(npc=npc,
+                agent_execution__operation_key=execution["operation_key"],
+                agent_execution__epoch=execution["epoch"]).first()
+            if prior:
+                if prior.agent_execution["request"] != execution["request"]:
+                    return False, ResultCode.REQUEST_ID_CONFLICT, None
+                return True, ResultCode.COMMAND_REPLAYED, prior
 
         # 提取 ID
         message_id = uuid.UUID(envelope_id)
@@ -1234,14 +1333,13 @@ class CommandService:
 
         # Acquire authority time before runtime state.  Bootstrap uses this
         # same global -> command/runtime lock order for recovery snapshots.
-        GlobalGameTimeState.get_instance()
-        time_state = GlobalGameTimeState.objects.select_for_update().get(pk=1)
-
         # 校验队列上限
         queue_count = NpcCommandState.objects.filter(
             npc=npc,
-            status__in=["RECEIVED", "QUEUED", "RUNNING"],
+            status__in=["RECEIVED", "QUEUED", "RUNNING", "SETTLING"],
         ).count()
+        if queue_count:
+            return False, ResultCode.NPC_BUSY, None
         queue_limit = VillageSimulationConfig.objects.filter(config_key="default").values_list(
             "command_queue_limit", flat=True
         ).first()
@@ -1256,6 +1354,8 @@ class CommandService:
             runtime = NpcRuntimeState.objects.select_for_update().get(npc=npc)
         except NpcRuntimeState.DoesNotExist:
             return False, ResultCode.BOOTSTRAP_NPC_SET_MISMATCH, None
+        if runtime.active_command_id is not None or runtime.action_status != "IDLE":
+            return False, ResultCode.NPC_BUSY, None
         expected_version = content.get("expected_state_version")
         if fast_integration or server_resolved_intent or expected_version is None:
             expected_version = runtime.state_version
@@ -1268,6 +1368,12 @@ class CommandService:
                 content["expires_world_minute"] < time_state.world_minute):
             return False, ResultCode.MESSAGE_EXPIRED, None
         params = content["params"]
+        if action_name in COMMISSION_ACTIONS | AFFAIR_ACTIONS:
+            if runtime.active_command_id is not None or runtime.action_status != "IDLE":
+                return False, ResultCode.NPC_BUSY, None
+            unavailable = CommandService.unavailable_reason(action_name, runtime, params)
+            if unavailable:
+                return False, unavailable, None
         if action_name in {"MOVE", "GO_HOME", "SLEEP"}:
             from .dialogue_service import DialogueService
             if DialogueService.active_for_npc(npc):
@@ -1290,6 +1396,7 @@ class CommandService:
             target_id=content.get("target_id", ""),
             location_code=location_code or point_code,
             sanitized_parameters=params,
+            agent_execution=execution,
             production_state={"rule_version": RULE_VERSION} if action_name in JACK_ACTIONS else {},
             payload_sha256=payload_sha256,
             queue_mode=content.get("queue_mode", "STRICT"),
@@ -1304,37 +1411,13 @@ class CommandService:
             validated_at_state_version=expected_version,
         )
 
-        # Story mutations already have a Backend transaction service. Keep the
-        # command row as the durable lifecycle anchor instead of introducing a
-        # second executor in Unity.
-        if action_name in CommandService.STORY_ACTIONS and not is_repair_labor(action_name, params):
-            from .phase5_story import dispatch_story_command
-            story_payload = dict(content)
-            story_payload["command"] = action_name
-            story_payload["npc_id"] = str(sender)
-            story_payload["current_location_code"] = runtime.current_location_code
-            story_result = dispatch_story_command(story_payload)
-            story_code = story_result.get("result_code", ResultCode.ACTION_NOT_ALLOWED)
-            receipt = VillageActionReceipt.objects.filter(request_id=request_id).first()
-            if receipt is not None:
-                receipt.command = command
-                receipt.save(update_fields=["command"])
-                command.status = "SUCCEEDED" if receipt.success else "FAILED"
-                command.result_code = receipt.result_code
-                command.completed_world_minute = receipt.world_minute
-                command.state_version = runtime.state_version
-                command.save(update_fields=["status", "result_code", "completed_world_minute", "state_version", "updated_at"])
-                OutboxService.ensure_outcome(receipt)
-                return receipt.success, story_code, command
-            ActionService.complete_action(
-                command.command_id, command.request_id, False, story_code,
-                message=story_result.get("message") or "Story command rejected by Backend story rules.",
-                data=story_result, allow_prestart_failure=True,
-            )
-            # complete_action loads its own model instance; serialize the saved
-            # terminal state, not this stale RECEIVED object, to the Unity caller.
-            command.refresh_from_db()
-            return False, story_code, command
+        if action_name in COMMISSION_ACTIONS:
+            from .personal_commission_commands import finish_immediate
+            return finish_immediate(command, runtime, time_state)
+
+        if action_name in AFFAIR_ACTIONS and not is_repair_labor(action_name, params):
+            from .affair_commands import finish_immediate
+            return finish_immediate(command, runtime, time_state)
 
         return True, ResultCode.COMMAND_ACCEPTED, command
 
@@ -1353,6 +1436,7 @@ class CommandService:
             "received_world_minute": command.received_world_minute,
             "started_world_minute": command.started_world_minute,
             "completed_world_minute": command.completed_world_minute,
+            "agent_execution": command.agent_execution,
             "receipt": {
                 "success": receipt.success,
                 "result_code": receipt.result_code,
@@ -1469,6 +1553,11 @@ class CommandService:
         if command.status not in ["RECEIVED", "QUEUED"]:
             return False, ResultCode.NPC_BUSY, None
 
+        if command.kind not in CommandService.ALLOWED_ACTIONS:
+            ActionService.complete_action(command.command_id, command.request_id, False, "ACTION_RETIRED",
+                message="此指令已停用。", allow_prestart_failure=True)
+            return False, "ACTION_RETIRED", command
+
         # SOCIALIZE acquires both runtime rows in stable agent-id order before
         # any reservation is created.  Every later start sees the HELD shared
         # reservation and refuses to claim either participant.
@@ -1561,20 +1650,25 @@ class CommandService:
             return False, ResultCode.NPC_BUSY, None
 
         if is_repair_labor(command.kind, command.sanitized_parameters):
-            from .phase5_story import repair_labor_unavailable
+            from .affair_commands import labor_unavailable as repair_labor_unavailable
             error = repair_labor_unavailable(rt, time_state.world_minute, command.sanitized_parameters)
             if error:
                 ActionService.complete_action(command.command_id, command.request_id, False, error,
-                    message="修桥劳动开始条件不满足。", allow_prestart_failure=True)
+                    message="事务劳动开始条件不满足。", allow_prestart_failure=True)
                 return False, error, command
             if rt.active_command_id is not None or rt.action_status != "IDLE":
                 return False, ResultCode.NPC_BUSY, None
-            command.duration_minutes = REPAIR_LABOR_MINUTES
-            command.sanitized_parameters = dict(command.sanitized_parameters, _repair_needs_until=time_state.world_minute)
+            from .affairs import resolve_condition
+            from .affair_commands import get_target
+            affair = get_target(command.sanitized_parameters)
+            condition = resolve_condition(affair, command.sanitized_parameters.get("condition_id"), "labor")
+            command.duration_minutes = condition["unit_minutes"]
+            command.sanitized_parameters = dict(command.sanitized_parameters, condition_id=condition["id"],
+                _repair_needs_until=time_state.world_minute)
             command.save(update_fields=["duration_minutes", "sanitized_parameters", "updated_at"])
 
         if not fast_integration and command.kind not in CommandService.PHASE2_ACTIONS:
-            unavailable = CommandService.unavailable_reason(command.kind, rt)
+            unavailable = CommandService.unavailable_reason(command.kind, rt, command.sanitized_parameters)
             if unavailable:
                 ActionService.complete_action(
                     command.command_id, command.request_id, False, unavailable,
@@ -1585,9 +1679,12 @@ class CommandService:
 
         # ``time_state`` remains locked from the first lifecycle read through
         # transition to RUNNING; do not re-read an unlocked minute here.
-        if command.kind == "PLANT":
-            from .phase3_production import plant_preflight
-            failure = plant_preflight(int(command.npc.agent_id), command.sanitized_parameters, time_state.world_minute)
+        if command.kind in {"PLANT", "COOK"}:
+            if command.kind == "COOK":
+                from .lucy_cooking import cook_preflight as preflight
+            else:
+                from .phase3_production import plant_preflight as preflight
+            failure = preflight(int(command.npc.agent_id), command.sanitized_parameters, time_state.world_minute)
             if failure:
                 ActionService.complete_action(command.command_id, command.request_id, False,
                     failure["result_code"], data=failure.get("data"), allow_prestart_failure=True)
@@ -1768,6 +1865,9 @@ class ActionService:
         except NpcCommandState.DoesNotExist:
             return False, ResultCode.INVALID_COMMAND_SCHEMA, None
 
+        if command.kind not in CommandService.ALLOWED_ACTIONS:
+            success, result_code, message = False, "ACTION_RETIRED", "此指令已停用。"
+
         # Phase-two life actions are completed only by LifeActionService so
         # Unity cannot turn a local animation completion into an asset/needs
         # success fact through the stage-one generic endpoint.
@@ -1800,11 +1900,16 @@ class ActionService:
         timed_repair = is_repair_labor(command.kind, command.sanitized_parameters)
         from .jack_production import is_jack_work, settle_work_needs
         jack_work = is_jack_work(command)
+        if command.kind == "CHOP_TREE":
+            if success:
+                return False, "TREE_FELL_REQUIRED", None
+            from .forestry import release_command_attempts
+            release_command_attempts(command)
         if jack_work and success:
             return False, "PRODUCTION_SETTLEMENT_REQUIRED", None
         if timed_repair and success:
-            if command.started_world_minute is None or time_state.world_minute < command.started_world_minute + REPAIR_LABOR_MINUTES:
-                return False, "REPAIR_LABOR_NOT_FINISHED", None
+            if command.started_world_minute is None or time_state.world_minute < command.started_world_minute + command.duration_minutes:
+                return False, "AFFAIR_LABOR_NOT_FINISHED", None
         if timed_repair:
             from .phase2_services import settle_repair_needs_locked
             error = settle_repair_needs_locked(rt, command, time_state.world_minute)
@@ -1812,7 +1917,10 @@ class ActionService:
                 success, result_code = False, error
         elif jack_work:
             settle_work_needs(rt, command, time_state.world_minute)
-        elif success or command.kind in {"PLANT", "HARVEST", "HUNT", "PROCESS_GAME", "COOK"}:
+            if command.kind == "HUNT":
+                from .wildlife import release_command_attempts
+                release_command_attempts(command)
+        elif success or command.kind in {"PLANT", "HARVEST", "HUNT", "CHOP_TREE", "PROCESS_GAME", "COOK"}:
             from .phase2_services import settle_action_needs_locked
             started = command.started_world_minute
             ended = (
@@ -1826,38 +1934,8 @@ class ActionService:
                 return False, error, None
 
         if timed_repair and success:
-            from .phase5_story import complete_story_action
-            params = dict(command.sanitized_parameters)
-            params.pop("expected_story_version", None)
-            params.pop("_repair_needs_until", None)
-            story_result = complete_story_action({
-                "request_id": str(request_id), "npc_id": str(command.npc.agent_id),
-                "current_location_code": rt.current_location_code, "params": params,
-            }, _labor_command=command)
-            if story_result.get("result_code") == "OK":
-                receipt = VillageActionReceipt.objects.get(request_id=request_id)
-                rt.state_version += 1
-                rt.current_action = ""
-                rt.action_status = "IDLE"
-                rt.action_started_world_minute = None
-                rt.action_ends_world_minute = None
-                rt.active_command_id = None
-                rt.last_simulated_world_minute = time_state.world_minute
-                rt.time_revision = time_state.time_revision
-                rt.save()
-                command.status = "SUCCEEDED"
-                command.result_code = "OK"
-                command.completed_world_minute = time_state.world_minute
-                command.state_version = rt.state_version
-                command.save()
-                receipt.command = command
-                receipt.state_version = rt.state_version
-                receipt.save(update_fields=["command", "state_version"])
-                OutboxService.ensure_outcome(receipt)
-                return True, "OK", receipt
-            success = False
-            result_code = story_result["result_code"]
-            data = story_result
+            from .affair_commands import execute
+            success, result_code, data = execute(command, rt, time_state.world_minute)
         command.status = "SETTLING"
         command.save(update_fields=["status", "updated_at"])
 
@@ -1902,6 +1980,10 @@ class ActionService:
             state_version=rt.state_version + 1,
             world_event=event,
         )
+
+        if command.kind in AFFAIR_ACTIONS:
+            from .models import EconomicLedgerEntry
+            EconomicLedgerEntry.objects.filter(request_id=request_id).update(event=event)
 
         # 更新命令状态
         command.status = "SUCCEEDED" if success else "FAILED"
@@ -1949,7 +2031,7 @@ class ActionService:
             "state_version": rt.state_version,
             "retryable": False,
             "effects": {},
-            "data": data or {},
+            "data": _with_command_timing(data, command),
         }
 
         VillageDeliveryOutbox.objects.get_or_create(
@@ -2094,6 +2176,27 @@ class ReservationService:
 # Outbox 服务
 # ============================================================================
 
+def _with_command_timing(data, command):
+    """Keep the configured budget separate from the authoritative elapsed interval."""
+    data = dict(data or {})
+    if command.duration_minutes is not None:
+        budget_key = "max_duration_minutes" if command.kind in {"HUNT", "CHOP_TREE"} else "planned_duration_minutes"
+        data.setdefault(budget_key, command.duration_minutes)
+    # Domain settlement facts take precedence over receipt/transport timing.
+    for source in (data, data.get("data") or {}):
+        for key in ("actual_duration_minutes", "slept_minutes"):
+            value = source.get(key)
+            if type(value) is int and value >= 0:
+                data["actual_duration_minutes"] = value
+                return data
+    start, end = command.started_world_minute, command.completed_world_minute
+    if start is not None and end is not None and end >= start:
+        data["actual_duration_minutes"] = end - start
+    elif start is None and command.status in {"FAILED", "CANCELLED", "EXPIRED"}:
+        data["actual_duration_minutes"] = 0
+    return data
+
+
 class OutboxService:
     """Outbox 领取和确认服务。"""
 
@@ -2117,7 +2220,7 @@ class OutboxService:
         payload.setdefault("phase", "COMPLETED")
         payload.setdefault("terminal", True)
         if command:
-            payload_data = dict(payload.get("data") or {})
+            payload_data = _with_command_timing(payload.get("data"), command)
             if command.duration_minutes is not None:
                 payload_data.setdefault("duration_minutes", command.duration_minutes)
             for key in ("target_npc_id", "location_code", "point_code"):
@@ -2215,6 +2318,9 @@ class OutboxService:
             entry.last_sent_at = now
             entry.save()
 
+            payload = dict(entry.payload)
+            if entry.message_kind == "OUTCOME" and entry.command_id and entry.command.agent_execution:
+                payload["agent_execution"] = entry.command.agent_execution
             results.append({
                 "delivery_id": str(entry.delivery_id),
                 "message_kind": entry.message_kind,
@@ -2227,7 +2333,7 @@ class OutboxService:
                     "recipient": entry.recipient,
                     "payload": {
                         "type": "outcome" if entry.message_kind == "OUTCOME" else "event",
-                        "content": entry.payload,
+                        "content": payload,
                     },
                 },
                 "attempt_count": entry.attempt_count,

@@ -83,21 +83,23 @@ class AgentQueryTests(TestCase):
         self.assertEqual(code, "OK")
         self.assertNotIn("asset_version", data)
         self.assertEqual(data["items"][0]["food_instance_id"], str(self.food.instance_id))
+        self.assertEqual(data["items"][0]["instance_id"], str(self.food.instance_id))
         self.assertEqual(
             data["items"][0]["sale"],
             {"target": "GENERAL_STORE", "unit_price": 8},
         )
         self.assertEqual(
             set(data["items"][0]),
-            {"food_instance_id", "item_id", "name", "item_type", "quantity", "available_quantity", "sale"},
+            {"food_instance_id", "instance_id", "item_id", "name", "item_type", "quantity", "available_quantity", "sale"},
         )
         self.assertNotIn(str(self.other_food.instance_id), str(data))
         seed = next(row for row in data["items"] if row["item_id"] == 1051)
         self.assertEqual(
             set(seed),
-            {"item_id", "name", "item_type", "quantity", "available_quantity", "sale", "planting"},
+            {"instance_id", "item_id", "name", "item_type", "quantity", "available_quantity", "sale", "planting"},
         )
         self.assertEqual(seed["sale"], {"target": "GENERAL_STORE", "unit_price": 5})
+        self.assertEqual(seed["instance_id"], str(self.corn_seed.instance_id))
         self.assertEqual(
             seed["planting"],
             {
@@ -222,6 +224,8 @@ class AgentQueryTests(TestCase):
         success, code, data = execute_agent_query("10011", "INSPECT_NEARBY")
         self.assertTrue(success)
         self.assertEqual(data["nearby_npcs"][0]["npc_id"], "90012")
+        self.assertEqual(data["nearby_players"], [])
+        self.assertFalse(data["players_observation_available"])
         self.assertEqual(data["npc_names"]["90012"], "Jack")
         self.assertEqual([row["location_code"] for row in data["nearby_locations"]], ["MARKET_STREET"])
         success, code, data = execute_agent_query("90012", "INSPECT_INVENTORY")
@@ -287,6 +291,31 @@ class AgentQueryTests(TestCase):
         self.assertFalse(success)
         self.assertEqual(code, "STORY_NOT_VISIBLE")
 
+    def test_resource_affairs_remain_visible_after_legacy_story_end_and_meetings(self):
+        from village.models import VillageAffair
+        profile = NpcProfile.objects.get(npc=self.bill)
+        profile.capabilities = self.capabilities + ["STORY_ACT"]
+        profile.save(update_fields=["capabilities"])
+        arc = VillageStoryArc.objects.create(arc_code="BROKEN_TRADE_ROUTE_V1", current_phase="CRISIS_CHECK",
+                                            current_plan="RATION_AND_WAIT", is_completed=True, outcome="LONG_SHORTAGE")
+        VillageStoryFact.objects.create(arc=arc)
+        affair = VillageAffair.objects.create(code="BRIDGE_REPAIR", title="修桥", opened_world_minute=0,
+            locations=["REPAIR_YARD"], requirements={"materials": {"1002": 100}, "meals": 20, "gold": 500, "labor": 20},
+            progress={"materials": {}, "meals": 0, "gold": 0, "labor": 0})
+        success, code, data = execute_agent_query("10011", "INSPECT_STORY_STATE")
+        self.assertTrue(success, code)
+        self.assertEqual(data["status"], "ACTIVE")
+        self.assertIn("DONATE_REPAIR_RESOURCES", data["available_actions"])
+        self.assertNotIn("REPAIR_LABOR", data["available_actions"])
+        self.assertEqual(data["affairs"][0]["gold"]["remaining"], 500)
+        affair.progress = {"materials": {"1002": 100}, "meals": 20, "gold": 500, "labor": 0}
+        affair.status = "READY"
+        affair.save()
+        success, code, data = execute_agent_query("10011", "INSPECT_STORY_STATE")
+        self.assertTrue(success, code)
+        self.assertIn("REPAIR_LABOR", data["available_actions"])
+        self.assertNotIn("DONATE_REPAIR_RESOURCES", data["available_actions"])
+
     def test_discover_has_low_frequency_profile_and_visible_locations_only(self):
         user = GameAccount.objects.create(username="agent-query-env", password="unused")
         request = APIRequestFactory().get("/api/village/npcs/10011/discover")
@@ -302,8 +331,8 @@ class AgentQueryTests(TestCase):
     def test_movement_commands_advertise_deferred_execution_tags(self):
         self.assertIn("long_running", agent_tool("MOVE")["tags"])
         self.assertIn("movement", agent_tool("MOVE")["tags"])
-        self.assertIn("long_running", agent_tool("WAIT")["tags"])
-        self.assertNotIn("movement", agent_tool("WAIT")["tags"])
+        self.assertIn("long_running", agent_tool("GO_HOME")["tags"])
+        self.assertIn("movement", agent_tool("GO_HOME")["tags"])
 
     def test_context_contains_only_rules_and_follows_capabilities_and_configuration(self):
         user = GameAccount.objects.create(username="context-env", password="unused")
@@ -343,7 +372,7 @@ class AgentQueryTests(TestCase):
         self.assertIn("BILL_HOME=Bill农舍", text)
         self.assertIn("MARKET_STREET=市场街", text)
         self.assertNotIn("SECRET", text)
-        self.assertEqual({tool["name"] for tool in data["tools"]}, {"OBSERVE", "PLANT"})
+        self.assertEqual({tool["name"] for tool in data["tools"]}, {"GET_RULE", "OBSERVE", "PLANT"})
 
         NpcRuntimeState.objects.filter(npc=self.bill).update(
             action_status="RUNNING", hunger_fp=990, current_location_code="MARKET_STREET"
@@ -359,7 +388,7 @@ class AgentQueryTests(TestCase):
         self.assertIn("HUNT", text)
         self.assertNotIn("玉米", text)
         self.assertNotIn("PLANT", text)
-        self.assertEqual({tool["name"] for tool in data["tools"]}, {"OBSERVE", "HUNT"})
+        self.assertEqual({tool["name"] for tool in data["tools"]}, {"GET_RULE", "OBSERVE", "HUNT"})
 
         with patch.dict(CommandService.NEED_GATE_LIMITS, {"hunger": 800}):
             data = npc_available_actions(request, "10011").data["data"]
@@ -467,7 +496,9 @@ class AgentQueryTests(TestCase):
                 COMMAND_CATALOG[action]["parameters"]["properties"]["store_code"]["enum"],
                 ["GENERAL_STORE", "RESTAURANT_STORE"],
             )
-        self.assertIn("20米", COMMAND_CATALOG["INSPECT_NEARBY"]["description"])
+        self.assertIn("10米", COMMAND_CATALOG["INSPECT_NEARBY"]["description"])
+        self.assertIn("nearby_players", COMMAND_CATALOG["INSPECT_NEARBY"]["description"])
+        self.assertIn("players_observation_available", COMMAND_CATALOG["INSPECT_NEARBY"]["description"])
         self.assertTrue({"START_DIALOGUE", "SPEAK", "SPEECH"}.isdisjoint(COMMAND_CATALOG))
 
     def test_browse_marketplace_accepts_django_query_params(self):
@@ -516,6 +547,10 @@ class AgentQueryTests(TestCase):
         self.assertIsNotNone(buy_result["transaction"])
 
         success, code, data = execute_agent_query("10011", "BROWSE_MARKETPLACE")
+        self.assertTrue(success, code)
+        self.assertEqual(data["listings"], [])  # Buyers cannot buy their own listings.
+        NpcProfile.objects.filter(npc=other).update(capabilities=["BROWSE_MARKETPLACE"])
+        success, code, data = execute_agent_query("90012", "BROWSE_MARKETPLACE")
         self.assertTrue(success, code)
         self.assertEqual(data["listings"][0]["listingId"], listing.pk)
         self.assertIn("sellerName", data["listings"][0])

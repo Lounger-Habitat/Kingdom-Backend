@@ -1,0 +1,71 @@
+{
+  "version": 1,
+  "models": [
+    {
+      "id": "artisan_male_01",
+      "label": "造型一",
+      "meshName": "SM_Chr_Blacksmith_Male_01",
+      "npcOnly": false
+    },
+    {
+      "id": "artisan_female_01",
+      "label": "造型二",
+      "meshName": "SM_Chr_Blacksmith_Female_01",
+      "npcOnly": false
+    },
+    {
+      "id": "bartender_01",
+      "label": "造型三",
+      "meshName": "SM_Chr_Bartender_01",
+      "npcOnly": false
+    },
+    {
+      "id": "soldier_male_01",
+      "label": "造型四",
+      "meshName": "SM_Chr_Soldier_Male_01",
+      "npcOnly": false
+    },
+    {
+      "id": "soldier_female_01",
+      "label": "造型五",
+      "meshName": "SM_Chr_Soldier_Female_01",
+      "npcOnly": false
+    },
+    {
+      "id": "fortune_teller_01",
+      "label": "造型六",
+      "meshName": "SM_Chr_FortuneTeller_01",
+      "npcOnly": false
+    },
+    {
+      "id": "villager_male_01",
+      "label": "Bill 专用",
+      "meshName": "SM_Chr_Peasant_Male_01",
+      "npcOnly": true
+    },
+    {
+      "id": "merchant_01",
+      "label": "Jack 专用",
+      "meshName": "SM_Chr_Merchant_01",
+      "npcOnly": true
+    },
+    {
+      "id": "hermit_01",
+      "label": "Mark 专用",
+      "meshName": "SM_Chr_Hermit_01",
+      "npcOnly": true
+    },
+    {
+      "id": "villager_female_01",
+      "label": "Lucy 专用",
+      "meshName": "SM_Chr_Peasant_Female_01",
+      "npcOnly": true
+    },
+    {
+      "id": "rider_01",
+      "label": "Nora 专用",
+      "meshName": "SM_Chr_Rider_01",
+      "npcOnly": true
+    }
+  ]
+}

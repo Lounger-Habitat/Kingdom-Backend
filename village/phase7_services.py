@@ -128,7 +128,7 @@ def _public_command_summary(action: str, params: dict, duration: int | None,
         if not goods:
             goods = named_item(resolved("instances", "food_instance_id").get("item_id"))
         return f"进食{goods}（{source}）" if goods and source else f"进食（{source}）" if source else label
-    if action in {"REST", "SLEEP", "WAIT", "WORK_PLACEHOLDER"}:
+    if action in {"REST", "SLEEP", "WORK_PLACEHOLDER"}:
         return f"{label} {duration} 分钟" if duration is not None else label
     if action == "SOCIALIZE":
         target = npc("target_npc_id")
@@ -141,7 +141,14 @@ def _public_command_summary(action: str, params: dict, duration: int | None,
         return f"{detail}：{topic}" if topic else detail
     if action in {"SPEECH", "SPEAK"}:
         speech = str(params.get("text", "")).strip()
-        return f"对话发言：“{speech}”" if speech else label
+        speech_label = "对话发言"
+        if params.get("speech_scope") == "public":
+            speech_label = "附近公开发言"
+        elif params.get("speech_scope") == "player_dialogue":
+            player = str(params.get("player_name") or "玩家").strip() or "玩家"
+            participant = f"玩家{player}" if player != "玩家" else "玩家"
+            speech_label = f"{participant}发言" if params.get("speaker_role") == "player" else f"回复{participant}"
+        return f"{speech_label}：“{speech}”" if speech else (speech_label if params.get("speech_scope") else label)
     if action == "PLANT":
         plot, crop = _display_code(params.get("plot_code")), _display_code(params.get("crop_code"))
         return f"在{plot}播种{crop}" if plot and crop else label
@@ -360,6 +367,8 @@ def _public_command_detail(action: str, params: dict, duration: int | None,
         verb = "取消" if status == "CANCELLED" else "失效"
         return bounded(f"等待或执行{spent}分钟后{verb}。")
     if status != "SUCCEEDED":
+        if action in {"SPEECH", "SPEAK"} and data.get("reason"):
+            return bounded(data["reason"])
         reason = _OUTCOME_REASONS.get(result_code, "执行结果未分类").replace(
             "Backend", "服务端").replace("Hub", "服务").replace("NPC", "村民")
         spent = elapsed(completed if completed is not None else now)
@@ -379,7 +388,7 @@ def _public_command_detail(action: str, params: dict, duration: int | None,
     if action in {"MOVE", "GO_HOME"}:
         destination = location_name()
         return bounded(f"用时{spent or 0}分钟，到达{destination or '目标地点'}。")
-    if action in {"WAIT", "REST", "SLEEP", "WORK_PLACEHOLDER"}:
+    if action in {"REST", "SLEEP", "WORK_PLACEHOLDER"}:
         energy = number(effects.get("needs", {}), "energy")
         extra = f"，精力变化{energy:+g}" if energy is not None else ""
         return bounded(f"实际用时{spent if spent is not None else duration or 0}分钟{extra}。")
@@ -396,6 +405,14 @@ def _public_command_detail(action: str, params: dict, duration: int | None,
     if action == "START_DIALOGUE":
         return bounded(f"与{npc_name('target_npc_id')}建立对话，话题{len(str(params.get('topic', '')))}字。")
     if action in {"SPEECH", "SPEAK"}:
+        length = len(str(params.get("text", "")))
+        if params.get("speech_scope") == "public":
+            if result_code == "DIALOGUE_NO_LISTENER":
+                return bounded(f"公开发言{length}字，无人听见。")
+            return bounded(f"公开发言{length}字，已发送给{params.get('npc_delivery_count', 0)}位村民、"
+                           f"{params.get('player_delivery_count', 0)}位玩家客户端。")
+        if params.get("speech_scope") == "player_dialogue" and params.get("speaker_role") == "player":
+            return bounded(f"收到玩家发言{length}字，已转交。")
         ended = result_code == "DIALOGUE_COMPLETED" or bool(params.get("end_turn"))
         return bounded(f"发送{len(str(params.get('text', '')))}字，对话{'结束' if ended else '继续'}。")
 
@@ -491,6 +508,11 @@ def _public_command_detail(action: str, params: dict, duration: int | None,
         relationships = data.get("relationships", [])
         commitments = data.get("commitments", [])
         return bounded(f"关系{len(relationships) if isinstance(relationships, list) else 0}人，承诺{len(commitments) if isinstance(commitments, list) else 0}项。")
+    if action == "INSPECT_PERSONAL_COMMISSIONS":
+        return bounded(f"个人委托{len(data.get('commissions', []))}项。")
+    if action in {"PUBLISH_PERSONAL_COMMISSION", "WITHDRAW_PERSONAL_COMMISSION"}:
+        status = {"OPEN": "待认领", "ACTIVE": "进行中", "COMPLETED": "已完成", "WITHDRAWN": "已撤回", "ABANDONED": "已放弃", "EXPIRED": "已到期"}.get(data.get("status"), data.get("status", ""))
+        return bounded(f"{data.get('title', '个人委托')}：{status}，报酬{data.get('reward_gold', 0)}金币。")
     if action in {"INSPECT_STORY_STATE", "INSPECT_STORY_DETAIL"}:
         phase = _display_code(data.get("phase", data.get("current_phase")))
         actions = data.get("available_actions", [])
@@ -532,7 +554,7 @@ def _category(event: VillageWorldEvent) -> str:
     if explicit:
         return explicit
     event_type = event.event_type.upper()
-    if event_type.startswith("STORY_"):
+    if event_type.startswith(("STORY_", "VILLAGE_AFFAIR_")):
         return "STORY"
     if any(word in event_type for word in (
         "TRADE", "ORDER", "STORE", "PRICE", "FUND", "IMPORT", "EXPORT",
@@ -693,12 +715,15 @@ def _public_economy(world_minute: int) -> dict:
 
 
 def _public_story(player_id: str) -> dict:
+    from .affairs import project_affairs
+    minute = GlobalGameTimeState.objects.filter(pk=1).values_list("world_minute", flat=True).first() or 0
+    affairs = project_affairs(minute)
     arc = VillageStoryArc.objects.order_by("arc_code").first()
     if not arc:
-        return {}
+        return {"affairs": affairs}
     fact = getattr(arc, "facts", None)
     progress = {}
-    if fact is not None and arc.current_plan == "BRIDGE_REPAIR":
+    if fact is not None:
         progress = {
             "bridge_condition": fact.bridge_condition,
             "repair_fund": fact.repair_fund,
@@ -707,28 +732,19 @@ def _public_story(player_id: str) -> dict:
             "repair_labor_hours": fact.repair_labor_hours,
             "community_meals": fact.community_meals,
         }
-    elif fact is not None and arc.current_plan == "FOREST_ROUTE":
-        progress = {
-            "retired": True,
-            "message": "森林旧路方案已退役；历史进度不再是工作目标。Nora可独立付费开通应急商队。",
-        }
-        if fact.emergency_caravan_contacted:
-            progress["emergency_caravan_status"] = (
-                "SUCCEEDED" if fact.emergency_caravan_succeeded else "FAILED"
-            )
-    elif fact is not None and arc.current_plan == "RATION_AND_WAIT":
-        progress = {
+        progress.update({
             "ration_rules_published": fact.ration_rules_published,
             "store_limits_enabled": fact.store_limits_enabled,
-            "community_meals": fact.community_meals,
-        }
+        })
+        if fact.emergency_caravan_contacted:
+            progress["emergency_caravan_status"] = "SUCCEEDED" if fact.emergency_caravan_succeeded else "FAILED"
         if fact.store_limits_enabled:
             progress["ration_daily_limits"] = dict(fact.ration_daily_limits or {})
     transition = VillageStoryTransitionReceipt.objects.filter(
         arc=arc, applied=True
     ).order_by("-created_at").first()
     contribution_events = []
-    for event in VillageWorldEvent.objects.filter(event_type__startswith="STORY_").order_by("-event_sequence")[:100]:
+    for event in VillageWorldEvent.objects.filter(Q(event_type__startswith="STORY_") | Q(event_type__startswith="VILLAGE_AFFAIR_")).order_by("-event_sequence")[:100]:
         if player_id in {str(value) for value in (event.player_ids or [])}:
             contribution_events.append(str(event.event_id))
             if len(contribution_events) == 10:
@@ -739,6 +755,7 @@ def _public_story(player_id: str) -> dict:
         "public_plan": arc.current_plan or None,
         "retired_plan": arc.current_plan == "FOREST_ROUTE",
         "progress": progress,
+        "affairs": affairs,
         "player_contribution": {
             "event_count": len(contribution_events),
             "event_ids": contribution_events,
@@ -901,9 +918,23 @@ def public_store(store_code: str) -> dict | None:
     matching_entries = EconomicLedgerEntry.objects.filter(
         changes__listing_id__in=listing_ids,
     ).select_related("actor_npc").order_by("-world_minute", "-id")
+    # Immediate buybacks have no listing: the goods enter the warehouse.
+    # Read existing receipts so sales made before this projection also appear.
+    buyback_receipts = VillageActionReceipt.objects.filter(
+        success=True,
+        response_data__data__sale_mode="IMMEDIATE_STORE",
+        response_data__data__store_code=store_code,
+    )
+    buyback_entries = EconomicLedgerEntry.objects.filter(
+        entry_type="PROPOSE_TRADE",
+        request_id__in=buyback_receipts.values("request_id"),
+    ).select_related("actor_npc").order_by("-world_minute", "-id")
     entries = [
         *matching_entries.filter(entry_type__in=STORE_HISTORY_TYPES)[:30],
         *matching_entries.filter(entry_type="BUY_FROM_STORE")[:30],
+        *buyback_entries[:30],
+        *EconomicLedgerEntry.objects.filter(entry_type="SELL_TO_STORE", changes__store_code=store_code)
+            .select_related("actor_npc").order_by("-world_minute", "-id")[:30],
     ]
     receipts = {
         str(row.request_id): row.response_data
@@ -918,33 +949,58 @@ def public_store(store_code: str) -> dict | None:
         return data if isinstance(data, dict) else {}
 
     def actor(entry):
+        if entry.actor_npc_id is None and (entry.changes or {}).get("player_id"):
+            return None, entry.changes.get("player_display_name", "玩家")
         npc_id = str(entry.actor_npc.agent_id) if entry.actor_npc else None
         return npc_id, npc_names.get(npc_id, entry.actor_npc.name if entry.actor_npc else "")
 
     listing_history = []
     transactions = []
-    for entry in entries:
+    for entry in sorted(entries, key=lambda row: (row.world_minute, row.id), reverse=True):
+        data = entry_data(entry)
+        actor_id, actor_name = actor(entry)
+        if entry.entry_type in ("PROPOSE_TRADE", "SELL_TO_STORE"):
+            if entry.entry_type == "SELL_TO_STORE":
+                data = entry.changes or {}
+            # Older single-item receipts use scalar fields; batch receipts use items.
+            for item in data.get("items") or [data]:
+                if len(transactions) >= 30:
+                    break
+                if not isinstance(item, dict) or not item.get("item_id"):
+                    continue
+                transactions.append({
+                    "ledger_id": entry.id,
+                    "direction": "STORE_PURCHASE",
+                    "seller_npc_id": actor_id,
+                    "seller_display_name": actor_name,
+                    "item_id": item["item_id"],
+                    "item_name": item.get("item_name") or f"物品#{item['item_id']}",
+                    "amount": item.get("amount", 0),
+                    "unit_price": item.get("unit_price", 0),
+                    "gross_amount": item.get("gold_amount", 0),
+                    "world_minute": entry.world_minute,
+                })
+            continue
         changes = entry.changes if isinstance(entry.changes, dict) else {}
         listing = listing_by_id.get(str(changes.get("listing_id", "")))
         if listing is None:
             continue
-        data = entry_data(entry)
-        actor_id, actor_name = actor(entry)
         if entry.entry_type == "BUY_FROM_STORE":
             if len(transactions) >= 30:
                 continue
             transactions.append({
                 "ledger_id": entry.id,
+                "direction": "STORE_SALE",
                 "listing_id": str(listing.listing_id),
                 "buyer_npc_id": actor_id,
                 "buyer_display_name": actor_name,
                 "item_id": listing.item_id,
                 "item_name": item_names.get(listing.item_id, f"物品#{listing.item_id}"),
-                "amount": data.get("amount", 0),
+                "amount": data.get("amount", changes.get("amount", 0)),
                 "gross_amount": data.get("gross_amount", changes.get("gross_amount", 0)),
                 "fee_amount": data.get("fee_amount", changes.get("fee_amount", 0)),
                 "store_net_amount": data.get("store_net_amount", changes.get("store_net_amount", 0)),
-                "subsidy_amount": data.get("subsidy_amount", 0),
+                "subsidy_amount": data.get("subsidy_amount", changes.get("subsidy_amount", 0)),
                 "public_meal_code": listing.public_meal_code or None,
                 "world_minute": entry.world_minute,
             })
@@ -1295,6 +1351,9 @@ def public_npc_observation(npc_id: str) -> dict | None:
         ordered_commands.append((order_minute, active_command.created_at, row))
     ordered_commands.sort(key=lambda item: (item[0], item[1]), reverse=True)
     recent_commands = [item[2] for item in ordered_commands]
+    from .runtime_services import CommandService
+    for row in recent_commands:
+        row["category"] = "QUERY" if row["name"] in CommandService.READ_QUERY_ACTIONS else "EXECUTION"
     dialogue = NpcDialogueSession.objects.filter(
         Q(initiator=profile.npc) | Q(target=profile.npc), status="ACTIVE"
     ).select_related("initiator", "target").first()

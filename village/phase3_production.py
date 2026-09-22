@@ -19,6 +19,7 @@ from inventory.models import NpcGlobalInventory, NpcGlobalInventorySlot
 from recipes.models import Recipe, RecipeIngredient
 
 from .models import VillageFarmPlot
+from .player_farm import project_plot
 from .phase3_asset_service import (
     _fail,
     _ok,
@@ -33,11 +34,6 @@ from .phase3_catalog import (
     DISH_SPOILAGE_MINUTES,
     FARM_CROP_RULES,
     FARM_TOOL_ITEM_ID,
-    HUNT_MEAT_ITEM_IDS,
-    HUNT_MEAT_SPOILAGE_MINUTES,
-    HUNT_MEAT_YIELD_MAX,
-    HUNT_MEAT_YIELD_MIN,
-    HUNT_TOOL_ITEM_ID,
     RECIPE_WHITELIST,
 )
 from .phase3_contract import (
@@ -80,6 +76,9 @@ def plant_preflight(npc_id, params, world_minute):
         )
 
     # Lock inventory
+    if plot.lessee_player_id is not None or plot.lease_enabled:
+        return _fail(ResultCode.P3_PLOT_NOT_READY, data={"failure_kind": "PLOT_RESERVED_FOR_PLAYER", "plot_code": plot_code})
+
     try:
         inventory = NpcGlobalInventory.objects.select_for_update().get(
             npc__agent_id=str(npc_id)
@@ -174,10 +173,12 @@ def _do_plant(
         plot.batch_id = batch_id
         plot.crop_code = crop_code
         plot.planted_world_minute = world_minute
-        plot.mature_world_minute = world_minute + crop_rule["growth_minutes"]
+        from .farm_irrigation import effective_growth_minutes
+        plot.mature_world_minute = world_minute + effective_growth_minutes(crop_rule["growth_minutes"])
         plot.yield_seed = yield_seed
         plot.source_request_id = request_id
         plot.status = "GROWING"
+        plot.plot_version += 1
         plot.save()
 
         # Increment asset version
@@ -190,13 +191,14 @@ def _do_plant(
             "items_consumed": [{"item_id": seed_item_id, "amount": 1}],
             "tool_used": {"item_id": FARM_TOOL_ITEM_ID, "instance_id": str(used_tool.instance_id), "uses": 1, "remaining_uses": used_tool.remaining_uses},
             "plot": {
+                **project_plot(plot, world_minute),
                 "plot_code": plot.plot_code,
                 "status": "GROWING",
                 "crop_code": crop_code,
                 "crop_name": crop_rule.get("display_name", crop_code),
                 "batch_id": str(batch_id),
                 "planted_world_minute": world_minute,
-                "mature_world_minute": world_minute + crop_rule["growth_minutes"],
+                "mature_world_minute": plot.mature_world_minute,
             },
         },
     )
@@ -237,6 +239,9 @@ def _do_harvest(
 
         if expected_version is not None and inventory.asset_version != expected_version:
             return _fail(ResultCode.P3_ASSET_VERSION_CONFLICT)
+
+        if plot.lessee_player_id is not None:
+            return _fail(ResultCode.P3_PLOT_NOT_READY, data={"failure_kind": "PLOT_PLAYER_LEASED", "plot_code": plot_code})
 
         if plot.status != "GROWING":
             return _fail(
@@ -335,6 +340,7 @@ def _do_harvest(
         plot.yield_seed = None
         plot.source_request_id = None
         plot.status = "EMPTY"
+        plot.plot_version += 1
         plot.save()
 
         # Increment asset version
@@ -347,6 +353,7 @@ def _do_harvest(
             "items_added": added_items,
             "tool_used": {"item_id": FARM_TOOL_ITEM_ID, "instance_id": str(used_tool.instance_id), "uses": 1, "remaining_uses": used_tool.remaining_uses},
             "plot": {
+                **project_plot(plot, world_minute),
                 "plot_code": plot_code,
                 "status": "EMPTY",
                 "crop_code": "",
@@ -375,71 +382,8 @@ def _do_hunt(
     if hunt_code == "HUNT_ANIMALS":
         from .jack_production import finish_work
         return finish_work(npc_id, params, world_minute, request_id)
-    expected_version = params.get("expected_asset_version")
-
-    if hunt_code != "HUNT_CHICKEN":
-        return _fail(ResultCode.P3_INVALID_PARAMS)
-
-    with transaction.atomic():
-        try:
-            inventory = NpcGlobalInventory.objects.select_for_update().get(
-                npc__agent_id=str(npc_id)
-            )
-        except NpcGlobalInventory.DoesNotExist:
-            return _fail(ResultCode.P3_INVALID_PARAMS)
-
-        if expected_version is not None and inventory.asset_version != expected_version:
-            return _fail(ResultCode.P3_ASSET_VERSION_CONFLICT)
-
-        # Direct settlement calls retain the original defensive health gate;
-        # the formal Hub path also rejects this before the action starts.
-        from .models import NpcRuntimeState
-        try:
-            runtime = NpcRuntimeState.objects.get(npc__agent_id=str(npc_id))
-        except NpcRuntimeState.DoesNotExist:
-            return _fail(ResultCode.P3_INVALID_PARAMS)
-        if runtime.health_fp <= 300:
-            return _fail(ResultCode.P3_FORBIDDEN_ACTOR)
-
-        # Consume 1 hunt tool use
-        try:
-            used_tool = consume_tool_use(npc_id, HUNT_TOOL_ITEM_ID, world_minute)
-        except ValueError:
-            return _fail(ResultCode.P3_TOOL_BROKEN)
-
-        # Deterministic yield
-        day_index = world_minute // 1440
-        rng = deterministic_rng(request_id, "HUNT", day_index)
-        meat_item_id = rng.choice(HUNT_MEAT_ITEM_IDS)
-        meat_amount = rng.randint(HUNT_MEAT_YIELD_MIN, HUNT_MEAT_YIELD_MAX)
-
-        # Add one randomly selected meat type with expiry
-        add_batch(
-            inventory,
-            meat_item_id,
-            meat_amount,
-            world_minute,
-            world_minute + HUNT_MEAT_SPOILAGE_MINUTES,
-            request_id,
-        )
-
-        # Increment asset version
-        inventory.asset_version += 1
-        inventory.save(update_fields=["asset_version", "updated_at"])
-
-    return _ok(
-        asset_versions={str(npc_id): inventory.asset_version},
-        effects={
-            "items_added": [
-                {
-                    "item_id": meat_item_id,
-                    "amount": meat_amount,
-                    "expires_world_minute": world_minute + HUNT_MEAT_SPOILAGE_MINUTES,
-                }
-            ],
-            "tool_used": {"item_id": HUNT_TOOL_ITEM_ID, "instance_id": str(used_tool.instance_id), "uses": 1, "remaining_uses": used_tool.remaining_uses},
-        },
-    )
+    # The retired timer-only command must never mint meat.
+    return _fail("HUNT_CODE_RETIRED")
 
 
 # ── COOK ─────────────────────────────────────────────────────────────────────

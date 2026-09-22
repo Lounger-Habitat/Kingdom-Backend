@@ -68,7 +68,7 @@ def sync_visit(minute):
     if not cfg or not cfg.village_economy_enabled:
         return None
     fact = VillageStoryFact.objects.filter(arc_id="BROKEN_TRADE_ROUTE_V1").first()
-    route = "NORMAL" if fact and fact.bridge_condition == "REPAIRED" else "EMERGENCY" if fact and fact.emergency_caravan_succeeded else "NONE"
+    route = current_route()
     location = "TRADE_ROAD" if route == "NORMAL" else EMERGENCY_LOCATION if route == "EMERGENCY" else ""
     request = VillageCaravanRequest.objects.filter(pk=day).first()
     requested = request.item_ids if request else []
@@ -112,8 +112,7 @@ def projection(minute):
     demand = VillageCaravanRequest.objects.filter(pk=next_day).first()
     present = bool(visit and visit.route != "NONE" and ARRIVAL <= clock < DEPARTURE)
     fact = VillageStoryFact.objects.filter(arc_id="BROKEN_TRADE_ROUTE_V1").first()
-    route = visit.route if visit else ("NORMAL" if fact and fact.bridge_condition == "REPAIRED" else
-        "EMERGENCY" if fact and fact.emergency_caravan_succeeded else "NONE")
+    route = visit.route if visit else current_route()
     location = visit.location_code if visit else ("TRADE_ROAD" if route == "NORMAL" else
         EMERGENCY_LOCATION if route == "EMERGENCY" else "")
     return {
@@ -253,10 +252,20 @@ def handle_contact(npc_id, params, minute, request_id):
             "需求已登记，但路线未开通；目标11:00仅为计划窗口，登记需求不会让商队自动到达。"})
 
 
+def current_route():
+    from .models import VillageAffair, VillageRouteAttempt
+    fact = VillageStoryFact.objects.filter(arc_id="BROKEN_TRADE_ROUTE_V1").first()
+    if VillageAffair.objects.filter(pk="BRIDGE_REPAIR", status="COMPLETED").exists() or (fact and fact.bridge_condition == "REPAIRED"):
+        return "NORMAL"
+    if VillageRouteAttempt.objects.filter(result_code="SUCCESS").exists() or (fact and fact.emergency_caravan_succeeded):
+        return "EMERGENCY"
+    return "NONE"
+
+
 def route_readiness(npc_id=None):
     from .models import VillageStoryArc
     fact = VillageStoryFact.objects.filter(arc_id="BROKEN_TRADE_ROUTE_V1").first()
-    route = "NORMAL" if fact and fact.bridge_condition == "REPAIRED" else "EMERGENCY" if fact and fact.emergency_caravan_succeeded else "NONE"
+    route = current_route()
     missing = []
     if route == "NONE":
         if str(npc_id) == "10015":

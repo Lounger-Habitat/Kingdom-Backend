@@ -1,7 +1,9 @@
 from django.urls import path
 from . import views
+from .speech import transcribe
 
 urlpatterns = [
+    path("api/player/speech/transcribe", transcribe, name="player-speech-transcribe"),
     path("player/state", views.player_state, name="player-state"),
     path("player/cost_action", views.player_cost_action, name="player-cost-action"),
     path("api/player/recipes", views.player_recipes, name="player-recipes"),

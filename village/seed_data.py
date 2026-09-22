@@ -1,22 +1,21 @@
 BASE_ACTIONS = [
-    "MOVE", "WAIT", "GO_HOME",
-    "EAT", "REST", "SLEEP", "WORK_PLACEHOLDER",
-    "PROPOSE_TRADE", "RESPOND_TRADE", "CANCEL_TRADE_OFFER",
+    "WRITE_SCHEDULE", "INSPECT_SCHEDULE", "UPDATE_SCHEDULE",
+    "WRITE_DIARY", "INSPECT_DIARIES", "UPDATE_DIARY",
+    "MOVE", "GO_HOME",
+    "EAT", "REST", "SLEEP",
+    "GET_RULE", "INSPECT_LIVING_OPTIONS",
+    "GIVE_ITEMS", "PROPOSE_TRADE", "RESPOND_TRADE", "CANCEL_TRADE_OFFER",
     "BUY_FROM_STORE", "BUY_FROM_MARKETPLACE", "SELL_ON_MARKETPLACE",
     "DELIST_FROM_MARKETPLACE", "BROWSE_MARKETPLACE",
     "CHECK_MY_MARKETPLACE_LISTINGS", "CHECK_MARKETPLACE_HISTORY",
     "INSPECT_STORE_INVENTORY",
-    "INSPECT_SOCIAL_STATE", "CREATE_COMMITMENT", "CANCEL_COMMITMENT",
-    "PERFORM_COMMITMENT", "STORY_VOTE", "STORY_ACT",
+    "INSPECT_SOCIAL_STATE", "CONTRIBUTE_TO_AFFAIR",
     "OBSERVE", "INSPECT_NEARBY", "INSPECT_INVENTORY",
-    "INSPECT_TRADE_OFFERS", "INSPECT_STORY_STATE", "INSPECT_RELEVANT_STORIES",
-    "INSPECT_STORY_DETAIL",
+    "INSPECT_TRADE_OFFERS", "INSPECT_AFFAIRS",
+    "PUBLISH_PERSONAL_COMMISSION", "INSPECT_PERSONAL_COMMISSIONS", "WITHDRAW_PERSONAL_COMMISSION",
 ]
 
 
-# 订单流动作（CREATE_ORDER/CANCEL_ORDER/START_DELIVERY）在指令目录中有定义，
-# 但刻意不授予任何 NPC：保持与线上 NpcProfile.capabilities 一致，重置/重播种
-# 不得新增指令。如要启用，先在线上 DB 授权再同步到这里。
 NPC_SEEDS = [
     {
         "agent_id": "10011",
@@ -46,7 +45,7 @@ NPC_SEEDS = [
         "personality_traits": ["independent", "wry", "cautious"],
         "personal_goal": "狩猎并处理猎物，出售肉类和副产品，购买工具食物并维持生活",
         "capabilities": BASE_ACTIONS + [
-            "HUNT", "PROCESS_GAME",
+            "HUNT", "CHOP_TREE", "PROCESS_GAME",
         ],
         "money": 240,
         "items": [(1009, 4), (1034, 3), (1056, 6), (1019, 4)],
@@ -55,15 +54,14 @@ NPC_SEEDS = [
         "agent_id": "10013",
         "name": "mark",
         "display_name": "Mark",
-        "occupation": "clerk_reviewer",
+        "occupation": "external_dish_reviewer",
         "home_location_code": "RECORD_HALL",
         "work_location_code": "RECORD_HALL",
         "social_location_code": "VILLAGE_SQUARE",
         "personality_traits": ["rational", "restrained", "responsible", "cautious"],
-        "personal_goal": "公开筹集修桥资金并维持村庄秩序",
+        "personal_goal": "作为村庄从外部聘请的品鉴师，独立、公正地评价真实菜品；由村庄公共资金承担每日固定工资",
         "capabilities": BASE_ACTIONS + [
-            "RATE_DISH", "PUBLISH_PRICE_INDEX", "AUDIT_PUBLIC_FUND",
-            "INSPECT_RATEABLE_DISHES", "INSPECT_PUBLIC_ECONOMY_STATE",
+            "RATE_DISH", "INSPECT_RATEABLE_DISHES",
         ],
         "money": 120,
         "items": [(1019, 3)],
@@ -97,7 +95,7 @@ NPC_SEEDS = [
         "personality_traits": ["shrewd", "practical", "persuasive", "controlling"],
         "personal_goal": "恢复商路并建立可信的村庄供货网络",
         "capabilities": BASE_ACTIONS + [
-            "IMPORT_GOODS", "EXPORT_GOODS", "CONTACT_CARAVAN", "WITHDRAW_STORE_FUNDS", "DEPOSIT_STORE_FUNDS", "WITHDRAW_STORE_ITEM", "SET_STORE_LIMITS",
+            "IMPORT_GOODS", "EXPORT_GOODS", "CONTACT_CARAVAN", "CONTACT_EMERGENCY_CARAVAN", "WITHDRAW_STORE_FUNDS", "DEPOSIT_STORE_FUNDS", "WITHDRAW_STORE_ITEM", "SET_STORE_LIMITS",
             "LIST_STORE_ITEM", "UPDATE_STORE_PRICE", "DELIST_STORE_ITEM",
             "INSPECT_MARKET_STATE",
             "INSPECT_CARAVAN_REQUESTS",
@@ -120,10 +118,11 @@ LOCATION_SEEDS = [
     ("BUTCHER_YARD", "Jack 屠宰棚", (-49, 1, 20), "work", 4),
     ("EMERGENCY_TRADE_POST", "林边应急商队接货点", (-94.98, 2.4783, 38.74), "market", 3),
     ("FOREST_EDGE", "森林边缘", (-81, 3, 40), "resource", 8),
+    ("FOREST_LOGGING", "西侧伐木林", (-118, 2.42818, 43), "resource", 8),
     ("HUNTING_GATE", "猎场入口", (-91, 4, 47), "offmap_gate", 2),
     ("RIVER_EAST", "东侧河道", (69, -1, 0), "boundary", 0),
-    ("OLD_BRIDGE", "旧桥", (69, 0, 0), "story", 3),
-    ("REPAIR_YARD", "修桥料场", (48, 0, -11), "story_work", 8),
+    ("OLD_BRIDGE", "旧桥", (61.98, -0.6, -0.13), "story", 3),
+    ("REPAIR_YARD", "修桥料场", (45.26, 0, -10.31), "story_work", 8),
     ("TRADE_ROAD", "外部商路", (92, 0, 0), "offmap_gate", 4),
 ]
 

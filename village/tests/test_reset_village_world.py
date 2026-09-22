@@ -4,14 +4,24 @@ import uuid
 from account.models import GameAccount
 from django.core.management import call_command
 from django.core.management.base import CommandError
+from django.db import connection
 from django.test import TestCase, override_settings
+from django.utils import timezone
 
 from game_time.models import GlobalGameTimeState
-from inventory.models import NpcDefinition, NpcGlobalInventory, NpcGlobalInventorySlot
+from inventory.models import (BagTemplate, BagTemplateSlot, EnvActionReceipt, InventoryBag, InventorySlot,
+                              NpcDefinition, NpcGlobalInventory, NpcGlobalInventorySlot, PlayerCollectionPoint,
+                              CollectionPoint)
+from cooking.models import PityCounter
+from leaderboard.models import LeaderboardEntry, PendingReward, ReportEvent
+from player.models import DefaultRecipe, PlayerRecipe, PlayerState, PlayerTitle
+from restaurant.models import (PlayerRestaurantState, MenuItem, DailyBusinessLog,
+                               CustomerTransaction, RestaurantHourlySlot, RestaurantSaleEvent)
 from items.models import Item
 from marketplace.models import MarketListing, MarketListingSource, MarketTransaction
 from village.models import (
     NpcActionReservation,
+    NpcCommandState,
     NpcCookingCounter,
     NpcDialogueSession,
     NpcRelationship,
@@ -31,8 +41,19 @@ from village.models import (
     VillageStoreInventorySlot,
     VillageStoreListing,
     VillageWorldEvent,
+    VillageAffair,
+    VillagePlayerActionReceipt,
+    VillagePlayerContribution,
+    VillagePlayerAffairLabor,
+    VillagePersonalCommission,
+    VillagePersonalCommissionEscrow,
+    VillagePersonalCommissionReceipt,
+    VillageWildlife,
+    VillageHuntAttempt,
+    VillageWildlifeReceipt,
 )
 from village.management.commands.reset_village_world import (
+    FORMAL_NPC_INITIAL_BALANCE,
     GENERAL_STORE_INITIAL_BALANCE,
     GENERAL_STORE_INITIAL_STOCK,
     PUBLIC_FUND_INITIAL_BALANCE,
@@ -67,9 +88,13 @@ class ResetVillageWorldTests(TestCase):
                     "item_description": seed["item_description"],
                     "item_price": seed["item_price"],
                     "collectable": seed["collectable"],
+                    "max_use_count": seed.get("max_use_count", 1),
                 },
             )
         call_command("seed_village_v1", stdout=StringIO())
+        template = BagTemplate.objects.create(character_id="player", money=123)
+        BagTemplateSlot.objects.create(template=template, slot_index=0, item_id=4001, item_amount=1, hide_in_shop=True)
+        DefaultRecipe.objects.create(recipe_name="reset-default-recipe")
 
     def test_reset_restores_world_and_preserves_feature_flags(self):
         config = VillageSimulationConfig.objects.get(config_key="default")
@@ -271,7 +296,7 @@ class ResetVillageWorldTests(TestCase):
         self.assertEqual(len(plots), len(FARM_PLOT_SEEDS))
         self.assertEqual(
             (len(empty_plots), len(half_grown_plots), len(mature_plots)),
-            (12, 12, 12),
+            (18, 9, 9),
         )
         for plot in empty_plots:
             self.assertEqual(plot.crop_code, "")
@@ -301,7 +326,10 @@ class ResetVillageWorldTests(TestCase):
         bill_runtime = NpcRuntimeState.objects.get(npc__agent_id="10011")
         config.refresh_from_db()
         public_fund = VillageAccount.objects.get(account_code="PUBLIC_FUND")
-        self.assertEqual((bill_bag.money, bill_bag.asset_version), (200, 0))
+        self.assertEqual(
+            (bill_bag.money, bill_bag.asset_version),
+            (FORMAL_NPC_INITIAL_BALANCE, 0),
+        )
         self.assertEqual(
             (
                 public_fund.balance,
@@ -342,8 +370,8 @@ class ResetVillageWorldTests(TestCase):
         self.assertTrue(VillageDishReview.objects.filter(pk=test_review.pk).exists())
         self.assertTrue(MarketListing.objects.filter(pk=test_listing.pk).exists())
         self.assertTrue(MarketTransaction.objects.filter(pk=test_transaction.pk).exists())
-        self.assertTrue(MarketListing.objects.filter(pk=player_listing.pk).exists())
-        self.assertTrue(MarketTransaction.objects.filter(pk=player_transaction.pk).exists())
+        self.assertFalse(MarketListing.objects.filter(pk=player_listing.pk).exists())
+        self.assertFalse(MarketTransaction.objects.filter(pk=player_transaction.pk).exists())
 
         self.assertEqual(
             VillageStoreAccount.objects.get(store_id="GENERAL_STORE").balance,
@@ -392,11 +420,19 @@ class ResetVillageWorldTests(TestCase):
         # 二跑复盘 R6：摘要只写重置时刻真实存在的事实。
         self.assertIn("2026-03-08 07:00", reset_event.hub_summary)
         self.assertIn("FARM_PLOT_A", reset_event.hub_summary)
-        self.assertIn("12 块空置", reset_event.hub_summary)
-        self.assertIn("12 块生长至一半", reset_event.hub_summary)
-        self.assertIn("12 块可收获", reset_event.hub_summary)
-        self.assertIn("Bill 200", reset_event.hub_summary)
-        self.assertIn("Nora 450", reset_event.hub_summary)
+        self.assertIn("18 块空置（其中 9 块可租）", reset_event.hub_summary)
+        self.assertIn("9 块生长至一半", reset_event.hub_summary)
+        self.assertIn("9 块可收获", reset_event.hub_summary)
+        self.assertIn("Bill 2000", reset_event.hub_summary)
+        self.assertIn("Nora 2000", reset_event.hub_summary)
+        self.assertEqual(
+            set(
+                NpcGlobalInventory.objects.filter(
+                    npc__agent_id__in={seed["agent_id"] for seed in NPC_SEEDS}
+                ).values_list("money", flat=True)
+            ),
+            {FORMAL_NPC_INITIAL_BALANCE},
+        )
         self.assertIn(f"公共基金 {PUBLIC_FUND_INITIAL_BALANCE}", reset_event.hub_summary)
         # 剧情 arc 此刻已删，不得在摘要里声称具体剧情阶段。
         self.assertNotIn("AFTERMATH", reset_event.hub_summary)
@@ -412,6 +448,147 @@ class ResetVillageWorldTests(TestCase):
         self.assertTrue(config.village_economy_enabled)
         self.assertTrue(config.village_social_enabled)
         self.assertTrue(config.village_story_enabled)
+
+    def _create_current_progress(self):
+        player = GameAccount.objects.create(username="full-reset-player", password="keep-password",
+                                            appearance={"test": "keep-appearance"}, appearance_revision=4)
+        state = PlayerState.objects.create(player_id=str(player.pk), action_points=7, action_points_max=2000,
+                                           current_season_id="old-season")
+        PlayerRecipe.objects.create(player=state, recipe_name="old-recipe")
+        PlayerTitle.objects.create(player=state, title_id="old-title", title_name="old")
+        bag = InventoryBag.objects.create(player=player, character_id=player.username)
+        InventoryBag.objects.filter(pk=bag.pk).update(money=9999)
+        InventorySlot.objects.create(bag=bag, slot_index=0, item_id=4001, item_amount=3, remaining_uses=1)
+        EnvActionReceipt.objects.create(player=player, request_id="old-gift", action="character_trade",
+                                        response_data={"success": True})
+        VillagePlayerActionReceipt.objects.create(player=player, request_id=uuid.uuid4(), payload_hash="a"*64,
+            action="buy_store", response={"success": True}, world_minute=100)
+        VillagePlayerContribution.objects.create(player=player, request_id=uuid.uuid4(), kind="material",
+            item_id=1002, quantity=3, earned_gold=20, world_minute=100)
+
+        bill = NpcDefinition.objects.get(agent_id="10011")
+        command = NpcCommandState.objects.create(npc=bill, message_id=uuid.uuid4(), request_id=uuid.uuid4(),
+            sender_id="test", recipient_id="10011", kind="HUNT", payload_sha256="a"*64, status="RUNNING")
+        prey = VillageWildlife.objects.create(prey_id=uuid.uuid4(), species="PIG", region_id="HUNTING_GROUNDS",
+            position={"x": 1}, status="CLAIMED", claim_version=1, born_world_minute=100)
+        VillageHuntAttempt.objects.create(attempt_id=uuid.uuid4(), prey=prey, actor_type="NPC", actor_id="10011",
+            command=command, claim_version=1, started_world_minute=100)
+        VillageWildlifeReceipt.objects.create(request_id=uuid.uuid4(), payload_hash="b"*64,
+            response={"success": True}, world_minute=100)
+        commission = VillagePersonalCommission.objects.create(publisher=bill, title="old commission", status="ACTIVE",
+            actor_type="PLAYER", actor_id=str(player.pk), reward_gold=80, reserved_reward_gold=80, escrow_gold=30,
+            opened_world_minute=100, expires_world_minute=200, created_request_id=uuid.uuid4())
+        VillagePersonalCommissionEscrow.objects.create(commission=commission, condition_id="wood", item_id=1002,
+            quantity=2, source_instance_id=uuid.uuid4(), batch_snapshot={"quality": 4})
+        VillagePersonalCommissionReceipt.objects.create(commission=commission, actor_type="PLAYER", actor_id=str(player.pk),
+            request_id=uuid.uuid4(), action="CONTRIBUTE", payload_hash="c"*64, response={}, world_minute=100)
+        VillagePlayerAffairLabor.objects.create(player=player, commission=commission, authority_session_id=uuid.uuid4(),
+            location_code="BILL_FARM", accumulated_minutes=12, last_world_minute=100, last_time_revision=2,
+            last_seen_at=timezone.now())
+
+        clock = GlobalGameTimeState.get_instance()
+        clock.apply_world_minute(clock.world_minute + 14400)
+        clock.time_revision = 123
+        clock.save()
+        VillageFarmPlot.objects.filter(plot_code="FARM_PLOT_D_01").update(lessee_player=player,
+            leased_world_minute=clock.world_minute, lease_ends_world_minute=clock.world_minute+1440,
+            lease_price_paid=50, lease_grace_minutes=2, lease_expiry_notified=True, plot_version=7,
+            status="GROWING", crop_code="CORN", batch_id=uuid.uuid4(),
+            planted_world_minute=clock.world_minute, mature_world_minute=clock.world_minute+500)
+        VillageAffair.objects.filter(pk="FARM_IRRIGATION").update(status="COMPLETED", version=12)
+        return player
+
+    def test_full_reset_clears_protected_history_and_recreates_initial_world(self):
+        player = self._create_current_progress()
+        call_command("reset_village_world", "--confirm", "RESET_WUXI_VILLAGE", stdout=StringIO())
+        for model in (VillageHuntAttempt, VillageWildlife, VillageWildlifeReceipt, NpcCommandState,
+                      VillagePersonalCommission, VillagePersonalCommissionEscrow, VillagePersonalCommissionReceipt,
+                      VillagePlayerAffairLabor, VillagePlayerActionReceipt, VillagePlayerContribution, EnvActionReceipt):
+            self.assertFalse(model.objects.exists(), model.__name__)
+        for code in ("BRIDGE_REPAIR", "FARM_IRRIGATION"):
+            affair = VillageAffair.objects.get(pk=code)
+            self.assertEqual(affair.status, "ACTIVE")
+            self.assertFalse(any(affair.progress["conditions"].values()))
+        clock = GlobalGameTimeState.get_instance()
+        self.assertEqual((clock.game_year, clock.game_month, clock.game_day, clock.game_hour, clock.game_minute,
+                          clock.time_revision), (2026, 3, 8, 7, 0, 0))
+        plot = VillageFarmPlot.objects.get(plot_code="FARM_PLOT_D_01")
+        self.assertEqual((plot.status, plot.crop_code, plot.plot_version, plot.lease_price_paid), ("EMPTY", "", 0, 0))
+        self.assertIsNone(plot.lessee_player_id)
+        self.assertIsNone(plot.leased_world_minute)
+        self.assertIsNone(plot.lease_ends_world_minute)
+        self.assertIsNone(plot.batch_id)
+        self.assertFalse(plot.lease_expiry_notified)
+        self.assertEqual(plot.lease_grace_minutes, VillageSimulationConfig.objects.get(config_key="default").farm_grace_minutes)
+        player.refresh_from_db()
+        self.assertEqual((player.password, player.appearance_revision), ("keep-password", 4))
+        self.assertEqual(player.appearance, {"test": "keep-appearance"})
+        self.assertEqual(
+            NpcGlobalInventory.objects.get(npc__agent_id="10011").money,
+            FORMAL_NPC_INITIAL_BALANCE,
+        )
+        # The whole reset is repeatable after the bridge and water canal have been rebuilt.
+        call_command("reset_village_world", "--confirm", "RESET_WUXI_VILLAGE", stdout=StringIO())
+        self.assertEqual(VillageAffair.objects.filter(pk__in=("BRIDGE_REPAIR", "FARM_IRRIGATION")).count(), 2)
+
+    def test_player_assets_progress_and_pending_income_return_to_defaults(self):
+        player = self._create_current_progress()
+        point = CollectionPoint.objects.create(collect_type="reset-point", name="test")
+        PlayerCollectionPoint.objects.create(player=player, collection_point=point, current_level=8)
+        PityCounter.objects.create(player=player, count_6=90)
+        PlayerRestaurantState.objects.create(player=player, current_level=8, total_gold_earned=400)
+        MenuItem.objects.create(player=player, instance_id=str(uuid.uuid4()), item_id=1002, item_name="old", quantity=20)
+        daily = DailyBusinessLog.objects.create(player=player)
+        sale = CustomerTransaction.objects.create(player=player, daily_log=daily, game_day=3, customer_name="old",
+                                                   item_id=1002, item_name="old")
+        hour = RestaurantHourlySlot.objects.create(player=player, game_year=2026, game_month=3, game_day=9, game_hour=10)
+        RestaurantSaleEvent.objects.create(slot=hour, scheduled_minute=20, transaction=sale)
+        PendingReward.objects.create(player_id=str(player.pk), reward_id="old-reward", rewards=[{"gold": 999}])
+        ReportEvent.objects.create(player_id=str(player.pk), event_type="old")
+        LeaderboardEntry.objects.create(character_id=str(player.pk), board_type="total_wealth", season_id="old", score=9999)
+
+        call_command("reset_village_world", "--confirm", "RESET_WUXI_VILLAGE", stdout=StringIO())
+        state = PlayerState.objects.get(player_id=str(player.pk))
+        self.assertEqual((state.action_points, state.action_points_max, state.current_season_id), (200, 1000, ""))
+        self.assertEqual(list(state.recipes.values_list("recipe_name", flat=True)), ["reset-default-recipe"])
+        self.assertFalse(state.titles.exists())
+        bag = InventoryBag.objects.get(player=player, character_id=player.username)
+        self.assertEqual(bag.money, 123)
+        slot = bag.slots.get()
+        self.assertEqual((slot.item_id, slot.item_amount, slot.remaining_uses, slot.hide_in_shop), (4001, 1, 20, True))
+        for model in (PlayerCollectionPoint, PityCounter, PlayerRestaurantState, MenuItem, DailyBusinessLog,
+                      CustomerTransaction, RestaurantHourlySlot, RestaurantSaleEvent, PendingReward, ReportEvent, LeaderboardEntry):
+            self.assertFalse(model.objects.exists(), model.__name__)
+
+    def test_dry_run_rolls_back_all_new_state_and_player_assets(self):
+        self._create_current_progress()
+
+        def snapshot():
+            with connection.cursor() as cursor:
+                result = {}
+                for table in connection.introspection.table_names():
+                    cursor.execute(f"SELECT * FROM {connection.ops.quote_name(table)}")
+                    result[table] = sorted(cursor.fetchall(), key=repr)
+                return result
+
+        before = snapshot()
+        call_command("reset_village_world", "--dry-run", stdout=StringIO())
+        self.assertEqual(snapshot(), before)
+
+    def test_missing_player_template_fails_before_mutating_progress(self):
+        player = self._create_current_progress()
+        BagTemplate.objects.filter(character_id="player").delete()
+        with self.assertRaisesMessage(CommandError, "player 背包模板"):
+            call_command("reset_village_world", "--confirm", "RESET_WUXI_VILLAGE", stdout=StringIO())
+        self.assertEqual(InventoryBag.objects.get(player=player).money, 9999)
+        self.assertTrue(VillageHuntAttempt.objects.exists())
+        self.assertTrue(VillageFarmPlot.objects.filter(lessee_player=player).exists())
+
+    @override_settings(DEPLOYMENT_ENV="production")
+    def test_production_rejects_apply_and_dry_run(self):
+        for arguments in (("--confirm", "RESET_WUXI_VILLAGE"), ("--dry-run",)):
+            with self.assertRaisesMessage(CommandError, "正式环境禁止"):
+                call_command("reset_village_world", *arguments, stdout=StringIO())
 
     def test_confirmation_and_dry_run_are_safe(self):
         with self.assertRaises(CommandError):

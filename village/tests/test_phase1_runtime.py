@@ -380,35 +380,38 @@ class CommandServiceTest(TestCase):
         self.assertEqual(code, ResultCode.COMMAND_ACCEPTED)
         self.assertIsNotNone(cmd)
 
-    def test_accept_command_unknown_action(self):
+    def test_accept_command_unknown_or_retired_action(self):
         """未知动作应拒绝"""
-        content = {
-            "schema_version": "village.command.v1",
-            "id": str(uuid.uuid4()),
-            "request_id": str(uuid.uuid4()),
-            "name": "invalid_action",
-            "params": {},
-            "queue_mode": "STRICT",
-            "expected_state_version": 10,
-            "ttl_ms": 30000,
-        }
+        for action in ("invalid_action", "WAIT"):
+            with self.subTest(action=action):
+                content = {
+                    "schema_version": "village.command.v1",
+                    "id": str(uuid.uuid4()),
+                    "request_id": str(uuid.uuid4()),
+                    "name": action,
+                    "params": {},
+                    "queue_mode": "STRICT",
+                    "expected_state_version": 10,
+                    "ttl_ms": 30000,
+                }
 
-        ok, code, cmd = CommandService.accept_command(
-            envelope_id=str(uuid.uuid4()),
-            sender="10011",
-            recipient="env-001",
-            content=content,
-            timestamp_ms=int(time.time() * 1000),
-        )
-        self.assertFalse(ok)
-        self.assertEqual(code, ResultCode.UNKNOWN_ACTION)
+                ok, code, cmd = CommandService.accept_command(
+                    envelope_id=str(uuid.uuid4()),
+                    sender="10011",
+                    recipient="env-001",
+                    content=content,
+                    timestamp_ms=int(time.time() * 1000),
+                )
+                self.assertFalse(ok)
+                self.assertEqual(code, ResultCode.UNKNOWN_ACTION)
+                self.assertIsNone(cmd)
 
     def test_accept_command_rejects_unconfigured_action(self):
         content = {
             "schema_version": "village.command.v1",
             "id": str(uuid.uuid4()),
             "request_id": str(uuid.uuid4()),
-            "name": "WAIT",
+            "name": "REST",
             "params": {},
             "queue_mode": "STRICT",
             "expected_state_version": 10,

@@ -14,7 +14,7 @@ from .models import NpcCookingCounter, VillageDishReview, VillageAccount
 from .phase3_asset_service import (_ok, _fail, add_batch, consume_fefo, get_available_slot_amount,
                                   deterministic_rng, BATCH_ITEM_ATTRIBUTES)
 from .phase3_catalog import RECIPE_WHITELIST, DISH_SPOILAGE_MINUTES
-from .public_finance import mark_unavailable, pay_daily_salary
+from .public_finance import mark_unavailable
 
 
 def _pity(npc, quality, seconds, standard, rng):
@@ -38,6 +38,43 @@ def _pity(npc, quality, seconds, standard, rng):
     return quality, seconds
 
 
+def _missing_ingredients(inventory, recipe, minute):
+    missing = []
+    for ingredient in recipe.ingredients.all():
+        slots = inventory.slots.select_for_update().filter(item_id=ingredient.item_id, item_amount__gt=0)
+        available = sum(get_available_slot_amount(s, minute) for s in slots)
+        if available < ingredient.count:
+            missing.append(dict(item_id=ingredient.item_id, item_name=ingredient.item_name,
+                required=ingredient.count, available=available, shortage=ingredient.count - available))
+    if missing:
+        return _fail("P3_INSUFFICIENT_ITEM", data={"recipe_id": recipe.pk,
+            "recipe_name": recipe.recipe_name, "missing_items": missing,
+            "items_consumed": [], "failure_kind": "MISSING_INGREDIENTS",
+            "retry_condition": "所列缺料均补齐为本人背包中的可用材料后，才可重试此配方。",
+            "instruction": "材料未补齐时不要重复调用同一配方；可采购缺料、选择材料足够的其他配方，或等待补货。仅时间流逝不会补齐材料。"})
+    return None
+
+
+@transaction.atomic
+def cook_preflight(npc_id, params, minute):
+    """Reject unavailable recipes before starting the timed physical action."""
+    if str(npc_id) != "10014":
+        return _fail("P3_FORBIDDEN_ACTOR")
+    recipe_id = params.get("recipe_id")
+    if type(recipe_id) is not int or recipe_id not in RECIPE_WHITELIST:
+        return _fail("P3_RECIPE_NOT_ALLOWED")
+    recipe = Recipe.objects.prefetch_related("ingredients").filter(pk=recipe_id).first()
+    if recipe is None or not recipe.ingredients.all() or recipe.output_quantity < 1 or not Item.objects.filter(
+        item_id=recipe.item_id, is_deleted=False,
+    ).exists():
+        return _fail("P3_RECIPE_NOT_ALLOWED")
+    inventory = NpcGlobalInventory.objects.select_for_update().get(npc__agent_id=str(npc_id))
+    failure = _missing_ingredients(inventory, recipe, minute)
+    if failure:
+        failure["data"]["tool_error"] = {"executed": False, "automatic_retry_safe": False}
+    return failure
+
+
 def cook(npc_id, params, minute, request_id):
     if str(npc_id) != "10014":
         return _fail("P3_FORBIDDEN_ACTOR")
@@ -56,19 +93,10 @@ def cook(npc_id, params, minute, request_id):
         item = Item.objects.filter(item_id=recipe.item_id, is_deleted=False).first()
         if item is None:
             return _fail("P3_RECIPE_NOT_ALLOWED")
-        missing = []
-        for ingredient in ingredients:
-            slots = inventory.slots.select_for_update().filter(item_id=ingredient.item_id, item_amount__gt=0)
-            available = sum(get_available_slot_amount(s, minute) for s in slots)
-            if available < ingredient.count:
-                missing.append(dict(item_id=ingredient.item_id, item_name=ingredient.item_name,
-                    required=ingredient.count, available=available, shortage=ingredient.count - available))
-        if missing:
-            # Validate all ingredients while holding the inventory lock, before consuming any.
-            # The command may already have spent time running, so do not claim executed=false.
-            return _fail("P3_INSUFFICIENT_ITEM", data={"recipe_id": recipe.pk,
-                "recipe_name": recipe.recipe_name, "missing_items": missing,
-                "items_consumed": [], "failure_kind": "MISSING_INGREDIENTS"})
+        # Recheck at settlement: ingredients may have expired or been used since start.
+        failure = _missing_ingredients(inventory, recipe, minute)
+        if failure:
+            return failure
         inputs = []
         for ingredient in ingredients:
             try:
@@ -228,11 +256,8 @@ def rate_dish(npc_id, params, minute, request_id):
     inventory.save(update_fields=["asset_version", "updated_at"])
     changes = {"dish_rated": dict(review_id=str(row.pk), status=row.status, item_id=slot.item_id, food_instance_id=str(slot.instance_id),
         overall_score=score, rating_price=slot.rating_price, scores=scores, comment=comment)}
-    account = VillageAccount.objects.select_for_update().get(account_code="PUBLIC_FUND")
-    mark = NpcGlobalInventory.objects.select_for_update().get(npc__agent_id="10013")
-    pay_daily_salary(account, mark, changes, minute, request_id)
     return _ok(data=changes["dish_rated"], effects=changes, participant_npc_ids=["10013", str(row.owner.agent_id)], event_visibility="PARTICIPANTS",
-        external_delta=0, asset_versions={"10013": mark.asset_version, str(row.owner.agent_id): inventory.asset_version})
+        external_delta=0, asset_versions={str(row.owner.agent_id): inventory.asset_version})
 
 
 def pending_reviews(npc, minute, review_id=None):

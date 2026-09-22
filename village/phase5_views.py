@@ -63,12 +63,4 @@ def story_action_complete(request):
 @authentication_classes([EnvServerJWTAuthentication])
 @permission_classes([IsAuthenticated])
 def story_meeting_settle(request, meeting_id):
-    try:
-        result = settle_story_meeting(
-            uuid.UUID(str(meeting_id)),
-            expected_story_version=request.data.get("expected_story_version"),
-            request_id=request.data.get("request_id"),
-        )
-    except (TypeError, ValueError):
-        return Response({"result_code": "STORY_ACTION_INVALID"}, status=400)
-    return _response(result)
+    return _response({"status": "REJECTED", "result_code": "ACTION_RETIRED"})

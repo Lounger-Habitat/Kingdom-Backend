@@ -10,6 +10,9 @@ sys.stderr.reconfigure(encoding="utf-8")
 
 def main():
     os.environ.setdefault("DJANGO_SETTINGS_MODULE", "config.settings")
+    # Reset (including --dry-run) must never start schedulers outside its transaction.
+    if len(sys.argv) > 1 and sys.argv[1] == "reset_village_world":
+        os.environ["DISABLE_BACKGROUND_SCHEDULERS"] = "True"
 
     # 从 server_config.json 读取默认 host/port
     config_path = Path(__file__).resolve().parent / "server_config.json"

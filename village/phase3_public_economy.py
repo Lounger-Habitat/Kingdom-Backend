@@ -1,7 +1,7 @@
 """Phase 3 public economy actions: Nora, Lucy, Mark, EAT, COMMUNITY_MEAL.
 
-Handlers for IMPORT_GOODS, EXPORT_GOODS, RATE_DISH, PUBLISH_PRICE_INDEX,
-AUDIT_PUBLIC_FUND, EAT, and COMMUNITY_MEAL.
+Handlers for IMPORT_GOODS, EXPORT_GOODS, RATE_DISH, EAT, and COMMUNITY_MEAL.
+Legacy public-finance handlers reject retired actions.
 
 Each handler follows the signature:
     (npc_id, params, world_minute, request_id) -> dict
@@ -42,7 +42,7 @@ from .phase3_contract import (
     DeliveryStatus,
     ResultCode,
 )
-from .public_finance import mark_unavailable, pay_daily_salary, public_fund_delta, reconcile
+from .public_finance import mark_unavailable, public_fund_delta, reconcile
 
 
 # ── Food whitelist for EAT ───────────────────────────────────────────────────
@@ -91,19 +91,6 @@ def _get_published_price(item_id: int) -> int:
     return prices.get(str(item_id), BASE_PRICES.get(item_id, 10))
 
 
-# ── Mark salary helper ───────────────────────────────────────────────────────
-
-
-def _pay_mark_salary(
-    account: VillageAccount,
-    mark_inv: NpcGlobalInventory,
-    changes: Dict[str, Any],
-    world_minute: int,
-    request_id: uuid.UUID,
-) -> bool:
-    return pay_daily_salary(account, mark_inv, changes, world_minute, request_id)
-
-
 # ── IMPORT_GOODS ─────────────────────────────────────────────────────────────
 
 
@@ -124,118 +111,15 @@ def handle_rate_dish(
 # ── PUBLISH_PRICE_INDEX ──────────────────────────────────────────────────────
 
 
-def handle_publish_price_index(
-    npc_id: int,
-    params: Dict[str, Any],
-    world_minute: int,
-    request_id: uuid.UUID,
-) -> Dict[str, Any]:
-    """Mark publishes daily price index.
-
-    - Actor 10013, location RECORD_HALL
-    - Change DRAFT -> PUBLISHED for specified day_index
-    - Earn one daily meal-reference salary from PUBLIC_FUND
-    """
-    day_index = params.get("day_index")
-    if not isinstance(day_index, int) or isinstance(day_index, bool) or day_index != world_minute // 1440:
-        return _fail(ResultCode.P3_INVALID_PARAMS)
-    unavailable = mark_unavailable(world_minute)
-    if unavailable:
-        return _fail(unavailable)
-
-    with transaction.atomic():
-        # Lock account and mark_inv
-        try:
-            account = VillageAccount.objects.select_for_update().get(account_code="PUBLIC_FUND")
-        except VillageAccount.DoesNotExist:
-            return _fail(ResultCode.P3_INVALID_PARAMS)
-
-        mark_inv = NpcGlobalInventory.objects.select_for_update().get(
-            npc__agent_id="10013"
-        )
-
-        # Find the DRAFT snapshot
-        try:
-            snapshot = DailyPriceSnapshot.objects.select_for_update().get(
-                day_index=day_index,
-                status=DaySnapshotStatus.DRAFT,
-            )
-        except DailyPriceSnapshot.DoesNotExist:
-            current_status = DailyPriceSnapshot.objects.filter(day_index=day_index).values_list("status", flat=True).first()
-            return _fail(ResultCode.P3_PRICE_UNAVAILABLE, data={"day_index": day_index,
-                         "price_index_status": current_status or "MISSING", "query_action": "INSPECT_PUBLIC_ECONOMY_STATE"})
-
-        # Publish
-        snapshot.status = DaySnapshotStatus.PUBLISHED
-        snapshot.published_by_npc_id = npc_id
-        snapshot.published_world_minute = world_minute
-        snapshot.save(update_fields=[
-            "status", "published_by_npc_id", "published_world_minute",
-        ])
-
-        # Pay Mark salary
-        changes: Dict[str, Any] = {
-            "price_published": {
-                "day_index": day_index,
-                "prices": snapshot.prices,
-            },
-        }
-        _pay_mark_salary(account, mark_inv, changes, world_minute, request_id)
-
-    return _ok(
-        asset_versions={"10013": mark_inv.asset_version},
-        effects=changes,
-        external_delta=0,
-    )
+def handle_publish_price_index(npc_id, params, world_minute, request_id):
+    return _fail("ACTION_RETIRED")
 
 
 # ── AUDIT_PUBLIC_FUND ────────────────────────────────────────────────────────
 
 
-def handle_audit_public_fund(
-    npc_id: int,
-    params: Dict[str, Any],
-    world_minute: int,
-    request_id: uuid.UUID,
-) -> Dict[str, Any]:
-    """Mark audits public fund.
-
-    - Actor 10013, location RECORD_HALL
-    - Recalculate expected balance from ledger
-    - Compare with actual VillageAccount.balance
-    - Write audit event
-    - Earn one daily meal-reference salary from PUBLIC_FUND
-    """
-    day_index = params.get("day_index")
-    if not isinstance(day_index, int) or isinstance(day_index, bool) or day_index != world_minute // 1440:
-        return _fail(ResultCode.P3_INVALID_PARAMS)
-    unavailable = mark_unavailable(world_minute)
-    if unavailable:
-        return _fail(unavailable)
-
-    with transaction.atomic():
-        # Lock account and mark_inv
-        try:
-            account = VillageAccount.objects.select_for_update().get(account_code="PUBLIC_FUND")
-        except VillageAccount.DoesNotExist:
-            return _fail(ResultCode.P3_INVALID_PARAMS)
-
-        mark_inv = NpcGlobalInventory.objects.select_for_update().get(
-            npc__agent_id="10013"
-        )
-
-        # Recalculate expected balance from all ledger entries
-        # Pay Mark salary
-        changes: Dict[str, Any] = {
-            "audit": {"day_index": day_index, "balance_timing": "BEFORE_THIS_SALARY_PAYMENT", **reconcile(account)},
-        }
-        _pay_mark_salary(account, mark_inv, changes, world_minute, request_id)
-
-    return _ok(
-        asset_versions={"10013": mark_inv.asset_version},
-        effects=changes,
-        external_delta=0,
-    )
+def handle_audit_public_fund(npc_id, params, world_minute, request_id):
+    return _fail("ACTION_RETIRED")
 
 
 def _public_fund_money_delta(entry) -> int:

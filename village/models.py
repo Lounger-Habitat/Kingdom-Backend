@@ -87,6 +87,29 @@ class NpcProfile(models.Model):
         return f"{self.display_name} ({self.npc.agent_id})"
 
 
+class NpcDailyRecord(models.Model):
+    """Agent-authored text; each NPC owns one schedule and diary per game day."""
+
+    id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
+    npc = models.ForeignKey("inventory.NpcDefinition", on_delete=models.CASCADE, related_name="daily_records")
+    game_day = models.PositiveBigIntegerField("游戏日索引")
+    kind = models.CharField("记录类型", max_length=8, choices=[("SCHEDULE", "日程"), ("DIARY", "日记")])
+    content = models.TextField("正文", max_length=4000)
+    version = models.PositiveBigIntegerField("版本", default=1)
+    created_world_minute = models.PositiveBigIntegerField("创建世界分钟")
+    updated_world_minute = models.PositiveBigIntegerField("修改世界分钟")
+
+    class Meta:
+        verbose_name = "NPC 每日记录"
+        verbose_name_plural = "NPC 每日记录"
+        ordering = ["-game_day"]
+        constraints = [
+            models.UniqueConstraint(fields=["npc", "game_day", "kind"], name="npc_daily_record_unique"),
+            models.CheckConstraint(condition=models.Q(version__gte=1), name="npc_daily_record_version_positive"),
+            models.CheckConstraint(condition=models.Q(kind__in=["SCHEDULE", "DIARY"]), name="npc_daily_record_kind_valid"),
+        ]
+
+
 class NpcSubjectiveGoalState(models.Model):
     """Agent-authored current goal, separate from profile and action goals."""
 
@@ -137,15 +160,27 @@ class VillageSimulationConfig(models.Model):
     """Phase-gated village configuration. Phase zero seeds every flag as off."""
 
     config_key = models.CharField(max_length=32, unique=True, default="default")
+    action_epoch = models.UUIDField(default=uuid.uuid4, editable=False)
     tick_interval_seconds = models.PositiveIntegerField(default=5)
     hub_command_timeout_seconds = models.PositiveIntegerField(default=30)
     command_queue_limit = models.PositiveIntegerField(default=8)
     day_start_minute = models.PositiveIntegerField(default=360)
     day_close_minute = models.PositiveIntegerField(default=1320)
+    mark_daily_salary = models.PositiveIntegerField(default=100, verbose_name="Mark每日工资（金币）")
+    mark_employed_from_minute = models.BigIntegerField(null=True, blank=True, verbose_name="Mark聘用生效世界分钟",
+        help_text="空值表示未聘用；从生效日开始在日结支付固定工资，旧制欠薪不补发。")
     max_catchup_days = models.PositiveIntegerField(default=3)
     village_simulation_enabled = models.BooleanField(default=False)
     village_needs_enabled = models.BooleanField(default=False)
     village_economy_enabled = models.BooleanField(default=False)
+    farm_leasing_enabled = models.BooleanField(default=True)
+    farm_daily_price = models.PositiveIntegerField(default=10)
+    farm_min_days = models.PositiveIntegerField(default=1)
+    farm_max_days = models.PositiveIntegerField(default=30)
+    farm_max_plots = models.PositiveIntegerField(default=3)
+    farm_grace_minutes = models.PositiveIntegerField(default=1440)
+    farm_plant_action_cost = models.PositiveIntegerField(default=5)
+    farm_harvest_action_cost = models.PositiveIntegerField(default=5)
     village_direct_trade_enabled = models.BooleanField(default=False)
     village_social_enabled = models.BooleanField(default=False)
     village_story_enabled = models.BooleanField(default=False)
@@ -156,9 +191,10 @@ class VillageSimulationConfig(models.Model):
     debug_logs_enabled = models.BooleanField(default=False)
     story_fixed_seed = models.CharField(max_length=128, default="village-story-v1")
     story_repair_fund_target = models.PositiveIntegerField(default=500)
-    story_repair_wood_target = models.PositiveIntegerField(default=10)
+    story_repair_wood_target = models.PositiveIntegerField(default=100)
     story_repair_metal_target = models.PositiveIntegerField(default=4)
-    story_repair_labor_target = models.PositiveIntegerField(default=24)
+    story_repair_labor_target = models.PositiveIntegerField(default=20)
+    story_repair_meal_target = models.PositiveIntegerField(default=20)
     story_public_trust_minimum = models.SmallIntegerField(default=20)
     story_latest_day = models.PositiveIntegerField(default=25)
     caravan_normal_capacity = models.PositiveIntegerField(default=60)
@@ -181,6 +217,10 @@ class VillageSimulationConfig(models.Model):
 
     def clean(self):
         from items.models import Item
+        if not 1 <= self.farm_min_days <= self.farm_max_days <= 30:
+            raise ValidationError({"farm_max_days": "租期必须满足 1 ≤ 最少天数 ≤ 最多天数 ≤ 30。"})
+        if self.farm_daily_price < 1 or self.farm_max_plots < 1:
+            raise ValidationError("田地日租金和个人承租上限必须为正数。")
         for field in ("caravan_item_ids", "caravan_export_item_ids"):
             values = getattr(self, field)
             if not isinstance(values, list) or any(type(i) is not int for i in values):
@@ -204,7 +244,6 @@ class VillageActionDurationConfig(models.Model):
 
     ACTION_METADATA = {
         "MOVE": ("阶段一", "移动", "前往指定地点；以寻路到达为准，仅“导航超时（秒）”生效。"),
-        "WAIT": ("阶段一", "等待", "原地等待；使用“时长（世界分钟）”。"),
         "GO_HOME": ("阶段一", "回家", "返回 NPC 住所；以寻路到达为准，仅“导航超时（秒）”生效。"),
         "EAT": ("阶段二", "进食", "进食并结算饥饿值；使用配置的世界分钟时长。"),
         "REST": ("阶段二", "休息", "在家或餐厅休息；Agent 可指定正整数时长，省略时使用此配置。"),
@@ -213,7 +252,8 @@ class VillageActionDurationConfig(models.Model):
         "WORK_PLACEHOLDER": ("阶段二", "工作", "在工作地点执行工作；Agent 可指定正整数时长，省略时使用此配置。"),
         "PLANT": ("阶段三", "播种", "在 Bill 农田播种；使用“时长（世界分钟）”。"),
         "HARVEST": ("阶段三", "收获", "在 Bill 农田收获；使用“时长（世界分钟）”。"),
-        "HUNT": ("阶段三", "狩猎", "在狩猎入口狩猎；使用“时长（世界分钟）”。"),
+        "HUNT": ("阶段三", "狩猎", "追猎真实动物；时长为狩猎期限（世界分钟），到时不自动获得物品。"),
+        "CHOP_TREE": ("阶段三", "砍树", "前往西侧森林砍倒一棵树获取木材；时长为期限，到期不会自动产出。"),
         "PROCESS_GAME": ("阶段三", "处理猎物", "Jack在屠宰棚处理一件猎物；时长必须由数据库配置。"),
         "COOK": ("阶段三", "烹饪", "在餐厅烹饪；使用“时长（世界分钟）”。"),
         "CREATE_ORDER": ("阶段三", "创建订单", "创建交易订单；使用“时长（世界分钟）”。"),
@@ -231,6 +271,7 @@ class VillageActionDurationConfig(models.Model):
         "RATE_DISH": ("阶段三", "菜品评分", "在档案馆为菜品评分；使用“时长（世界分钟）”。"),
         "PUBLISH_PRICE_INDEX": ("阶段三", "发布价格指数", "在档案馆发布当日价格指数；使用“时长（世界分钟）”。"),
         "AUDIT_PUBLIC_FUND": ("阶段三", "审计公款", "在档案馆审计公共资金；使用“时长（世界分钟）”。"),
+        "GIVE_ITEMS": ("阶段三", "赠送物品", "向附近玩家或正式NPC单向赠送个人背包物品或钱包金币。"),
         "PROPOSE_TRADE": ("阶段三", "发起交易报价", "向指定 NPC 发起结构化定向报价；使用“时长（世界分钟）”。"),
         "RESPOND_TRADE": ("阶段三", "响应交易报价", "接受或拒绝交易报价；使用“时长（世界分钟）”。"),
         "CANCEL_TRADE_OFFER": ("阶段三", "取消交易报价", "发起方取消待处理报价；使用“时长（世界分钟）”。"),
@@ -254,7 +295,6 @@ class VillageActionDurationConfig(models.Model):
     ACTION_CHOICES = [(action, f"{label}（{action}）") for action, (_, label, _) in ACTION_METADATA.items()]
     NAVIGATION_ACTIONS = frozenset({"MOVE", "GO_HOME"})
     DEFAULT_DURATIONS = {
-        "WAIT": 1,
         "EAT": 30,
         "REST": 30,
         "SLEEP": 30,
@@ -278,6 +318,7 @@ class VillageActionDurationConfig(models.Model):
         "RATE_DISH": 30,
         "PUBLISH_PRICE_INDEX": 30,
         "AUDIT_PUBLIC_FUND": 30,
+        "GIVE_ITEMS": 1,
         "PROPOSE_TRADE": 1,
         "RESPOND_TRADE": 1,
         "CANCEL_TRADE_OFFER": 1,
@@ -303,7 +344,7 @@ class VillageActionDurationConfig(models.Model):
         "GO_HOME": 180,
     }
 
-    DATABASE_ONLY_DURATIONS = frozenset({"HUNT", "PROCESS_GAME"})
+    DATABASE_ONLY_DURATIONS = frozenset({"HUNT", "PROCESS_GAME", "CHOP_TREE"})
 
     @classmethod
     def timed_actions(cls):
@@ -384,14 +425,12 @@ class NpcRuntimeState(models.Model):
     GOAL_CHOICES = [
         ("NONE", "无目标"),
         ("MOVE", "移动"),
-        ("WAIT", "等待"),
         ("GO_HOME", "回家"),
     ]
 
     ACTION_CHOICES = [
         ("", "无"),
         ("MOVE", "移动"),
-        ("WAIT", "等待"),
         ("GO_HOME", "回家"),
     ]
 
@@ -549,11 +588,12 @@ class NpcSocialDailyCounter(models.Model):
 
 
 class VillageCommunityMealDailyUsage(models.Model):
-    """Locked per-day community meal quota, including each NPC's use count."""
+    """Locked daily meal quota shared by NPCs and authenticated players."""
 
     day_index = models.BigIntegerField(unique=True)
     total_meals = models.PositiveIntegerField(default=0)
     npc_usage = models.JSONField(default=dict, blank=True)
+    player_usage = models.JSONField(default=dict, blank=True)
     updated_at = models.DateTimeField(auto_now=True)
 
     class Meta:
@@ -565,13 +605,13 @@ class VillageCommunityMealDailyUsage(models.Model):
                 condition=models.Q(day_index__gte=0),
             ),
             models.CheckConstraint(
-                name="community_meal_total_at_most_five",
-                condition=models.Q(total_meals__gte=0, total_meals__lte=5),
+                name="community_meal_total_at_most_ten",
+                condition=models.Q(total_meals__gte=0, total_meals__lte=10),
             ),
         ]
 
     def __str__(self):
-        return f"community meals day={self.day_index}: {self.total_meals}/5"
+        return f"community meals day={self.day_index}: {self.total_meals}/10"
 
 
 class NpcCommandState(models.Model):
@@ -610,6 +650,7 @@ class NpcCommandState(models.Model):
     target_id = models.CharField("目标ID", max_length=64, blank=True, default="")
     location_code = models.CharField("地点码", max_length=64, blank=True, default="")
     sanitized_parameters = models.JSONField("清洗后参数", default=dict, blank=True)
+    agent_execution = models.JSONField(default=dict, blank=True)
     production_state = models.JSONField("后台生产规则与占用快照", default=dict, blank=True)
     payload_sha256 = models.CharField("Payload SHA256", max_length=64)
     queue_mode = models.CharField("队列模式", max_length=16, choices=QUEUE_MODE_CHOICES, default="STRICT")
@@ -986,6 +1027,15 @@ class VillageFarmPlot(models.Model):
     """A single farm plot on the village."""
 
     plot_code = models.CharField("地块代码", max_length=32, unique=True)
+    lease_enabled = models.BooleanField("开放出租", default=False)
+    lessee_player = models.ForeignKey("account.GameAccount", on_delete=models.PROTECT,
+        null=True, blank=True, related_name="leased_farm_plots")
+    leased_world_minute = models.BigIntegerField(null=True, blank=True)
+    lease_ends_world_minute = models.BigIntegerField(null=True, blank=True)
+    lease_grace_minutes = models.PositiveIntegerField(default=1440)
+    lease_price_paid = models.PositiveIntegerField(default=0)
+    lease_expiry_notified = models.BooleanField(default=False)
+    plot_version = models.PositiveBigIntegerField(default=0)
     status = models.CharField("状态", max_length=16, default="EMPTY")
     # EMPTY / GROWING / MATURE
     batch_id = models.UUIDField("批次ID", null=True, blank=True, unique=True)
@@ -1400,7 +1450,7 @@ class VillageStoreListing(models.Model):
             models.CheckConstraint(
                 name="village_store_listing_valid_price",
                 condition=(models.Q(unit_price__gt=0, public_meal_code="", subsidy_decision__isnull=True)
-                           | models.Q(unit_price=0, public_meal_code__in=["C1", "C2", "R1"], subsidy_decision__isnull=False)),
+                           | models.Q(unit_price=0, public_meal_code__in=["C1", "C2", "R1"])),
             ),
         ]
 
@@ -1729,6 +1779,47 @@ class PlayerStoryFactAccess(models.Model):
 # ============================================================================
 
 
+class VillageAffair(models.Model):
+    """Independent public work; requirements are frozen when an affair appears."""
+
+    code = models.CharField(max_length=64, primary_key=True)
+    kind = models.CharField(max_length=32, default="RESOURCE_PROJECT")
+    title = models.CharField(max_length=100)
+    status = models.CharField(max_length=16, default="PREPARING")
+    requirements = models.JSONField(default=dict)
+    progress = models.JSONField(default=dict)
+    locations = models.JSONField(default=list)
+    opened_world_minute = models.BigIntegerField()
+    completed_world_minute = models.BigIntegerField(null=True, blank=True)
+    version = models.PositiveBigIntegerField(default=0)
+
+    class Meta:
+        verbose_name = "村庄事务"
+        verbose_name_plural = "村庄事务"
+
+    def __str__(self):
+        return f"{self.title}（{self.code}）"
+
+
+class VillageAffairContribution(models.Model):
+    affair = models.ForeignKey(VillageAffair, on_delete=models.PROTECT, related_name="contributions")
+    request_id = models.UUIDField()
+    condition_id = models.CharField(max_length=64, blank=True, default="")
+    actor_type = models.CharField(max_length=16)
+    actor_id = models.CharField(max_length=100)
+    kind = models.CharField(max_length=16)
+    item_id = models.PositiveIntegerField(default=0)
+    quantity = models.PositiveIntegerField()
+    world_minute = models.BigIntegerField()
+
+    class Meta:
+        verbose_name = "事务贡献记录"
+        verbose_name_plural = "事务贡献记录"
+        constraints = [models.UniqueConstraint(
+            fields=["affair", "request_id", "condition_id", "kind", "item_id"], name="village_affair_contribution_once",
+        )]
+
+
 class VillageStoryArc(models.Model):
     PHASE_CHOICES = [(value.value, value.value) for value in StoryPhase]
     PLAN_CHOICES = [(value.value, value.value) for value in StoryPlan]
@@ -1802,10 +1893,10 @@ class VillageStoryMeeting(models.Model):
 
 
 class VillagePublicDecision(models.Model):
-    """An immutable copy of the proposal actually approved by a meeting."""
+    """System-configured public authorization; meeting links are historical only."""
 
     decision_id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
-    meeting = models.OneToOneField(VillageStoryMeeting, on_delete=models.PROTECT, related_name="decision")
+    meeting = models.OneToOneField(VillageStoryMeeting, on_delete=models.PROTECT, related_name="decision", null=True, blank=True)
     plan_code = models.CharField(max_length=32)
     terms = models.JSONField(default=dict)
     approved_world_minute = models.BigIntegerField()
@@ -1817,13 +1908,18 @@ class VillagePublicDecision(models.Model):
 class MarkDailySalary(models.Model):
     """One frozen daily entitlement; only real public funds can settle it."""
 
-    day_index = models.PositiveIntegerField(unique=True)
+    day_index = models.PositiveIntegerField()
+    policy = models.CharField(max_length=24, default="LEGACY", choices=[
+        ("LEGACY", "旧制历史记录（不补发）"), ("EXTERNAL_REVIEWER", "外聘品鉴师日薪")])
     amount_due = models.PositiveIntegerField()
     amount_paid = models.PositiveIntegerField(default=0)
     reference = models.JSONField(default=dict)
     earned_request_id = models.UUIDField(unique=True)
     earned_world_minute = models.BigIntegerField()
     paid_world_minute = models.BigIntegerField(null=True, blank=True)
+
+    class Meta:
+        constraints = [models.UniqueConstraint(fields=["day_index", "policy"], name="mark_salary_day_policy_unique")]
 
 
 class VillageProjectReview(models.Model):
@@ -1869,7 +1965,7 @@ class VillageStoryTransitionReceipt(models.Model):
 
 class VillageRouteAttempt(models.Model):
     route_attempt_id = models.UUIDField(primary_key=True, editable=False)
-    arc = models.ForeignKey(VillageStoryArc, on_delete=models.CASCADE, related_name="route_attempts")
+    arc = models.ForeignKey(VillageStoryArc, on_delete=models.SET_NULL, related_name="route_attempts", null=True, blank=True)
     request_id = models.UUIDField(unique=True)
     frozen_input = models.JSONField(default=dict)
     seed = models.CharField(max_length=128)
@@ -1915,3 +2011,205 @@ class VillageStoreInventorySlotDish(DishFields):
 
 class VillageStoreInventorySlotReview(ReviewFields):
     owner = models.OneToOneField(VillageStoreInventorySlot, on_delete=models.CASCADE, primary_key=True, related_name="review")
+
+
+class VillagePlayerActionReceipt(models.Model):
+    player = models.ForeignKey("account.GameAccount", on_delete=models.PROTECT)
+    request_id = models.UUIDField()
+    payload_hash = models.CharField(max_length=64)
+    action = models.CharField(max_length=32)
+    response = models.JSONField(default=dict)
+    world_minute = models.BigIntegerField()
+    created_at = models.DateTimeField(auto_now_add=True)
+
+    class Meta:
+        constraints = [models.UniqueConstraint(fields=["player", "request_id"], name="player_action_request_unique")]
+
+
+class VillagePlayerContribution(models.Model):
+    """Permanent settlement ledger; totals never depend on a recent-event window."""
+    player = models.ForeignKey("account.GameAccount", on_delete=models.PROTECT)
+    request_id = models.UUIDField()
+    kind = models.CharField(max_length=16)
+    item_id = models.PositiveIntegerField()
+    quantity = models.PositiveIntegerField()
+    earned_gold = models.PositiveIntegerField(default=0)
+    world_minute = models.BigIntegerField()
+    batches = models.JSONField(default=list)
+
+    class Meta:
+        constraints = [models.UniqueConstraint(fields=["player", "request_id"], name="player_contribution_request_unique")]
+
+
+class VillagePlayerAffairLabor(models.Model):
+    """A continuous, online work session attested by the trusted Env server."""
+    labor_id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
+    player = models.ForeignKey("account.GameAccount", on_delete=models.PROTECT)
+    affair = models.ForeignKey("VillageAffair", on_delete=models.PROTECT, null=True, blank=True)
+    commission = models.ForeignKey("VillagePersonalCommission", on_delete=models.PROTECT, null=True, blank=True)
+    condition_id = models.CharField(max_length=64, default="legacy_labor")
+    unit_minutes = models.PositiveIntegerField(default=60)
+    authority_session_id = models.UUIDField()
+    status = models.CharField(max_length=16, default="ACTIVE")
+    location_code = models.CharField(max_length=64)
+    accumulated_minutes = models.PositiveIntegerField(default=0)
+    completed_units = models.PositiveIntegerField(default=0)
+    last_world_minute = models.BigIntegerField()
+    last_time_revision = models.BigIntegerField()
+    last_seen_at = models.DateTimeField()
+    stop_reason = models.CharField(max_length=64, blank=True, default="")
+
+    class Meta:
+        constraints = [models.UniqueConstraint(fields=["player"], condition=models.Q(status="ACTIVE"),
+                                               name="player_one_active_affair_labor"),
+                       models.CheckConstraint(condition=(models.Q(affair__isnull=False, commission__isnull=True)
+                            | models.Q(affair__isnull=True, commission__isnull=False)),
+                            name="player_labor_exactly_one_target")]
+
+
+class VillagePersonalCommission(models.Model):
+    """Immutable NPC promise, with separate reward and delivery escrow."""
+    commission_id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
+    publisher = models.ForeignKey("inventory.NpcDefinition", on_delete=models.PROTECT, related_name="personal_commissions")
+    title = models.CharField(max_length=100)
+    description = models.TextField(blank=True, default="")
+    requirements = models.JSONField(default=dict)
+    locations = models.JSONField(default=list)
+    progress = models.JSONField(default=dict)
+    status = models.CharField(max_length=16, default="OPEN", db_index=True)
+    actor_type = models.CharField(max_length=8, blank=True, default="")
+    actor_id = models.CharField(max_length=100, blank=True, default="")
+    reward_gold = models.PositiveIntegerField()
+    reserved_reward_gold = models.PositiveIntegerField()
+    escrow_gold = models.PositiveIntegerField(default=0)
+    opened_world_minute = models.BigIntegerField()
+    expires_world_minute = models.BigIntegerField()
+    completed_world_minute = models.BigIntegerField(null=True, blank=True)
+    created_request_id = models.UUIDField()
+    version = models.PositiveBigIntegerField(default=1)
+
+    class Meta:
+        verbose_name = "NPC 个人委托"
+        verbose_name_plural = "NPC 个人委托"
+        constraints = [
+            models.UniqueConstraint(fields=["publisher", "created_request_id"], name="personal_commission_publish_once"),
+            models.CheckConstraint(condition=models.Q(reserved_reward_gold__lte=models.F("reward_gold")), name="commission_reward_bounded"),
+            models.CheckConstraint(condition=~models.Q(status="ACTIVE") | models.Q(actor_type="PLAYER"),
+                                   name="commission_active_player_only"),
+        ]
+
+
+class VillagePersonalCommissionEscrow(models.Model):
+    """An immutable copy of each real delivery batch until transfer/refund."""
+    commission = models.ForeignKey(VillagePersonalCommission, on_delete=models.PROTECT, related_name="escrow_batches")
+    condition_id = models.CharField(max_length=64)
+    item_id = models.PositiveIntegerField()
+    quantity = models.PositiveIntegerField()
+    source_instance_id = models.UUIDField()
+    batch_snapshot = models.JSONField(default=dict)
+    status = models.CharField(max_length=16, default="HELD")
+
+    class Meta:
+        verbose_name = "个人委托托管物品"
+        verbose_name_plural = "个人委托托管物品"
+
+
+class VillagePersonalCommissionReceipt(models.Model):
+    commission = models.ForeignKey(VillagePersonalCommission, on_delete=models.PROTECT, related_name="receipts")
+    actor_type = models.CharField(max_length=8)
+    actor_id = models.CharField(max_length=100)
+    request_id = models.UUIDField()
+    action = models.CharField(max_length=16)
+    payload_hash = models.CharField(max_length=64)
+    response = models.JSONField(default=dict)
+    world_minute = models.BigIntegerField()
+    created_at = models.DateTimeField(auto_now_add=True)
+
+    class Meta:
+        verbose_name = "个人委托操作记录"
+        verbose_name_plural = "个人委托操作记录"
+        constraints = [models.UniqueConstraint(fields=["actor_type", "actor_id", "request_id"], name="personal_commission_request_once")]
+
+
+class VillageWildlife(models.Model):
+    """One immutable animal life; a respawn must use a new prey_id."""
+    prey_id = models.UUIDField(primary_key=True)
+    species = models.CharField(max_length=16)
+    region_id = models.CharField(max_length=64)
+    position = models.JSONField(default=dict)
+    status = models.CharField(max_length=24, default="ALIVE")
+    claim_version = models.PositiveIntegerField(default=0)
+    active_attempt_id = models.UUIDField(null=True, blank=True)
+    born_world_minute = models.BigIntegerField()
+    death_world_minute = models.BigIntegerField(null=True, blank=True)
+    updated_at = models.DateTimeField(auto_now=True)
+
+
+class VillageHuntAttempt(models.Model):
+    attempt_id = models.UUIDField(primary_key=True)
+    prey = models.ForeignKey(VillageWildlife, on_delete=models.PROTECT, related_name="attempts")
+    actor_type = models.CharField(max_length=8)
+    actor_id = models.CharField(max_length=100)
+    command = models.ForeignKey(NpcCommandState, null=True, blank=True, on_delete=models.PROTECT)
+    claim_version = models.PositiveIntegerField()
+    status = models.CharField(max_length=16, default="ACTIVE")
+    started_world_minute = models.BigIntegerField()
+    completed_world_minute = models.BigIntegerField(null=True, blank=True)
+    result = models.JSONField(default=dict)
+
+    class Meta:
+        constraints = [
+            models.UniqueConstraint(fields=["actor_type", "actor_id"], condition=models.Q(status="ACTIVE"), name="wildlife_one_active_actor"),
+            models.UniqueConstraint(fields=["prey"], condition=models.Q(status="ACTIVE"), name="wildlife_one_active_prey"),
+            models.UniqueConstraint(fields=["prey"], condition=models.Q(status="SUCCEEDED"), name="wildlife_one_reward_per_life"),
+        ]
+
+
+class VillageWildlifeReceipt(models.Model):
+    request_id = models.UUIDField(primary_key=True)
+    payload_hash = models.CharField(max_length=64)
+    response = models.JSONField(default=dict)
+    world_minute = models.BigIntegerField()
+
+
+class VillageTreeNode(models.Model):
+    """A stable authored tree position; each generation can yield wood once."""
+    node_id = models.UUIDField(primary_key=True)
+    species = models.CharField(max_length=16)
+    position = models.JSONField(default=dict)
+    generation = models.PositiveIntegerField(default=1)
+    status = models.CharField(max_length=16, default="STANDING")
+    claim_version = models.PositiveIntegerField(default=0)
+    active_attempt_id = models.UUIDField(null=True, blank=True)
+    felled_world_minute = models.BigIntegerField(null=True, blank=True)
+    regrow_world_minute = models.BigIntegerField(null=True, blank=True)
+
+
+class VillageChopAttempt(models.Model):
+    attempt_id = models.UUIDField(primary_key=True)
+    node = models.ForeignKey(VillageTreeNode, on_delete=models.PROTECT, related_name="attempts")
+    generation = models.PositiveIntegerField()
+    claim_version = models.PositiveIntegerField()
+    actor_type = models.CharField(max_length=8)
+    actor_id = models.CharField(max_length=100)
+    command = models.ForeignKey(NpcCommandState, null=True, blank=True, on_delete=models.PROTECT)
+    status = models.CharField(max_length=16, default="ACTIVE")
+    started_world_minute = models.BigIntegerField()
+    completed_world_minute = models.BigIntegerField(null=True, blank=True)
+    wood_amount = models.PositiveIntegerField()
+    result = models.JSONField(default=dict)
+
+    class Meta:
+        constraints = [
+            models.UniqueConstraint(fields=["actor_type", "actor_id"], condition=models.Q(status="ACTIVE"), name="forestry_one_active_actor"),
+            models.UniqueConstraint(fields=["node"], condition=models.Q(status="ACTIVE"), name="forestry_one_active_tree"),
+            models.UniqueConstraint(fields=["node", "generation"], condition=models.Q(status="SUCCEEDED"), name="forestry_one_reward_per_growth"),
+            models.UniqueConstraint(fields=["command"], condition=models.Q(status="SUCCEEDED", command__isnull=False), name="forestry_one_reward_per_command"),
+        ]
+
+
+class VillageForestryReceipt(models.Model):
+    request_id = models.UUIDField(primary_key=True)
+    payload_hash = models.CharField(max_length=64)
+    response = models.JSONField(default=dict)
+    world_minute = models.BigIntegerField()

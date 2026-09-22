@@ -71,12 +71,16 @@ FARM_SEED_ITEM_DEFINITIONS = {
 }
 
 
-def farm_crop_catalog():
+def farm_crop_catalog(irrigation=None):
     """Serializable crop rules exposed by farm snapshots and agent queries."""
+    from .farm_irrigation import effective_growth_minutes, project_irrigation
+    if irrigation is None:
+        irrigation = project_irrigation()
     return {
         crop_code: {
             "crop_code": crop_code,
             **rule,
+            "growth_minutes": effective_growth_minutes(rule["growth_minutes"], irrigation),
         }
         for crop_code, rule in FARM_CROP_RULES.items()
     }

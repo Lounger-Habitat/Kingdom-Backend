@@ -62,6 +62,10 @@ class LifeActionServiceTests(TestCase):
         result = LifeActionService.execute(payload)
         self.assertTrue(result["success"], result)
         self.assertEqual(NpcCommandState.objects.get(command_id=payload["command_id"]).completed_world_minute, 7)
+        from village.models import VillageDeliveryOutbox
+        timing = VillageDeliveryOutbox.objects.get(command_id=payload["command_id"], message_kind="OUTCOME").payload["data"]
+        self.assertEqual(timing["actual_duration_minutes"], 7)
+        self.assertEqual(timing["planned_duration_minutes"], 7)
         self.slot.refresh_from_db()
         self.assertEqual(self.slot.item_amount, 0)
         self.assertEqual(LifeActionService.execute(payload)["result_code"], ResultCode.COMMAND_REPLAYED)
@@ -97,6 +101,10 @@ class LifeActionServiceTests(TestCase):
         self.assertTrue(result["success"], result)
         self.assertEqual(result["result_code"], ResultCode.SLEEP_INTERRUPTED)
         self.assertEqual((result["slept_minutes"], result["remaining_minutes"]), (180, 300))
+        from village.models import VillageDeliveryOutbox
+        timing = VillageDeliveryOutbox.objects.get(command_id=payload["command_id"], message_kind="OUTCOME").payload["data"]
+        self.assertEqual(timing["actual_duration_minutes"], 180)
+        self.assertEqual(timing["planned_duration_minutes"], 480)
         self.runtime.refresh_from_db()
         self.assertEqual((self.runtime.action_status, self.runtime.active_command_id), ("IDLE", None))
         self.assertEqual(NpcNeedsDaySummary.objects.get(npc=self.npc, day_index=0).sleep_minutes, 180)

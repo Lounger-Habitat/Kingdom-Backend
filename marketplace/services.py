@@ -481,7 +481,9 @@ def _create_listing_for_owner(owner, instance_id, amount, price, *, expected_ass
     if price * amount - commission <= 0 and owner["kind"] != "system":
         return None, "价格过低，手续费后收入为0"
 
-    item = Item.objects.filter(item_id=slot.item_id).first()
+    item = Item.objects.filter(item_id=slot.item_id, is_deleted=False).first()
+    if item is None:
+        return None, "物品不存在或已停用"
     listing = MarketListing.objects.create(
         **_listing_identity_fields(owner),
         **_get_item_snapshot_fields(slot, amount),
@@ -587,6 +589,8 @@ def _buy_listing_for_owner(buyer_owner, listing_id, amount, *, expected_asset_ve
     if listing.status != MarketListingStatus.ACTIVE:
         return None, "挂单不在出售中状态"
     batch = _listing_batch(listing)
+    if not Item.objects.filter(pk=listing.item_id, is_deleted=False).exists():
+        return None, "物品不存在或已停用"
     if batch.get("freshnessUnknown"):
         return None, "挂单物品保质期来源未核实，暂不能成交"
     expiry = batch.get("expiresWorldMinute")

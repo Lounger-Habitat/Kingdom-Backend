@@ -1,6 +1,216 @@
 {
   "actions": [
     {
+      "name": "WRITE_SCHEDULE",
+      "phase": "阶段一",
+      "label": "写每日日程",
+      "description": "根据当前游戏时间、你已知的情况、适用于你的游戏规则，以及今天想做的事情，安排并保存这一天的日程。用文字写清各时段准备做什么，可以用具体时间，也可以用上午、下午、晚上等大致时段。考虑身体状态、现有资源、地点、行动耗时和营业时间，为吃饭、休息、移动、社交及睡眠留出合适时间。一天已经开始时，从当前时间安排剩余活动。影响安排的信息不清楚时，按需查询 GET_RULE、OBSERVE 或相关业务指令；不编造条件，也不要求把每个时段排满。默认记录当天；当天已有日程时先查询，再用 UPDATE_SCHEDULE 调整。保存后由你自主行动，日程不会自动执行。",
+      "parameters": {
+        "type": "object",
+        "properties": {
+          "game_date": {
+            "type": "string",
+            "format": "date",
+            "description": "记录所属的游戏日期，YYYY-MM-DD；新建和详情查询省略时默认当天。"
+          },
+          "content": {
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 4000,
+            "description": "这一天的完整日程文字，以时段或时间组织准备进行的活动；可以留空闲，修改时提交调整后的全文。"
+          }
+        },
+        "required": [
+          "content"
+        ],
+        "additionalProperties": false
+      }
+    },
+    {
+      "name": "INSPECT_SCHEDULE",
+      "phase": "查询",
+      "label": "查看日程",
+      "description": "查看自己某个游戏日的日程，回顾今天原本如何安排，帮助决定接下来做什么或调整剩余活动。默认读取当天，指定 game_date 可读取其他日期，使用 view=list 浏览历史日期目录。返回正文与创建、修改时间。日程表达预期安排，实际做了什么应根据行动回执和日记判断；当前情况变化时可以修改日程。",
+      "parameters": {
+        "type": "object",
+        "properties": {
+          "game_date": {
+            "type": "string",
+            "format": "date",
+            "description": "记录所属的游戏日期，YYYY-MM-DD；新建和详情查询省略时默认当天。"
+          },
+          "view": {
+            "type": "string",
+            "enum": [
+              "detail",
+              "list"
+            ],
+            "description": "默认detail读某日全文；list按日期倒序分页，与game_date互斥。"
+          },
+          "before_date": {
+            "type": "string",
+            "format": "date",
+            "description": "仅list：读取此日期之前的记录；续页使用返回的next_before_date。"
+          },
+          "limit": {
+            "type": "integer",
+            "minimum": 1,
+            "maximum": 50,
+            "description": "仅list：每页条数，默认10，最多50。"
+          }
+        },
+        "required": [],
+        "additionalProperties": false
+      }
+    },
+    {
+      "name": "UPDATE_SCHEDULE",
+      "phase": "阶段一",
+      "label": "修改日程",
+      "description": "根据当前时间和新情况调整某个游戏日已有的日程。当活动比预计更久、资源不足、身体需要休息，或出现临时事情时，可以重新安排尚未进行的活动。先读取原日程，再提交完整的新日程；保留仍适用的安排，重要变化可简要注明原因。只需提交 game_date 和 content，新正文会完整替换该日原文。当天已过去的安排无需改写成实际结果，实际经历记入日记。修改只更新日程文字，正在执行的游戏行动仍由原有行动指令管理。",
+      "parameters": {
+        "type": "object",
+        "properties": {
+          "game_date": {
+            "type": "string",
+            "format": "date",
+            "description": "记录所属的游戏日期，YYYY-MM-DD；新建和详情查询省略时默认当天。"
+          },
+          "content": {
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 4000,
+            "description": "这一天的完整日程文字，以时段或时间组织准备进行的活动；可以留空闲，修改时提交调整后的全文。"
+          }
+        },
+        "required": [
+          "content",
+          "game_date"
+        ],
+        "additionalProperties": false
+      }
+    },
+    {
+      "name": "WRITE_DIARY",
+      "phase": "阶段一",
+      "label": "写日记",
+      "description": "回顾并保存你在某个游戏日的经历，帮助自己之后记住做过什么、发生了什么，以及有哪些事情需要继续处理。可以在完成一段活动、发生值得记录的事情或准备结束当天活动时使用，由你自行决定。根据你的实际观察、收到的消息和行动回执，用自己的口吻写清主要经历、实际结果、失败或未完成的事项；也可以记录感受、经验和对后续安排的想法。区分亲历、听说、推测和感受；正在执行或尚未确认结果的事情应注明，计划中的事情不能写成已经完成。不确定的细节注明未知，不编造经历。不传 game_date 默认记录当前游戏日，补写过去的经历时指定对应日期；该日已有日记时先查询，再用 UPDATE_DIARY 补充。提交完整正文后保存，Unity 客户端可查看。",
+      "parameters": {
+        "type": "object",
+        "properties": {
+          "game_date": {
+            "type": "string",
+            "format": "date",
+            "description": "记录所属的游戏日期，YYYY-MM-DD；新建和详情查询省略时默认当天。"
+          },
+          "content": {
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 4000,
+            "description": "该游戏日的完整日记，记录实际经历、结果、未完成事项及感受；区分事实与推测，修改时提交合并后的全文。"
+          }
+        },
+        "required": [
+          "content"
+        ],
+        "additionalProperties": false
+      }
+    },
+    {
+      "name": "INSPECT_DIARIES",
+      "phase": "查询",
+      "label": "查看日记",
+      "description": "查看自己保存的日记，回顾过去的经历、实际结果、经验和未完成事项，为继续行动、安排日程或补充日记提供参考。默认读取当前游戏日；指定 game_date 读取该日全文及创建、修改时间，使用 view=list 按日期分页浏览历史。日记反映记录时的经历和认识，可能包含个人感受或不完整的信息；决定当前行动时，如有必要应重新查询环境。没有日记表示尚未记录，不代表那一天什么也没发生。",
+      "parameters": {
+        "type": "object",
+        "properties": {
+          "game_date": {
+            "type": "string",
+            "format": "date",
+            "description": "记录所属的游戏日期，YYYY-MM-DD；新建和详情查询省略时默认当天。"
+          },
+          "view": {
+            "type": "string",
+            "enum": [
+              "detail",
+              "list"
+            ],
+            "description": "默认detail读某日全文；list按日期倒序分页，与game_date互斥。"
+          },
+          "before_date": {
+            "type": "string",
+            "format": "date",
+            "description": "仅list：读取此日期之前的记录；续页使用返回的next_before_date。"
+          },
+          "limit": {
+            "type": "integer",
+            "minimum": 1,
+            "maximum": 50,
+            "description": "仅list：每页条数，默认10，最多50。"
+          }
+        },
+        "required": [],
+        "additionalProperties": false
+      }
+    },
+    {
+      "name": "UPDATE_DIARY",
+      "phase": "阶段一",
+      "label": "修改日记",
+      "description": "补充或修正某个游戏日已有的日记。当当天又发生新的事情、之前等待的结果得到确认，或发现原文有遗漏和错误时，可以使用。先读取该日日记，再提交合并补充、修正后的完整正文，保留仍然准确的经历；纠正重要误记时简要说明原先未知或误解的情况。区分当时的经历和后来确认的信息，不把另一日发生的事情记成本日经历，也不把尚未完成的计划写成已经完成。只需提交 game_date 和 content，新正文会完整替换该日原文；允许修改过去日期，记录仍归原游戏日，环境另行保存实际修改时间。",
+      "parameters": {
+        "type": "object",
+        "properties": {
+          "game_date": {
+            "type": "string",
+            "format": "date",
+            "description": "记录所属的游戏日期，YYYY-MM-DD；新建和详情查询省略时默认当天。"
+          },
+          "content": {
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 4000,
+            "description": "该游戏日的完整日记，记录实际经历、结果、未完成事项及感受；区分事实与推测，修改时提交合并后的全文。"
+          }
+        },
+        "required": [
+          "content",
+          "game_date"
+        ],
+        "additionalProperties": false
+      }
+    },
+    {
+      "name": "CHOP_TREE",
+      "phase": "阶段三",
+      "label": "砍树",
+      "description": "寻路并砍倒一棵真实树木取得木材，全地图树木均可采伐。仅Jack可执行。省略node_id时选择最近的空闲可达树；深处树可能需先清除外层树，超时或中断不产出。",
+      "parameters": {
+        "type": "object",
+        "properties": {
+          "node_id": {
+            "type": "string",
+            "format": "uuid",
+            "description": "可选的树位ID；省略时自动寻找可砍树。"
+          }
+        },
+        "required": [],
+        "additionalProperties": false
+      }
+    },
+    {
+      "name": "INSPECT_LIVING_OPTIONS",
+      "phase": "查询",
+      "label": "查看生活资源",
+      "description": "远程查询成品食物和公共餐的商店、地点、营业状态、价格与购买限制，以及自己的休息和睡眠地点。只返回公开资源摘要和本人资格，不返回他人私产或商品批次；详细库存和listing_id仍须到店INSPECT_STORE_INVENTORY。available表示满足当前资源条件，执行仍需到场并复核。",
+      "parameters": {
+        "type": "object",
+        "properties": {},
+        "required": [],
+        "additionalProperties": false
+      }
+    },
+    {
       "name": "MOVE",
       "phase": "阶段一",
       "label": "移动",
@@ -30,23 +240,6 @@
             ]
           }
         ]
-      }
-    },
-    {
-      "name": "WAIT",
-      "phase": "阶段一",
-      "label": "等待",
-      "description": "原地等待；可指定正整数世界分钟时长，省略时使用后端配置；执行结果在 duration_minutes 字段返回实际消耗。",
-      "parameters": {
-        "type": "object",
-        "properties": {
-          "duration_minutes": {
-            "type": "integer",
-            "description": "等待时长（世界分钟）",
-            "minimum": 1
-          }
-        },
-        "required": []
       }
     },
     {
@@ -123,46 +316,6 @@
       }
     },
     {
-      "name": "SOCIALIZE",
-      "phase": "阶段二",
-      "label": "社交",
-      "description": "与另一名 NPC 社交；可指定正整数世界分钟时长，省略时使用后端配置。",
-      "parameters": {
-        "type": "object",
-        "properties": {
-          "target_npc_id": {
-            "type": "string",
-            "description": "目标NPC ID"
-          },
-          "duration_minutes": {
-            "type": "integer",
-            "description": "社交时长（世界分钟）",
-            "minimum": 1
-          }
-        },
-        "required": [
-          "target_npc_id"
-        ]
-      }
-    },
-    {
-      "name": "WORK_PLACEHOLDER",
-      "phase": "阶段二",
-      "label": "工作",
-      "description": "在工作地点执行工作；可指定正整数世界分钟时长，省略时使用后端配置。",
-      "parameters": {
-        "type": "object",
-        "properties": {
-          "duration_minutes": {
-            "type": "integer",
-            "description": "工作时长（世界分钟）",
-            "minimum": 1
-          }
-        },
-        "required": []
-      }
-    },
-    {
       "name": "PLANT",
       "phase": "阶段三",
       "label": "播种",
@@ -213,7 +366,7 @@
       "name": "HUNT",
       "phase": "阶段三",
       "label": "狩猎",
-      "description": "在HUNTING_GATE狩猎，获得1只待处理鸡、猪或牛；需可用猎具和健康体力。时长仅由数据库决定。同日第二次及以后另扣配置的精力。去BUTCHER_YARD处理后才得到肉类。",
+      "description": "从HUNTING_GATE进入共享猎场，追击并击杀真实动物后获得1只对应待处理猎物；需可用猎具和健康体力。数据库时长为追猎期限，到时不自动产物。同日第二次及以后另扣配置的精力。去BUTCHER_YARD处理后才得到肉类。",
       "parameters": {
         "type": "object",
         "properties": {
@@ -257,7 +410,7 @@
       "name": "COOK",
       "phase": "阶段三",
       "label": "烹饪",
-      "description": "在餐厅（地点代码 RESTAURANT）烹饪；耗时由系统决定（单位：世界分钟），无需传参；执行结果在 duration_minutes 字段返回实际消耗。",
+      "description": "在餐厅（地点代码 RESTAURANT）烹饪，提交 recipe_id。配方和材料清单查 GET_RULE.cooking_recipes，本人背包的可用材料查 INSPECT_INVENTORY。开工前检查缺料；若返回 MISSING_INGREDIENTS，按 missing_items 补齐本人可用材料后再重试同一配方，材料未补齐时不要重复调用，可采购、改做材料足够的其他配方或等待补货。耗时由系统决定，无需传时长；execution_duration_minutes 表示实际耗时，planned_duration_minutes 表示计划时长，单位均为世界分钟。",
       "parameters": {
         "type": "object",
         "properties": {
@@ -269,89 +422,6 @@
         },
         "required": [
           "recipe_id"
-        ]
-      }
-    },
-    {
-      "name": "CREATE_ORDER",
-      "phase": "阶段三",
-      "label": "创建订单",
-      "description": "创建交易订单；耗时由系统决定（单位：世界分钟），无需传参；执行结果在 duration_minutes 字段返回实际消耗。",
-      "parameters": {
-        "type": "object",
-        "properties": {
-          "side": {
-            "type": "string",
-            "description": "订单方向",
-            "enum": [
-              "BUY",
-              "SELL"
-            ]
-          },
-          "item_id": {
-            "type": "integer",
-            "description": "物品ID",
-            "minimum": 1
-          },
-          "amount": {
-            "type": "integer",
-            "description": "数量",
-            "minimum": 1
-          },
-          "unit_price": {
-            "type": "integer",
-            "description": "单价",
-            "minimum": 1
-          },
-          "delivery_point_code": {
-            "type": "string",
-            "description": "交付地点代码"
-          }
-        },
-        "required": [
-          "side",
-          "item_id",
-          "amount",
-          "unit_price",
-          "delivery_point_code"
-        ]
-      }
-    },
-    {
-      "name": "CANCEL_ORDER",
-      "phase": "阶段三",
-      "label": "取消订单",
-      "description": "取消自己的开放订单；耗时由系统决定（单位：世界分钟），无需传参；执行结果在 duration_minutes 字段返回实际消耗。",
-      "parameters": {
-        "type": "object",
-        "properties": {
-          "order_id": {
-            "type": "string",
-            "description": "订单ID",
-            "format": "uuid"
-          }
-        },
-        "required": [
-          "order_id"
-        ]
-      }
-    },
-    {
-      "name": "START_DELIVERY",
-      "phase": "阶段三",
-      "label": "开始配送",
-      "description": "开始已匹配订单的配送；耗时由系统决定（单位：世界分钟），无需传参；执行结果在 duration_minutes 字段返回实际消耗。",
-      "parameters": {
-        "type": "object",
-        "properties": {
-          "delivery_id": {
-            "type": "string",
-            "description": "配送单ID",
-            "format": "uuid"
-          }
-        },
-        "required": [
-          "delivery_id"
         ]
       }
     },
@@ -480,25 +550,70 @@
       }
     },
     {
-      "name": "PUBLISH_PRICE_INDEX",
+      "name": "GIVE_ITEMS",
       "phase": "阶段三",
-      "label": "发布价格指数",
-      "description": "公布当前游戏日已有的价格草稿；已公布不能重复发。与其他有效公共工作共用每天一次的基础餐参考价薪酬。",
+      "label": "赠送物品或金币",
+      "description": "向4米内在线参与村庄的玩家或其他正式NPC单向赠送个人背包中的物品或钱包金币，无需对方接受。先INSPECT_INVENTORY查询批次instance_id和可用金币，INSPECT_NEARBY查询目标ID。gold_amount为可选非负整数，省略为0；纯金币赠送传items=[]及正整数gold_amount，也可与物品一起赠送，不能赠送空礼物。全部物品和金币一次结算，任何数量或可用金币不足整笔失败；过期、保鲜状态不明或已预留物品、金币不可赠送。保留品质、耐久、保鲜及菜品信息。不会索取对方资产，也不保证对方回赠。耗时由系统决定。 exchange_id必填：回应PLAYER_GIFT时必须使用该事件的event_id，同一次交换跨任务和重试必须保持此ID，不得另起ID重复赠送；只有独立的新赠送才使用新UUID。同一ID复用原动作和结果；can_await=false时只查询get_action_status，不调用await_action。unknown时先核对原动作，禁止另发赠送。",
       "parameters": {
         "type": "object",
-        "properties": {},
-        "required": []
-      }
-    },
-    {
-      "name": "AUDIT_PUBLIC_FUND",
-      "phase": "阶段三",
-      "label": "审计公款",
-      "description": "核对当前游戏日公款：独立期初余额加真实分录，与实际余额比较。重复审计可查账但同日不重复计薪；旧历史缺基准会明确标注。",
-      "parameters": {
-        "type": "object",
-        "properties": {},
-        "required": []
+        "properties": {
+          "exchange_id": {
+            "type": "string",
+            "format": "uuid",
+            "pattern": "^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$",
+            "description": "这笔赠送的小写标准UUID。回赠使用收到物品事件的event_id；同一笔交换必须复用，不因任务切换或重试生成新ID。"
+          },
+          "target_type": {
+            "type": "string",
+            "enum": [
+              "PLAYER",
+              "NPC"
+            ],
+            "description": "接收方类型"
+          },
+          "target_id": {
+            "type": "string",
+            "description": "玩家player_id或正式NPC ID，不能填写姓名或自己的NPC ID"
+          },
+          "items": {
+            "type": "array",
+            "minItems": 0,
+            "maxItems": 20,
+            "description": "不重复的个人背包批次及赠送数量；仅赠送金币时传空列表",
+            "items": {
+              "type": "object",
+              "properties": {
+                "instance_id": {
+                  "type": "string",
+                  "format": "uuid"
+                },
+                "amount": {
+                  "type": "integer",
+                  "minimum": 1,
+                  "maximum": 2147483647
+                }
+              },
+              "required": [
+                "instance_id",
+                "amount"
+              ],
+              "additionalProperties": false
+            }
+          },
+          "gold_amount": {
+            "type": "integer",
+            "minimum": 0,
+            "maximum": 2147483647,
+            "description": "赠送的个人钱包金币，省略为0；items为空时必须大于0，不占用物品批次"
+          }
+        },
+        "required": [
+          "exchange_id",
+          "target_type",
+          "target_id",
+          "items"
+        ],
+        "additionalProperties": false
       }
     },
     {
@@ -624,7 +739,7 @@
       "name": "LIST_STORE_ITEM",
       "phase": "阶段三",
       "label": "上架商品",
-      "description": "经营者将真实批次上架本店。Lucy饭店必须指定food_instance_id，price_mode=ORIGINAL，普通菜后端按品质默认价值/有效点评价定价，不提交custom_unit_price；公共餐另传public_meal_code及有效decision_id，顾客0元。Nora杂货铺仍可CUSTOM自由定价。stock_source=STORE从本店未上架库存取货；下架只停售留店。",
+      "description": "经营者将真实批次上架本店。Lucy饭店必须指定food_instance_id，price_mode=ORIGINAL，普通菜后端按品质默认价值/有效点评价定价，不提交custom_unit_price；公共餐只需另传public_meal_code，无需授权；NPC和玩家0金领取，每人每日1份、全村共享10份。Nora杂货铺仍可CUSTOM自由定价。stock_source=STORE从本店未上架库存取货；下架只停售留店。",
       "parameters": {
         "type": "object",
         "properties": {
@@ -668,10 +783,6 @@
             "description": "默认PERSONAL从个人背包上架；STORE从本店未上架库存取货。"
           },
           "food_instance_id": {
-            "type": "string",
-            "format": "uuid"
-          },
-          "decision_id": {
             "type": "string",
             "format": "uuid"
           },
@@ -878,630 +989,6 @@
       }
     },
     {
-      "name": "CREATE_COMMITMENT",
-      "phase": "阶段四",
-      "label": "创建承诺",
-      "description": "自主创建承诺；beneficiary_npc_id必须是另一名NPC，due_world_minute必须晚于当前世界分钟。按commitment_type选target结构，不得增减字段。创建不转移钱货；履约再验证库存、资金、地点和期限。DONATION仅向指定NPC赠款/物，不是公共捐款；DELIVERY须关联真实个人交易完成；JOINT_WORK只记协作履约，不代替烹饪或公共工程结算。",
-      "parameters": {
-        "type": "object",
-        "properties": {
-          "beneficiary_npc_id": {
-            "type": "string",
-            "description": "承诺受益NPC ID"
-          },
-          "commitment_type": {
-            "type": "string",
-            "description": "承诺类型",
-            "enum": [
-              "DELIVERY",
-              "REPAYMENT",
-              "DONATION",
-              "JOINT_WORK",
-              "MEETING"
-            ]
-          },
-          "target": {
-            "type": "object",
-            "description": "按下方oneOf选择与commitment_type一致的结构；金额/数量为正整数，地点必须实际存在，work_code是双方约定的工作标识。"
-          },
-          "due_world_minute": {
-            "type": "integer",
-            "description": "截止世界分钟，必须严格大于OBSERVE返回的当前world_minute。",
-            "minimum": 0
-          }
-        },
-        "required": [
-          "beneficiary_npc_id",
-          "commitment_type",
-          "target",
-          "due_world_minute"
-        ],
-        "oneOf": [
-          {
-            "properties": {
-              "commitment_type": {
-                "enum": [
-                  "DELIVERY"
-                ]
-              },
-              "target": {
-                "type": "object",
-                "properties": {
-                  "item_id": {
-                    "type": "integer",
-                    "enum": [
-                      1003,
-                      1009,
-                      1022,
-                      1026,
-                      1030,
-                      1033,
-                      1034,
-                      1038,
-                      1040,
-                      1049,
-                      1050,
-                      1051,
-                      1053,
-                      1054,
-                      1056,
-                      1057,
-                      1058,
-                      1061,
-                      1067,
-                      1071,
-                      1076,
-                      1077,
-                      1099,
-                      1108,
-                      4001,
-                      4002,
-                      29104,
-                      29105
-                    ],
-                    "description": "承诺系统实际支持的物品ID白名单；还需具备真实可用物品。"
-                  },
-                  "amount": {
-                    "type": "integer",
-                    "minimum": 1
-                  },
-                  "gold_amount": {
-                    "type": "integer",
-                    "minimum": 1
-                  }
-                },
-                "required": [
-                  "item_id",
-                  "amount",
-                  "gold_amount"
-                ],
-                "additionalProperties": false
-              }
-            }
-          },
-          {
-            "properties": {
-              "commitment_type": {
-                "enum": [
-                  "REPAYMENT"
-                ]
-              },
-              "target": {
-                "type": "object",
-                "properties": {
-                  "gold_amount": {
-                    "type": "integer",
-                    "minimum": 1
-                  }
-                },
-                "required": [
-                  "gold_amount"
-                ],
-                "additionalProperties": false
-              }
-            }
-          },
-          {
-            "properties": {
-              "commitment_type": {
-                "enum": [
-                  "DONATION"
-                ]
-              },
-              "target": {
-                "type": "object",
-                "properties": {
-                  "asset_kind": {
-                    "type": "string",
-                    "enum": [
-                      "GOLD"
-                    ]
-                  },
-                  "gold_amount": {
-                    "type": "integer",
-                    "minimum": 1
-                  }
-                },
-                "required": [
-                  "asset_kind",
-                  "gold_amount"
-                ],
-                "additionalProperties": false
-              }
-            }
-          },
-          {
-            "properties": {
-              "commitment_type": {
-                "enum": [
-                  "DONATION"
-                ]
-              },
-              "target": {
-                "type": "object",
-                "properties": {
-                  "asset_kind": {
-                    "type": "string",
-                    "enum": [
-                      "ITEM"
-                    ]
-                  },
-                  "item_id": {
-                    "type": "integer",
-                    "enum": [
-                      1003,
-                      1009,
-                      1022,
-                      1026,
-                      1030,
-                      1033,
-                      1034,
-                      1038,
-                      1040,
-                      1049,
-                      1050,
-                      1051,
-                      1053,
-                      1054,
-                      1056,
-                      1057,
-                      1058,
-                      1061,
-                      1067,
-                      1071,
-                      1076,
-                      1077,
-                      1099,
-                      1108,
-                      4001,
-                      4002,
-                      29104,
-                      29105
-                    ],
-                    "description": "承诺系统实际支持的物品ID白名单；还需具备真实可用物品。"
-                  },
-                  "amount": {
-                    "type": "integer",
-                    "minimum": 1
-                  }
-                },
-                "required": [
-                  "asset_kind",
-                  "item_id",
-                  "amount"
-                ],
-                "additionalProperties": false
-              }
-            }
-          },
-          {
-            "properties": {
-              "commitment_type": {
-                "enum": [
-                  "JOINT_WORK"
-                ]
-              },
-              "target": {
-                "type": "object",
-                "properties": {
-                  "location_code": {
-                    "type": "string",
-                    "minLength": 1,
-                    "pattern": "\\S"
-                  },
-                  "work_code": {
-                    "type": "string",
-                    "minLength": 1,
-                    "pattern": "\\S"
-                  }
-                },
-                "required": [
-                  "location_code",
-                  "work_code"
-                ],
-                "additionalProperties": false
-              }
-            }
-          },
-          {
-            "properties": {
-              "commitment_type": {
-                "enum": [
-                  "MEETING"
-                ]
-              },
-              "target": {
-                "type": "object",
-                "properties": {
-                  "location_code": {
-                    "type": "string",
-                    "minLength": 1,
-                    "pattern": "\\S"
-                  }
-                },
-                "required": [
-                  "location_code"
-                ],
-                "additionalProperties": false
-              }
-            }
-          }
-        ],
-        "additionalProperties": false,
-        "examples": [
-          {
-            "beneficiary_npc_id": "10011",
-            "commitment_type": "DELIVERY",
-            "target": {
-              "item_id": 1030,
-              "amount": 1,
-              "gold_amount": 8
-            },
-            "due_world_minute": 2000
-          },
-          {
-            "beneficiary_npc_id": "10011",
-            "commitment_type": "REPAYMENT",
-            "target": {
-              "gold_amount": 2
-            },
-            "due_world_minute": 2000
-          },
-          {
-            "beneficiary_npc_id": "10011",
-            "commitment_type": "DONATION",
-            "target": {
-              "asset_kind": "GOLD",
-              "gold_amount": 2
-            },
-            "due_world_minute": 2000
-          },
-          {
-            "beneficiary_npc_id": "10011",
-            "commitment_type": "DONATION",
-            "target": {
-              "asset_kind": "ITEM",
-              "item_id": 1030,
-              "amount": 1
-            },
-            "due_world_minute": 2000
-          },
-          {
-            "beneficiary_npc_id": "10011",
-            "commitment_type": "JOINT_WORK",
-            "target": {
-              "location_code": "RESTAURANT",
-              "work_code": "MEAL_PREPARATION"
-            },
-            "due_world_minute": 2000
-          },
-          {
-            "beneficiary_npc_id": "10011",
-            "commitment_type": "MEETING",
-            "target": {
-              "location_code": "RECORD_HALL"
-            },
-            "due_world_minute": 2000
-          }
-        ]
-      }
-    },
-    {
-      "name": "CANCEL_COMMITMENT",
-      "phase": "阶段四",
-      "label": "取消承诺",
-      "description": "取消仍开放的 NPC 承诺；时长使用后端配置（世界分钟）。",
-      "parameters": {
-        "type": "object",
-        "properties": {
-          "commitment_id": {
-            "type": "string",
-            "description": "承诺ID",
-            "format": "uuid"
-          }
-        },
-        "required": [
-          "commitment_id"
-        ]
-      }
-    },
-    {
-      "name": "PERFORM_COMMITMENT",
-      "phase": "阶段四",
-      "label": "履行承诺",
-      "description": "履行本人仍开放且未过期的承诺。REPAYMENT/DONATION实际转移个人钱货；MEETING/JOINT_WORK双方需在target.location_code并可参与，工作承诺不直接产菜或记公共工程量。DELIVERY不能用此指令直接完成，须PROPOSE_TRADE附commitment_id并由对方接受相同物品、数量和金额的个人交易。",
-      "parameters": {
-        "type": "object",
-        "properties": {
-          "commitment_id": {
-            "type": "string",
-            "description": "承诺ID",
-            "format": "uuid"
-          }
-        },
-        "required": [
-          "commitment_id"
-        ]
-      }
-    },
-    {
-      "name": "STORY_VOTE",
-      "phase": "阶段五",
-      "label": "剧情投票",
-      "description": "在开放的村庄议事中提交方案选择。",
-      "parameters": {
-        "type": "object",
-        "properties": {
-          "meeting_id": {
-            "type": "string",
-            "description": "议事会议ID",
-            "format": "uuid"
-          },
-          "plan_code": {
-            "type": "string",
-            "description": "选择的方案代码",
-            "enum": [
-              "BRIDGE_REPAIR",
-              "RATION_AND_WAIT"
-            ]
-          }
-        },
-        "required": [
-          "meeting_id",
-          "plan_code"
-        ]
-      }
-    },
-    {
-      "name": "STORY_ACT",
-      "phase": "阶段五",
-      "label": "剧情行动",
-      "description": "执行已开放剧情行动，或由Mark召集会议、登记提案、公布决议/历史事实、审核工程凭证、领取欠薪。新公共决定需要Mark在场及至少三张有效票，执行须符合已公布授权。",
-      "parameters": {
-        "type": "object",
-        "properties": {
-          "action_code": {
-            "type": "string",
-            "description": "剧情行动代码；Mark行政入口：CALL_MEETING、REGISTER_PROPOSAL、PUBLISH_DECISION、REVEAL_STORY_FACT、CLAIM_PUBLIC_SALARY；审核工程使用MANAGE_REPAIR_LEDGER。"
-          },
-          "item_id": {
-            "type": "integer",
-            "description": "物品ID",
-            "minimum": 1
-          },
-          "amount": {
-            "type": "integer",
-            "description": "数量",
-            "minimum": 1
-          },
-          "gold_amount": {
-            "type": "integer",
-            "description": "金币数量",
-            "minimum": 1
-          },
-          "labor_hours": {
-            "type": "integer",
-            "description": "修桥劳动每次计划1人时，省略或填1；实际占用60游戏分钟，完整完成才入账，未完成不计工时",
-            "minimum": 1,
-            "maximum": 1
-          },
-          "route_attempt_id": {
-            "type": "string",
-            "description": "路线尝试ID",
-            "format": "uuid"
-          },
-          "segment_code": {
-            "type": "string",
-            "description": "路线分段代码"
-          },
-          "companion_npc_id": {
-            "type": "string",
-            "description": "同行NPC ID"
-          },
-          "supply_item_id": {
-            "type": "integer",
-            "description": "补给物品ID",
-            "minimum": 1
-          },
-          "supply_amount": {
-            "type": "integer",
-            "description": "补给数量",
-            "minimum": 1
-          },
-          "limit_item_id": {
-            "type": "integer",
-            "description": "限购物品ID",
-            "minimum": 1
-          },
-          "daily_limit": {
-            "type": "integer",
-            "description": "每日限购数量",
-            "minimum": 1
-          },
-          "meal_item_id": {
-            "type": "integer",
-            "description": "公共餐食物品ID",
-            "minimum": 1
-          },
-          "meal_amount": {
-            "type": "integer",
-            "description": "PROVIDE_COMMUNITY_MEAL将Lucy已制作的具体餐上架，实际领取时才计供餐份数；必须带food_instance_id/public_meal_code/decision_id。",
-            "minimum": 1
-          },
-          "item_ids": {
-            "type": "array",
-            "items": {
-              "type": "integer"
-            },
-            "description": "首次应急联络时可附带下次到货物品需求。"
-          },
-          "expires_world_minute": {
-            "type": "integer",
-            "minimum": 1,
-            "description": "提案必填的授权到期分钟；执行公共限购时必须与已批准期限一致。"
-          },
-          "meeting_id": {
-            "type": "string",
-            "format": "uuid",
-            "description": "REGISTER_PROPOSAL使用的开放会议ID；PUBLISH_DECISION也可传此ID，核实真实出席与投票后结算并公布。"
-          },
-          "decision_id": {
-            "type": "string",
-            "format": "uuid",
-            "description": "已通过表决的公共决定ID；采购、配给及工程贡献/审核必需。公布可用此ID，或用meeting_id结算真实投票后公布。"
-          },
-          "evidence_request_id": {
-            "type": "string",
-            "format": "uuid",
-            "description": "MANAGE_REPAIR_LEDGER要审核的真实成功工程凭证request_id。"
-          },
-          "plan_code": {
-            "type": "string",
-            "enum": [
-              "BRIDGE_REPAIR",
-              "RATION_AND_WAIT"
-            ],
-            "description": "要登记的现有候选方案。"
-          },
-          "budget_gold": {
-            "type": "integer",
-            "minimum": 0,
-            "description": "修桥采购预算，或RATION_AND_WAIT中明确meal_service供餐预算；不会自动拨款。"
-          },
-          "executor_npc_id": {
-            "type": "string",
-            "description": "提案执行人：修桥采购/配给为10015，旧路侦察为10012。"
-          },
-          "starts_world_minute": {
-            "type": "integer",
-            "minimum": 0,
-            "description": "CALL_MEETING会议开始世界分钟，不得早于当前时间；默认立即开始，当日截止。"
-          },
-          "ration_daily_limits": {
-            "type": "object",
-            "additionalProperties": {
-              "type": "integer",
-              "minimum": 1
-            },
-            "description": "配给提案必填，例如{\"29001\":1}；键为真实物品ID，值为每人每日额度。"
-          },
-          "fact_code": {
-            "type": "string",
-            "enum": [
-              "DEFERRED_BRIDGE_BUDGET"
-            ],
-            "description": "Mark可公开的本人已知历史预算事实。"
-          },
-          "food_instance_id": {
-            "type": "string",
-            "format": "uuid"
-          },
-          "public_meal_code": {
-            "type": "string",
-            "enum": [
-              "C1",
-              "C2",
-              "R1"
-            ]
-          },
-          "stock_source": {
-            "type": "string",
-            "enum": [
-              "PERSONAL",
-              "STORE"
-            ]
-          },
-          "meal_service": {
-            "type": "object",
-            "properties": {
-              "executor_npc_id": {
-                "type": "string",
-                "enum": [
-                  "10014"
-                ]
-              },
-              "store_code": {
-                "type": "string",
-                "enum": [
-                  "RESTAURANT_STORE"
-                ]
-              },
-              "menu_codes": {
-                "type": "array",
-                "items": {
-                  "type": "string",
-                  "enum": [
-                    "C1",
-                    "C2",
-                    "R1"
-                  ]
-                }
-              },
-              "subsidies": {
-                "type": "object",
-                "description": "所选C1=9、C2=12、R1=9金币/份，不随评分上浮。"
-              },
-              "beneficiaries": {
-                "type": "array",
-                "items": {
-                  "type": "string",
-                  "enum": [
-                    "10011",
-                    "10012",
-                    "10013",
-                    "10014",
-                    "10015"
-                  ]
-                }
-              },
-              "starts_world_minute": {
-                "type": "integer",
-                "minimum": 0
-              },
-              "per_npc_daily_limit": {
-                "type": "integer",
-                "enum": [
-                  1
-                ]
-              },
-              "village_daily_limit": {
-                "type": "integer",
-                "minimum": 1,
-                "maximum": 5
-              }
-            },
-            "required": [
-              "menu_codes",
-              "subsidies"
-            ]
-          }
-        },
-        "required": [
-          "action_code"
-        ]
-      }
-    },
-    {
       "name": "GET_RULE",
       "phase": "查询",
       "label": "获取村庄规则",
@@ -1527,7 +1014,7 @@
       "name": "INSPECT_NEARBY",
       "phase": "查询",
       "label": "观察附近",
-      "description": "查看自身周围20米内的NPC和地点，返回它们的名称、ID、状态和距离。",
+      "description": "查看自身周围10米内的NPC、在线参与村庄的玩家和地点。nearby_players返回name、distance、within_speech_range、activity、movement_state、is_in_dialogue。activity可为IDLE空闲、MOVING移动、SOCIALIZING对话、WORKING劳动、REVIEWING品鉴、ACTING交互或UNKNOWN未知；movement_state区分WALKING行走和RUNNING奔跑。对话状态优先，移动状态单独保留；不返回聊天内容和私人资产。players_observation_available=false表示实时玩家观察不可用，不代表附近无人。",
       "parameters": {
         "type": "object",
         "properties": {},
@@ -1541,7 +1028,17 @@
       "description": "查看自己的金币和物品。可选item_ids仅查指定物品，此时不附带钱包和店铺信息。工具查询包含范围内的tool_summaries，可用总次数不等于某一把工具的剩余次数。每件物品返回编号、名称、类型、数量、可用数量及出售信息；工具有实例和耐久，食物有food_instance_id及可读有效期。sale.unit_price为向sale.target出售每件可获得的金币；sale.allowed=false时reason说明不可出售原因。",
       "parameters": {
         "type": "object",
-        "properties": {"item_ids": {"type": "array", "items": {"type": "integer", "minimum": 1}, "minItems": 1, "maxItems": 100}},
+        "properties": {
+          "item_ids": {
+            "type": "array",
+            "items": {
+              "type": "integer",
+              "minimum": 1
+            },
+            "minItems": 1,
+            "maxItems": 100
+          }
+        },
         "required": []
       }
     },
@@ -1550,56 +1047,6 @@
       "phase": "查询",
       "label": "查看交易报价",
       "description": "查看自己收到和发出的待处理交易报价。",
-      "parameters": {
-        "type": "object",
-        "properties": {},
-        "required": []
-      }
-    },
-    {
-      "name": "INSPECT_STORY_STATE",
-      "phase": "查询",
-      "label": "查看剧情状态",
-      "description": "查看当前剧情、开放会议、候选方案和可执行剧情行动。",
-      "parameters": {
-        "type": "object",
-        "properties": {},
-        "required": []
-      }
-    },
-    {
-      "name": "INSPECT_RELEVANT_STORIES",
-      "phase": "查询",
-      "label": "查看相关剧情",
-      "description": "查看与自己有关的剧情目录和摘要。",
-      "parameters": {
-        "type": "object",
-        "properties": {},
-        "required": []
-      }
-    },
-    {
-      "name": "INSPECT_STORY_DETAIL",
-      "phase": "查询",
-      "label": "查看剧情详情",
-      "description": "按剧情唯一ID查看自己有权限看到的剧情详情。",
-      "parameters": {
-        "type": "object",
-        "properties": {
-          "story_id": {
-            "type": "string"
-          }
-        },
-        "required": [
-          "story_id"
-        ]
-      }
-    },
-    {
-      "name": "INSPECT_ORDERS",
-      "phase": "查询",
-      "label": "查看订单",
-      "description": "查看自己的交易订单和相关配送任务。",
       "parameters": {
         "type": "object",
         "properties": {},
@@ -1666,7 +1113,7 @@
       "name": "INSPECT_RESTAURANT_STATE",
       "phase": "查询",
       "label": "查看饭店状态",
-      "description": "查询餐厅营业状态和在售菜单。经营者另可查看餐厅店款、未上架可用库存、待评样品预留和当前公共餐授权、补贴、剩余预算、期限、份额及阻碍。菜谱与材料清单请查GET_RULE.cooking_recipes，个人可用食材查INSPECT_INVENTORY。只读查询不批准或预留公款。",
+      "description": "查询餐厅营业状态和在售菜单。经营者另可查看餐厅店款、未上架可用库存、待评样品预留和公共餐补贴、实际公款余额、每日共享份额及供应阻碍。菜谱与材料清单请查GET_RULE.cooking_recipes，个人可用食材查INSPECT_INVENTORY。只读查询不批准或预留公款。",
       "parameters": {
         "type": "object",
         "properties": {},
@@ -1680,18 +1127,12 @@
       "description": "默认读取仍有效的待评请求；空列表只表示当前没有待评，不代表历史请求未完成或已过期。可传review_id查询该请求的最终状态，已完成时返回原评分和价格。仅返回本人可见的请求。",
       "parameters": {
         "type": "object",
-        "properties": {"review_id": {"type": "string", "format": "uuid"}},
-        "required": []
-      }
-    },
-    {
-      "name": "INSPECT_PUBLIC_ECONOMY_STATE",
-      "phase": "查询",
-      "label": "查看公共经济",
-      "description": "查看当日价格指数、公款余额和审计状态；返回当日价格指数的 DRAFT/PUBLISHED 状态。没有草稿时查询不会生成草稿，应等待日结。",
-      "parameters": {
-        "type": "object",
-        "properties": {},
+        "properties": {
+          "review_id": {
+            "type": "string",
+            "format": "uuid"
+          }
+        },
         "required": []
       }
     },
@@ -1904,6 +1345,265 @@
         "required": [
           "review_id"
         ]
+      }
+    },
+    {
+      "name": "PUBLISH_PERSONAL_COMMISSION",
+      "phase": "个人委托",
+      "label": "发布个人委托",
+      "description": "根据自己的实际需求向玩家发布委托，预留全部金币报酬。阶段按序完成，每阶段条件全部满足才开放下一阶段；发布后不可改价或改条件。NPC不承接个人委托。",
+      "parameters": {
+        "type": "object",
+        "properties": {
+          "title": {
+            "type": "string",
+            "description": "委托名称"
+          },
+          "description": {
+            "type": "string",
+            "description": "委托说明"
+          },
+          "reward_gold": {
+            "type": "integer",
+            "minimum": 1,
+            "description": "完成后支付的总报酬"
+          },
+          "valid_for_minutes": {
+            "type": "integer",
+            "minimum": 1,
+            "description": "有效世界分钟"
+          },
+          "default_location_code": {
+            "type": "string",
+            "description": "省略时使用自己的工作地点"
+          },
+          "stages": {
+            "type": "array",
+            "minItems": 1,
+            "items": {
+              "type": "object",
+              "properties": {
+                "id": {
+                  "type": "string",
+                  "description": "可省略自动生成"
+                },
+                "title": {
+                  "type": "string",
+                  "description": "阶段名称"
+                },
+                "location_code": {
+                  "type": "string",
+                  "description": "留空继承委托默认地点"
+                },
+                "conditions": {
+                  "type": "array",
+                  "items": {
+                    "type": "object",
+                    "properties": {
+                      "id": {
+                        "type": "string",
+                        "description": "可省略自动生成"
+                      },
+                      "type": {
+                        "type": "string",
+                        "enum": [
+                          "item",
+                          "gold",
+                          "labor"
+                        ]
+                      },
+                      "label": {
+                        "type": "string",
+                        "description": "显示名称"
+                      },
+                      "target": {
+                        "type": "integer",
+                        "minimum": 1,
+                        "description": "数量"
+                      },
+                      "item_ids": {
+                        "type": "array",
+                        "items": {
+                          "type": "integer"
+                        },
+                        "minItems": 1
+                      },
+                      "min_quality": {
+                        "type": "integer",
+                        "minimum": 0,
+                        "maximum": 6
+                      },
+                      "requires_freshness": {
+                        "type": "boolean"
+                      },
+                      "min_remaining_minutes": {
+                        "type": "integer",
+                        "minimum": 0
+                      },
+                      "unit_minutes": {
+                        "type": "integer",
+                        "minimum": 1,
+                        "description": "每份劳动的真实游戏分钟"
+                      }
+                    },
+                    "required": [
+                      "type",
+                      "target"
+                    ],
+                    "additionalProperties": false
+                  },
+                  "minItems": 1
+                }
+              },
+              "required": [
+                "conditions"
+              ],
+              "additionalProperties": false
+            }
+          }
+        },
+        "required": [
+          "title",
+          "reward_gold",
+          "valid_for_minutes",
+          "stages"
+        ],
+        "additionalProperties": false
+      }
+    },
+    {
+      "name": "INSPECT_PERSONAL_COMMISSIONS",
+      "phase": "个人委托",
+      "label": "查询个人委托",
+      "description": "查询自己发布的个人委托、玩家承接进度、报酬和期限；scope=all仅浏览可见委托，NPC不能认领或完成个人委托。",
+      "parameters": {
+        "type": "object",
+        "properties": {
+          "scope": {
+            "type": "string",
+            "enum": [
+              "published",
+              "all"
+            ],
+            "default": "published"
+          }
+        },
+        "required": [],
+        "additionalProperties": false
+      }
+    },
+    {
+      "name": "WITHDRAW_PERSONAL_COMMISSION",
+      "phase": "个人委托",
+      "label": "撤回个人委托",
+      "description": "仅可撤回自己发布且尚未认领的委托，退回预留报酬。",
+      "parameters": {
+        "type": "object",
+        "properties": {
+          "commission_id": {
+            "type": "string",
+            "description": ""
+          }
+        },
+        "required": [
+          "commission_id"
+        ],
+        "additionalProperties": false
+      }
+    },
+    {
+      "name": "INSPECT_AFFAIRS",
+      "phase": "村庄事务",
+      "label": "查询村庄事务",
+      "description": "查询系统创建的村庄事务；省略affair_id列出事务，指定编号查看阶段、条件、进度和本人贡献。查询不创建事务。",
+      "parameters": {
+        "type": "object",
+        "properties": {
+          "affair_id": {
+            "type": "string",
+            "description": "事务编号；省略时查询列表",
+            "minLength": 1
+          }
+        },
+        "required": [],
+        "additionalProperties": false
+      }
+    },
+    {
+      "name": "CONTRIBUTE_TO_AFFAIR",
+      "phase": "村庄事务",
+      "label": "贡献事务资源或劳动",
+      "description": "向指定事务的开放条件贡献个人物品、金币或实际劳动。kind必须匹配条件type；item需要item_id和amount，gold需要amount，labor不传amount，按条件unit_minutes完成一份劳动。系统验证资源品质、剩余需求和地点；中断劳动不计进度。",
+      "parameters": {
+        "type": "object",
+        "properties": {
+          "affair_id": {
+            "type": "string",
+            "description": "事务编号",
+            "minLength": 1
+          },
+          "condition_id": {
+            "type": "string",
+            "description": "条件编号",
+            "minLength": 1
+          },
+          "kind": {
+            "type": "string",
+            "enum": [
+              "item",
+              "gold",
+              "labor"
+            ]
+          },
+          "item_id": {
+            "type": "integer",
+            "minimum": 1
+          },
+          "amount": {
+            "type": "integer",
+            "minimum": 1,
+            "maximum": 2147483647
+          },
+          "food_instance_id": {
+            "type": "string",
+            "format": "uuid",
+            "description": "指定物品批次，可选"
+          }
+        },
+        "required": [
+          "affair_id",
+          "condition_id",
+          "kind"
+        ],
+        "additionalProperties": false
+      }
+    },
+    {
+      "name": "CONTACT_EMERGENCY_CARAVAN",
+      "phase": "村庄事务",
+      "label": "联系应急商队",
+      "description": "Nora在杂货铺或市场街支付个人费用开通应急商队；已开通不重复收费。可附带登记物品需求。",
+      "parameters": {
+        "type": "object",
+        "properties": {
+          "route_attempt_id": {
+            "type": "string",
+            "format": "uuid",
+            "description": "本次联系尝试的唯一UUID"
+          },
+          "item_ids": {
+            "type": "array",
+            "items": {
+              "type": "integer",
+              "minimum": 1
+            },
+            "minItems": 1
+          }
+        },
+        "required": [
+          "route_attempt_id"
+        ],
+        "additionalProperties": false
       }
     }
   ]

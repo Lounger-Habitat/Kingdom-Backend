@@ -9,7 +9,7 @@ def project_story_state(detail, npc_id, capabilities, world_minute, outcome=None
     data = {key: deepcopy(detail[key]) for key in (
         "story_id", "title", "status", "phase", "plan", "story_version",
         "bridge_condition", "progress", "available_actions",
-        "available_actions_explanation", "known_facts",
+        "available_actions_explanation", "known_facts", "affairs",
     ) if key in detail}
     if outcome:
         data["outcome"] = outcome
@@ -24,10 +24,10 @@ def project_story_state(detail, npc_id, capabilities, world_minute, outcome=None
         progress.pop("ration_limits_until_world_minute", None)
 
     explanation = data.get("available_actions_explanation", "")
-    if data.get("phase") == "AFTERMATH" and "日结评估满足任一条件" in explanation:
+    if not data.get("affairs") and data.get("phase") == "AFTERMATH" and "日结评估满足任一条件" in explanation:
         activities = [label for action, label in (
             ("PLANT", "种植"), ("HUNT", "狩猎"), ("COOK", "做饭"),
-            ("LIST_STORE_ITEM", "备货上架"), ("EAT", "就餐"), ("WAIT", "等待"),
+            ("LIST_STORE_ITEM", "备货上架"), ("EAT", "就餐"),
         ) if action in capabilities]
         data["available_actions_explanation"] = (
             "当前尚未进入公共行动阶段，日结评估满足条件后会推进。"

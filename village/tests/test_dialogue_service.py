@@ -41,7 +41,7 @@ class DialogueServiceTests(TestCase):
                 "display_name": agent_id, "occupation": "test",
                 "home_location_code": "SQUARE", "work_location_code": "SQUARE",
                 "social_location_code": "SQUARE",
-                "capabilities": ["MOVE", "WAIT", "GET_RULE"],
+                "capabilities": ["MOVE", "REST", "GET_RULE"],
             })
             NpcRuntimeState.objects.update_or_create(npc=npc, defaults={
                 "current_location_code": "SQUARE", "needs_world_minute": 0,
@@ -220,7 +220,7 @@ class DialogueServiceTests(TestCase):
 
         self.assertEqual(accept("MOVE", {"location_code": "SQUARE"}),
                          (False, ResultCode.SOCIAL_TARGET_BUSY))
-        self.assertEqual(accept("WAIT", {}, 1),
+        self.assertEqual(accept("REST", {}, 1),
                          (True, ResultCode.COMMAND_ACCEPTED))
 
     def test_dialogue_coexists_with_held_daily_reservation(self):

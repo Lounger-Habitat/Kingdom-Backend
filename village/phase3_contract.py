@@ -17,6 +17,7 @@ class ActionName(str, Enum):
     PLANT = "PLANT"
     HARVEST = "HARVEST"
     HUNT = "HUNT"
+    CHOP_TREE = "CHOP_TREE"
     PROCESS_GAME = "PROCESS_GAME"
     COOK = "COOK"
     CREATE_ORDER = "CREATE_ORDER"
@@ -36,6 +37,7 @@ class ActionName(str, Enum):
     AUDIT_PUBLIC_FUND = "AUDIT_PUBLIC_FUND"
     EAT = "EAT"
     COMMUNITY_MEAL = "COMMUNITY_MEAL"
+    GIVE_ITEMS = "GIVE_ITEMS"
     PROPOSE_TRADE = "PROPOSE_TRADE"
     RESPOND_TRADE = "RESPOND_TRADE"
     CANCEL_TRADE_OFFER = "CANCEL_TRADE_OFFER"
@@ -211,6 +213,7 @@ ACTOR_WHITELIST = {
     ActionName.PLANT: {"10011"},
     ActionName.HARVEST: {"10011"},
     ActionName.HUNT: {"10012"},
+    ActionName.CHOP_TREE: {"10012"},
     ActionName.PROCESS_GAME: {"10012"},
     ActionName.COOK: {"10014"},
     ActionName.CREATE_ORDER: {"10011", "10012", "10014", "10015"},
@@ -230,6 +233,7 @@ ACTOR_WHITELIST = {
     ActionName.AUDIT_PUBLIC_FUND: {"10013"},
     ActionName.EAT: set(),  # any NPC
     ActionName.COMMUNITY_MEAL: set(),  # any NPC
+    ActionName.GIVE_ITEMS: {"10011", "10012", "10013", "10014", "10015"},
     ActionName.PROPOSE_TRADE: set(),  # any formal NPC
     ActionName.RESPOND_TRADE: set(),  # runtime-validated as the non-proposer
     ActionName.CANCEL_TRADE_OFFER: set(),  # runtime-validated as the proposer
@@ -249,6 +253,7 @@ LOCATION_REQUIREMENTS = {
     ActionName.PLANT: "BILL_FARM",
     ActionName.HARVEST: "BILL_FARM",
     ActionName.HUNT: "HUNTING_GATE",
+    ActionName.CHOP_TREE: None,
     ActionName.PROCESS_GAME: "BUTCHER_YARD",
     ActionName.COOK: "RESTAURANT",
     ActionName.CREATE_ORDER: None,  # any valid location
@@ -268,6 +273,7 @@ LOCATION_REQUIREMENTS = {
     ActionName.AUDIT_PUBLIC_FUND: "RECORD_HALL",
     ActionName.EAT: None,  # any location
     ActionName.COMMUNITY_MEAL: "RESTAURANT",
+    ActionName.GIVE_ITEMS: None,  # Env validates live recipient distance.
     ActionName.PROPOSE_TRADE: None,  # runtime-validated: both NPCs colocated
     ActionName.RESPOND_TRADE: None,  # runtime-validated: both NPCs colocated
     ActionName.CANCEL_TRADE_OFFER: None,
@@ -302,6 +308,7 @@ ACTION_DURATION = {
     ActionName.AUDIT_PUBLIC_FUND: 30,
     ActionName.EAT: 30,
     ActionName.COMMUNITY_MEAL: 30,
+    ActionName.GIVE_ITEMS: 1,
     ActionName.PROPOSE_TRADE: 1,
     ActionName.RESPOND_TRADE: 1,
     ActionName.CANCEL_TRADE_OFFER: 1,
@@ -324,6 +331,7 @@ PARAM_WHITELIST = {
     ActionName.PLANT: frozenset({"plot_code", "crop_code", "expected_asset_version"}),
     ActionName.HARVEST: frozenset({"plot_code", "expected_asset_version"}),
     ActionName.HUNT: frozenset({"hunt_code", "expected_asset_version"}),
+    ActionName.CHOP_TREE: frozenset({"node_id"}),
     ActionName.PROCESS_GAME: frozenset({"prey_instance_id", "expected_asset_version"}),
     ActionName.COOK: frozenset({"recipe_id", "expected_asset_version"}),
     ActionName.CREATE_ORDER: frozenset({
@@ -347,6 +355,7 @@ PARAM_WHITELIST = {
     ActionName.AUDIT_PUBLIC_FUND: frozenset({"day_index"}),
     ActionName.EAT: frozenset({"source", "food_instance_id", "expected_asset_version"}),
     ActionName.COMMUNITY_MEAL: frozenset({"expected_asset_version"}),
+    ActionName.GIVE_ITEMS: frozenset({"exchange_id", "target_type", "target_id", "items", "gold_amount"}),
     ActionName.PROPOSE_TRADE: frozenset({
         "target_npc_id", "side", "item_id", "amount", "items", "gold_amount",
         "conversation_id", "expected_seller_asset_version", "expires_world_minute",
@@ -355,7 +364,7 @@ PARAM_WHITELIST = {
     ActionName.RESPOND_TRADE: frozenset({"offer_id", "decision"}),
     ActionName.CANCEL_TRADE_OFFER: frozenset({"offer_id"}),
     ActionName.LIST_STORE_ITEM: frozenset({
-        "food_instance_id", "public_meal_code", "decision_id",
+        "food_instance_id", "public_meal_code",
         "store_code", "item_id", "amount", "price_mode", "custom_unit_price", "stock_source",
         "expected_operator_asset_version", "expected_store_inventory_version",
     }),

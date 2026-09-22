@@ -1,0 +1,29 @@
+{% extends "admin/base_site.html" %}
+{% load i18n admin_urls static %}
+{% block extrastyle %}{{ block.super }}<link rel="stylesheet" href="{% static 'admin/css/forms.css' %}"><link rel="stylesheet" href="{% static 'village/affair_admin.css' %}">{% endblock %}
+{% block extrahead %}{{ block.super }}{{ media }}<script src="{% static 'village/affair_admin.js' %}" defer></script>{% endblock %}
+{% block bodyclass %}{{ block.super }} app-{{ opts.app_label }} model-{{ opts.model_name }} change-form{% endblock %}
+{% block breadcrumbs %}<div class="breadcrumbs"><a href="{% url 'admin:index' %}">首页</a> &rsaquo; <a href="{% url 'admin:app_list' app_label=opts.app_label %}">{{ opts.app_config.verbose_name }}</a> &rsaquo; <a href="{% url opts|admin_urlname:'changelist' %}">村庄事务</a> &rsaquo; 新增事务</div>{% endblock %}
+{% block content %}<div id="content-main">
+  <p>按需要配置一个或多个阶段。每阶段的所有条件满足后，自动开放下一阶段；最后一阶段完成时，事务完成。</p>
+  <form method="post" id="affair-form" novalidate>{% csrf_token %}
+    {% if form.errors or stage_formset.total_error_count or condition_formset.total_error_count %}<p class="errornote">请修正下方错误后重新提交。</p>{% endif %}
+    {{ form.non_field_errors }}{% for hidden in form.hidden_fields %}{{ hidden }}{{ hidden.errors }}{% endfor %}
+    <fieldset class="module"><h2>基本信息</h2><div class="stage-name">{{ form.title.errors }}{{ form.title.label_tag }}{{ form.title }}<p class="help">事务标识由系统自动生成，无需填写。</p>{{ form.default_location_code.errors }}{{ form.default_location_code.label_tag }}{{ form.default_location_code }}<p class="help">{{ form.default_location_code.help_text }}</p></div></fieldset>
+    {{ stage_formset.management_form }}{{ stage_formset.management_form.errors }}{{ stage_formset.non_form_errors }}
+    {{ condition_formset.management_form }}{{ condition_formset.management_form.errors }}{{ condition_formset.non_form_errors }}
+    <div id="affair-stages">{% for section in stage_sections %}{% include "admin/village/villageaffair/stage_form.html" with stage_form=section.form conditions=section.conditions %}{% endfor %}</div>
+    {% if orphan_conditions %}<div class="errornote">以下条件未关联有效阶段，请移除后重新添加。</div>{% for row in orphan_conditions %}{% include "admin/village/villageaffair/condition_form.html" %}{% endfor %}{% endif %}
+    <button type="button" class="button" id="affair-add-stage" hidden>添加后续阶段</button>
+    <template id="affair-stage-template">{% include "admin/village/villageaffair/stage_form.html" with stage_form=stage_formset.empty_form conditions=None %}</template>
+    <template id="affair-condition-template">{% include "admin/village/villageaffair/condition_form.html" with row=condition_formset.empty_form %}</template>
+    <div class="module affair-notes"><h2>发布说明</h2><ul>
+      <li>每个阶段至少添加一个条件。不需要金币、餐食或劳动时，无需添加对应条件。</li>
+      <li>物品多选表示接受其中任意一种，数量合并累计；要求每种物品都交齐时，请分别添加条件。</li>
+      <li>阶段可单独选择一个地点，未选择时沿用事务默认地点。品质、保鲜要求按物品条件设置，物品自身的可用规则仍然有效。</li>
+      <li>点击发布后立即出现事务，已发布条件保持固定。后续阶段不能提前交付或劳动。</li>
+      <li>此页配置物品、金币、劳动条件。会议使用自己的规则；供水、解锁建筑等实际完成效果须接入业务代码。</li>
+    </ul></div>
+    <div class="submit-row"><input type="submit" value="创建并发布事务" class="default" name="_save"><a class="closelink" href="{% url opts|admin_urlname:'changelist' %}">返回事务列表</a></div>
+  </form>
+</div>{% endblock %}

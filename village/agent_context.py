@@ -3,7 +3,7 @@
 from django.db.models import Q
 
 from .dialogue_service import DialogueService
-from .models import VillageActionDurationConfig, VillageLocationDefinition, VillageStore
+from .models import VillageActionDurationConfig, VillageLocationDefinition, VillageStore, VillageSimulationConfig
 from .phase2_services import ACTION_DELTA_ACTIVITIES, NEEDS_SCALE, needs_rules
 from . import phase3_catalog as economy
 from .runtime_services import CommandService
@@ -61,6 +61,8 @@ def build_agent_context(actions, profile=None):
         f"世界时间每经过30分钟，基础变化为{_effects(needs['base_effects_per_30_minutes'])}。动作另按实际持续时间结算行为变化；以下活动总效果已包含基础变化，不要重复叠加。",
         "需求数值由环境计算，不能通过行动参数直接修改。普通行动受忙碌状态限制，只读查询不会占用行动队列或结算资产。",
     ]
+    if "INSPECT_NEARBY" in actions:
+        common.append("INSPECT_NEARBY分别返回nearby_npcs、nearby_players和nearby_locations，默认半径10米。玩家仅包含在线、已完成初始化且参与村庄的角色；activity是公开状态，movement_state区分行走和奔跑，is_in_dialogue表示是否正在对话。SOCIALIZING优先于移动，二者可同时成立；UNKNOWN表示无法确认状态。players_observation_available=false时不能把空列表理解为附近没有玩家。")
     if profile is not None:
         common.append(f"你的 NPC 编号：{profile.npc.agent_id}；姓名：{profile.display_name}。消息中的 actor_npc_id 与此编号相同表示你自己的事件。")
         location_parts = []
@@ -89,7 +91,7 @@ def build_agent_context(actions, profile=None):
         "公开发言使用scope.mode=public，只广播，不建立双人对话或计双人社交收益。",
         f"对话是环境规则，不依赖具体行动指令：双方距离必须在{DialogueService.MAX_CHAT_DISTANCE_METERS}米以内才能开始或继续对话，"
         f"超出会被环境拒绝，离开范围会结束对话。"
-        f"开口前先 INSPECT_NEARBY 看 distance 字段——注意'附近'半径（20 米）大于对话范围，"
+        f"开口前先 INSPECT_NEARBY 看 distance 字段——注意'附近'半径（10 米）大于对话范围，"
         f"distance 超过{DialogueService.MAX_CHAT_DISTANCE_METERS}米的人必须先 MOVE 靠近再开口。"
         f"收到 conversation_failed（距离原因）时，只允许就近 MOVE 一次并重试一次，仍失败则记录原因并停止，不循环追逐。"
         f"单次发言不能为空且不能超过{DialogueService.MAX_TEXT_LENGTH}个字符；超出时该句话不会显示或发送，若是首句话，对话不会开始。"
@@ -116,6 +118,13 @@ def build_agent_context(actions, profile=None):
         )
 
     rules = []
+    if "PUBLISH_PERSONAL_COMMISSION" in actions:
+        rules.extend([
+            "个人委托由你根据实际需求主动发布，不会自动生成。先查询自己的库存、可用金币和已发布但尚未完成的委托，避免重复采购。",
+            "PUBLISH_PERSONAL_COMMISSION：发布时预留全部金币报酬；发布者由你的身份确定。一个或多个阶段按顺序开放，同阶段全部条件满足才进入下一阶段；阶段地点未配置时继承委托默认地点。",
+            "个人委托独立于商店、交易和村庄公共事务。个人委托仅由玩家认领并完成，每份同时只有一名玩家承接；NPC只能发布、查询和撤回尚未认领的自己的委托。发布后不能修改条件、报酬或期限。",
+            "交付物品和金币先托管，全部阶段完成后转给发布者并把报酬付给承接者；发布者只能撤回未认领委托。放弃或到期会关闭委托并退回托管资产，劳动不退，保鲜期不刷新。",
+        ])
     durations = VillageActionDurationConfig.default_durations()
     timeouts = VillageActionDurationConfig.default_navigation_timeouts()
     for action, duration, timeout in VillageActionDurationConfig.objects.filter(
@@ -150,6 +159,10 @@ def build_agent_context(actions, profile=None):
             f"EAT：个人食物必须来自自己的真实库存并会被消耗；公共餐食需到餐厅且受开放状态和每日限额限制。"
             f"进食完成时额外获得{_effects(needs['eat_completion_effect'])}，时间流逝的基础变化另行计算。"
         )
+    if "BUY_FROM_STORE" in actions:
+        rules.append("健康不高于30时仍可BUY_FROM_STORE购买可食用成品或领取公共餐，不能购买原料、种子、工具等非成品食物；仍须到店并满足库存、金币和限额条件。公共餐先零元领取，再EAT。")
+    if "INSPECT_LIVING_OPTIONS" in actions:
+        rules.append("缺饭或需要休息时可INSPECT_LIVING_OPTIONS远程查看公开生活资源及本人限制；摘要不含listing_id和批次，购买前仍须到店INSPECT_STORE_INVENTORY。available是资源条件快照，不代表已到场、空闲或已预留，最终以执行结果为准。")
     if "REST" in actions:
         rules.append("REST：只能在自己的住所或开放的餐厅休息。")
     if "SLEEP" in actions:
@@ -177,9 +190,9 @@ def build_agent_context(actions, profile=None):
             "调用 INSPECT_INVENTORY 确认实际持有的种子、可收获物、产量和种植时长。"
         )
     if "HUNT" in actions:
-        rules.append("HUNT使用HUNT_ANIMALS：猎场入口获得鸡/猪/牛待处理猎物1件；鸡60%、猪30%、牛10%。PROCESS_GAME在屠宰棚每次处理1件：鸡→鸡肉3+羽毛1；猪→里脊1+排骨1+五花肉2+粗皮革1；牛→牛肉6+粗皮革2。两动作各耗1次猎具，时长只读数据库；肉与原猎物共用猎获完成起2880分钟鲜期。库存查询提供当日猎次、下一猎额外精力、可处理实例及阻碍；取消已开始的狩猎仍计次。肉可向Lucy报价，副产品可向Nora杂货店报价；采购、售卖和休息自主安排。")
+        rules.append("HUNT使用HUNT_ANIMALS：从猎场入口追击真实鸡/猪/牛，成功击杀后获得对应待处理猎物1件；数据库时长是狩猎期限，到时不自动发奖。PROCESS_GAME在屠宰棚每次处理1件：鸡→鸡肉3+羽毛1；猪→里脊1+排骨1+五花肉2+粗皮革1；牛→牛肉6+粗皮革2。两动作各耗1次猎具，时长只读数据库；肉与原猎物共用实际击杀起2880分钟鲜期。库存查询提供当日猎次、下一猎额外精力、可处理实例及阻碍；取消已开始的狩猎仍计次。肉可向Lucy报价，副产品可向Nora杂货店报价；采购、售卖和休息自主安排。")
     if "COOK" in actions:
-        rules.append(f"COOK：需先 MOVE 到 RESTAURANT，使用允许的配方并消耗真实材料；配方编号、产量和材料清单查GET_RULE.cooking_recipes，个人可用材料查INSPECT_INVENTORY，菜品保鲜期为{economy.DISH_SPOILAGE_MINUTES}世界分钟。")
+        rules.append(f"COOK：需先 MOVE 到 RESTAURANT，使用允许的配方并消耗真实材料；配方编号、产量和材料清单查GET_RULE.cooking_recipes，个人可用材料查INSPECT_INVENTORY，菜品保鲜期为{economy.DISH_SPOILAGE_MINUTES}世界分钟。缺料会在开工前拒绝；按missing_items补齐本人可用材料后再重试该配方，未补齐时应采购、换配方或等待补货，不重复烹饪。")
     if actions & {"IMPORT_GOODS", "EXPORT_GOODS"}:
         rules.append("商队每日到访窗口为11:00–15:00，路线未开通不保证到访；先用INSPECT_MARKET_STATE查询caravan地点与时间，再MOVE；items的import_available_amount/import_unit_price是当趟进货余量与单价，export_unit_price是当趟出口收购单价；INSPECT_CARAVAN_REQUESTS单独返回完整补货目录requestable_items、requested=true登记标记、目标到访时间和配置进口总量，不能当作现货；CONTACT_CARAVAN提交完整item_ids并替换目标批次的旧登记。断桥使用 EMERGENCY_TRADE_POST，修好后后续到访使用 TRADE_ROAD，当趟以查询为准。CONTACT_CARAVAN 在杂货铺提交 item_ids，11点前完成针对本次、否则针对次日，合法需求登记100%成功；首次应急路线由Nora在允许地点个人付费开通，不要求森林侦察或补给。进口按配置总量配货并受本趟余货限制，出口受caravan.export_remaining_amount跨品种共享收购额度限制、收入归个人但保留村庄安全库存；商品目录和浮动报价每趟固定，后台变更从后续批次生效。进货仅扣个人可用金币，货进个人背包，不支持store_code；需要售卖时到自己的商店用LIST_STORE_ITEM、stock_source=PERSONAL自主上架。INSPECT_INVENTORY查看个人背包及自己商店的store_finances.unlisted_stock，INSPECT_STORE_INVENTORY查看指定商店的公开在售商品；提款须保留经营储备。")
     if actions & {"LIST_STORE_ITEM", "UPDATE_STORE_PRICE", "DELIST_STORE_ITEM"}:
@@ -190,19 +203,19 @@ def build_agent_context(actions, profile=None):
     if "INSPECT_INVENTORY" in actions:
         rules.append("库存按物品类型返回行动所需字段。sale.unit_price 是当前向 sale.target 出售每件可获得的金币；sale.allowed=false 时不可出售，reason说明原因。EAT须同时传source=PERSONAL_INVENTORY和个人可用熟食的food_instance_id。")
     if "INSPECT_RESTAURANT_STATE" in actions:
-        rules.append("INSPECT_RESTAURANT_STATE只查询餐厅营业状态、在售菜单及本人的经营资料，不返回菜谱。public_meal_availability.authorizations只列已公布且未撤销、未到期的公共餐授权，保留decision_id、批准商品、补贴、剩余预算、期限和当日份额；未到开始时间仍会说明阻碍。没有当前授权时只提示需授权。该摘要不批准或预留公款，执行时仍复核本人状态、地点和最新钱货。")
+        rules.append("INSPECT_RESTAURANT_STATE只查询餐厅营业状态、在售菜单及本人的经营资料，不返回菜谱。public_meal_availability返回三种公共餐的补贴、实际公款余额、可制作/上架的真实食材和成品、每日剩余份额及阻碍。公共餐无需授权，没有预算和授权期限前置条件。该摘要不批准或预留公款，执行时仍复核本人状态、地点和最新钱货。")
     if "REQUEST_DISH_REVIEW" in actions:
         rules.append("Lucy制作产物先归个人，可留餐自食再上架。到RECORD_HALL用REQUEST_DISH_REVIEW(food_instance_id)提交具体1份给Mark；待评预留180分钟，不可重复吃卖，可CANCEL_DISH_REVIEW(review_id)。未评可按默认价值卖，评后按点评价卖。配方及产量查GET_RULE.cooking_recipes，再对照INSPECT_INVENTORY的可用量判断缺料；cook_time_seconds是工艺随机秒数，不是工作游戏分钟。")
     if "RATE_DISH" in actions:
         rules.append("Mark先INSPECT_RATEABLE_DISHES读取Lucy实际送来的review_id及完整菜品快照，用本人LLM判断色color、香aroma、味taste、摆盘presentation四项1–10分及comment。RATE_DISH提交review_id、scores对象、comment，不传总分/价格；后台按加权总分与默认价值计算价格。历史资料不完整须在评语说明，不编造原料。")
     if actions & {"BUY_FROM_STORE", "LIST_STORE_ITEM"}:
-        rules.append("公共餐由Lucy实际制作后在饭店用ORIGINAL加public_meal_code=C1/C2/R1及decision_id上架，顾客价格0。按真实领取向饭店补贴9/12/9金，受已公布的meal_service授权、期限和预算限制；三类共享每NPC每天1份、全村每天5份，Lucy同额，游客不领取。缺公款整笔失败。先BUY_FROM_STORE领取，再EAT个人食物，吃饭不再次发补贴。")
+        rules.append("公共餐由Lucy实际制作后在饭店用ORIGINAL加public_meal_code=C1/C2/R1上架，无需授权，顾客价格0。按真实领取向饭店补贴9/12/9金；三类共享每人每个游戏日1份、全村每天10份，NPC（包括Lucy）和参与村庄生活的玩家共同占用总额度，游戏日零点重置。缺公款整笔失败。先BUY_FROM_STORE领取，再EAT个人食物，吃饭不再次发补贴。")
     if "DEPOSIT_STORE_FUNDS" in actions:
         rules.append("DEPOSIT_STORE_FUNDS：在自己的商店将个人可用资金存入店铺，不收费、不计作销售收入；WITHDRAW_STORE_FUNDS反向提款时须保留经营储备。")
     if "WITHDRAW_STORE_ITEM" in actions:
         rules.append("WITHDRAW_STORE_ITEM：在自己的商店取出未上架、未占用且未过期的库存到个人背包；已上架先下架。取货不转钱，保留批次属性；之后可自行到商队EXPORT_GOODS，收入归个人。出口失败货物仍在个人背包，也可重新上架。")
     if "CONTACT_CARAVAN" in actions:
-        rules.append("CONTACT_CARAVAN登记下一趟需求，不自动开通路线。成功回执查看route_open和arrival_world_time；route_open=false时到访时间仅为计划窗口。Nora首次开通应急路线用STORY_ACT(action_code=CONTACT_EMERGENCY_CARAVAN,route_attempt_id=新UUID)，在GENERAL_STORE或MARKET_STREET由个人支付配置费用。无森林侦察、补给、会议或剧情阶段前置，已开通不重复收费。每日11:00到访、15:00离开，11:00后路线已冻结的当天不会补来，修桥改线同样从下次到访生效。")
+        rules.append("CONTACT_CARAVAN登记下一趟需求，不自动开通路线。成功回执查看route_open和arrival_world_time；route_open=false时到访时间仅为计划窗口。Nora首次开通应急路线用CONTACT_EMERGENCY_CARAVAN(route_attempt_id=新UUID)，在GENERAL_STORE或MARKET_STREET由个人支付配置费用。无森林侦察、补给、会议或剧情阶段前置，已开通不重复收费。每日11:00到访、15:00离开，11:00后路线已冻结的当天不会补来，修桥改线同样从下次到访生效。")
     if actions & {"BUY_FROM_STORE", "INSPECT_STORE_INVENTORY"}:
         visible_location_codes = {code for code, _ in _location_directory(profile)}
         stores = VillageStore.objects.filter(
@@ -221,23 +234,19 @@ def build_agent_context(actions, profile=None):
             )
     if actions & {"BUY_FROM_MARKETPLACE", "SELL_ON_MARKETPLACE", "DELIST_FROM_MARKETPLACE"}:
         rules.append("全服市场交易：需到MARKET_STREET；只能上架自己的真实库存、下架自己的挂单，购买会检查库存和资金。")
+    if "GIVE_ITEMS" in actions:
+        rules.append("GIVE_ITEMS：向4米内的玩家或正式NPC单向赠送物品或金币，无需对方接受；先INSPECT_INVENTORY取得自己的instance_id和可用金币，再INSPECT_NEARBY取得目标的准确名字。target_type为PLAYER或NPC，target_name填写目标名字，由Unity解析ID；名字不存在或重名时不会执行，items为instance_id与amount列表。gold_amount为可选非负整数，省略为0；仅送金币传items=[]及正整数gold_amount，也可同时赠送物品和金币，二者不能同时为空。exchange_id必填小写标准UUID：回应PLAYER_GIFT时必须使用该事件的event_id，所有任务处理同一次交换都用这个ID，不得因换任务或重试生成新ID；只有独立的新赠送才使用新UUID。重复调用复用原动作/结果，can_await=false时只查询get_action_status，不await_action；unknown时先核对原动作，禁止另发赠送。全部物品和金币一次交付，可用余额不足整笔失败，失败不扣物不扣款；这是赠送，不保证对方回赠，不可用于从对方背包取物或取钱。")
     if actions & {"PROPOSE_TRADE", "RESPOND_TRADE", "CANCEL_TRADE_OFFER"}:
         rules.append("NPC个人交易及Nora主动发起的商店BUY采购：报价必须明确物品、数量和金额；接受时检查报价状态、双方地点、库存和资金。只有发起方能取消仍待处理的报价。NPC向商店SELL按下述直接售货规则执行。")
-        rules.append('向Nora商店卖货：到GENERAL_STORE，PROPOSE_TRADE指定side=SELL、store_code=GENERAL_STORE、items=[{"item_id":1030,"amount":6},{"item_id":1049,"amount":5}]即可一次卖多种自己的物品；不需要target_npc_id、报价金额或报价期限。INSPECT_INVENTORY中sale.unit_price是每件实际售价；sale.allowed=false时不可出售，reason说明原因。合计直接成交，无需Nora回应或在场；不能自行定价。重复item_id合并数量；兼容原单品item_id+amount，但不能与items混填。商店账户付款、金币进卖方个人钱包、货进商店未上架库存；店款不足提示“商店金币不足，无法收购”。任一物品可售数量不足或店款不足，整批失败、全部钱货不变。商店须营业，过期或预留货不可重复卖。工具自动收购只接受配置满耐久批次；已损耗、耗尽、耐久不明或无效的工具不可收购。个人工具交易仍由双方议价并确认。不带store_code仍为双方回应的单品个人交易，须指定target_npc_id、item_id、amount和gold_amount；Nora主动商店BUY仍是单品询价。只能查看自己背包、商店公开货物及自己参与的报价，不能查看对方私人背包或钱包。')
+        rules.append('向Nora商店卖货：到GENERAL_STORE，PROPOSE_TRADE指定side=SELL、store_code=GENERAL_STORE、items=[{"item_id":1030,"amount":6},{"item_id":1049,"amount":5}]即可一次卖多种自己的物品；不需要target_npc_name、报价金额或报价期限。INSPECT_INVENTORY中sale.unit_price是每件实际售价；sale.allowed=false时不可出售，reason说明原因。合计直接成交，无需Nora回应或在场；不能自行定价。重复item_id合并数量；兼容原单品item_id+amount，但不能与items混填。商店账户付款、金币进卖方个人钱包、货进商店未上架库存；店款不足提示“商店金币不足，无法收购”。任一物品可售数量不足或店款不足，整批失败、全部钱货不变。商店须营业，过期或预留货不可重复卖。工具自动收购只接受配置满耐久批次；已损耗、耗尽、耐久不明或无效的工具不可收购。个人工具交易仍由双方议价并确认。不带store_code仍为双方回应的单品个人交易，须指定target_npc_name、item_id、amount和gold_amount；Nora主动商店BUY仍是单品询价。只能查看自己背包、商店公开货物及自己参与的报价，不能查看对方私人背包或钱包。')
     if actions & {"CREATE_ORDER", "CANCEL_ORDER", "START_DELIVERY"}:
         rules.append("订单交易：只能取消自己的开放订单；配送必须对应已匹配订单，并满足交付地点和资产条件。")
-    if actions & {"RATE_DISH", "PUBLISH_PRICE_INDEX", "AUDIT_PUBLIC_FUND"}:
-        rules.append("公共经济事务：需先MOVE到RECORD_HALL。评分针对真实且可评分菜品；物价发布、公款审计的day_index必须为当前游戏日。每天首次有效履职按最低有效成品餐公开参考价计一次日薪，无发布价则用基础价；公款不足记欠薪，不凭空发钱。当天重复审计或换工作不会重复计薪；可用STORY_ACT/CLAIM_PUBLIC_SALARY主动领取已有欠薪。审计对照独立期初和账目，历史缺基准时仅核对迁移之后。耗时以本次实际配置为准。")
-    if actions & {"CREATE_COMMITMENT", "CANCEL_COMMITMENT", "PERFORM_COMMITMENT"}:
-        rules.append("承诺：交付、还款、捐赠、共同工作和见面均需满足参与者、目标、地点和期限条件；履约和违约可能改变关系。")
-        rules.append('CREATE_COMMITMENT按类型填写target：DELIVERY={"item_id":1030,"amount":1,"gold_amount":8}；REPAYMENT={"gold_amount":2}；DONATION赠款={"asset_kind":"GOLD","gold_amount":2}或赠物={"asset_kind":"ITEM","item_id":1030,"amount":1}；JOINT_WORK={"location_code":"RESTAURANT","work_code":"MEAL_PREPARATION"}；MEETING={"location_code":"RECORD_HALL"}。金额数量为正整数，物品按工具白名单，地点须存在；due_world_minute大于当前世界分钟，beneficiary_npc_id是他人。创建不扣资产；DONATION给个人而非公款；DELIVERY须个人PROPOSE_TRADE携带commitment_id，买卖双方和钱货与承诺一致、接受成交才履约；其他用PERFORM_COMMITMENT。会面/共同工作要求双方在目标地点并可参与，JOINT_WORK不代替COOK或公共工程结算。')
-    if actions & CommandService.STORY_ACTIONS:
-        rules.append("会议通知含meeting_id、starts_world_minute/starts_world_time；world_time只是通知发生时间。收到召集/提案/投票/公布事件后，按需查INSPECT_STORY_DETAIL.meetings：can_settle是当前结算条件快照，unavailable_reasons列缺项，valid_npc_vote_count与attendee_count分别是有效NPC票数和出席人数，own_vote只表示自己的投票；terms_locked不代表票已齐。voting_open只表示投票时间窗口，仍须符合在场和提案条件；投票截止后的OPEN会议可依既有规则结算。正式结算仍由后端重新核实，leading_plan不是已通过决定，不代投、不因通知自动到场。")
-        rules.append("剧情行动：投票受开放会议和候选方案限制，剧情行动受当前阶段、方案、角色权限、地点、已知事实和资源限制；进度变化后应重新查询，不要假定旧方案仍可执行。")
-        rules.append("REPAIR_LABOR：先到REPAIR_YARD或OLD_BRIDGE，使用STORY_ACT并填写有效decision_id。每次占用60游戏分钟，labor_hours省略或填1；完整完成后才记1人时，中断不计工时。受伤、AWAY、精力不足、离开工地或授权失效会停止。DONATE_REPAIR_RESOURCES的木材是1002，工程金属是4003，1003南瓜种子不能抵木材。")
-        rules.append("公共决定：先查INSPECT_STORY_DETAIL中的会议提案与public_decisions。新决定须Mark在场、至少3人出席及3张有效票；提案一旦有人投票不能改。工程采购/贡献须带decision_id，采购者还须匹配执行人、物品、有效期和剩余预算。Mark缺席时不能新增决定，但已经公布的有限有效授权可继续执行。公共配给须先公布再由Nora按批准额度与期限启用；普通店铺限购可自主更严格，不能放宽有效公共规则；剧情结束不提前取消合法期限。")
-    if profile and str(profile.npc.agent_id) == "10013" and "STORY_ACT" in actions:
-        rules.append("公共履职回执保留会议/决定编号、条款、审核凭证与salary。salary.new_amount_due是本次新产生应付，paid是本次实际到账（可能含补发往日欠薪），amount_due_today/amount_paid_for_today只针对今天这份工资，outstanding是尚欠；不要把应付当现金。audit提供结构化对账范围和差额。回执缺字段时查询公共经济与剧情详情，不凭空补编号或条款。")
-        rules.append("书记操作均通过STORY_ACT，在RECORD_HALL执行：CALL_MEETING(starts_world_minute)召集；REGISTER_PROPOSAL(meeting_id,plan_code,budget_gold,executor_npc_id,expires_world_minute,ration_daily_limits,meal_service)登记修桥/配给提案；PUBLISH_DECISION(meeting_id)核实真实出席与投票、结算并原样公布，或用decision_id公布已经结算的决定，配给也可用PUBLISH_RATION_RULES。公共配给公布后即受执行端强制保护，Nora按已批准范围启用。REVEAL_STORY_FACT(fact_code=DEFERRED_BRIDGE_BUDGET)公开本人已有的历史预算事实；MANAGE_REPAIR_LEDGER(decision_id,evidence_request_id)审核真实工程凭证，同一凭证只能审一次。CALL_MEETING/登记提案不计薪；已失能、睡眠或AWAY不可履职。召集、投票和采购均由各Agent自行决定。")
-
+    if "RATE_DISH" in actions:
+        rules.append("Mark是村庄从外部聘请的品鉴师，专属职责是菜品品鉴：先MOVE到RECORD_HALL，使用INSPECT_RATEABLE_DISHES查询真实待评样品，再通过RATE_DISH提交色、香、味、形四项1–10分评分和具体评语。系统据此更新该份菜品的评价和评价价格；单次评分不触发工资支付。")
+        employment = VillageSimulationConfig.objects.filter(config_key="default").first()
+        if employment and employment.mark_employed_from_minute is not None:
+            rules.append(f"受聘起点为世界分钟{employment.mark_employed_from_minute}，从该游戏日开始每日工资{employment.mark_daily_salary}金币，由系统在日结时从公共资金自动支付到个人钱包，无需领取指令；当天没有菜品可评也计薪。资金不足记录新制欠薪，后续日结优先补发；旧制历史欠薪不补发。")
+    if "CONTRIBUTE_TO_AFFAIR" in actions:
+        rules.append("村庄事务由系统创建和定义，NPC自主决定是否参与。使用INSPECT_AFFAIRS查询；使用CONTRIBUTE_TO_AFFAIR指定affair_id、condition_id和kind，仅贡献available=true的条件。各事务独立推进，无全局剧情阶段、会议、投票或发布决议前置。")
+        rules.append("kind=item提交item_id和amount，可用food_instance_id指定批次；kind=gold提交amount，扣个人可用金币。系统按条件品质、新鲜度、地点和剩余需求校验，不能重复贡献或使用公款。kind=labor不传amount，真实完成unit_minutes才计1份，中断不计。最后阶段完成后由系统结算完成效果。")
     return {"common_rules": common, "npc_rules": rules}

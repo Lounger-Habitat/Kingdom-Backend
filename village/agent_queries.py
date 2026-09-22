@@ -18,16 +18,11 @@ from .models import (
     NpcDialogueSession,
     NpcNeedsDaySummary,
     NpcRuntimeState,
-    NpcStoryFactAccess,
-    NpcTradeDelivery,
-    NpcTradeOrder,
     VillageAccount,
     VillageFarmPlot,
     VillageLocationDefinition,
     VillageRestaurantState,
     VillageStore,
-    VillageStoryArc,
-    VillageStoryFact,
     VillageTradeOffer,
     VillageWorldEvent,
 )
@@ -47,31 +42,30 @@ from .phase3_marketplace import (
     marketplace_history_query,
     my_marketplace_listings_query,
 )
-from .phase5_contract import FORMAL_NPC_IDS, STORY_ACTION_ACTORS, STORY_FACT_CODES
-from .phase5_story import ARC_CODE, STORY_ACTION_PLANS, _snapshot
+from .phase5_contract import FORMAL_NPC_IDS
 from .public_finance import public_finance_query
 from .public_governance import ADMIN_ACTIONS, governance_query
+from .daily_records import READ_ACTIONS, query_daily_records
 
 
 QUERY_NAMES = frozenset({
+    "INSPECT_SCHEDULE", "INSPECT_DIARIES",
     "GET_RULE",
+    "INSPECT_LIVING_OPTIONS",
+    "INSPECT_AFFAIRS",
     "OBSERVE",
     "INSPECT_NEARBY",
     "INSPECT_INVENTORY",
     "INSPECT_TRADE_OFFERS",
-    "INSPECT_STORY_STATE",
-    "INSPECT_RELEVANT_STORIES",
-    "INSPECT_STORY_DETAIL",
-    "INSPECT_ORDERS",
     "INSPECT_MARKET_STATE",
     "INSPECT_CARAVAN_REQUESTS",
     "INSPECT_FARM_STATE",
     "INSPECT_RESTAURANT_STATE",
     "INSPECT_RATEABLE_DISHES",
-    "INSPECT_PUBLIC_ECONOMY_STATE",
     "BROWSE_MARKETPLACE",
     "INSPECT_STORE_INVENTORY",
     "INSPECT_SOCIAL_STATE",
+    "INSPECT_PERSONAL_COMMISSIONS",
     "CHECK_MY_MARKETPLACE_LISTINGS",
     "CHECK_MARKETPLACE_HISTORY",
 })
@@ -315,6 +309,9 @@ def _nearby(npc: NpcDefinition) -> dict:
         "current_location": runtime.current_location_code,
         "npc_names": npc_names,
         "nearby_npcs": nearby_npcs,
+        # Live player presence belongs to the Unity Env server, not this database.
+        "nearby_players": [],
+        "players_observation_available": False,
         "nearby_locations": locations[:5],
     }
 
@@ -477,183 +474,6 @@ def _trade_offers(npc: NpcDefinition) -> dict:
     } for row in rows]}
 
 
-def _story_state(npc: NpcDefinition) -> dict:
-    from .story_state_projection import project_story_state
-
-    arc = VillageStoryArc.objects.filter(arc_code=ARC_CODE).first()
-    if arc is None:
-        return {
-            "status": "INACTIVE",
-            "available_actions": [],
-            "available_actions_explanation": "当前没有可公开的剧情行动。",
-        }
-    detail = _broken_trade_route_detail(npc)
-    if detail is None:
-        return {
-            "story_id": arc.arc_code,
-            "status": "UNAVAILABLE",
-            "available_actions": [],
-            "available_actions_explanation": "当前剧情状态尚未准备好，暂时没有可公开行动。",
-        }
-    return project_story_state(
-        detail, npc.agent_id, npc.village_profile.capabilities or [],
-        _world_minute(), arc.outcome,
-    )
-
-
-def _broken_trade_route_detail(npc: NpcDefinition) -> dict | None:
-    """Return the current story projection after NPC fact/action filtering."""
-    arc = VillageStoryArc.objects.filter(arc_code=ARC_CODE).first()
-    if arc is None:
-        return None
-    fact = VillageStoryFact.objects.filter(arc=arc).first()
-    if fact is None:
-        return None
-    meeting = arc.meetings.filter(status="OPEN").order_by("opened_day").first()
-    snapshot = _snapshot(arc, fact, meeting)
-    known_facts = list(NpcStoryFactAccess.objects.filter(
-        npc=npc, fact_code__in=STORY_FACT_CODES,
-    ).values_list("fact_code", flat=True))
-    available_actions = [
-        action for action, plans in STORY_ACTION_PLANS.items()
-        if not arc.is_completed and arc.current_phase == "EXECUTION"
-        and arc.current_plan and arc.current_plan in plans
-        and str(npc.agent_id) in STORY_ACTION_ACTORS.get(action, set())
-    ]
-    if str(npc.agent_id) == "10013":
-        available_actions = sorted(set(available_actions) | ADMIN_ACTIONS)
-        if arc.current_phase == "AFTERMATH" and not arc.is_completed:
-            available_actions.remove("CALL_MEETING")
-    if str(npc.agent_id) == "10015":
-        available_actions = sorted(set(available_actions) | {"CONTACT_EMERGENCY_CARAVAN"})
-    governance = governance_query(arc, npc.agent_id, _world_minute())
-    if str(npc.agent_id) == "10015" and any(
-        d["plan_code"] == "RATION_AND_WAIT" and d["published_world_minute"] is not None
-        and d["revoked_world_minute"] is None and d["terms"].get("expires_world_minute", 0) > _world_minute()
-        for d in governance["public_decisions"]
-    ):
-        available_actions = sorted(set(available_actions) | {"ENABLE_STORE_LIMITS"})
-    runtime = NpcRuntimeState.objects.filter(npc=npc).first()
-    unavailable = runtime is not None and (
-        runtime.health_fp <= 300 or runtime.action_status in {"AWAY", "SLEEPING"}
-        or (runtime.away_until_world_minute is not None and runtime.away_until_world_minute > _world_minute())
-    )
-    if unavailable:
-        available_actions = []
-        waiting_reason = "当前失能、睡眠或缺席，恢复后重新查询可履行的公共事务。"
-    elif available_actions:
-        waiting_reason = "以下为角色当前阶段的公共能力；执行仍须满足地点、会议提案、有效投票或既有授权等条件。"
-    elif snapshot["is_completed"]:
-        waiting_reason = "主线剧情已完成；已公布的公共授权仍按各自期限执行。"
-    elif meeting is not None and "STORY_VOTE" in {
-        str(value).strip().upper() for value in (npc.village_profile.capabilities or [])
-    }:
-        waiting_reason = f"公开会议进行中，可参加会议；会议在第{meeting.closes_day}日结束。"
-    elif snapshot["phase"] == "EXECUTION":
-        waiting_reason = "当前阶段没有分配给你的可执行公开行动。"
-    elif snapshot["phase"] == "AFTERMATH":
-        # 二跑复盘（R3）：写明推进条件，避免 agent 反复查询同一空窗结论。
-        waiting_reason = (
-            "当前阶段（AFTERMATH）不开放执行行动；日结评估满足任一条件后自动进入下一阶段："
-            "距起始日满 1 天、粮食覆盖不足 4 天、或工具覆盖不足 7 天。"
-            "此前可处理日常生计（种植/狩猎/备货/就餐），也可以等待。"
-        )
-    else:
-        waiting_reason = "当前阶段不开放执行行动，等待后续日结评估推进，届时重新查看剧情。"
-    return {
-        "story_id": ARC_CODE,
-        "arc_code": ARC_CODE,
-        "title": "断掉的商路",
-        "type": "MAIN",
-        "phase": snapshot["phase"],
-        "plan": snapshot["plan"],
-        "status": "COMPLETED" if snapshot["is_completed"] else "ACTIVE",
-        "story_version": snapshot["story_version"],
-        "bridge_condition": snapshot["bridge_condition"],
-        "progress": snapshot["plan_progress"],
-        "available_actions": available_actions,
-        "available_actions_explanation": waiting_reason,
-        "known_facts": known_facts,
-        "retired_plan": arc.current_plan == "FOREST_ROUTE",
-        "emergency_route_rule": "Nora个人支付一次开通费，无森林侦察、补给、会议或剧情阶段前置；11:00后当前到访路线已冻结，次日生效。",
-        **governance,
-    }
-
-
-_STORY_PROJECTORS = {ARC_CODE: _broken_trade_route_detail}
-
-
-def _story_detail(npc: NpcDefinition, story_id: str) -> dict | None:
-    if str(npc.agent_id) not in FORMAL_NPC_IDS:
-        return None
-    projector = _STORY_PROJECTORS.get(story_id)
-    detail = projector(npc) if projector else None
-    if detail is None:
-        return None
-    from .story_state_projection import project_story_state
-    arc = VillageStoryArc.objects.filter(arc_code=story_id).first()
-    projected = project_story_state(detail, npc.agent_id, npc.village_profile.capabilities or [],
-                                    _world_minute(), arc.outcome if arc else None)
-    projected["type"] = detail.get("type", "MAIN")
-    return projected
-
-
-def _relevant_stories(npc: NpcDefinition) -> dict:
-    # Keep this registry as the only place a future story projector is added.
-    stories = []
-    for story_id in _STORY_PROJECTORS:
-        detail = _story_detail(npc, story_id)
-        if detail is None:
-            continue
-        stories.append({
-            "story_id": story_id,
-            "arc_code": story_id,
-            "title": detail["title"],
-            "type": detail["type"],
-            "status": detail["status"],
-            "phase": detail["phase"],
-            "story_version": detail["story_version"],
-            "role": "PARTICIPANT",
-            "latest_summary": f"桥梁状态：{detail['bridge_condition']}",
-        })
-    return {"stories": stories}
-
-
-def _orders(npc: NpcDefinition) -> dict:
-    orders = list(NpcTradeOrder.objects.filter(
-        npc=npc, status__in=("OPEN", "MATCHED"),
-    ).order_by("created_at"))
-    deliveries = NpcTradeDelivery.objects.select_related(
-        "buyer_order__npc", "seller_order__npc",
-    ).filter(
-        Q(buyer_order__npc=npc) | Q(seller_order__npc=npc), status="ACTIVE",
-    ).order_by("created_at")
-    return {
-        "orders": [{
-            "order_id": str(row.order_id),
-            "side": row.side,
-            "item_id": row.item_id,
-            "quantity": row.amount,
-            "unit_price": row.unit_price,
-            "delivery_point_code": row.delivery_point_code,
-            "expires_world_minute": row.expires_world_minute,
-            "status": row.status,
-        } for row in orders],
-        "deliveries": [{
-            "delivery_id": str(row.delivery_id),
-            "item_id": row.seller_order.item_id,
-            "buyer_order_id": str(row.buyer_order.order_id),
-            "seller_order_id": str(row.seller_order.order_id),
-            "buyer_npc_id": str(row.buyer_order.npc.agent_id),
-            "seller_npc_id": str(row.seller_order.npc.agent_id),
-            "delivery_point_code": row.delivery_point_code,
-            "quantity": row.reserved_amount,
-            "expires_world_minute": row.expires_world_minute,
-            "role": "SELLER" if row.seller_order.npc_id == npc.pk else "BUYER",
-        } for row in deliveries],
-    }
-
-
 def _strict_query_int(query_params, name: str, default: int, *, minimum: int = 0, maximum: int | None = None) -> int:
     value = (query_params or {}).get(name, default)
     if isinstance(value, bool):
@@ -710,24 +530,18 @@ def _farm_state(_npc: NpcDefinition, query_params=None) -> dict:
     crop_catalog = farm_crop_catalog()
     plots = []
     plot_filter = {"plot_code": plot_code} if plot_code is not None else {"plot_code__in": PLOT_CODES}
-    for row in VillageFarmPlot.objects.filter(**plot_filter).order_by("plot_code"):
-        status = row.status
-        if status == FarmPlotStatus.GROWING and row.mature_world_minute is not None and world_minute >= row.mature_world_minute:
-            status = FarmPlotStatus.MATURE
-        plot = {
-            "plot_code": row.plot_code,
-            "status": status,
-        }
-        if status != FarmPlotStatus.EMPTY:
-            crop_rule = crop_catalog.get(row.crop_code, {})
-            plot["crop_code"] = row.crop_code
-            plot["crop_name"] = crop_rule.get("display_name", row.crop_code)
-            if status == FarmPlotStatus.MATURE:
-                plot["harvestable"] = True
-            else:
-                plot["remaining_minutes"] = max(
-                    0, (row.mature_world_minute or world_minute) - world_minute
-                )
+    from .player_farm import project_plot
+    for row in VillageFarmPlot.objects.select_related("lessee_player").filter(**plot_filter).order_by("plot_code"):
+        plot = project_plot(row, world_minute)
+        is_bill = str(_npc.agent_id) == "10011"
+        player_owned = row.lessee_player_id is not None
+        plot["harvestable"] = is_bill and not player_owned and plot["status"] == FarmPlotStatus.MATURE
+        plot["plantable"] = is_bill and not player_owned and not row.lease_enabled and plot["status"] == FarmPlotStatus.EMPTY
+        plot["blocked_reason"] = ("PLAYER_LEASED" if player_owned else
+            "BILL_ONLY" if not is_bill else "RESERVED_FOR_LEASING" if row.lease_enabled and plot["status"] == "EMPTY" else "")
+        if plot["status"] != FarmPlotStatus.EMPTY:
+            plot["crop_name"] = crop_catalog.get(row.crop_code, {}).get("display_name", row.crop_code)
+            plot["remaining_minutes"] = max(0, (row.mature_world_minute or world_minute)-world_minute)
         plots.append(plot)
     return {"plots": plots}
 
@@ -782,34 +596,6 @@ def _rateable_dishes(_npc: NpcDefinition, query_params=None) -> dict:
 
 
 
-def _public_economy(_npc: NpcDefinition) -> dict:
-    world_minute = _world_minute()
-    day_index = world_minute // 1440
-    account = VillageAccount.objects.filter(account_code="PUBLIC_FUND").first()
-    snapshot = DailyPriceSnapshot.objects.filter(day_index=day_index).first()
-    price_index_status = snapshot.status if snapshot else "MISSING"
-    audited = VillageWorldEvent.objects.filter(
-        event_type="ECONOMY_AUDIT_PUBLIC_FUND",
-        world_minute__gte=day_index * 1440,
-        world_minute__lt=(day_index + 1) * 1440,
-    ).exists()
-    return {
-        "day_index": day_index,
-        "public_fund_balance": account.balance if account else None,
-        "public_fund_available": account is not None,
-        "price_index": None if snapshot is None else {
-            "status": snapshot.status,
-            "prices": dict(snapshot.prices or {}),
-            "price_items": [{"item_id": int(item_id), "unit_price": price}
-                            for item_id, price in (snapshot.prices or {}).items()],
-            "published_world_minute": snapshot.published_world_minute,
-        },
-        "price_index_status": price_index_status,
-        "draft_exists": snapshot is not None and price_index_status == "DRAFT",
-        "published": price_index_status == "PUBLISHED",
-        "audited_today": audited,
-        **public_finance_query(world_minute),
-    }
 
 
 def _browse_marketplace(npc: NpcDefinition, query_params=None) -> dict:
@@ -822,6 +608,96 @@ def _my_marketplace_listings(npc: NpcDefinition, query_params=None) -> dict:
 
 def _marketplace_history(npc: NpcDefinition, query_params=None) -> dict:
     return marketplace_history_query(npc, query_params)
+
+
+def _living_options(npc: NpcDefinition) -> dict:
+    """Remote public resource summary; batch/listing details remain an on-site query."""
+    from .agent_context import _location_directory
+    from .models import VillageSimulationConfig
+    from .phase2_services import LifeActionService
+    from .phase3_direct_trade import _get_buyer_available_money, query_store_inventory
+    from .runtime_services import CommandService
+
+    minute = _world_minute()
+    profile = npc.village_profile
+    runtime = NpcRuntimeState.objects.get(npc=npc)
+    bag = NpcGlobalInventory.objects.get(npc=npc)
+    money = _get_buyer_available_money(bag)
+    actions = CommandService.allowed_actions_for(npc)
+    config = VillageSimulationConfig.objects.filter(config_key="default").first()
+    trade_enabled = bool(config and config.village_economy_enabled and config.village_direct_trade_enabled)
+    locations = {row.location_code: row for row in VillageLocationDefinition.objects.filter(
+        location_code__in=dict(_location_directory(profile)), is_active=True)}
+    edible_ids = set(Item.objects.filter(item_type=ItemType.FOOD, is_deleted=False).values_list("item_id", flat=True))
+    food_sources = []
+    for store in VillageStore.objects.filter(location_code__in=locations).select_related("operator_npc").order_by("store_code"):
+        error, menu = query_store_inventory(store.pk, minute, npc.agent_id)
+        store_reasons = []
+        if error:
+            store_reasons.append(error)
+        if not trade_enabled:
+            store_reasons.append("P3_FEATURE_DISABLED")
+        if "BUY_FROM_STORE" not in actions:
+            store_reasons.append("ACTION_NOT_ALLOWED")
+        foods = []
+        for item in (menu or {}).get("items", []):
+            if item["item_id"] not in edible_ids:
+                continue
+            public_meal = bool(item.get("public_meal_code"))
+            reasons = list(store_reasons)
+            if item["available_amount"] <= 0:
+                reasons.append("TRADE_INSUFFICIENT_ITEM")
+            if public_meal:
+                if item.get("unavailable_reason"):
+                    reasons.append(item["unavailable_reason"])
+                remaining = min(item.get("remaining_personal_today", 0), item.get("remaining_village_today", 0))
+            else:
+                remaining = menu["purchase_limits"]["remaining_today"].get(str(item["item_id"]))
+                if store.operator_npc_id == npc.pk:
+                    reasons.append("TRADE_STORE_FORBIDDEN")
+                if remaining is not None and remaining <= 0:
+                    reasons.append("STORY_RATION_LIMIT_REACHED")
+                if money < item["unit_price"]:
+                    reasons.append("TRADE_INSUFFICIENT_MONEY")
+            foods.append({
+                "item_id": item["item_id"], "name": item["name"],
+                "unit_price": item["unit_price"], "available_amount": item["available_amount"],
+                "public_meal": public_meal, "remaining_today": remaining,
+                "available": not reasons, "blocked_reasons": reasons,
+            })
+        food_sources.append({
+            "store_code": store.pk, "name": store.display_name, "location_code": store.location_code,
+            "status": store.status, "opening_hours": locations[store.location_code].opening_hours,
+            "requires_move": runtime.current_location_code != store.location_code,
+            "available": any(food["available"] for food in foods),
+            "blocked_reasons": store_reasons or ([] if foods else ["NO_EDIBLE_FOOD_LISTED"]),
+            "foods": foods, "detail_query": "INSPECT_STORE_INVENTORY",
+        })
+
+    rest_places = []
+    for code in dict.fromkeys([profile.home_location_code, "RESTAURANT"]):
+        location = locations.get(code)
+        if location is None:
+            continue
+        reasons = [] if code != "RESTAURANT" or LifeActionService._location_open(code) else ["LOCATION_CLOSED"]
+        options = []
+        if "REST" in actions:
+            options.append("REST")
+        if code == profile.home_location_code and "SLEEP" in actions:
+            options.append("SLEEP")
+        # A closed restaurant blocks REST; sleeping at one's own home remains legal.
+        rest_places.append({
+            "location_code": code, "name": location.display_name,
+            "opening_hours": location.opening_hours,
+            "requires_move": runtime.current_location_code != code,
+            "actions": [{"action": action, "available": not reasons or action == "SLEEP",
+                         "blocked_reasons": reasons if action == "REST" else []} for action in options],
+        })
+    return {
+        "world_minute": minute, "available_money": money,
+        "food_sources": food_sources, "rest_places": rest_places,
+        "note": "这是当前资源与本人资格的只读快照，不预留钱货；不代表已经到场或空闲。先MOVE到对应地点，购物再INSPECT_STORE_INVENTORY选择listing_id；公共餐先领取到个人库存再EAT。营业时间按配置原样返回，不推测未配置的开门时间。",
+    }
 
 
 def _rules(npc: NpcDefinition) -> dict:
@@ -847,26 +723,68 @@ def _authorized(_npc: NpcDefinition) -> dict:
     return {"authorized": True}
 
 
+def _personal_commissions(npc, query_params=None):
+    from .personal_commissions import list_commissions
+    params = query_params or {}
+    scope = params.get("scope", "published")
+    if set(params) - {"scope"} or not isinstance(scope, str) or scope not in {"published", "all"}:
+        raise ValueError("Invalid commission scope")
+    rows = list_commissions(_world_minute(), actor_type="NPC", actor_id=str(npc.pk))
+    if scope == "published":
+        rows = [row for row in rows if str(row.get("publisher_id")) == str(npc.pk)]
+    bag = NpcGlobalInventory.objects.filter(npc=npc).first()
+    from .phase3_asset_service import get_available_money
+    from .personal_commissions import MAX_OPEN_PER_NPC
+    return {"scope": scope, "commissions": rows, "available_gold": get_available_money(bag) if bag else 0,
+        "max_open_per_npc": MAX_OPEN_PER_NPC,
+        "world_minute": _world_minute()}
+
+
+def _affairs(npc, query_params=None):
+    from .models import VillageAffair, VillageAffairContribution
+    from .affairs import project_affair
+    from .affair_agent_projection import project_npc_affairs
+    from .runtime_services import CommandService
+    params = query_params or {}
+    if not isinstance(params, dict) or set(params) - {"affair_id"}:
+        raise ValueError("Invalid affair query")
+    rows = VillageAffair.objects.filter(kind="RESOURCE_PROJECT").order_by("opened_world_minute", "code")
+    if "affair_id" in params:
+        if not isinstance(params["affair_id"], str) or not params["affair_id"].strip():
+            raise ValueError("Invalid affair ID")
+        rows = rows.filter(pk=params["affair_id"])
+        if not rows.exists():
+            raise AgentQueryError("AFFAIR_NOT_FOUND", {})
+    runtime = NpcRuntimeState.objects.get(npc=npc)
+    data = project_npc_affairs([project_affair(row) for row in rows], CommandService.allowed_actions_for(npc),
+        unavailable=runtime.health_fp <= 300 or runtime.action_status in {"AWAY", "SLEEPING"})
+    for row in data:
+        row.pop("story_version", None)
+        row["my_contributions"] = list(VillageAffairContribution.objects.filter(affair_id=row["affair_id"],
+            actor_type="NPC", actor_id=str(npc.agent_id)).order_by("world_minute", "pk").values(
+                "condition_id", "kind", "item_id", "quantity", "world_minute"))
+    return {"affairs": data, "world_minute": _world_minute()}
+
+
 _HANDLERS = {
     "GET_RULE": _rules,
+    "INSPECT_AFFAIRS": _affairs,
+    "INSPECT_LIVING_OPTIONS": _living_options,
     "OBSERVE": _observe,
     "INSPECT_NEARBY": _nearby,
     "INSPECT_INVENTORY": _inventory,
     "INSPECT_TRADE_OFFERS": _trade_offers,
-    "INSPECT_STORY_STATE": _story_state,
-    "INSPECT_RELEVANT_STORIES": _relevant_stories,
-    "INSPECT_ORDERS": _orders,
     "INSPECT_MARKET_STATE": _market_state,
     "INSPECT_CARAVAN_REQUESTS": _caravan_requests,
     "INSPECT_FARM_STATE": _farm_state,
     "INSPECT_RESTAURANT_STATE": _restaurant_state,
     "INSPECT_RATEABLE_DISHES": _rateable_dishes,
-    "INSPECT_PUBLIC_ECONOMY_STATE": _public_economy,
     "BROWSE_MARKETPLACE": _browse_marketplace,
     "CHECK_MY_MARKETPLACE_LISTINGS": _my_marketplace_listings,
     "CHECK_MARKETPLACE_HISTORY": _marketplace_history,
     "INSPECT_STORE_INVENTORY": _authorized,
     "INSPECT_SOCIAL_STATE": _authorized,
+    "INSPECT_PERSONAL_COMMISSIONS": _personal_commissions,
 }
 
 
@@ -881,18 +799,20 @@ def execute_agent_query(npc_id: str, query_name: str, query_params=None) -> tupl
         )
     except NpcDefinition.DoesNotExist:
         return False, "NPC_NOT_FOUND", None
-    capabilities = {str(value).strip().upper() for value in npc.village_profile.capabilities}
+    from .runtime_services import CommandService
+    capabilities = CommandService.allowed_actions_for(npc)
     if query_name not in capabilities:
         return False, "ACTION_NOT_ALLOWED", None
+    if query_name in READ_ACTIONS:
+        try:
+            return True, "OK", query_daily_records(npc, READ_ACTIONS[query_name], query_params)
+        except ValueError:
+            return False, "INVALID_QUERY_PARAMS", None
     try:
-        if query_name == "INSPECT_STORY_DETAIL":
-            story_id = str((query_params or {}).get("story_id", "")).strip()
-            data = _story_detail(npc, story_id)
-            return (True, "OK", add_item_names(data)) if data is not None else (False, "STORY_NOT_VISIBLE", None)
         if query_name in {"BROWSE_MARKETPLACE", "CHECK_MY_MARKETPLACE_LISTINGS", "CHECK_MARKETPLACE_HISTORY"}:
             return True, "OK", add_item_names(_HANDLERS[query_name](npc, query_params))
         handler = _HANDLERS[query_name]
-        if query_name in {"INSPECT_MARKET_STATE", "INSPECT_FARM_STATE", "INSPECT_INVENTORY", "INSPECT_RATEABLE_DISHES"}:
+        if query_name in {"INSPECT_MARKET_STATE", "INSPECT_FARM_STATE", "INSPECT_INVENTORY", "INSPECT_RATEABLE_DISHES", "INSPECT_PERSONAL_COMMISSIONS", "INSPECT_AFFAIRS"}:
             try:
                 return True, "OK", add_item_names(handler(npc, query_params))
             except ValueError:

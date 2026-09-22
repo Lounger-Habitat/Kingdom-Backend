@@ -64,3 +64,29 @@ class MarketPresentationTests(TestCase):
         self.config.village_presentation_enabled = False
         self.config.save(update_fields=["village_presentation_enabled"])
         self.assertEqual(self.client.get(path).status_code, 404)
+
+    def test_authenticated_owner_flags_and_freshness_are_read_only(self):
+        from django.db import connection
+        from django.test.utils import CaptureQueriesContext
+        other = GameAccount.objects.create(username="OtherMarketSeller")
+        own = self.listing(source_type="player", seller=self.user,
+            item_snapshot={"batchMetadataVersion": 1, "expiresWorldMinute": 1600})
+        theirs = self.listing(source_type="player", seller=other,
+            item_snapshot={"batchMetadataVersion": 1, "freshnessUnknown": True})
+        system = self.listing()
+        expired = self.listing(source_type="player", seller=self.user,
+            expires_at=timezone.now() - timedelta(seconds=1))
+        with CaptureQueriesContext(connection) as queries:
+            answer = self.client.get("/api/village/public/market")
+        self.assertEqual(answer.status_code, 200)
+        rows = {r["listing_id"]: r for r in answer.data["data"]["listings"]}
+        self.assertEqual((rows[own.pk]["is_own_listing"], rows[own.pk]["source_type"]), (True, "player"))
+        self.assertFalse(rows[theirs.pk]["is_own_listing"])
+        self.assertEqual((rows[system.pk]["is_own_listing"], rows[system.pk]["source_type"]), (False, "system"))
+        self.assertEqual(rows[own.pk]["batch"]["freshness"], {"state": "FRESH", "expiresWorldMinute": 1600})
+        self.assertEqual(rows[theirs.pk]["batch"]["freshness"]["state"], "UNKNOWN")
+        self.assertNotIn(expired.pk, rows)
+        self.assertFalse(any(q["sql"].lstrip().upper().startswith(("INSERT", "UPDATE", "DELETE")) for q in queries))
+        expired.refresh_from_db()
+        self.assertEqual(expired.status, "active")
+        self.assertEqual(self.client.get("/api/village/public/market", {"player_id": other.pk}).status_code, 400)

@@ -218,7 +218,7 @@ class PlantSuccessTest(ProductionTestBase):
         plot = VillageFarmPlot.objects.get(plot_code="FARM_PLOT_A_02")
         self.assertEqual(plot.crop_code, "WHEAT")
         self.assertEqual(resp["effects"]["plot"]["crop_code"], "WHEAT")
-        self.assertEqual(resp["effects"]["items_consumed"], [{"item_id": 29301, "amount": 1}])
+        self.assertEqual([(row["item_id"], row["amount"]) for row in resp["effects"]["items_consumed"]], [(29301, 1)])
 
 
 class PlantFailureTest(ProductionTestBase):
@@ -352,27 +352,12 @@ class HarvestFailureTest(ProductionTestBase):
 
 
 class HuntSuccessTest(ProductionTestBase):
-    def test_hunt_success(self):
+    def test_legacy_timer_hunt_is_retired(self):
         resp = self._hunt()
-        self.assertEqual(resp["result_code"], ResultCode.OK)
-
-        # One current meat type added
-        meat_slots = NpcGlobalInventorySlot.objects.filter(
-            bag=self.jack_inv, item_id__in=HUNT_MEAT_ITEM_IDS,
-        )
-        self.assertEqual(len(meat_slots), 1)
-        self.assertIn(meat_slots[0].item_id, HUNT_MEAT_ITEM_IDS)
-        self.assertGreaterEqual(meat_slots[0].item_amount, 3)
-        self.assertLessEqual(meat_slots[0].item_amount, 5)
-
-        # Expiry set
-        self.assertEqual(meat_slots[0].expires_world_minute, 700 + 2880)
-
-        # Tool durability decreased
+        self.assertEqual(resp["result_code"], "HUNT_KILL_REQUIRED")
+        self.assertFalse(self.jack_inv.slots.filter(item_id__in=HUNT_MEAT_ITEM_IDS).exists())
         self.jack_hunt_tool.refresh_from_db()
-        slots = list(self.jack_inv.slots.filter(item_id=4002))
-        self.assertEqual(sum(row.item_amount for row in slots), 3)
-        self.assertEqual(sum(row.item_amount * row.remaining_uses for row in slots), 44)
+        self.assertEqual(self.jack_hunt_tool.remaining_uses, 15)
 
 
 class HuntFailureTest(ProductionTestBase):
@@ -394,13 +379,13 @@ class HuntFailureTest(ProductionTestBase):
         self.jack_rt.health_fp = 200
         self.jack_rt.save(update_fields=["health_fp"])
         resp = self._hunt()
-        self.assertEqual(resp["result_code"], ResultCode.P3_FORBIDDEN_ACTOR)
+        self.assertEqual(resp["result_code"], "HUNT_KILL_REQUIRED")
 
     def test_hunt_tool_broken(self):
         self.jack_hunt_tool.remaining_uses = 0
         self.jack_hunt_tool.save(update_fields=["remaining_uses"])
         resp = self._hunt()
-        self.assertEqual(resp["result_code"], ResultCode.P3_TOOL_BROKEN)
+        self.assertEqual(resp["result_code"], "HUNT_KILL_REQUIRED")
 
 
 # ============================================================================

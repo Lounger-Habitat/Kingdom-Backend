@@ -545,6 +545,24 @@ class TravelerSalesTest(DayCloseTestBase):
         self.assertEqual(ledger.changes["traveler_revenue"], 50)
         self.assertEqual(ledger.external_delta, 50)
 
+    def test_traveler_fees_and_mark_salary_share_a_balanced_day_close(self):
+        from village.public_finance import reconcile
+        VillageSimulationConfig.objects.filter(config_key="default").update(
+            mark_daily_salary=100, mark_employed_from_minute=0)
+        mark_inv, _ = NpcGlobalInventory.objects.update_or_create(npc=self.mark, defaults={"money": 120})
+        NpcGlobalInventorySlot.objects.create(bag=self.lucy_inv, slot_index=0, item_id=1053,
+            item_amount=2, produced_world_minute=1000, expires_world_minute=4000, dish_quality=3)
+        result = self._close_day(0)
+        self.assertEqual(result["result_code"], ResultCode.OK)
+        self.assertEqual(result["data"]["traveler_sales"]["fee_amount"], 2)
+        self.account.refresh_from_db()
+        mark_inv.refresh_from_db()
+        self.assertEqual((self.account.balance, mark_inv.money), (402, 220))
+        self.assertTrue(reconcile(self.account)["balance_matches"])
+        ledger = EconomicLedgerEntry.objects.get(request_id=_day_close_request_id(0))
+        self.assertEqual(ledger.changes["PUBLIC_FUND"]["money"], -98)
+        self.assertEqual(ledger.changes["10013"]["money"], 100)
+
     def test_traveler_sales_max_two_per_day(self):
         """At most 2 dishes sold per day-close."""
         for i in range(5):

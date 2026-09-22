@@ -1,3 +1,4 @@
+from django.conf import settings
 from django.core.paginator import Paginator
 from django.db.models import Q
 from django.utils.dateparse import parse_datetime
@@ -11,6 +12,14 @@ from items.models import Item
 from .models import MarketListing, MarketListingSource, MarketListingStatus, MarketTransaction
 from .serializers import serialize_listing, serialize_listings, serialize_transaction, success_response, error_response
 from . import services
+
+
+def _env_required():
+    # No client-provided header/body field can relax this deployment policy.
+    if settings.VILLAGE_REQUIRE_ENV_MARKET_WRITES:
+        return Response(dict(success=False, result_code="ENV_REQUIRED",
+            message="请在玩家模式前往集市，通过现场交互完成交易。"), status=403)
+    return None
 
 
 @extend_schema(
@@ -29,6 +38,9 @@ from . import services
 )
 @api_view(["POST"])
 def marketplace_list(request):
+    denied = _env_required()
+    if denied is not None:
+        return denied
     instance_id = request.data.get("instanceId")
     amount = request.data.get("amount", 1)
     price = request.data.get("price", 0)
@@ -49,6 +61,9 @@ def marketplace_list(request):
 
 @api_view(["POST"])
 def marketplace_delist(request):
+    denied = _env_required()
+    if denied is not None:
+        return denied
     listing_id = request.data.get("listingId")
     if not listing_id:
         return Response(error_response("缺少 listingId"), status=400)
@@ -117,6 +132,9 @@ def marketplace_browse(request):
 
 @api_view(["POST"])
 def marketplace_buy(request):
+    denied = _env_required()
+    if denied is not None:
+        return denied
     listing_id = request.data.get("listingId")
     amount = request.data.get("amount", 1)
 

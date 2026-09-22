@@ -35,8 +35,15 @@ TRADE_EVENT_TYPES = {
     "ECONOMY_RESPOND_TRADE",
     "ECONOMY_CANCEL_TRADE_OFFER",
 }
+NPC_GIFT_EVENT = "ECONOMY_GIVE_ITEMS"
 REVIEW_EVENT_TYPES = {"ECONOMY_REQUEST_DISH_REVIEW", "ECONOMY_CANCEL_DISH_REVIEW", "ECONOMY_RATE_DISH"}
 STORE_SALE_EVENT = "ECONOMY_BUY_FROM_STORE"
+GIFT_EVENT_TYPES = {"PLAYER_GIFT", "PLAYER_RESCUE_GIFT"}
+FARM_EVENT_TYPES = {
+    "PLAYER_LEASE_FARM_PLOT", "PLAYER_RENEW_FARM_PLOT",
+    "PLAYER_PLANT_FARM_PLOT", "PLAYER_HARVEST_FARM_PLOT",
+    "FARM_LEASE_RELEASED", "FARM_LEASE_HARVEST_ONLY", "FARM_LEASE_EXPIRING",
+}
 
 
 def _is_action_event(event: VillageWorldEvent) -> bool:
@@ -45,7 +52,7 @@ def _is_action_event(event: VillageWorldEvent) -> bool:
     # Direct trade events are participant notifications, not actor echoes.
     # Their own recipient projection below deliberately excludes the actor.
     return (
-        (event_type.startswith("ECONOMY_") and event_type not in TRADE_EVENT_TYPES | REVIEW_EVENT_TYPES | {STORE_SALE_EVENT})
+        (event_type.startswith("ECONOMY_") and event_type not in TRADE_EVENT_TYPES | REVIEW_EVENT_TYPES | {STORE_SALE_EVENT, NPC_GIFT_EVENT})
         or event_type in SUPPRESSED_ACTION_EVENT_TYPES
     )
 
@@ -114,11 +121,28 @@ def _event_content(event: VillageWorldEvent, recipient: str | None = None) -> di
             value = data.get(key)
             if isinstance(value, str) and SAFE_PUBLIC_VALUE.fullmatch(value):
                 content[key] = value
+        if event.event_type in FARM_EVENT_TYPES:
+            # These are server-authored public plot projections, never bags.
+            content["public_data"] = {key: data[key] for key in ("plot", "farm_action_effect") if key in data}
+            content.update(content["public_data"])
+        if event.event_type == NPC_GIFT_EVENT and visibility == "PARTICIPANTS":
+            receipt = dict(getattr(event, "private_data", {}) or {})
+            player_id = str(receipt.get("target_id") or "")
+            if receipt.get("status") == "DELIVERED" and receipt.get("target_type") == "PLAYER" and player_id in players:
+                # Only the recipient's receipt crosses this boundary, never bag snapshots or batch IDs.
+                content["gift"] = {
+                    "gift_id": str(event.event_id), "player_id": player_id,
+                    "npc_id": str(receipt.get("sender_npc_id") or ""),
+                    "npc_name": str(receipt.get("sender_name") or ""),
+                    "gold_amount": receipt.get("gold_amount", 0),
+                    "items": [{key: item[key] for key in ("item_id", "item_name", "amount") if key in item}
+                              for item in receipt.get("items", [])],
+                }
         return content
 
-    # private_data is only ever sent to the immutable NPC participant set.  The
-    # player projection is intentionally summary-only.
-    if not is_player_delivery and visibility == "PARTICIPANTS" and recipient in participants:
+    # Full private_data is only sent to the immutable NPC participant set.
+    # Players receive the summary and, for gifts, the explicit receipt whitelist above.
+    if recipient in participants and (visibility == "PARTICIPANTS" or event.event_type in FARM_EVENT_TYPES):
         data["private_data"] = dict(getattr(event, "private_data", {}) or {})
 
     content = {
@@ -158,6 +182,11 @@ def _recipients(event: VillageWorldEvent) -> list[str]:
     witnesses = _ids(getattr(event, "witness_npc_ids", []))
     players = _ids(getattr(event, "player_ids", []))
 
+    if event.event_type in GIFT_EVENT_TYPES:
+        # Only the recipient NPC needs a gift receipt. The gifting player
+        # already gets the character-trade response; bystanders get no event.
+        return list(dict.fromkeys(participants))
+
     if event.event_type == STORE_SALE_EVENT:
         # Older purchase events were public actor echoes, not operator receipts.
         # Do not turn that historical data into new village-wide broadcasts.
@@ -166,7 +195,10 @@ def _recipients(event: VillageWorldEvent) -> list[str]:
         actor_id = str(event.actor_npc.agent_id) if event.actor_npc else None
         return list(dict.fromkeys(p for p in participants if p != actor_id))
 
-    if visibility == "PUBLIC" and event.event_type == "ECONOMY_AUDIT_PUBLIC_FUND":
+    if visibility == "PUBLIC" and event.event_type in FARM_EVENT_TYPES:
+        # Farm ownership stays public to player clients; only Bill needs the NPC notification.
+        recipients = [npc_id for npc_id in participants if npc_id == "10011"]
+    elif visibility == "PUBLIC" and event.event_type == "ECONOMY_AUDIT_PUBLIC_FUND":
         effects = getattr(event, "effects", {}) or {}
         audit = effects.get("audit") if isinstance(effects, dict) else None
         recipients = [str(event.actor_npc.agent_id)] if (
@@ -179,7 +211,7 @@ def _recipients(event: VillageWorldEvent) -> list[str]:
         recipients = list(FORMAL_NPC_IDS)
     elif visibility == "PARTICIPANTS":
         recipients = participants
-        if event.event_type in TRADE_EVENT_TYPES | REVIEW_EVENT_TYPES and event.actor_npc:
+        if event.event_type in TRADE_EVENT_TYPES | REVIEW_EVENT_TYPES | {NPC_GIFT_EVENT} and event.actor_npc:
             actor_id = str(event.actor_npc.agent_id)
             recipients = [recipient for recipient in recipients if recipient != actor_id]
     elif visibility == "PRESENT":

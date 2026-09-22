@@ -75,6 +75,9 @@ class SeedVillageTests(PhaseZeroTestCase):
             ),
         )
         self.assertEqual(NpcDefinition.objects.filter(is_test_only=True).count(), 3)
+        for profile in NpcProfile.objects.filter(npc__is_test_only=False):
+            self.assertTrue({"GET_RULE", "INSPECT_LIVING_OPTIONS"}.issubset(profile.capabilities))
+            self.assertNotIn("WORK_PLACEHOLDER", profile.capabilities)
         config = VillageSimulationConfig.objects.get(config_key="default")
         self.assertTrue(config.village_simulation_enabled)
         self.assertTrue(config.village_hub_command_adapter_enabled)

@@ -25,7 +25,7 @@ class PhaseSixRuntimeTests(TestCase):
             str(uuid.uuid4()), "10011", "env-server-001",
             {
                 "schema_version": "village.command.v1", "id": str(uuid.uuid4()),
-                "request_id": str(uuid.uuid4()), "name": "WAIT", "params": {},
+                "request_id": str(uuid.uuid4()), "name": "GO_HOME", "params": {},
                 "expected_state_version": 0, "queue_mode": "STRICT", "ttl_ms": 30000,
             }, int(time.time() * 1000),
         )

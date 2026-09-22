@@ -251,30 +251,16 @@ def economy_snapshot(request):
         last_closed_day_index = account.last_closed_day_index if account else -1
         public_fund_balance = account.balance if account else 0
 
-        # Farm plots with mature projection
-        farm_plots = []
-        for plot in VillageFarmPlot.objects.filter(plot_code__in=PLOT_CODES).order_by("plot_code"):
-            status = plot.status
-            # Time projection: if GROWING and current time >= mature, report as MATURE
-            if (
-                status == FarmPlotStatus.GROWING
-                and plot.mature_world_minute is not None
-                and world_minute >= plot.mature_world_minute
-            ):
-                status = FarmPlotStatus.MATURE
-            farm_plots.append(
-                {
-                    "plot_code": plot.plot_code,
-                    "status": status,
-                    "crop_code": plot.crop_code or "",
-                    "batch_id": str(plot.batch_id) if plot.batch_id else None,
-                    "planted_world_minute": plot.planted_world_minute,
-                    "mature_world_minute": plot.mature_world_minute,
-                }
-            )
+        # Read-only projection also fails closed if a lease awaits tick cleanup.
+        from .player_farm import project_plot
+        farm_plots = [project_plot(plot, world_minute) for plot in
+            VillageFarmPlot.objects.select_related("lessee_player").filter(
+                plot_code__in=PLOT_CODES).order_by("plot_code")]
 
         # Prices: latest published snapshot, fallback to base prices
         from .phase3_catalog import BASE_PRICES, farm_crop_catalog
+        from .farm_irrigation import project_irrigation
+        irrigation = project_irrigation()
 
         latest_published = (
             DailyPriceSnapshot.objects.filter(status="PUBLISHED")
@@ -413,7 +399,8 @@ def economy_snapshot(request):
                     "last_closed_day_index": last_closed_day_index,
                     "allowed_plot_codes": list(PLOT_CODES),
                     "allowed_crop_codes": list(CROP_CODES),
-                    "crop_catalog": farm_crop_catalog(),
+                    "crop_catalog": farm_crop_catalog(irrigation),
+                    "farm_irrigation": irrigation,
                     "farm_plots": farm_plots,
                     "prices": prices,
                     "restaurant_status": restaurant_status,

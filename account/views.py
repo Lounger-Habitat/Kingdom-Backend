@@ -8,6 +8,7 @@ from rest_framework.response import Response
 from rest_framework_simplejwt.tokens import RefreshToken
 
 from .models import GameAccount
+from .appearance import appearance_profile
 from .serializers import RegisterSerializer, LoginSerializer, ConvertGuestSerializer
 from .env_auth import EnvServerJWTAuthentication, validate_player_access_token
 from inventory.services import init_player_bags
@@ -34,6 +35,7 @@ def _jwt_response(account):
             "user_id": account.id,
             "username": account.username,
             "is_guest": account.is_guest,
+            **appearance_profile(account),
         },
     }
 
@@ -140,6 +142,7 @@ def auth_refresh(request):
                 "user_id": account.id,
                 "username": account.username,
                 "is_guest": account.is_guest,
+                **appearance_profile(account),
             },
         })
     except Exception:
@@ -172,5 +175,6 @@ def env_verify_player(request):
         "data": {
             "playerId": str(account.id),
             "playerName": account.username,
+            **appearance_profile(account),
         },
     })

@@ -143,11 +143,10 @@ class Phase1FixtureConsistencyTest(TestCase):
         self.assertIn("delivery_id", content["data"])
 
     def test_success_codes_count(self):
-        """应该有 6 个成功码"""
-        self.assertEqual(len(SUCCESS_CODES), 6)
+        """应该有 5 个成功码"""
+        self.assertEqual(len(SUCCESS_CODES), 5)
         self.assertIn("COMMAND_ACCEPTED", SUCCESS_CODES)
         self.assertIn("MOVE_COMPLETED", SUCCESS_CODES)
-        self.assertIn("WAIT_COMPLETED", SUCCESS_CODES)
         self.assertIn("GO_HOME_COMPLETED", SUCCESS_CODES)
 
     def test_failure_codes_count(self):
@@ -159,10 +158,9 @@ class Phase1FixtureConsistencyTest(TestCase):
         self.assertIn("ASSET_EFFECT_NOT_ALLOWED", FAILURE_CODES)
 
     def test_allowed_actions(self):
-        """阶段一应该只有 MOVE、WAIT、GO_HOME"""
-        self.assertEqual(len(ALLOWED_ACTIONS), 3)
+        """阶段一应该只有 MOVE、GO_HOME"""
+        self.assertEqual(len(ALLOWED_ACTIONS), 2)
         self.assertIn("MOVE", ALLOWED_ACTIONS)
-        self.assertIn("WAIT", ALLOWED_ACTIONS)
         self.assertIn("GO_HOME", ALLOWED_ACTIONS)
 
     def test_event_types(self):

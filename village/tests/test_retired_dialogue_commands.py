@@ -14,8 +14,9 @@ from game_time.models import GlobalGameTimeState
 from inventory.models import NpcDefinition
 from village.command_catalog import COMMAND_CATALOG
 from village.models import (
-    NpcProfile, NpcRuntimeState, NpcDialogueSession, NpcSocialDailyCounter,
-    VillageActionReceipt, VillageLocationDefinition, VillageSimulationConfig, VillageWorldEvent,
+    NpcCommandState, NpcProfile, NpcRuntimeState, NpcDialogueSession, NpcSocialDailyCounter,
+    VillageActionDurationConfig, VillageActionReceipt, VillageLocationDefinition,
+    VillageDeliveryOutbox, VillageSimulationConfig, VillageWorldEvent,
 )
 from village.runtime_services import CommandService, ResultCode
 from village.seed_data import BASE_ACTIONS
@@ -37,7 +38,7 @@ class RetiredDialogueCommandTests(TestCase):
             NpcProfile.objects.update_or_create(npc=npc, defaults={
                 "display_name": npc_id, "occupation": "test", "is_active": True,
                 "home_location_code": "SQUARE", "work_location_code": "SQUARE",
-                "social_location_code": "SQUARE", "capabilities": ["MOVE", "WAIT", "GET_RULE"],
+                "social_location_code": "SQUARE", "capabilities": ["MOVE", "GO_HOME", "GET_RULE"],
             })
             NpcRuntimeState.objects.update_or_create(npc=npc, defaults={
                 "current_location_code": "SQUARE", "action_status": "IDLE", "needs_world_minute": 0,
@@ -88,15 +89,50 @@ class RetiredDialogueCommandTests(TestCase):
 
     def test_migration_only_removes_retired_permissions_and_is_idempotent(self):
         for profile in NpcProfile.objects.all():
-            profile.capabilities = ["MOVE", "START_DIALOGUE", "GET_RULE", " speak ", "WAIT"]
+            profile.capabilities = ["MOVE", "START_DIALOGUE", "GET_RULE", " speak ", "GO_HOME"]
             profile.save(update_fields=["capabilities"])
         before = list(NpcRuntimeState.objects.order_by("pk").values())
         migrate = import_module("village.migrations.0040_retire_dialogue_commands").remove_dialogue_commands
         migrate(apps, connection.schema_editor())
         migrate(apps, connection.schema_editor())
         for profile in NpcProfile.objects.all():
-            self.assertEqual(profile.capabilities, ["MOVE", "GET_RULE", "WAIT"])
+            self.assertEqual(profile.capabilities, ["MOVE", "GET_RULE", "GO_HOME"])
         self.assertEqual(before, list(NpcRuntimeState.objects.order_by("pk").values()))
+
+    def test_wait_retirement_migration_removes_permissions_and_duration(self):
+        profile = NpcProfile.objects.order_by("pk").first()
+        profile.capabilities = ["MOVE", "WAIT", "REST", " wait "]
+        profile.save(update_fields=["capabilities"])
+        VillageActionDurationConfig.objects.create(action_name="WAIT", duration_minutes=7)
+        runtime = NpcRuntimeState.objects.get(npc=profile.npc)
+        command = NpcCommandState.objects.create(
+            command_id=uuid.uuid4(), message_id=uuid.uuid4(), request_id=uuid.uuid4(),
+            npc=profile.npc, sender_id=str(profile.npc.agent_id), recipient_id="env",
+            kind="WAIT", sanitized_parameters={}, payload_sha256="e" * 64,
+            status="RUNNING", received_world_minute=0, started_world_minute=0,
+        )
+        runtime.current_action = "WAIT"
+        runtime.current_goal = "WAIT"
+        runtime.action_status = "ACTING"
+        runtime.active_command_id = command.command_id
+        runtime.save()
+        migrate = import_module("village.migrations.0063_retire_wait_command").retire_wait_command
+
+        migrate(apps, connection.schema_editor())
+        migrate(apps, connection.schema_editor())
+
+        profile.refresh_from_db()
+        runtime.refresh_from_db()
+        command.refresh_from_db()
+        self.assertEqual(profile.capabilities, ["MOVE", "REST"])
+        self.assertFalse(VillageActionDurationConfig.objects.filter(action_name="WAIT").exists())
+        self.assertEqual(
+            (runtime.current_action, runtime.current_goal, runtime.action_status, runtime.active_command_id),
+            ("", "NONE", "IDLE", None),
+        )
+        self.assertEqual((command.status, command.result_code), ("FAILED", "ACTION_RETIRED"))
+        self.assertTrue(VillageActionReceipt.objects.filter(command=command).exists())
+        self.assertTrue(VillageDeliveryOutbox.objects.filter(command=command).exists())
 
     def test_speech_session_http_chain_still_settles_once_without_old_permissions(self):
         conversation = "event-speech-session"

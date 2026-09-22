@@ -248,16 +248,16 @@ class NeedsServiceTests(TestCase):
 
         self.assertEqual(
             {spec["name"] for spec in response.data["data"]["action_specs"]},
-            {"EAT", "MOVE"},
+            {"GET_RULE", "EAT", "MOVE"},
         )
-        self.assertEqual(response.data["data"]["available_actions"], ["EAT", "MOVE"])
+        self.assertEqual(response.data["data"]["available_actions"], ["EAT", "GET_RULE", "MOVE"])
         self.assertEqual(
             {spec["expires_world_minute"] for spec in response.data["data"]["action_specs"]},
             {1530},
         )
         self.assertEqual(
             {tool["name"] for tool in response.data["data"]["tools"]},
-            {"EAT", "MOVE"},
+            {"GET_RULE", "EAT", "MOVE"},
         )
         for tool in response.data["data"]["tools"]:
             self.assertEqual(set(tool), {"name", "description", "parameters", "tags"})

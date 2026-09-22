@@ -7,6 +7,9 @@ from dotenv import load_dotenv
 BASE_DIR = Path(__file__).resolve().parent.parent
 load_dotenv(BASE_DIR / ".env")
 
+# NPC voice drafts: server-side MiMo ASR credentials only.
+MIMO_API_KEY = os.environ.get("MIMO_API_KEY", "")
+
 SECRET_KEY = os.environ.get(
     "DJANGO_SECRET_KEY", "django-insecure-kingdom-dev-key-change-in-production"
 )
@@ -188,6 +191,10 @@ VILLAGE_FAST_COMMAND_INTEGRATION = (
     ).lower()
     in {"1", "true", "yes", "on"}
 )
+
+# Village clients must settle through the authenticated Env action route. Disable
+# only on deployments that intentionally retain the standalone legacy market.
+VILLAGE_REQUIRE_ENV_MARKET_WRITES = os.getenv("VILLAGE_REQUIRE_ENV_MARKET_WRITES", "true").lower() in {"1", "true", "yes", "on"}
 
 # Logging: suppress noisy runserver access logs for high-frequency runtime
 # tick endpoints, but only on success (2xx) — errors still print.

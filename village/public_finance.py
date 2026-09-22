@@ -1,8 +1,10 @@
-"""Public account reconciliation and Mark's earned daily wage."""
+"""Public account reconciliation and the external dish reviewer's fixed daily wage."""
+
+import uuid
 
 from django.db.models import F
 
-from .models import DailyPriceSnapshot, EconomicLedgerEntry, MarkDailySalary, NpcRuntimeState, VillageAccount
+from .models import DailyPriceSnapshot, EconomicLedgerEntry, MarkDailySalary, NpcRuntimeState, VillageAccount, VillageSimulationConfig, VillageWorldEvent
 from .phase3_catalog import BASE_PRICES, RECIPE_WHITELIST
 
 
@@ -40,54 +42,65 @@ def meal_reference(world_minute):
             "price_day": snapshot.day_index if source == "PUBLISHED" else None}
 
 
-def pay_daily_salary(account, mark_inv, changes, world_minute, request_id, *, earn=True):
-    day = world_minute // 1440
-    entitlement = MarkDailySalary.objects.select_for_update().filter(day_index=day).first()
-    already_earned = entitlement is not None
-    if earn and entitlement is None:
-        reference = meal_reference(world_minute)
-        if reference:
-            entitlement = MarkDailySalary.objects.create(
-                day_index=day, amount_due=reference["amount"], reference=reference,
-                earned_request_id=request_id, earned_world_minute=world_minute,
-            )
-    paid = 0
-    paid_days = []
-    # All callers hold the public account lock; settle oldest debt first, in
-    # whole daily amounts. No world timer creates or pays entitlements.
-    for row in MarkDailySalary.objects.select_for_update().filter(
-        amount_paid__lt=F("amount_due"), day_index__lte=day,
-    ).order_by("day_index"):
+def settle_mark_daily_salary(account, day_index, world_minute, request_id):
+    """Run inside day-close's transaction and public-account lock, once per closed day."""
+    from inventory.models import NpcGlobalInventory
+    from .phase4_visibility import enqueue_event_deliveries
+
+    config = VillageSimulationConfig.objects.filter(config_key="default").first()
+    salary = {"day_index": day_index, "new_amount_due": 0, "paid": 0, "paid_days": [], "outstanding": 0}
+    if config is None or config.mark_employed_from_minute is None:
+        return salary
+    start = config.mark_employed_from_minute
+    if world_minute < start or day_index < start // 1440:
+        return salary
+
+    # Policy is part of the unique key: a legacy record on the hiring date must
+    # neither block this salary nor become eligible for repayment.
+    entitlement, created = MarkDailySalary.objects.get_or_create(
+        day_index=day_index, policy="EXTERNAL_REVIEWER",
+        defaults={"amount_due": config.mark_daily_salary,
+                  "reference": {"policy": "FIXED_DAILY", "employed_from_minute": start},
+                  "earned_request_id": uuid.uuid5(uuid.NAMESPACE_URL, f"mark-external-salary:{day_index}"),
+                  "earned_world_minute": world_minute})
+    salary["new_amount_due"] = entitlement.amount_due if created else 0
+    salary["amount_due_today"] = entitlement.amount_due
+    mark = NpcGlobalInventory.objects.select_for_update().filter(
+        npc__agent_id="10013", npc__is_test_only=False).first()
+    rows = MarkDailySalary.objects.select_for_update().filter(
+        policy="EXTERNAL_REVIEWER", day_index__lte=day_index,
+        amount_paid__lt=F("amount_due")).order_by("day_index")
+    for row in rows:
         remaining = row.amount_due - row.amount_paid
-        if remaining > account.balance - paid:
+        if mark is None or remaining > account.balance - salary["paid"]:
             break
-        paid += remaining
-        paid_days.append(row.day_index)
+        salary["paid"] += remaining
+        salary["paid_days"].append(row.day_index)
         row.amount_paid = row.amount_due
         row.paid_world_minute = world_minute
         row.save(update_fields=["amount_paid", "paid_world_minute"])
-    if paid:
-        account.balance -= paid
+    if salary["paid"]:
+        account.balance -= salary["paid"]
         account.asset_version += 1
         account.save(update_fields=["balance", "asset_version", "updated_at"])
-        mark_inv.money += paid
-        mark_inv.asset_version += 1
-        mark_inv.save(update_fields=["money", "asset_version", "updated_at"])
-    outstanding = sum(row.amount_due - row.amount_paid for row in MarkDailySalary.objects.filter(amount_paid__lt=F("amount_due")))
-    # Receipt facts only: the entitlement and payment rules above are unchanged.
-    paid_for_today = MarkDailySalary.objects.filter(day_index=day).values_list("amount_paid", flat=True).first() or 0
-    changes.update({"mark_salary": paid, "salary_skipped": paid == 0,
-                    "salary": {"day_index": day, "already_earned_today": already_earned,
-                               "reference": entitlement.reference if entitlement else None,
-                               "amount_due_today": entitlement.amount_due if entitlement else 0,
-                               "new_amount_due": entitlement.amount_due if entitlement and not already_earned else 0,
-                               "amount_paid_for_today": paid_for_today,
-                               "paid": paid, "paid_days": paid_days, "outstanding": outstanding,
-                               "personal_balance": mark_inv.money, "public_fund_balance": account.balance}})
-    for key, delta in (("PUBLIC_FUND", -paid), ("10013", paid)):
-        values = changes.setdefault(key, {})
-        values["money"] = int(values.get("money", 0)) + delta
-    return paid > 0
+        mark.money += salary["paid"]
+        mark.asset_version += 1
+        mark.save(update_fields=["money", "asset_version", "updated_at"])
+    salary["outstanding"] = sum(row.amount_due - row.amount_paid for row in
+        MarkDailySalary.objects.filter(policy="EXTERNAL_REVIEWER", amount_paid__lt=F("amount_due")))
+    if mark is not None:
+        salary["personal_balance"] = mark.money
+        summary = (f"外聘品鉴师工资结算：当日应付{entitlement.amount_due}金币，"
+                   f"本次到账{salary['paid']}金币，新制累计欠薪{salary['outstanding']}金币。旧制欠薪不补发。")
+        event = VillageWorldEvent.objects.create(
+            dedupe_key=f"mark-daily-salary:{day_index}", event_type="MARK_DAILY_SALARY",
+            world_minute=world_minute, time_revision=world_minute, request_id=request_id,
+            participant_npc_ids=["10013"], visibility="PARTICIPANTS",
+            private_data={"npc_id": "10013", **salary}, effects={"salary": salary},
+            player_summary="外聘品鉴师工资已结算。", hub_summary=summary)
+        enqueue_event_deliveries(event)
+    return salary
+
 
 
 def public_fund_delta(entry):
@@ -105,7 +118,7 @@ def public_fund_delta(entry):
         delta -= int(eat.get("payment", 0) or 0)
     if entry.entry_type == "EXPORT_GOODS" and not changes.get("income_account"):
         delta += int(entry.external_delta or 0)
-    if changes.get("action_code") in {"DONATE_REPAIR_RESOURCES", "PURCHASE_REPAIR_MATERIALS"}:
+    if not changes.get("affair_id") and changes.get("action_code") in {"DONATE_REPAIR_RESOURCES", "PURCHASE_REPAIR_MATERIALS"}:
         delta += int(changes.get("gold", 0) or 0)
     return delta
 
@@ -132,10 +145,10 @@ def public_finance_query(world_minute):
                          "public_fund_delta": delta, "actor_npc_id": str(entry.actor_npc.agent_id) if entry.actor_npc else None})
         if len(rows) >= 30:
             break
-    salary = MarkDailySalary.objects.filter(day_index=world_minute // 1440).first()
+    salary = MarkDailySalary.objects.filter(day_index=world_minute // 1440, policy="EXTERNAL_REVIEWER").first()
     return {"reconciliation": reconcile(account) if account else None, "public_fund_entries": rows,
             "public_fund_entries_scope": "RECENT_30_PUBLIC_ENTRIES_WITHIN_LAST_200_LEDGER_ROWS",
-            "salary_policy": "ONE_MEAL_REFERENCE_PER_WORKED_GAME_DAY",
+            "salary_policy": "FIXED_DAILY_EXTERNAL_REVIEWER",
             "current_meal_reference": meal_reference(world_minute),
             "salary_today": None if salary is None else {"amount_due": salary.amount_due, "amount_paid": salary.amount_paid, "reference": salary.reference},
-            "salary_outstanding": sum(r.amount_due-r.amount_paid for r in MarkDailySalary.objects.filter(amount_paid__lt=F("amount_due")))}
+            "salary_outstanding": sum(r.amount_due-r.amount_paid for r in MarkDailySalary.objects.filter(policy="EXTERNAL_REVIEWER", amount_paid__lt=F("amount_due")))}

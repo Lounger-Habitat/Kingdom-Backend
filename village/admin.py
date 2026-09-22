@@ -44,6 +44,9 @@ from .models import (
     VillageCaravanConfig,
 )
 from .runtime_services import CommandService
+from .affair_admin import VillageAffairAdmin, VillageAffairContributionAdmin  # noqa: F401
+from .personal_commission_admin import (PersonalCommissionAdmin, PersonalCommissionEscrowAdmin,
+                                        PersonalCommissionReceiptAdmin)  # noqa: F401
 
 
 class NpcProfileAdminForm(forms.ModelForm):
@@ -300,9 +303,10 @@ class VillageAccountAdmin(admin.ModelAdmin):
 
 @admin.register(VillageFarmPlot)
 class VillageFarmPlotAdmin(admin.ModelAdmin):
-    list_display = ("plot_code", "status", "crop_code", "planted_world_minute", "mature_world_minute", "updated_at")
-    list_filter = ("status",)
-    readonly_fields = ("updated_at",)
+    list_display = ("plot_code", "status", "crop_code", "lease_enabled", "lessee_player", "lease_ends_world_minute", "plot_version", "updated_at")
+    list_filter = ("status", "lease_enabled")
+    readonly_fields = ("updated_at", "lessee_player", "leased_world_minute", "lease_ends_world_minute",
+        "lease_price_paid", "lease_grace_minutes", "lease_expiry_notified", "plot_version")
 
 
 @admin.register(NpcTradeOrder)

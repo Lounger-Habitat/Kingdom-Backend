@@ -614,18 +614,10 @@ def commands_accept(request):
         timestamp_ms=timestamp_ms,
     )
 
-    if not ok:
-        return Response({"success": False, "resultCode": result_code}, status=409)
-
-    return Response({
-        "success": True,
-        "resultCode": result_code,
-        "data": {
-            "command_id": str(command.command_id) if command else None,
-            "status": command.status if command else None,
-            "duration_minutes": command.duration_minutes if command else None,
-        },
-    })
+    data = CommandService.serialize_status(command) if command else None
+    if data is not None:
+        data["duration_minutes"] = command.duration_minutes
+    return Response({"success": ok, "resultCode": result_code, "data": data}, status=200 if ok else 409)
 
 
 @api_view(["POST"])

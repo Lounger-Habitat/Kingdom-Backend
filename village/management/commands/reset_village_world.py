@@ -7,10 +7,23 @@ from django.core.management.base import BaseCommand, CommandError
 from django.db import transaction
 from django.db.models import Q
 
+from account.models import GameAccount
+from autobuy.models import AutoBuyConfig, AutoBuyPurchase
+from cooking.models import PityCounter
 from game_time.models import GlobalGameTimeState
-from inventory.models import NpcDefinition, NpcGlobalInventory
+from inventory.models import (
+    BagTemplate, EnvActionReceipt, InventoryBag, InventorySlot,
+    NpcDefinition, NpcGlobalInventory, PlayerCollectionPoint,
+)
 from items.models import Item
+from leaderboard.models import LeaderboardEntry, PendingReward, ReportEvent
 from marketplace.models import MarketListing, MarketTransaction
+from player.models import DefaultRecipe, PlayerRecipe, PlayerState
+from recipes.models import Recipe
+from restaurant.models import (
+    CustomerTransaction, DailyBusinessLog, MenuItem, PlayerRestaurantState,
+    RestaurantHourlySlot,
+)
 from village.management.commands.seed_village_v1 import Command as SeedVillageCommand
 from village.models import (
     DailyPriceSnapshot,
@@ -30,10 +43,22 @@ from village.models import (
     NpcSocialDailyCounter,
     NpcStoryFactAccess,
     NpcSubjectiveGoalState,
+    NpcDailyRecord,
     NpcTradeDelivery,
     NpcTradeOrder,
     PlayerStoryFactAccess,
     VillageAccount,
+    VillageAffair,
+    VillageAffairContribution,
+    VillagePlayerAffairLabor,
+    VillagePlayerActionReceipt,
+    VillagePlayerContribution,
+    VillagePersonalCommission,
+    VillagePersonalCommissionEscrow,
+    VillagePersonalCommissionReceipt,
+    VillageHuntAttempt,
+    VillageWildlife,
+    VillageWildlifeReceipt,
     VillageActionReceipt,
     VillageCommunityMealDailyUsage,
     VillageDeliveryCursor,
@@ -72,7 +97,8 @@ from village.seed_data import (
 
 CONFIRMATION = "RESET_WUXI_VILLAGE"
 START_TIME = (2026, 3, 8, 7, 0)
-GENERAL_STORE_INITIAL_BALANCE = 1000
+FORMAL_NPC_INITIAL_BALANCE = 2000
+GENERAL_STORE_INITIAL_BALANCE = 10000
 PUBLIC_FUND_INITIAL_BALANCE = 2000
 GENERAL_STORE_INITIAL_STOCK = (
     (1049, 5, None),  # 盐
@@ -84,7 +110,7 @@ GENERAL_STORE_INITIAL_STOCK = (
 
 
 class Command(BaseCommand):
-    help = "仅开发环境：把雾溪村运行状态恢复到五名正式 NPC 的初始 Seed"
+    help = "仅开发环境：重置雾溪村、租约、时间及全部玩家进度；保留账号、外观和配置"
 
     def add_arguments(self, parser):
         parser.add_argument("--dry-run", action="store_true", help="执行完整重置但回滚所有写入")
@@ -135,19 +161,24 @@ class Command(BaseCommand):
         missing = required_items - set(Item.objects.filter(item_id__in=required_items).values_list("item_id", flat=True))
         if missing:
             raise CommandError(f"缺少正式 Seed Item: {sorted(missing)}")
+        if GameAccount.objects.exists() and BagTemplate.objects.filter(character_id="player", npc__isnull=True).count() != 1:
+            raise CommandError("完整重置玩家需要唯一的 player 背包模板")
 
     def _reset(self):
+        GlobalGameTimeState.get_instance()
+        GlobalGameTimeState.objects.select_for_update().get(pk=1)
         cleared = 0
         formal_npc_ids = tuple(FORMAL_NPC_AGENT_IDS)
 
-        # Marketplace history lives outside the village app. Only remove rows
-        # involving the five formal NPCs; player-only and test-NPC rows remain.
+        # Player inventories are reset too. Keep only unrelated test-NPC/system listings.
         for queryset in (
             MarketTransaction.objects.filter(
                 Q(seller_npc__agent_id__in=formal_npc_ids)
                 | Q(buyer_npc__agent_id__in=formal_npc_ids)
+                | Q(seller__isnull=False) | Q(buyer__isnull=False)
             ),
-            MarketListing.objects.filter(seller_npc__agent_id__in=formal_npc_ids),
+            MarketListing.objects.filter(
+                Q(seller_npc__agent_id__in=formal_npc_ids) | Q(seller__isnull=False)),
             VillageDishReview.objects.filter(owner__agent_id__in=formal_npc_ids),
             NpcCookingCounter.objects.filter(npc__agent_id__in=formal_npc_ids),
         ):
@@ -157,6 +188,17 @@ class Command(BaseCommand):
 
         # Clear children that protect or feed the event/command history first.
         for model in (
+            VillageWildlifeReceipt,
+            VillageHuntAttempt,  # PROTECTs both wildlife and NPC command rows.
+            VillageWildlife,
+            VillagePlayerAffairLabor,
+            VillagePersonalCommissionReceipt,
+            VillagePersonalCommissionEscrow,
+            VillagePersonalCommission,
+            VillagePlayerActionReceipt,
+            VillagePlayerContribution,
+            VillageAffairContribution,
+            VillageAffair,
             VillageCaravanRequest,
             VillageCaravanVisit,
             VillageDeliveryOutbox,
@@ -192,11 +234,15 @@ class Command(BaseCommand):
             NpcCommandState,
             VillageWorldEvent,
             NpcSubjectiveGoalState,
+            NpcDailyRecord,
             NpcRuntimeState,
         ):
             count = model.objects.count()
             model.objects.all().delete()
             cleared += count
+
+        # Escrow is discarded, not refunded: both sides receive fresh starting assets.
+        cleared += self._reset_players()
 
         year, month, day, hour, minute = START_TIME
         time_state = GlobalGameTimeState.get_instance()
@@ -211,6 +257,9 @@ class Command(BaseCommand):
         time_state.time_revision = 0
         time_state.save()
 
+        VillageSimulationConfig.objects.filter(config_key="default").update(
+            mark_daily_salary=100, mark_employed_from_minute=time_state.world_minute,
+            action_epoch=uuid.uuid4())
         VillageAccount.objects.update(
             balance=0,
             asset_version=0,
@@ -225,6 +274,13 @@ class Command(BaseCommand):
             audit_opening_balance=PUBLIC_FUND_INITIAL_BALANCE,
         )
         VillageFarmPlot.objects.update(
+            lessee_player=None,
+            leased_world_minute=None,
+            lease_ends_world_minute=None,
+            lease_price_paid=0,
+            lease_expiry_notified=False,
+            lease_grace_minutes=VillageSimulationConfig.objects.get(config_key="default").farm_grace_minutes,
+            plot_version=0,
             status="EMPTY",
             batch_id=None,
             crop_code="",
@@ -246,7 +302,7 @@ class Command(BaseCommand):
         for seed in NPC_SEEDS:
             npc = NpcDefinition.objects.get(agent_id=seed["agent_id"])
             bag = NpcGlobalInventory.objects.get(npc=npc)
-            bag.money = seed["money"]
+            bag.money = FORMAL_NPC_INITIAL_BALANCE
             bag.asset_version = 0
             bag.save(update_fields=["money", "asset_version", "updated_at"])
             seed_command._replace_inventory_slots(bag, seed["items"], items)
@@ -262,18 +318,21 @@ class Command(BaseCommand):
         }
         seed_command._seed_phase3_grants(summary)
         seed_command._seed_phase4_social(summary)
+        from village.affairs import ensure_bridge_affair
+        from village.farm_irrigation import ensure_irrigation_affair
+        ensure_bridge_affair(time_state.world_minute)
+        ensure_irrigation_affair(time_state.world_minute)
         # 二跑复盘（R6）：摘要只写重置那一刻真实存在的事实。
-        # 注意：VillageStoryArc 已被清空，剧情阶段此刻还不存在（稍后由 Unity
-        # bootstrap_story 重建），因此不写"剧情 AFTERMATH"之类的内容——写错比不写更糟。
+        # 剧情已改为独立事务，bootstrap_story 只读；不声称存在旧剧情阶段。
         reset_wallets = "、".join(
-            f"{seed['display_name']} {seed['money']}" for seed in NPC_SEEDS
+            f"{seed['display_name']} {FORMAL_NPC_INITIAL_BALANCE}" for seed in NPC_SEEDS
         )
         farm_codes = [seed["plot_code"] for seed in FARM_PLOT_SEEDS]
         reset_summary = (
             f"村庄世界已重置。当前日历 {time_state.game_year:04d}-{time_state.game_month:02d}-"
             f"{time_state.game_day:02d} {time_state.game_hour:02d}:{time_state.game_minute:02d}。"
             f"农田 {len(farm_codes)} 块（含 {farm_codes[0]}）："
-            f"{farm_counts['empty']} 块空置、{farm_counts['half_grown']} 块生长至一半、"
+            f"{farm_counts['empty']} 块空置（其中 {farm_counts['leasable']} 块可租）、{farm_counts['half_grown']} 块生长至一半、"
             f"{farm_counts['mature']} 块可收获，已种作物随机；"
             f"GENERAL_STORE 与 RESTAURANT_STORE 营业中；"
             f"公共基金 {PUBLIC_FUND_INITIAL_BALANCE}；个人钱包恢复初始值：{reset_wallets}。"
@@ -299,6 +358,46 @@ class Command(BaseCommand):
             player_summary=reset_summary,
         )
         enqueue_event_deliveries(reset_event)
+        return cleared
+
+    @staticmethod
+    def _reset_players():
+        """Reset progress through current templates, without minting money-change reports."""
+        cleared = 0
+        for model in (
+            EnvActionReceipt, AutoBuyPurchase, RestaurantHourlySlot,
+            CustomerTransaction, DailyBusinessLog, MenuItem, PlayerRestaurantState,
+            PlayerCollectionPoint, PityCounter, InventoryBag, PlayerState,
+            PendingReward, ReportEvent, LeaderboardEntry,
+        ):
+            cleared += model.objects.count()
+            model.objects.all().delete()
+        AutoBuyConfig.objects.update(fund=0)
+
+        template = BagTemplate.objects.filter(character_id="player", npc__isnull=True).first()
+        template_slots = list(template.slots.select_related("item")) if template else []
+        default_recipes = list(DefaultRecipe.objects.values_list("recipe_name", flat=True))
+        catalogs = dict(Recipe.objects.filter(recipe_name__in=default_recipes).values_list("recipe_name", "pk"))
+        for account in GameAccount.objects.all():
+            state = PlayerState.objects.create(player_id=str(account.pk))
+            PlayerRecipe.objects.bulk_create([
+                PlayerRecipe(player=state, recipe_name=name, catalog_recipe_id=catalogs.get(name))
+                for name in default_recipes
+            ])
+            # bulk_create deliberately bypasses InventoryBag.save's leaderboard side effects.
+            bag = InventoryBag(player=account, character_id=account.username, money=template.money)
+            InventoryBag.objects.bulk_create([bag])
+            for slot in template_slots:
+                InventorySlot.objects.create(
+                    bag=bag, slot_index=slot.slot_index,
+                    item_id=slot.item_id or 0, item_amount=slot.item_amount,
+                    item_bag_name=f"{slot.item.item_name}_{slot.slot_index}" if slot.item else "",
+                    rated=slot.rated, rating_price=slot.rating_price, overall_score=slot.overall_score,
+                    ingredient=slot.ingredient, cook_time=slot.cook_time, dish_quality=slot.dish_quality,
+                    review_comment=slot.review_comment, hide_in_shop=slot.hide_in_shop,
+                    remaining_uses=slot.item.max_use_count if slot.item and (
+                        slot.item.item_type == "Usable" or slot.item.item_type.endswith("Tool")) else None,
+                )
         return cleared
 
     @staticmethod
@@ -336,7 +435,7 @@ class Command(BaseCommand):
         """Randomly split formal plots between empty, half-grown, and harvestable."""
         farm_codes = [seed["plot_code"] for seed in FARM_PLOT_SEEDS]
         plots = list(
-            VillageFarmPlot.objects.filter(plot_code__in=farm_codes).order_by("plot_code")
+            VillageFarmPlot.objects.filter(plot_code__in=farm_codes, lessee_player__isnull=True, lease_enabled=False).order_by("plot_code")
         )
         random.shuffle(plots)
 
@@ -375,8 +474,10 @@ class Command(BaseCommand):
                 "source_request_id",
             ],
         )
+        leasable_count = VillageFarmPlot.objects.filter(plot_code__in=farm_codes, lease_enabled=True).count()
         return {
-            "empty": empty_count,
+            "empty": empty_count + leasable_count,
+            "leasable": leasable_count,
             "half_grown": half_grown_count,
             "mature": len(plots) - empty_count - half_grown_count,
         }
