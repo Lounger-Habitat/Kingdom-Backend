@@ -754,7 +754,19 @@ def _affairs(npc, query_params=None):
             raise ValueError("Invalid affair ID")
         rows = rows.filter(pk=params["affair_id"])
         if not rows.exists():
-            raise AgentQueryError("AFFAIR_NOT_FOUND", {})
+            raise AgentQueryError("AFFAIR_NOT_FOUND", {
+                "failure_kind": "INVALID_REFERENCE",
+                "invalid_field": "affair_id",
+                "received_value": params["affair_id"],
+                "query_action": "INSPECT_AFFAIRS",
+                "discover": {"tool": "INSPECT_AFFAIRS", "arguments": {}},
+                "instruction": (
+                    "未找到该事务编号。请先无参调用 INSPECT_AFFAIRS 查询事务列表，"
+                    "从结果中选择对应事务的 affair_id；locations 是地点代码，condition_id 是施工条件编号。"
+                    "修正前不要重复提交同一错误编号；重新查询后仍无法确定时，说明无法确认。"
+                ),
+                "tool_error": {"executed": False, "automatic_retry_safe": False},
+            })
     runtime = NpcRuntimeState.objects.get(npc=npc)
     data = project_npc_affairs([project_affair(row) for row in rows], CommandService.allowed_actions_for(npc),
         unavailable=runtime.health_fp <= 300 or runtime.action_status in {"AWAY", "SLEEPING"})

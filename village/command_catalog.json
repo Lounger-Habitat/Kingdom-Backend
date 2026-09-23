@@ -1515,13 +1515,13 @@
       "name": "INSPECT_AFFAIRS",
       "phase": "村庄事务",
       "label": "查询村庄事务",
-      "description": "查询系统创建的村庄事务；省略affair_id列出事务，指定编号查看阶段、条件、进度和本人贡献。查询不创建事务。",
+      "description": "查询系统创建的村庄事务；省略affair_id列出事务，指定编号查看阶段、条件、进度和本人贡献。编号不确定时先无参查询，再使用结果中的affair_id；不要把地点代码或条件编号当作事务编号。查询不创建事务。",
       "parameters": {
         "type": "object",
         "properties": {
           "affair_id": {
             "type": "string",
-            "description": "事务编号；省略时查询列表",
+            "description": "查询结果中的affairs[].affair_id；省略时查询列表。不是locations中的地点代码，也不是condition_id。",
             "minLength": 1
           }
         },
@@ -1539,12 +1539,12 @@
         "properties": {
           "affair_id": {
             "type": "string",
-            "description": "事务编号",
+            "description": "从INSPECT_AFFAIRS结果取得的affair_id；不是地点代码。编号不确定时先无参查询事务列表。",
             "minLength": 1
           },
           "condition_id": {
             "type": "string",
-            "description": "条件编号",
+            "description": "所选affair_id下面的condition_id，须来自该事务查询结果。该条件的locations用于确定施工地点，不能代替此编号。",
             "minLength": 1
           },
           "kind": {

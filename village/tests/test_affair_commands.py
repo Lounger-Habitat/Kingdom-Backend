@@ -8,6 +8,7 @@ from django.apps import apps
 from django.core.management import call_command
 from django.db import connection
 from django.test import TestCase, override_settings
+from rest_framework.test import APIRequestFactory, force_authenticate
 from game_time.models import GlobalGameTimeState
 from inventory.models import NpcDefinition, NpcGlobalInventory, NpcGlobalInventorySlot
 from items.models import Item
@@ -68,6 +69,54 @@ class AffairCommandTests(TestCase):
         self.assertFalse(VillageAffair.objects.filter(pk="BRIDGE_REPAIR").exists())
         self.assertEqual(execute_agent_query("10011", "INSPECT_AFFAIRS", {"affair_id":"missing"})[1], "AFFAIR_NOT_FOUND")
         self.assertEqual(execute_agent_query("10011", "INSPECT_AFFAIRS", {"story_id":"x"})[1], "INVALID_QUERY_PARAMS")
+
+    def test_wrong_affair_reference_returns_http_diagnostic_without_writes(self):
+        from village.views import npc_agent_query
+        self.project()
+
+        def read_only(execute, sql, params, many, context):
+            self.assertFalse(sql.lstrip().upper().startswith(("INSERT", "UPDATE", "DELETE")), sql)
+            return execute(sql, params, many, context)
+
+        for wrong in ("VILLAGE_SQUARE", "gold", "unknown-project"):
+            with self.subTest(reference=wrong):
+                request = APIRequestFactory().get("/", {"affair_id": wrong})
+                force_authenticate(request, user=SimpleNamespace(is_authenticated=True))
+                with connection.execute_wrapper(read_only):
+                    response = npc_agent_query(request, "10011", "INSPECT_AFFAIRS")
+                self.assertEqual(response.status_code, 409)
+                self.assertFalse(response.data["success"])
+                self.assertEqual(response.data["resultCode"], "AFFAIR_NOT_FOUND")
+                error = response.data["data"]
+                self.assertEqual(error["invalid_field"], "affair_id")
+                self.assertEqual(error["received_value"], wrong)
+                self.assertFalse(error["tool_error"]["executed"])
+                self.assertFalse(error["tool_error"]["automatic_retry_safe"])
+                self.assertNotIn("allowed_values", error)
+
+    def test_reference_discovery_reads_real_projects_without_executing_contributions(self):
+        self.project("CUSTOM_PROJECT")
+        ok, code, error = execute_agent_query("10011", "INSPECT_AFFAIRS", {"affair_id": "VILLAGE_SQUARE"})
+        self.assertFalse(ok)
+        self.assertEqual(code, "AFFAIR_NOT_FOUND")
+        discover = error["discover"]
+        ok, code, listing = execute_agent_query("10011", discover["tool"], discover["arguments"])
+        self.assertTrue(ok, code)
+        selected = next(row for row in listing["affairs"] if row["affair_id"] == "CUSTOM_PROJECT")
+        ok, code, detail = execute_agent_query("10011", "INSPECT_AFFAIRS", {"affair_id": selected["affair_id"]})
+        self.assertTrue(ok, code)
+        self.assertEqual(len(detail["affairs"]), 1)
+        self.assertEqual(detail["affairs"][0]["affair_id"], "CUSTOM_PROJECT")
+        self.assertFalse(VillageAffairContribution.objects.exists())
+        self.bag.refresh_from_db()
+        self.assertEqual(self.bag.money, 1000)
+
+    def test_reference_diagnostic_does_not_bypass_query_capability(self):
+        NpcProfile.objects.filter(npc=self.npc).update(capabilities=[])
+        ok, code, data = execute_agent_query("10011", "INSPECT_AFFAIRS", {"affair_id": "missing"})
+        self.assertFalse(ok)
+        self.assertEqual(code, "ACTION_NOT_ALLOWED")
+        self.assertIsNone(data)
 
     def test_gold_settlement_and_replay_are_atomic_and_independent(self):
         a, b = self.project(), self.project("PROJECT_B")
