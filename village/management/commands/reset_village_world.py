@@ -4,7 +4,8 @@ import uuid
 
 from django.conf import settings
 from django.core.management.base import BaseCommand, CommandError
-from django.db import transaction
+from django.db import connection, transaction
+from django.db.migrations.executor import MigrationExecutor
 from django.db.models import Q
 
 from account.models import GameAccount
@@ -135,6 +136,15 @@ class Command(BaseCommand):
 
     @staticmethod
     def _preflight():
+        executor = MigrationExecutor(connection)
+        pending = executor.migration_plan(executor.loader.graph.leaf_nodes())
+        if pending:
+            names = ", ".join(f"{migration.app_label}.{migration.name}" for migration, _ in pending)
+            raise CommandError(
+                f"数据库迁移未完成: {names}。"
+                "请先在 Backend 目录执行 python manage.py migrate，再重试重置。"
+            )
+
         expected = set(FORMAL_NPC_AGENT_IDS)
         actual = set(NpcDefinition.objects.filter(agent_id__in=expected).values_list("agent_id", flat=True))
         if actual != expected:

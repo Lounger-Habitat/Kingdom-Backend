@@ -172,6 +172,8 @@ def _get_affair(params, minute):
 
 
 def overview(player, bag, minute, *, read_only=False):
+    from .daily_events import project_daily_events
+    from inventory.batches import project_batch
     from .lucy_restaurant import public_meal_quota
     from .player_farm import farm_overview
     from .affairs import project_affairs
@@ -225,10 +227,12 @@ def overview(player, bag, minute, *, read_only=False):
         contributions=contributions, project=_project(minute)[0], market=market,
         commissions=commissions, my_commissions=[c for c in commissions
             if c.get("actor_type") == "PLAYER" and str(c.get("actor_id")) == str(player.pk)],
-        affairs=affairs, public_meals=public_meal_quota(minute, player_id=player.pk),
+        affairs=affairs, daily_events=project_daily_events(minute),
+        public_meals=public_meal_quota(minute, player_id=player.pk),
         my_labor=current_labor(player), farm=farm_overview(player, bag, minute, read_only=read_only),
         general_store=dict(status=general_store["status"], coin_balance=general_store["account__balance"]) if general_store else None,
         inventory=[{**_batch_data(s, minute, names),
+            "batch": project_batch(s, items.get(s.item_id), minute),
             "item_type": items[s.item_id].item_type if s.item_id in items else "",
             "general_store_sale": store_sale_quote(s, items.get(s.item_id), minute)}
             for s in bag.slots.filter(item_amount__gt=0).select_related("usage", "dish", "review")] if bag.pk else [])
@@ -460,6 +464,9 @@ def execute_player_action(payload):
                 bag, _ = get_player_main_bag(player)
                 bag = InventoryBag.objects.select_for_update().get(pk=bag.pk)
                 result = _execute(player, bag, action, params, rid, payload.get("current_location_code", ""), clock, payload.get("authority_session_id"))
+                if action != "overview":
+                    from .daily_events import evaluate_daily_events
+                    evaluate_daily_events(clock.world_minute)
             answer = response(rid, data=dict(result=result, overview=overview(player, bag, clock.world_minute)))
         except ActionError as exc:
             data = {}

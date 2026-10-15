@@ -88,7 +88,7 @@ def _result(success, code, data=None):
 
 
 @transaction.atomic
-def write_daily_record(envelope):
+def write_daily_record(envelope, *, action_task=None):
     if not isinstance(envelope, dict) or not isinstance(envelope.get("content"), dict):
         return _result(False, "INVALID_DAILY_RECORD_SCHEMA")
     content = envelope["content"]
@@ -97,12 +97,13 @@ def write_daily_record(envelope):
     sender = str(envelope.get("sender", ""))
     if sender not in FORMAL_NPC_IDS:
         return _result(False, "SENDER_BINDING_INVALID")
-    if not isinstance(action, str) or action not in WRITE_ACTIONS or content.get("schema_version") != "village.command.v1" or not isinstance(params, dict):
+    if not isinstance(action, str) or action not in WRITE_ACTIONS or (action_task is None and content.get("schema_version") != "village.command.v1") or not isinstance(params, dict):
         return _result(False, "INVALID_DAILY_RECORD_SCHEMA")
     try:
         uuid.UUID(str(envelope.get("envelope_id", "")))
-        uuid.UUID(str(content.get("id", "")))
-        request_id = uuid.UUID(str(content.get("request_id", "")))
+        if action_task is None:
+            uuid.UUID(str(content.get("id", "")))
+        request_id = action_task.pk if action_task is not None else uuid.UUID(str(content.get("request_id", "")))
     except (ValueError, TypeError, AttributeError):
         return _result(False, "INVALID_DAILY_RECORD_SCHEMA")
 

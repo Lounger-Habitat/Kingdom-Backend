@@ -36,6 +36,28 @@ class PlayerSiteTradeTests(PlayerFixture, TestCase):
         return self.run_action("buy_store", dict(listing_id=str(listing.pk), quantity=quantity,
             expected_unit_price=listing.unit_price), location=listing.store.location_code, **kwargs)
 
+    def test_trade_overview_uses_the_same_batch_contract_as_the_bag(self):
+        from inventory.serializers import serialize_bag
+        Item.objects.filter(pk=1030).update(stackable=True, quality_enabled=False, max_stack_size=10)
+        self.slot(quantity=5, quality=2)
+        self.slot(quantity=7, quality=4, expires_world_minute=3000)
+        self.slot(quantity=1, expires_world_minute=99)
+        self.slot(quantity=1, freshness_unknown=True)
+        self.slot(quantity=1, remaining_uses=8)
+        self.slot(quantity=1, dish_metadata={"source": "kitchen"})
+        for quality_enabled in (False, True):
+            with self.subTest(quality_enabled=quality_enabled):
+                Item.objects.filter(pk=1030).update(quality_enabled=quality_enabled)
+                answer = self.run_action("overview")
+                self.assertTrue(answer["success"], answer)
+                trade = answer["data"]["overview"]["inventory"]
+                bag_batches = [row["batch"] for row in serialize_bag(self.bag_a)["items"]]
+                self.assertEqual([row["batch"] for row in trade], bag_batches)
+                self.assertEqual(trade[0]["batch"]["stacking"], {"stackable": True, "maxPerSlot": 10})
+                self.assertEqual(trade[0]["batch"]["quality"], 2 if quality_enabled else None)
+                self.assertFalse(trade[4]["batch"]["stacking"]["stackable"])
+                self.assertFalse(trade[5]["batch"]["stacking"]["stackable"])
+
     def test_store_fefo_components_fee_receipt_and_sale_history(self):
         listing, first = self.shelf(amount=1, quality=4, remaining_uses=8, ingredient="corn",
             dish_metadata={"origin": "harvest"}, rated=True, rating_price=10, overall_score=88, review_comment="good")

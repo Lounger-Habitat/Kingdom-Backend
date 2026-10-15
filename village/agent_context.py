@@ -124,6 +124,7 @@ def build_agent_context(actions, profile=None):
             "PUBLISH_PERSONAL_COMMISSION：发布时预留全部金币报酬；发布者由你的身份确定。一个或多个阶段按顺序开放，同阶段全部条件满足才进入下一阶段；阶段地点未配置时继承委托默认地点。",
             "个人委托独立于商店、交易和村庄公共事务。个人委托仅由玩家认领并完成，每份同时只有一名玩家承接；NPC只能发布、查询和撤回尚未认领的自己的委托。发布后不能修改条件、报酬或期限。",
             "交付物品和金币先托管，全部阶段完成后转给发布者并把报酬付给承接者；发布者只能撤回未认领委托。放弃或到期会关闭委托并退回托管资产，劳动不退，保鲜期不刷新。",
+            "当餐急需先考虑现有采购、交易或换菜；玩家委托可用于后续备料。即使同一阶段有多条条件，也须全部阶段完成后才能使用托管食材。已认领委托仍须按原承诺履行；自行买到原料不改变玩家的交付条件和报酬。",
         ])
     durations = VillageActionDurationConfig.default_durations()
     timeouts = VillageActionDurationConfig.default_navigation_timeouts()
@@ -249,4 +250,17 @@ def build_agent_context(actions, profile=None):
     if "CONTRIBUTE_TO_AFFAIR" in actions:
         rules.append("村庄事务由系统创建和定义，NPC自主决定是否参与。使用INSPECT_AFFAIRS查询；使用CONTRIBUTE_TO_AFFAIR指定affair_id、condition_id和kind，仅贡献available=true的条件。各事务独立推进，无全局剧情阶段、会议、投票或发布决议前置。")
         rules.append("kind=item提交item_id和amount，可用food_instance_id指定批次；kind=gold提交amount，扣个人可用金币。系统按条件品质、新鲜度、地点和剩余需求校验，不能重复贡献或使用公款。kind=labor不传amount，真实完成unit_minutes才计1份，中断不计。最后阶段完成后由系统结算完成效果。")
-    return {"common_rules": common, "npc_rules": rules}
+    opportunity_query = "GET_RULE 或 INSPECT_AFFAIRS" if "INSPECT_AFFAIRS" in actions else "GET_RULE"
+    common.append(
+        "current_daily_events 是与你有关的公开机会和近期结果，不是任务指令；你自主决定是否参与，并照常安排吃饭、休息和职业活动。"
+        "status=OPEN表示邀请仍开放，RESOLVED表示已有实际结果，EXPIRED表示邀请窗口已结束。"
+        "invite_until_world_minute 只控制邀请窗口，不会取消已认领委托、冻结交易或清零公共工程。"
+        "summary 说明已知起因，resolution_summary 说明已结算事实；行动是否完成仍以真实业务回执为准。"
+        f"使用{opportunity_query}可重新查询；已结束机会不要求再次执行。"
+    )
+    from .daily_events import project_daily_events
+    context = {"common_rules": common, "npc_rules": rules}
+    daily_events = project_daily_events(npc_id=profile.npc.agent_id) if profile else []
+    if daily_events:
+        context["current_daily_events"] = daily_events
+    return context

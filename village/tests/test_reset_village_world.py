@@ -5,6 +5,7 @@ from account.models import GameAccount
 from django.core.management import call_command
 from django.core.management.base import CommandError
 from django.db import connection
+from django.db.migrations.recorder import MigrationRecorder
 from django.test import TestCase, override_settings
 from django.utils import timezone
 
@@ -580,6 +581,19 @@ class ResetVillageWorldTests(TestCase):
         BagTemplate.objects.filter(character_id="player").delete()
         with self.assertRaisesMessage(CommandError, "player 背包模板"):
             call_command("reset_village_world", "--confirm", "RESET_WUXI_VILLAGE", stdout=StringIO())
+        self.assertEqual(InventoryBag.objects.get(player=player).money, 9999)
+        self.assertTrue(VillageHuntAttempt.objects.exists())
+        self.assertTrue(VillageFarmPlot.objects.filter(lessee_player=player).exists())
+
+    def test_pending_migration_fails_before_mutating_progress(self):
+        player = self._create_current_progress()
+        MigrationRecorder(connection).record_unapplied("village", "0074_villageactiontask")
+
+        for arguments in (("--confirm", "RESET_WUXI_VILLAGE"), ("--dry-run",)):
+            with self.assertRaisesMessage(CommandError, "python manage.py migrate") as error:
+                call_command("reset_village_world", *arguments, stdout=StringIO())
+            self.assertIn("village.0074_villageactiontask", str(error.exception))
+
         self.assertEqual(InventoryBag.objects.get(player=player).money, 9999)
         self.assertTrue(VillageHuntAttempt.objects.exists())
         self.assertTrue(VillageFarmPlot.objects.filter(lessee_player=player).exists())

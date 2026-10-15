@@ -4,6 +4,7 @@ Covers success, wrong NPC, wrong location, missing items, tool broken,
 plot not empty/ready, idempotent replay, and concurrent operations.
 """
 
+import time
 import uuid
 
 from django.test import TestCase
@@ -16,7 +17,9 @@ from inventory.models import (
 )
 from recipes.models import Recipe, RecipeIngredient
 from village.models import (
+    NpcProfile,
     NpcRuntimeState,
+    VillageActionReceipt,
     VillageFarmPlot,
     VillageSimulationConfig,
 )
@@ -26,6 +29,7 @@ from village.phase3_contract import (
     VILLAGE_ECONOMY_ACTION_V1,
     ResultCode,
 )
+from village.runtime_services import CommandService
 
 
 def _payload(command_name, npc_id, location, params, request_id=None):
@@ -344,6 +348,129 @@ class HarvestFailureTest(ProductionTestBase):
              "expected_asset_version": self.bill_inv.asset_version},
         ))
         self.assertEqual(resp["result_code"], ResultCode.OK)
+
+
+# ============================================================================
+# HARVEST start checks
+# ============================================================================
+
+
+class HarvestStartTest(ProductionTestBase):
+    def setUp(self):
+        super().setUp()
+        NpcProfile.objects.update_or_create(npc=self.bill, defaults={
+            "display_name": "Bill", "occupation": "farmer",
+            "home_location_code": "BILL_HOME", "work_location_code": "BILL_FARM",
+            "social_location_code": "VILLAGE_SQUARE", "capabilities": ["HARVEST"],
+        })
+        self.plot = VillageFarmPlot.objects.get(plot_code="FARM_PLOT_A")
+        self.plot.status = "GROWING"
+        self.plot.crop_code = "CORN"
+        self.plot.batch_id = uuid.uuid4()
+        self.plot.planted_world_minute = 0
+        self.plot.mature_world_minute = self.time.world_minute
+        self.plot.save()
+
+    def _accept_harvest(self, **params):
+        self.bill_rt.refresh_from_db()
+        ok, code, command = CommandService.accept_command(
+            envelope_id=str(uuid.uuid4()), sender="10011", recipient="WuxiVillage",
+            timestamp_ms=int(time.time() * 1000), content={
+                "schema_version": "village.command.v1", "id": str(uuid.uuid4()),
+                "request_id": str(uuid.uuid4()), "name": "HARVEST",
+                "params": {"plot_code": self.plot.plot_code, **params},
+                "queue_mode": "STRICT", "expected_state_version": self.bill_rt.state_version,
+                "not_before_world_minute": self.time.world_minute, "ttl_ms": 120000,
+            },
+        )
+        self.assertTrue(ok, code)
+        return command
+
+    def _assert_start_rejected(self, code, failure_kind=None, **params):
+        command = self._accept_harvest(**params)
+        needs_before = (self.bill_rt.hunger_fp, self.bill_rt.energy_fp)
+        ok, result, _ = CommandService.start_command(command.command_id)
+        self.assertFalse(ok)
+        self.assertEqual(result, code)
+        command.refresh_from_db()
+        self.bill_rt.refresh_from_db()
+        self.assertEqual(command.status, "FAILED")
+        self.assertIsNone(command.started_world_minute)
+        self.assertEqual(command.completed_world_minute, self.time.world_minute)
+        self.assertEqual(self.bill_rt.action_status, "IDLE")
+        self.assertIsNone(self.bill_rt.active_command_id)
+        self.assertIsNone(self.bill_rt.action_ends_world_minute)
+        self.assertEqual((self.bill_rt.hunger_fp, self.bill_rt.energy_fp), needs_before)
+        receipt = VillageActionReceipt.objects.get(request_id=command.request_id)
+        self.assertFalse(receipt.success)
+        if failure_kind:
+            self.assertEqual(receipt.response_data["failure_kind"], failure_kind)
+
+    def test_rejects_immature_crop_even_if_it_would_mature_during_action(self):
+        self.plot.mature_world_minute = self.time.world_minute + 1
+        self.plot.save()
+        self._assert_start_rejected(ResultCode.P3_PLOT_NOT_READY, "PLOT_NOT_MATURE")
+        self.bill_farm_tool.refresh_from_db()
+        self.assertEqual(self.bill_farm_tool.remaining_uses, 20)
+
+    def test_rejects_empty_plot_before_start(self):
+        self.plot.status = "EMPTY"
+        self.plot.save()
+        self._assert_start_rejected(ResultCode.P3_PLOT_NOT_READY, "PLOT_EMPTY")
+
+    def test_fast_integration_also_rejects_immature_crop_before_start(self):
+        self.plot.mature_world_minute = self.time.world_minute + 1
+        self.plot.save()
+        with self.settings(VILLAGE_FAST_COMMAND_INTEGRATION=True):
+            self._assert_start_rejected(ResultCode.P3_PLOT_NOT_READY, "PLOT_NOT_MATURE")
+
+    def test_rejects_missing_broken_unknown_and_invalid_tools_before_start(self):
+        for amount, uses in ((0, 20), (5, 0), (5, None), (5, -1)):
+            with self.subTest(amount=amount, uses=uses):
+                self.bill_farm_tool.item_amount = amount
+                self.bill_farm_tool.remaining_uses = uses
+                self.bill_farm_tool.save()
+                self._assert_start_rejected(ResultCode.P3_TOOL_BROKEN, "FARM_TOOL_UNAVAILABLE")
+                self.bill_farm_tool.refresh_from_db()
+                self.assertEqual(self.bill_farm_tool.item_amount, amount)
+                self.assertEqual(self.bill_farm_tool.remaining_uses, uses)
+
+    def test_rejects_stale_inventory_version_before_start(self):
+        self._assert_start_rejected(ResultCode.P3_ASSET_VERSION_CONFLICT, expected_asset_version=999)
+
+    def test_ready_crop_starts_without_consuming_tools_or_harvesting(self):
+        command = self._accept_harvest(expected_asset_version=self.bill_inv.asset_version)
+        ok, code, _ = CommandService.start_command(command.command_id)
+        self.assertTrue(ok, code)
+        command.refresh_from_db()
+        self.bill_rt.refresh_from_db()
+        self.plot.refresh_from_db()
+        self.bill_farm_tool.refresh_from_db()
+        self.bill_inv.refresh_from_db()
+        self.assertEqual(command.status, "RUNNING")
+        self.assertEqual(command.started_world_minute, self.time.world_minute)
+        self.assertEqual(self.bill_rt.action_status, "ACTING")
+        self.assertEqual(self.bill_rt.action_ends_world_minute, self.time.world_minute + command.duration_minutes)
+        self.assertEqual(self.plot.status, "GROWING")
+        self.assertEqual(self.bill_farm_tool.remaining_uses, 20)
+        self.assertEqual(self.bill_inv.asset_version, 0)
+        self.assertFalse(self.bill_inv.slots.filter(item_id=1030).exists())
+
+    def test_settlement_rechecks_tools_after_successful_start(self):
+        command = self._accept_harvest()
+        self.assertTrue(CommandService.start_command(command.command_id)[0])
+        self.bill_farm_tool.item_amount = 0
+        self.bill_farm_tool.save()
+        self.time.world_minute += command.duration_minutes
+        self.time.save()
+        payload = _payload("HARVEST", 10011, "BILL_FARM", {"plot_code": self.plot.plot_code})
+        payload.update(command_id=str(command.command_id), request_id=str(command.request_id),
+                       message_id=str(command.message_id))
+        result = commit_economy_action(payload)
+        self.assertEqual(result["result_code"], ResultCode.P3_TOOL_BROKEN)
+        self.plot.refresh_from_db()
+        self.assertEqual(self.plot.status, "GROWING")
+        self.assertFalse(self.bill_inv.slots.filter(item_id=1030).exists())
 
 
 # ============================================================================

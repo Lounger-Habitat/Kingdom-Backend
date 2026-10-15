@@ -62,6 +62,7 @@ def agent_tool(action):
     # 也不占用写操作的重放保护。只读集合以 CommandService.READ_QUERY_ACTIONS
     # 为准（与 agent_queries.QUERY_NAMES 一致）；延迟导入避免模块级循环依赖。
     from .runtime_services import CommandService
+    from .evidence_policy import policy_for
 
     command = COMMAND_CATALOG[action]
     tags = ["read"] if action in CommandService.READ_QUERY_ACTIONS else []
@@ -69,12 +70,16 @@ def agent_tool(action):
         tags.append("long_running")
     if action in _MOVEMENT_ACTIONS:
         tags.append("movement")
-    return {
+    result = {
         "name": action,
         "description": command["description"],
         "parameters": deepcopy(command["parameters"]),
         "tags": tags,
     }
+    policy = command.get("evidence_policy", policy_for(action))
+    if policy is not None:
+        result["evidence_policy"] = deepcopy(policy)
+    return result
 
 
 def command_admin_label(action):

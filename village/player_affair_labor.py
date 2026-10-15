@@ -190,6 +190,9 @@ def tick_player_labor(payload):
                 labor.accumulated_minutes = 0
                 break
         labor.save()
+        if credited:
+            from .daily_events import evaluate_daily_events
+            evaluate_daily_events(clock.world_minute)
         return response(labor_id, data=dict(labor=labor_data(labor), credited_units=credited,
                                            earned_gold=earned_gold, affected_npc_ids=affected_npcs))
     except ActionError as exc:

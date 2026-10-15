@@ -82,13 +82,31 @@ class PlayerWildlifeTests(WildlifeFixture, PlayerFixture, TestCase):
         self.assertEqual(invalid['result_code'], 'INVALID_PARAMS')
         attempt = self.begin(prey, self.a.pk)
         alias = self.call('begin', self.register(), attempt_id=str(uuid.uuid4()), actor_type='PLAYER', actor_id='0'+str(self.a.pk))
-        self.assertEqual(alias['result_code'], 'ACTOR_BUSY')
+        self.assertTrue(alias['success'], alias)
+        self.assertEqual(alias['data']['attempt']['actor_id'], str(self.a.pk))
         self.assertEqual(self.call('complete', prey, attempt_id=attempt, death_world_minute=101)['result_code'], 'INVALID_DEATH_TIME')
         self.assertEqual(self.call('complete', prey, attempt_id=attempt, death_world_minute=99)['result_code'], 'INVALID_DEATH_TIME')
         payload = dict(action='complete', request_id=str(uuid.uuid4()), prey_id=str(prey), attempt_id=attempt)
         self.assertEqual(execute(dict(payload, item_id=29103))['result_code'], 'INVALID_PARAMS')
         self.assertTrue(execute(payload)['success'])
         self.assertEqual(execute(dict(payload, action='cancel'))['result_code'], 'REQUEST_CONFLICT')
+
+    def test_final_hit_replaces_legacy_owner_and_only_last_hitter_receives_meat(self):
+        prey = self.register()
+        old = self.begin(prey, self.a.pk)
+        payload = dict(action='finish', request_id=str(uuid.uuid4()), prey_id=str(prey),
+                       attempt_id=str(uuid.uuid4()), actor_type='PLAYER', actor_id=str(self.b.pk),
+                       death_world_minute=100)
+        result = execute(payload)
+        self.assertTrue(result['success'], result)
+        self.assertEqual(execute(payload), result)
+        self.assertEqual(VillageHuntAttempt.objects.get(pk=old).status, 'CANCELLED')
+        self.assertFalse(self.bag_a.slots.exists())
+        self.assertEqual(self.bag_b.slots.get(item_id=29102).item_amount, 1)
+        late = execute(dict(payload, request_id=str(uuid.uuid4()), attempt_id=str(uuid.uuid4()), actor_id=str(self.a.pk)))
+        self.assertFalse(late['success'])
+        self.assertFalse(self.bag_a.slots.exists())
+        self.assertEqual(VillageHuntAttempt.objects.filter(status='SUCCEEDED').count(), 1)
 
     def test_failure_rolls_back_death_and_asset_then_same_request_can_retry(self):
         prey = self.register()
@@ -182,6 +200,18 @@ class JackWildlifeTests(WildlifeFixture, ProductionTestBase):
         settled = bootstrap()['data']['settled_attempts']
         self.assertEqual(settled[0]['attempt']['command_id'], str(command.pk))
         self.assertEqual(settled[0]['economy_result']['request_id'], str(command.request_id))
+
+    def test_npc_final_hit_settles_atomically_at_the_authoritative_death_time(self):
+        command = self.start()
+        prey = self.register()
+        self.time.world_minute = 720
+        self.time.save()
+        result = self.call('finish', prey, attempt_id=str(uuid.uuid4()), actor_type='NPC',
+                           actor_id='10012', command_id=str(command.pk), death_world_minute=704)
+        self.assertTrue(result['success'], result)
+        self.assertEqual(self.jack_inv.slots.get(item_id=29102).expires_world_minute, 3584)
+        command.refresh_from_db()
+        self.assertEqual(command.status, 'SUCCEEDED')
 
     def test_elapsed_budget_alone_never_mints_and_retarget_does_not_repeat_fatigue(self):
         command = self.start()

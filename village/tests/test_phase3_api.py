@@ -124,6 +124,60 @@ class Phase3EconomyApiTests(TestCase):
 
     # ── actions/complete tests ────────────────────────────────────────────────
 
+    def test_accepted_harvest_completion_needs_no_duplicate_metadata_and_replays_once(self):
+        inventory = self.inventories["10011"]
+        inventory.slots.all().delete()
+        tool = NpcGlobalInventorySlot.objects.create(
+            bag=inventory, slot_index=0, item_id=4001, item_amount=1, remaining_uses=20,
+        )
+        plot = VillageFarmPlot.objects.get(plot_code="FARM_PLOT_A")
+        plot.status = "GROWING"
+        plot.crop_code = "CORN"
+        plot.batch_id = uuid.uuid4()
+        plot.planted_world_minute = 9000
+        plot.mature_world_minute = 9999
+        plot.yield_seed = 5
+        plot.save()
+        command = NpcCommandState.objects.create(
+            command_id=uuid.uuid4(), request_id=uuid.uuid4(), message_id=uuid.uuid4(),
+            npc=self.npcs["10011"], kind="HARVEST", status="RUNNING",
+            sender_id="10011", recipient_id="WuxiVillage", location_code="BILL_FARM",
+            sanitized_parameters={"plot_code": "FARM_PLOT_A"}, payload_sha256="a" * 64,
+            received_world_minute=9994, started_world_minute=9995, duration_minutes=5,
+        )
+        NpcRuntimeState.objects.filter(npc=command.npc).update(
+            active_command_id=command.command_id, current_action="HARVEST", action_status="ACTING",
+            action_started_world_minute=9995, action_ends_world_minute=10000,
+            needs_world_minute=9995, last_simulated_world_minute=9995,
+        )
+        payload = {"command_id": str(command.command_id), "completed_world_minute": 10000,
+                   "time_revision": 0, "current_location_code": "BILL_FARM"}
+        response = self.client.post("/api/village/economy/actions/complete", payload,
+                                    format="json", HTTP_AUTHORIZATION=self._auth_header())
+        self.assertEqual(response.status_code, 200, response.content)
+        result = response.json()
+        self.assertEqual(result["result_code"], ResultCode.OK, result)
+        command.refresh_from_db()
+        self.assertEqual(command.status, "SUCCEEDED")
+        self.assertEqual(result["request_id"], str(command.request_id))
+        corn = sum(inventory.slots.filter(item_id=1030).values_list("item_amount", flat=True))
+        self.assertEqual(corn, 5)
+        tool.refresh_from_db()
+        uses = tool.remaining_uses
+        self.assertEqual(uses, 19)
+        replay = self.client.post("/api/village/economy/actions/complete", payload,
+                                 format="json", HTTP_AUTHORIZATION=self._auth_header())
+        self.assertEqual(replay.status_code, 200)
+        self.assertEqual(replay.json(), {**result, "replayed": True})
+        self.assertEqual(sum(inventory.slots.filter(item_id=1030).values_list("item_amount", flat=True)), corn)
+        tool.refresh_from_db()
+        self.assertEqual(tool.remaining_uses, uses)
+        self.assertEqual(VillageActionReceipt.objects.filter(command_id=command.command_id).count(), 1)
+        unknown = {**payload, "command_id": str(uuid.uuid4())}
+        rejected = self.client.post("/api/village/economy/actions/complete", unknown,
+                                   format="json", HTTP_AUTHORIZATION=self._auth_header())
+        self.assertEqual(rejected.status_code, 400)
+
     def test_rate_dish_invalid_instance_id_returns_structured_200(self):
         payload = _economy_action_payload(
             command_name="RATE_DISH",

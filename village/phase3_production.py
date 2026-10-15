@@ -207,9 +207,8 @@ def _do_plant(
 # ── HARVEST ──────────────────────────────────────────────────────────────────
 
 
-def _do_harvest(
-    npc_id: int, params: Dict[str, Any], world_minute: int, request_id: uuid.UUID
-) -> Dict[str, Any]:
+def harvest_preflight(npc_id, params, world_minute, request_id=None):
+    """Read-only start check; settlement repeats it under the same locks."""
     plot_code = params.get("plot_code", "")
     expected_version = params.get("expected_asset_version")
 
@@ -220,81 +219,101 @@ def _do_harvest(
                   "allowed_values": sorted(PLOT_CODES)},
         )
 
+    try:
+        plot = VillageFarmPlot.objects.select_for_update().get(plot_code=plot_code)
+    except VillageFarmPlot.DoesNotExist:
+        return _fail(
+            ResultCode.P3_INVALID_PARAMS,
+            data={"invalid_field": "plot_code", "received_value": plot_code,
+                  "failure_kind": "PLOT_NOT_FOUND"},
+        )
+
+    try:
+        inventory = NpcGlobalInventory.objects.select_for_update().get(
+            npc__agent_id=str(npc_id)
+        )
+    except NpcGlobalInventory.DoesNotExist:
+        return _fail(ResultCode.P3_INVALID_PARAMS, data={"failure_kind": "INVENTORY_NOT_FOUND"})
+
+    if expected_version is not None and inventory.asset_version != expected_version:
+        return _fail(ResultCode.P3_ASSET_VERSION_CONFLICT)
+
+    if plot.lessee_player_id is not None:
+        return _fail(ResultCode.P3_PLOT_NOT_READY, data={"failure_kind": "PLOT_PLAYER_LEASED", "plot_code": plot_code})
+
+    if plot.status != "GROWING":
+        return _fail(
+            ResultCode.P3_PLOT_NOT_READY,
+            data={
+                "failure_kind": "PLOT_EMPTY" if plot.status == "EMPTY" else "PLOT_NOT_HARVESTABLE",
+                "plot_code": plot.plot_code,
+                "plot_status": plot.status,
+                "crop_code": plot.crop_code or None,
+                "planted_world_minute": plot.planted_world_minute,
+                "mature_world_minute": plot.mature_world_minute,
+            },
+        )
+
+    if request_id is not None and plot.source_request_id == request_id:
+        # Already harvested by this request_id (replay)
+        return _fail(
+            ResultCode.P3_PLOT_NOT_READY,
+            data={"failure_kind": "PLOT_ALREADY_HARVESTED", "plot_code": plot.plot_code},
+        )
+
+    if world_minute < (plot.mature_world_minute or 0):
+        return _fail(
+            ResultCode.P3_PLOT_NOT_READY,
+            data={
+                "failure_kind": "PLOT_NOT_MATURE",
+                "plot_code": plot.plot_code,
+                "plot_status": plot.status,
+                "crop_code": plot.crop_code or None,
+                "planted_world_minute": plot.planted_world_minute,
+                "mature_world_minute": plot.mature_world_minute,
+            },
+        )
+
+    try:
+        get_usable_tool_slot(inventory, FARM_TOOL_ITEM_ID, world_minute)
+    except ValueError:
+        return _fail(
+            ResultCode.P3_TOOL_BROKEN,
+            data={"failure_kind": "FARM_TOOL_UNAVAILABLE", "required_item_id": FARM_TOOL_ITEM_ID},
+        )
+
+    if plot.crop_code not in FARM_CROP_RULES:
+        return _fail(
+            ResultCode.P3_PLOT_NOT_READY,
+            data={
+                "failure_kind": "PLOT_CROP_NOT_CONFIGURED",
+                "plot_code": plot.plot_code,
+                "crop_code": plot.crop_code or None,
+            },
+        )
+    return None
+
+
+def _do_harvest(
+    npc_id: int, params: Dict[str, Any], world_minute: int, request_id: uuid.UUID
+) -> Dict[str, Any]:
     with transaction.atomic():
-        try:
-            plot = VillageFarmPlot.objects.select_for_update().get(plot_code=plot_code)
-        except VillageFarmPlot.DoesNotExist:
-            return _fail(
-                ResultCode.P3_INVALID_PARAMS,
-                data={"invalid_field": "plot_code", "received_value": plot_code,
-                      "failure_kind": "PLOT_NOT_FOUND"},
-            )
+        failure = harvest_preflight(npc_id, params, world_minute, request_id)
+        if failure:
+            return failure
+        plot_code = params["plot_code"]
+        plot = VillageFarmPlot.objects.select_for_update().get(plot_code=plot_code)
+        inventory = NpcGlobalInventory.objects.select_for_update().get(npc__agent_id=str(npc_id))
+        crop_code = plot.crop_code
+        crop_rule = FARM_CROP_RULES[crop_code]
 
-        try:
-            inventory = NpcGlobalInventory.objects.select_for_update().get(
-                npc__agent_id=str(npc_id)
-            )
-        except NpcGlobalInventory.DoesNotExist:
-            return _fail(ResultCode.P3_INVALID_PARAMS, data={"failure_kind": "INVENTORY_NOT_FOUND"})
-
-        if expected_version is not None and inventory.asset_version != expected_version:
-            return _fail(ResultCode.P3_ASSET_VERSION_CONFLICT)
-
-        if plot.lessee_player_id is not None:
-            return _fail(ResultCode.P3_PLOT_NOT_READY, data={"failure_kind": "PLOT_PLAYER_LEASED", "plot_code": plot_code})
-
-        if plot.status != "GROWING":
-            return _fail(
-                ResultCode.P3_PLOT_NOT_READY,
-                data={
-                    "failure_kind": "PLOT_EMPTY" if plot.status == "EMPTY" else "PLOT_NOT_HARVESTABLE",
-                    "plot_code": plot.plot_code,
-                    "plot_status": plot.status,
-                    "crop_code": plot.crop_code or None,
-                    "planted_world_minute": plot.planted_world_minute,
-                    "mature_world_minute": plot.mature_world_minute,
-                },
-            )
-
-        if plot.source_request_id == request_id:
-            # Already harvested by this request_id (replay)
-            return _fail(
-                ResultCode.P3_PLOT_NOT_READY,
-                data={"failure_kind": "PLOT_ALREADY_HARVESTED", "plot_code": plot.plot_code},
-            )
-
-        if world_minute < (plot.mature_world_minute or 0):
-            return _fail(
-                ResultCode.P3_PLOT_NOT_READY,
-                data={
-                    "failure_kind": "PLOT_NOT_MATURE",
-                    "plot_code": plot.plot_code,
-                    "plot_status": plot.status,
-                    "crop_code": plot.crop_code or None,
-                    "planted_world_minute": plot.planted_world_minute,
-                    "mature_world_minute": plot.mature_world_minute,
-                },
-            )
-
-        # Consume 1 farm tool use
+        # Consume 1 farm tool use only during settlement.
         try:
             used_tool = consume_tool_use(npc_id, FARM_TOOL_ITEM_ID, world_minute)
         except ValueError:
             return _fail(
                 ResultCode.P3_TOOL_BROKEN,
                 data={"failure_kind": "FARM_TOOL_UNAVAILABLE", "required_item_id": FARM_TOOL_ITEM_ID},
-            )
-
-        crop_code = plot.crop_code
-        crop_rule = FARM_CROP_RULES.get(crop_code)
-        if crop_rule is None:
-            return _fail(
-                ResultCode.P3_PLOT_NOT_READY,
-                data={
-                    "failure_kind": "PLOT_CROP_NOT_CONFIGURED",
-                    "plot_code": plot.plot_code,
-                    "crop_code": crop_code or None,
-                },
             )
 
         # Capture the batch before clearing the persistent plot.  The success

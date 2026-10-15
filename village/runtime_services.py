@@ -545,6 +545,8 @@ class TimeService:
             expire_commissions(state.world_minute)
             from .player_farm import maintain_leases
             maintain_leases(state.world_minute, state.time_revision)
+            from .daily_events import evaluate_daily_events
+            evaluate_daily_events(state.world_minute, expire_only=True)
         return True, ResultCode.COMMAND_ACCEPTED, state
 
 
@@ -554,6 +556,18 @@ class TimeService:
 
 class BootstrapService:
     """启动快照服务。"""
+
+    @staticmethod
+    def context_for_command(command):
+        from .star_actions import command_task_context
+        return command_task_context(command)
+
+    @staticmethod
+    def action_tasks():
+        from .models import VillageActionTask, VillageSimulationConfig
+        from .star_actions import task_context
+        config = VillageSimulationConfig.objects.filter(config_key="default").first()
+        return [task_context(task) for task in VillageActionTask.objects.filter(epoch=config.action_epoch).select_related("command")] if config else []
 
     @staticmethod
     @transaction.atomic
@@ -645,6 +659,14 @@ class BootstrapService:
 
         def serialize_command(command: NpcCommandState) -> Dict[str, Any]:
             """Return the complete, replay-safe command wire data required by Env recovery."""
+            from .star_actions import command_task_context
+            task = command_task_context(command)
+            if task:
+                return {"content": task["action"]["payload"]["content"], "execution_context": task,
+                        "sender": command.sender_id, "recipient": command.recipient_id,
+                        "envelope_id": task["action"]["id"],
+                        "status": command.status, "started_world_minute": command.started_world_minute,
+                        "completed_world_minute": command.completed_world_minute, "state_version": command.state_version}
             return {
                 "envelope_id": str(command.message_id),
                 "timestamp": command.sent_at_ms,
@@ -713,6 +735,8 @@ class BootstrapService:
                 "queued_commands": [serialize_command(c) for c in npc_commands if c is not active],
             })
 
+        from .daily_events import evaluate_daily_events, project_daily_events
+        evaluate_daily_events(time_state.world_minute)
         return {
             "world_minute": time_state.world_minute,
             "time_revision": time_state.time_revision,
@@ -723,7 +747,9 @@ class BootstrapService:
             "game_minute": time_state.game_minute,
             "season": time_state.season,
             "npcs": npc_data,
+            "daily_events": project_daily_events(time_state.world_minute),
             "commands": [serialize_command(command) for command in active_commands],
+            "action_tasks": BootstrapService.action_tasks(),
             "action_epoch": str(config.action_epoch) if config else "",
             "config": {
                 "tick_interval_seconds": config.tick_interval_seconds if config else 5,
@@ -1069,7 +1095,7 @@ class CommandService:
         return hashlib.sha256(canonical.encode()).hexdigest()
 
     @staticmethod
-    def validate_phase2_command(action_name: str, content: Dict[str, Any]) -> Optional[str]:
+    def validate_phase2_command(action_name: str, content: Dict[str, Any], world_minute=None) -> Optional[str]:
         if action_name not in CommandService.PHASE2_ACTIONS:
             return None
         params = content.get("params")
@@ -1100,7 +1126,7 @@ class CommandService:
                 except (ValueError, TypeError):
                     return ResultCode.INVALID_COMMAND_SCHEMA
             return None
-        start = content.get("not_before_world_minute")
+        start = content.get("not_before_world_minute") if world_minute is None else world_minute
         expires = content.get("expires_world_minute")
         if isinstance(start, bool) or not isinstance(start, int) or (
             expires is not None and (isinstance(expires, bool) or not isinstance(expires, int))
@@ -1151,6 +1177,7 @@ class CommandService:
         recipient: str,
         content: Dict[str, Any],
         timestamp_ms: Optional[int] = None,
+        *, action_task=None,
     ) -> Tuple[bool, str, Optional[NpcCommandState]]:
         """接受命令。
 
@@ -1160,7 +1187,8 @@ class CommandService:
         # 校验 sender
         fast_integration = _fast_integration_enabled()
         content = dict(content or {})
-        server_resolved_intent = content.pop("_server_resolved_intent", False) is True
+        native_action = action_task is not None
+        server_resolved_intent = native_action or content.pop("_server_resolved_intent", False) is True
         if not isinstance(content.get("params", {}), dict):
             return False, ResultCode.INVALID_COMMAND_SCHEMA, None
         content["params"] = dict(content.get("params", {}))
@@ -1176,7 +1204,7 @@ class CommandService:
             requested = content["duration_minutes"]
             if isinstance(requested, bool) or not isinstance(requested, int) or requested <= 0:
                 return False, ResultCode.INVALID_ACTION_DURATION, None
-        if fast_integration:
+        if fast_integration and not native_action:
             content["schema_version"] = "village.command.v1"
             content["queue_mode"] = "STRICT"
             content["ttl_ms"] = 86_400_000
@@ -1192,16 +1220,16 @@ class CommandService:
 
         try:
             message_id = uuid.UUID(str(envelope_id))
-            command_id = uuid.UUID(str(content["id"]))
-            request_id = uuid.UUID(str(content["request_id"]))
+            command_id = action_task.pk if native_action else uuid.UUID(str(content["id"]))
+            request_id = command_id if native_action else uuid.UUID(str(content["request_id"]))
             timestamp_ms = int(timestamp_ms)
         except (KeyError, TypeError, ValueError, AttributeError):
             return False, ResultCode.INVALID_COMMAND_SCHEMA, None
         if (not fast_integration and timestamp_ms < 1_000_000_000_000) or not isinstance(content.get("params"), dict):
             return False, ResultCode.INVALID_COMMAND_SCHEMA, None
-        if "parameters" in content or (not fast_integration and content.get("queue_mode") != "STRICT"):
+        if "parameters" in content or (not native_action and not fast_integration and content.get("queue_mode") != "STRICT"):
             return False, ResultCode.INVALID_COMMAND_SCHEMA, None
-        ttl_ms = content.get("ttl_ms")
+        ttl_ms = getattr(settings, "VILLAGE_ACTION_MAX_AGE_MS", 86_400_000) if native_action else content.get("ttl_ms")
         if not fast_integration and (not isinstance(ttl_ms, int) or ttl_ms <= 0):
             return False, ResultCode.INVALID_COMMAND_SCHEMA, None
         now_ms = int(timezone.now().timestamp() * 1000)
@@ -1215,8 +1243,8 @@ class CommandService:
             return False, ResultCode.SENDER_BINDING_INVALID, None
 
         # 校验 schema_version
-        schema_version = content.get("schema_version", "")
-        if schema_version != "village.command.v1":
+        schema_version = "" if native_action else content.get("schema_version", "")
+        if not native_action and schema_version != "village.command.v1":
             return False, ResultCode.PROTOCOL_VERSION_UNSUPPORTED, None
 
         # 校验 action
@@ -1243,17 +1271,10 @@ class CommandService:
             if error:
                 return False, error, None
         if action_name == "MOVE":
-            params = content.get("params")
-            if (not isinstance(params, dict) or set(params) not in (
-                {"location_code"}, {"target_npc_id"}
-            )):
-                return False, ResultCode.INVALID_COMMAND_SCHEMA, None
-            if "target_npc_id" in params and not NpcDefinition.objects.filter(
-                agent_id=str(params["target_npc_id"]), is_test_only=False
-            ).exists():
-                return False, ResultCode.SOCIAL_TARGET_INVALID, None
-            if str(params.get("target_npc_id", "")) == str(sender):
-                return False, ResultCode.SOCIAL_TARGET_INVALID, None
+            from .scene_navigation import validate_move
+            error = validate_move(content.get("params"), sender)
+            if error:
+                return False, error, None
         if action_name in CommandService.PHASE2_ACTIONS and not fast_integration:
             if not VillageSimulationConfig.objects.filter(
                 config_key="default", village_needs_enabled=True
@@ -1280,8 +1301,8 @@ class CommandService:
 
         # 提取 ID
         message_id = uuid.UUID(envelope_id)
-        command_id = uuid.UUID(content.get("id", str(uuid.uuid4())))
-        request_id = uuid.UUID(content.get("request_id", str(uuid.uuid4())))
+        command_id = action_task.pk if native_action else uuid.UUID(content.get("id", str(uuid.uuid4())))
+        request_id = command_id if native_action else uuid.UUID(content.get("request_id", str(uuid.uuid4())))
 
         # 检查 message_id 幂等
         existing = NpcCommandState.objects.filter(message_id=message_id).first()
@@ -1327,7 +1348,8 @@ class CommandService:
             duration = content.get("duration_minutes")
             if isinstance(duration, bool) or not isinstance(duration, int) or duration <= 0:
                 return False, ResultCode.INVALID_ACTION_DURATION, None
-        phase2_validation = CommandService.validate_phase2_command(action_name, content)
+        phase2_validation = CommandService.validate_phase2_command(
+            action_name, content, time_state.world_minute if native_action else None)
         if phase2_validation:
             return False, phase2_validation, None
 
@@ -1359,7 +1381,8 @@ class CommandService:
         expected_version = content.get("expected_state_version")
         if fast_integration or server_resolved_intent or expected_version is None:
             expected_version = runtime.state_version
-            content["expected_state_version"] = expected_version
+            if not native_action:
+                content["expected_state_version"] = expected_version
         if not isinstance(expected_version, int):
             return False, ResultCode.INVALID_COMMAND_SCHEMA, None
         if not fast_integration and expected_version != runtime.state_version:
@@ -1404,7 +1427,7 @@ class CommandService:
             sent_at_ms=timestamp_ms,
             received_at_ms=now_ms,
             ttl_ms=ttl_ms,
-            not_before_world_minute=content.get("not_before_world_minute"),
+            not_before_world_minute=time_state.world_minute if native_action else content.get("not_before_world_minute"),
             expires_world_minute=content.get("expires_world_minute"),
             duration_minutes=content.get("duration_minutes"),
             received_world_minute=time_state.world_minute,
@@ -1679,9 +1702,11 @@ class CommandService:
 
         # ``time_state`` remains locked from the first lifecycle read through
         # transition to RUNNING; do not re-read an unlocked minute here.
-        if command.kind in {"PLANT", "COOK"}:
+        if command.kind in {"PLANT", "HARVEST", "COOK"}:
             if command.kind == "COOK":
                 from .lucy_cooking import cook_preflight as preflight
+            elif command.kind == "HARVEST":
+                from .phase3_production import harvest_preflight as preflight
             else:
                 from .phase3_production import plant_preflight as preflight
             failure = preflight(int(command.npc.agent_id), command.sanitized_parameters, time_state.world_minute)
@@ -1945,7 +1970,7 @@ class ActionService:
         if success and command.kind in {"MOVE", "GO_HOME"} and data:
             from .models import VillageLocationDefinition
             arrived = data.get("current_location_code")
-            if arrived and VillageLocationDefinition.objects.filter(location_code=arrived, is_active=True).exists():
+            if arrived == "OUTDOORS" or (arrived and VillageLocationDefinition.objects.filter(location_code=arrived, is_active=True).exists()):
                 rt.current_location_code = arrived
                 rt.current_point_code = data.get("current_point_code") or arrived
 
@@ -2053,6 +2078,8 @@ class ActionService:
         # OUTCOME 行收到完整结果；事件本身已落库 VillageWorldEvent 存档，
         # 动作类事件的广播投递由 phase4_visibility.SUPPRESS_ACTION_EVENT_DELIVERY 控制。
 
+        from .daily_events import evaluate_daily_events
+        evaluate_daily_events(time_state.world_minute)
         return True, result_code, receipt
 
 
@@ -2308,10 +2335,22 @@ class OutboxService:
         ).filter(
             Q(next_attempt_at__isnull=True) | Q(next_attempt_at__lte=now)
         )
-        entries = list(qs.order_by("-priority", "created_at", "delivery_id")[:limit])
-
+        entries = list(qs.select_related("event").order_by("-priority", "created_at", "delivery_id")[:limit])
         results = []
         for entry in entries:
+            if entry.message_kind == "EVENT" and entry.event_id:
+                from .phase4_visibility import DAILY_STORY_EVENT_TYPES, _recipients, event_payload
+                if entry.event.event_type in DAILY_STORY_EVENT_TYPES:
+                    if entry.recipient not in _recipients(entry.event):
+                        # Close old wrong-audience deliveries as marked terminal
+                        # rows, preserving history without blocking safe cursors.
+                        entry.status = "ACKED"
+                        entry.acked_at = now
+                        entry.lease_until = None
+                        entry.last_error_code = "DAILY_NPC_SCOPE_SUPPRESSED"
+                        entry.save(update_fields=["status", "acked_at", "lease_until", "last_error_code"])
+                        continue
+                    entry.payload = event_payload(entry.event, entry.recipient)
             entry.status = "IN_FLIGHT"
             entry.attempt_count += 1
             entry.lease_until = lease_until
@@ -2337,6 +2376,7 @@ class OutboxService:
                     },
                 },
                 "attempt_count": entry.attempt_count,
+                "action_task": BootstrapService.context_for_command(entry.command) if entry.command_id else None,
             })
 
         return results

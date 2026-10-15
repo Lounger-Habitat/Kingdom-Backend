@@ -27,6 +27,7 @@ FIELDS = {
     "register_batch": {"trees"},
     "begin": {"generation", "attempt_id", "actor_type", "actor_id", "command_id"},
     "complete": {"generation", "attempt_id", "claim_version", "felled_world_minute"},
+    "finish": {"generation", "attempt_id", "actor_type", "actor_id", "command_id", "felled_world_minute"},
     "cancel": {"generation", "attempt_id", "claim_version"},
     "respawn": {"generation"},
 }
@@ -108,6 +109,19 @@ def settle_npc_wood(npc_id, params, world_minute, request_id):
 
 
 def _execute(action, p, clock):
+    if action == "finish":
+        # Env submits only the lethal hit. Claim and award in one transaction;
+        # earlier damage never reserves a tree or locks an actor into chopping.
+        minute = p.get("felled_world_minute")
+        if type(minute) is not int or not 0 <= minute <= clock.world_minute:
+            reject("INVALID_FELL_TIME")
+        node = VillageTreeNode.objects.select_for_update().filter(pk=identifier(p.get("node_id"))).first()
+        if node and node.status == "CLAIMED" and node.active_attempt_id:
+            _cancel(node, VillageChopAttempt.objects.select_for_update().get(pk=node.active_attempt_id))
+        hit_clock = copy.copy(clock)
+        hit_clock.world_minute = minute
+        begun = _execute("begin", p, hit_clock)
+        return _execute("complete", dict(p, claim_version=begun["attempt"]["claim_version"]), clock)
     if action == "register_batch":
         rows = p.get("trees")
         if "node_id" in p or not isinstance(rows, list) or not 1 <= len(rows) <= 64:
@@ -169,8 +183,6 @@ def _execute(action, p, clock):
             return dict(tree=tree_data(node), attempt=attempt_data(attempt))
         if node.status != "STANDING":
             reject("TREE_BUSY" if node.status == "CLAIMED" else "TREE_NOT_READY")
-        if VillageChopAttempt.objects.filter(actor_type=actor_type, actor_id=actor_id, status="ACTIVE").exists() or VillageHuntAttempt.objects.filter(actor_type=actor_type, actor_id=actor_id, status="ACTIVE").exists():
-            reject("ACTOR_BUSY")
         command = None
         if actor_type == "PLAYER":
             if not GameAccount.objects.filter(pk=int(actor_id), is_active=True, is_ai=False).exists():

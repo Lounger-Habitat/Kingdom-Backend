@@ -196,10 +196,15 @@ VILLAGE_FAST_COMMAND_INTEGRATION = (
 # only on deployments that intentionally retain the standalone legacy market.
 VILLAGE_REQUIRE_ENV_MARKET_WRITES = os.getenv("VILLAGE_REQUIRE_ENV_MARKET_WRITES", "true").lower() in {"1", "true", "yes", "on"}
 
-# Logging: suppress noisy runserver access logs for high-frequency runtime
-# tick endpoints, but only on success (2xx) — errors still print.
+# Logging: send normal runserver access logs to stdout and warnings/errors to
+# stderr. Suppress high-frequency runtime tick logs only on success (2xx).
 import logging
 import re
+
+
+class _BelowWarningFilter(logging.Filter):
+    def filter(self, record):
+        return record.levelno < logging.WARNING
 
 
 class _SuppressRuntimeTickFilter(logging.Filter):
@@ -227,16 +232,34 @@ class _SuppressRuntimeTickFilter(logging.Filter):
 
 LOGGING = {
     "version": 1,
+    "disable_existing_loggers": False,
     "filters": {
+        "below_warning": {
+            "()": _BelowWarningFilter,
+        },
         "suppress_runtime_tick": {
             "()": _SuppressRuntimeTickFilter,
         },
     },
+    "handlers": {
+        "server_stdout": {
+            "class": "logging.StreamHandler",
+            "level": "INFO",
+            "stream": "ext://sys.stdout",
+            "filters": ["below_warning"],
+        },
+        "server_stderr": {
+            "class": "logging.StreamHandler",
+            "level": "WARNING",
+            "stream": "ext://sys.stderr",
+        },
+    },
     "loggers": {
         "django.server": {
+            "handlers": ["server_stdout", "server_stderr"],
             "level": "INFO",
             "filters": ["suppress_runtime_tick"],
-            "propagate": True,
+            "propagate": False,
         },
     },
 }

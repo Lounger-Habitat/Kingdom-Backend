@@ -71,7 +71,9 @@ class FlexibleAffairTests(TestCase):
         self.assertEqual(project_affair(row)["active_stage_id"], "finish")
         self.add(row, "item", 1, "corn", 1030)
         self.assertEqual(row.status, "COMPLETED")
-        self.assertEqual(VillageWorldEvent.objects.filter(dedupe_key__startswith="affair:TEST_FLEX:").count(), 3)
+        events = VillageWorldEvent.objects.filter(dedupe_key__startswith="affair:TEST_FLEX:")
+        self.assertEqual(events.exclude(event_type="VILLAGE_AFFAIR_PROGRESS").count(), 3)
+        self.assertEqual(events.filter(event_type="VILLAGE_AFFAIR_PROGRESS").count(), 1)
 
     def test_same_stage_labor_does_not_invent_preparation_requirement(self):
         row = self.create([dict(id="wood", type="item", item_ids=[1002], target=1), dict(id="work", type="labor", target=1, unit_minutes=10)])

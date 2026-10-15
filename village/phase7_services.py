@@ -571,7 +571,8 @@ def _visible(event: VillageWorldEvent, player_id: str) -> bool:
 
 
 def _journal_item(event: VillageWorldEvent) -> dict:
-    return {
+    from .phase4_visibility import public_story_event_fields
+    item = {
         "event_id": str(event.event_id),
         "event_sequence": event.event_sequence,
         "event_type": event.event_type,
@@ -582,6 +583,8 @@ def _journal_item(event: VillageWorldEvent) -> dict:
         "player_summary": event.player_summary,
         "category": _category(event),
     }
+    item.update(public_story_event_fields(event))
+    return item
 
 
 def public_journal(player_id: str, filters: dict) -> dict:
@@ -716,11 +719,13 @@ def _public_economy(world_minute: int) -> dict:
 
 def _public_story(player_id: str) -> dict:
     from .affairs import project_affairs
+    from .daily_events import project_daily_events
     minute = GlobalGameTimeState.objects.filter(pk=1).values_list("world_minute", flat=True).first() or 0
     affairs = project_affairs(minute)
+    daily_events = project_daily_events(minute)
     arc = VillageStoryArc.objects.order_by("arc_code").first()
     if not arc:
-        return {"affairs": affairs}
+        return {"affairs": affairs, "daily_events": daily_events}
     fact = getattr(arc, "facts", None)
     progress = {}
     if fact is not None:
@@ -756,6 +761,7 @@ def _public_story(player_id: str) -> dict:
         "retired_plan": arc.current_plan == "FOREST_ROUTE",
         "progress": progress,
         "affairs": affairs,
+        "daily_events": daily_events,
         "player_contribution": {
             "event_count": len(contribution_events),
             "event_ids": contribution_events,

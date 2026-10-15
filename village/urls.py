@@ -66,6 +66,7 @@ urlpatterns = [
     path("api/village/deliveries/<str:delivery_id>/ack", views.deliveries_ack, name="village-deliveries-ack"),
     path("api/village/deliveries/cursor", views.deliveries_cursor, name="village-deliveries-cursor"),
     path("api/village/commands/accept", views.commands_accept, name="village-commands-accept"),
+    path("api/village/action-tasks/<str:npc_id>/<path:action_id>", views.star_action_status, name="village-star-action-status"),
     path("api/village/commands/<str:command_id>/start", views.commands_start, name="village-commands-start"),
     path("api/village/commands/<str:command_id>/status", views.commands_status, name="village-commands-status"),
     path("api/village/commands/<str:command_id>/cancel", views.commands_cancel, name="village-commands-cancel"),

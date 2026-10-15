@@ -442,9 +442,10 @@ def npc_available_actions(request, npc_id):
             "parameter_schema": {
                 "type": "object",
                 "properties": {
-                    "sleep_command_id": {"type": "string", "format": "uuid"},
+                    "sleep_action_id": {"type": "string", "minLength": 1, "maxLength": 256,
+                                        "description": "本人原 SLEEP Action 的编号。"},
                 },
-                "required": ["sleep_command_id"],
+                "required": ["sleep_action_id"],
             },
             "result_codes": [ResultCode.SLEEP_INTERRUPTED, ResultCode.NPC_NOT_SLEEPING,
                              ResultCode.SLEEP_COMMAND_MISMATCH],
@@ -594,6 +595,12 @@ def events_list(request):
 @permission_classes([IsAuthenticated])
 def commands_accept(request):
     """POST /api/village/commands/accept"""
+    if isinstance(request.data, dict) and "payload" in request.data:
+        from .star_actions import accept_action, task_context
+        ok, code, task, replayed = accept_action(request.data)
+        return Response({"success": ok, "resultCode": code,
+                         "data": {**task_context(task), "replayed": replayed} if task else None},
+                        status=200 if ok else 409)
     envelope_id = request.data.get("envelope_id")
     sender = request.data.get("sender")
     recipient = request.data.get("recipient")
@@ -665,6 +672,19 @@ def commands_start(request, command_id):
             ),
         },
     })
+
+
+@api_view(["GET"])
+@authentication_classes([EnvServerJWTAuthentication])
+@permission_classes([IsAuthenticated])
+def star_action_status(request, npc_id, action_id):
+    from .models import VillageActionTask
+    from .star_actions import task_context
+    config = VillageSimulationConfig.objects.filter(config_key="default").first()
+    task = VillageActionTask.objects.filter(environment=request.query_params.get("environment"),
+        sender=npc_id, action_id=action_id, epoch=config.action_epoch).select_related("command").first() if config else None
+    return Response({"success": task is not None, "resultCode": "OK" if task else "COMMAND_NOT_FOUND",
+                     "data": task_context(task) if task else None}, status=200 if task else 404)
 
 
 @api_view(["GET"])

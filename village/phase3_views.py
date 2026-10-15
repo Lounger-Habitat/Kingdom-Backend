@@ -26,6 +26,7 @@ from inventory.models import NpcGlobalInventory, NpcGlobalInventorySlot
 
 from .models import (
     DailyPriceSnapshot,
+    NpcCommandState,
     NpcRuntimeState,
     NpcTradeDelivery,
     NpcTradeOrder,
@@ -80,6 +81,11 @@ _ECONOMY_ACTION_ALLOWED_FIELDS: Set[str] = {
     "current_location_code",
     "params",
 }
+
+# An accepted task already owns its identity, actor and resolved parameters.
+_ECONOMY_COMPLETION_FIELDS = frozenset({
+    "command_id", "completed_world_minute", "time_revision", "current_location_code",
+})
 
 _DAY_CLOSE_ALLOWED_FIELDS: Set[str] = {
     "day_index",
@@ -152,6 +158,24 @@ def economy_actions_complete(request):
                 ResultCode.P3_INVALID_PARAMS,
                 detail=f"Unknown fields: {', '.join(sorted(unknown))}",
             )
+
+        if set(data) <= _ECONOMY_COMPLETION_FIELDS:
+            if not _validate_uuid_field(data.get("command_id"), "command_id"):
+                return _error_response(ResultCode.P3_INVALID_PARAMS, detail="Invalid UUID: command_id")
+            command = NpcCommandState.objects.select_related("npc").filter(
+                command_id=data["command_id"],
+            ).first()
+            if command is None:
+                return _error_response(ResultCode.P3_INVALID_PARAMS, detail="Accepted command not found")
+            data = {
+                **data,
+                "schema_version": VILLAGE_ECONOMY_ACTION_V1,
+                "request_id": str(command.request_id),
+                "message_id": str(command.message_id),
+                "command_name": command.kind,
+                "npc_id": int(command.npc.agent_id),
+                "params": command.sanitized_parameters,
+            }
 
         # Validate required fields
         for field in _ECONOMY_ACTION_REQUIRED_FIELDS:

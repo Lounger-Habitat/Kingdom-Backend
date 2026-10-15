@@ -260,7 +260,10 @@ def _center(location: VillageLocationDefinition):
     return None
 
 
-def _nearby(npc: NpcDefinition) -> dict:
+def _nearby(npc: NpcDefinition, query_params=None) -> dict:
+    from .scene_navigation import valid_nearby_options
+    if not valid_nearby_options(query_params):
+        raise AgentQueryError("INVALID_QUERY_PARAMS", {})
     runtime = NpcRuntimeState.objects.get(npc=npc)
     profile = NpcProfile.objects.get(npc=npc)
     current = VillageLocationDefinition.objects.filter(
@@ -718,9 +721,32 @@ def _rules(npc: NpcDefinition) -> dict:
     return data
 
 
-def _authorized(_npc: NpcDefinition) -> dict:
-    """Capability gate for parameterized legacy query endpoints."""
-    return {"authorized": True}
+def _store_inventory(npc: NpcDefinition, query_params=None) -> dict:
+    from .phase3_direct_trade import query_store_inventory
+    params = query_params or {}
+    if not isinstance(params, dict) or set(params) != {"store_code"} or not isinstance(params["store_code"], str) or params["store_code"] not in {"GENERAL_STORE", "RESTAURANT_STORE"}:
+        raise AgentQueryError("INVALID_QUERY_PARAMS", {})
+    store = VillageStore.objects.filter(store_code=params["store_code"]).first()
+    if store is None:
+        raise AgentQueryError("TRADE_TARGET_NOT_FOUND", {})
+    runtime = NpcRuntimeState.objects.get(npc=npc)
+    if runtime.current_location_code != store.location_code:
+        raise AgentQueryError("P3_WRONG_LOCATION", {
+            "current_location_code": runtime.current_location_code, "required_location_code": store.location_code})
+    code, data = query_store_inventory(store.pk, _world_minute(), npc.agent_id)
+    if code:
+        raise AgentQueryError(code, data)
+    return {"store_inventory": data}
+
+
+def _social_state(npc: NpcDefinition, query_params=None) -> dict:
+    if query_params:
+        raise AgentQueryError("INVALID_QUERY_PARAMS", {})
+    from .phase4_social import inspect_social_state
+    result = inspect_social_state(npc.agent_id)
+    if result["status"] != "SUCCEEDED":
+        raise AgentQueryError(result["result_code"], result["data"])
+    return result["data"]
 
 
 def _personal_commissions(npc, query_params=None):
@@ -745,6 +771,7 @@ def _affairs(npc, query_params=None):
     from .affairs import project_affair
     from .affair_agent_projection import project_npc_affairs
     from .runtime_services import CommandService
+    from .daily_events import project_daily_events
     params = query_params or {}
     if not isinstance(params, dict) or set(params) - {"affair_id"}:
         raise ValueError("Invalid affair query")
@@ -775,7 +802,8 @@ def _affairs(npc, query_params=None):
         row["my_contributions"] = list(VillageAffairContribution.objects.filter(affair_id=row["affair_id"],
             actor_type="NPC", actor_id=str(npc.agent_id)).order_by("world_minute", "pk").values(
                 "condition_id", "kind", "item_id", "quantity", "world_minute"))
-    return {"affairs": data, "world_minute": _world_minute()}
+    return {"affairs": data, "world_minute": _world_minute(),
+            "daily_events": project_daily_events(npc_id=npc.agent_id)}
 
 
 _HANDLERS = {
@@ -794,8 +822,8 @@ _HANDLERS = {
     "BROWSE_MARKETPLACE": _browse_marketplace,
     "CHECK_MY_MARKETPLACE_LISTINGS": _my_marketplace_listings,
     "CHECK_MARKETPLACE_HISTORY": _marketplace_history,
-    "INSPECT_STORE_INVENTORY": _authorized,
-    "INSPECT_SOCIAL_STATE": _authorized,
+    "INSPECT_STORE_INVENTORY": _store_inventory,
+    "INSPECT_SOCIAL_STATE": _social_state,
     "INSPECT_PERSONAL_COMMISSIONS": _personal_commissions,
 }
 
@@ -824,13 +852,13 @@ def execute_agent_query(npc_id: str, query_name: str, query_params=None) -> tupl
         if query_name in {"BROWSE_MARKETPLACE", "CHECK_MY_MARKETPLACE_LISTINGS", "CHECK_MARKETPLACE_HISTORY"}:
             return True, "OK", add_item_names(_HANDLERS[query_name](npc, query_params))
         handler = _HANDLERS[query_name]
-        if query_name in {"INSPECT_MARKET_STATE", "INSPECT_FARM_STATE", "INSPECT_INVENTORY", "INSPECT_RATEABLE_DISHES", "INSPECT_PERSONAL_COMMISSIONS", "INSPECT_AFFAIRS"}:
+        if query_name in {"INSPECT_NEARBY", "INSPECT_MARKET_STATE", "INSPECT_FARM_STATE", "INSPECT_INVENTORY", "INSPECT_RATEABLE_DISHES", "INSPECT_PERSONAL_COMMISSIONS", "INSPECT_AFFAIRS", "INSPECT_STORE_INVENTORY", "INSPECT_SOCIAL_STATE"}:
             try:
                 return True, "OK", add_item_names(handler(npc, query_params))
             except ValueError:
                 return False, "INVALID_QUERY_PARAMS", None
         return True, "OK", add_item_names(handler(npc))
     except AgentQueryError as error:
-        return False, error.code, error.data
+        return False, error.code, add_item_names(error.data)
     except (NpcRuntimeState.DoesNotExist, NpcGlobalInventory.DoesNotExist, NpcProfile.DoesNotExist):
         return False, "NPC_NOT_READY", None

@@ -45,6 +45,7 @@ from .models import (
 )
 from .runtime_services import CommandService
 from .affair_admin import VillageAffairAdmin, VillageAffairContributionAdmin  # noqa: F401
+from .daily_event_admin import VillageDailyEventAdmin, VillageDailyEventTemplateAdmin  # noqa: F401
 from .personal_commission_admin import (PersonalCommissionAdmin, PersonalCommissionEscrowAdmin,
                                         PersonalCommissionReceiptAdmin)  # noqa: F401
 

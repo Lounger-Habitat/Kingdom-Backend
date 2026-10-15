@@ -8,9 +8,11 @@ retry state.
 from __future__ import annotations
 
 import re
+from copy import deepcopy
 from typing import Any, Iterable
 
 from .models import NpcRuntimeState, VillageDeliveryOutbox, VillageWorldEvent
+from .evidence_policy import event_changes
 
 
 FORMAL_NPC_IDS = ("10011", "10012", "10013", "10014", "10015")
@@ -44,6 +46,50 @@ FARM_EVENT_TYPES = {
     "PLAYER_PLANT_FARM_PLOT", "PLAYER_HARVEST_FARM_PLOT",
     "FARM_LEASE_RELEASED", "FARM_LEASE_HARVEST_ONLY", "FARM_LEASE_EXPIRING",
 }
+AFFAIR_EVENT_TYPES = {"VILLAGE_AFFAIR_PROGRESS", "VILLAGE_AFFAIR_READY", "VILLAGE_AFFAIR_COMPLETED"}
+DAILY_STORY_EVENT_TYPES = {"STORY_DAILY_OPENED", "STORY_DAILY_RESOLVED", "STORY_DAILY_EXPIRED"}
+PUBLIC_AFFAIR_FIELDS = ("affair_id", "stage_id", "current_stage_title", "open_needs", "completion_effect", "version")
+PUBLIC_AFFAIR_NEED_FIELDS = ("condition_id", "label", "kind", "item_id", "remaining", "unit_minutes", "locations")
+PUBLIC_STORY_EVENT_FIELDS = (
+    "id", "template_code", "title", "status", "summary", "participation_hint", "resolution_summary",
+    "npc_id", "location_code", "source_type", "source_id", "affair_id", "opened_world_minute",
+    "invite_until_world_minute", "closed_world_minute", "npc_scope",
+)
+PUBLIC_DAILY_SOURCE_TYPES = {"PUBLIC_MEAL", "AFFAIR_STAGE", "NORMAL_CARAVAN_RETURN"}
+
+
+def daily_story_npc_scope(story: dict[str, Any]) -> str | None:
+    """Old invitations infer scope; explicitly invalid scope grants no NPC audience."""
+    if "npc_scope" in story:
+        scope = story["npc_scope"]
+        return scope if isinstance(scope, str) and scope in {"PERSONAL", "PUBLIC"} else None
+    source_type = story.get("source_type")
+    if isinstance(source_type, str) and source_type in PUBLIC_DAILY_SOURCE_TYPES:
+        return "PUBLIC"
+    return "PERSONAL"
+
+
+def public_story_event_fields(event: VillageWorldEvent) -> dict[str, Any]:
+    """Use the same explicit public fields for live delivery and journal replay."""
+    if _visibility(event) != "PUBLIC":
+        return {}
+    data = getattr(event, "public_data", {}) or {}
+    fields = {}
+    if event.event_type in AFFAIR_EVENT_TYPES:
+        fields.update({key: deepcopy(data[key]) for key in PUBLIC_AFFAIR_FIELDS if key != "open_needs" and key in data})
+        if isinstance(data.get("open_needs"), list):
+            fields["open_needs"] = [
+                {key: deepcopy(need[key]) for key in PUBLIC_AFFAIR_NEED_FIELDS if key in need}
+                for need in data["open_needs"] if isinstance(need, dict)
+            ]
+    if event.event_type in DAILY_STORY_EVENT_TYPES and isinstance(data.get("story_event"), dict):
+        fields["story_event"] = {
+            key: deepcopy(data["story_event"][key]) for key in PUBLIC_STORY_EVENT_FIELDS
+            if key in data["story_event"]
+        }
+        if "npc_scope" not in data["story_event"]:
+            fields["story_event"]["npc_scope"] = daily_story_npc_scope(data["story_event"])
+    return fields
 
 
 def _is_action_event(event: VillageWorldEvent) -> bool:
@@ -121,6 +167,7 @@ def _event_content(event: VillageWorldEvent, recipient: str | None = None) -> di
             value = data.get(key)
             if isinstance(value, str) and SAFE_PUBLIC_VALUE.fullmatch(value):
                 content[key] = value
+        content.update(public_story_event_fields(event))
         if event.event_type in FARM_EVENT_TYPES:
             # These are server-authored public plot projections, never bags.
             content["public_data"] = {key: data[key] for key in ("plot", "farm_action_effect") if key in data}
@@ -166,6 +213,7 @@ def _event_content(event: VillageWorldEvent, recipient: str | None = None) -> di
         "public_data": data,
         "summary": event.player_summary if is_player_delivery else event.hub_summary,
     }
+    content["evidence_changes"] = event_changes(content)
     return content
 
 
@@ -181,6 +229,20 @@ def _recipients(event: VillageWorldEvent) -> list[str]:
     participants = _ids(getattr(event, "participant_npc_ids", []))
     witnesses = _ids(getattr(event, "witness_npc_ids", []))
     players = _ids(getattr(event, "player_ids", []))
+
+    if event.event_type in DAILY_STORY_EVENT_TYPES:
+        data = getattr(event, "public_data", {}) or {}
+        story_event = data.get("story_event")
+        recipients = []
+        if visibility == "PUBLIC" and isinstance(story_event, dict):
+            scope = daily_story_npc_scope(story_event)
+            if scope == "PUBLIC":
+                recipients = list(FORMAL_NPC_IDS)
+            elif scope == "PERSONAL" and str(story_event.get("npc_id")) in FORMAL_NPC_IDS:
+                recipients = [str(story_event["npc_id"])]
+        if visibility != "SYSTEM" and (visibility == "PUBLIC" or players):
+            recipients.append(ENV_CLIENTS)
+        return recipients
 
     if event.event_type in GIFT_EVENT_TYPES:
         # Only the recipient NPC needs a gift receipt. The gifting player

@@ -1,0 +1,17 @@
+{
+  "name": "Kingdom Backend",
+  "processes": [
+    {
+      "id": "django",
+      "name": "Django Backend",
+      "command": "python manage.py runserver 127.0.0.1:8088",
+      "port": 8088
+    },
+    {
+      "id": "reset-test-all",
+      "name": "重置全部测试数据",
+      "command": "cmd.exe /d /c \"..\\reset_test_state.cmd\"",
+      "autostart": false
+    }
+  ]
+}

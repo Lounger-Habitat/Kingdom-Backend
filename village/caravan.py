@@ -98,7 +98,7 @@ def sync_visit(minute):
     export_pool = Item.objects.filter(item_id__in=cfg.caravan_export_item_ids, is_deleted=False).order_by("item_id")
     exports = {str(i): price(i, "export") for i in export_pool.values_list("item_id", flat=True)}
     return VillageCaravanVisit.objects.create(
-        day_index=day, route=route, location_code=location, stock=stock,
+        day_index=day, created_world_minute=minute, route=route, location_code=location, stock=stock,
         initial_stock=dict(stock), import_prices=imports, export_prices=exports,
         export_capacity=cfg.caravan_export_capacity,
         requested_items=requested, error_code=error or "",

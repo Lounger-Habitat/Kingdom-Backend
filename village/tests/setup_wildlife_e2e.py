@@ -48,7 +48,8 @@ def main():
         suffix = uuid.uuid4().hex[:8]
         players = []
         for index in (1, 2):
-            account = GameAccount.objects.create(username=f'e2e-hunter-{suffix}-{index}')
+            account = GameAccount.objects.create(username=f'e2e-hunter-{suffix}-{index}',
+                appearance={'schemaVersion':1,'modelId':'artisan_male_01'}, appearance_revision=1)
             InventoryBag.objects.create(player=account, character_id=account.username)
             PlayerState.objects.create(player_id=str(account.pk), action_points=0,
                                        action_points_recovered_at=timezone.now()+timedelta(days=1))

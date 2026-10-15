@@ -688,6 +688,28 @@ class NpcCommandState(models.Model):
         return f"{self.command_id} - {self.kind} - {self.status}"
 
 
+class VillageActionTask(models.Model):
+    """Original star-protocol Action and its private execution record."""
+
+    id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
+    environment = models.CharField(max_length=128)
+    sender = models.CharField(max_length=32)
+    action_id = models.CharField(max_length=256)
+    epoch = models.UUIDField()
+    envelope = models.JSONField()
+    command = models.OneToOneField(
+        NpcCommandState, null=True, blank=True, on_delete=models.CASCADE,
+        related_name="star_action_task",
+    )
+    result = models.JSONField(default=dict, blank=True)
+
+    class Meta:
+        constraints = [models.UniqueConstraint(
+            fields=["environment", "sender", "action_id", "epoch"],
+            name="star_action_owner_identity",
+        )]
+
+
 class VillageActionReceipt(models.Model):
     """村庄动作收据（阶段一）。
 
@@ -744,6 +766,83 @@ class VillageActionReceipt(models.Model):
 
     def __str__(self):
         return f"{self.request_id} - {self.action_kind} - {'OK' if self.success else 'FAIL'}"
+
+
+class VillageDailyEventTemplate(models.Model):
+    """Configurable opportunities; rules observe business facts, never execute NPC actions."""
+
+    RULE_CHOICES = [(code, label) for code, label in (
+        ("INVENTORY_SHORTAGE", "库存不足"), ("RECIPE_PREPARATION", "料理备料"),
+        ("FARM_PREPARATION", "农活准备"), ("PERISHABLE_STOCK", "鲜货临期"),
+        ("DISH_REVIEW", "真实送评"), ("CARAVAN_VISIT", "商队补货"),
+        ("PUBLIC_MEAL", "公共供餐"), ("AFFAIR_STAGE", "公共事务阶段"),
+        ("NORMAL_CARAVAN_RETURN", "修桥后首次正常商队"),
+    )]
+    code = models.CharField("模板代码", max_length=64, primary_key=True)
+    title = models.CharField("标题", max_length=100)
+    enabled = models.BooleanField("启用", default=True)
+    rule_type = models.CharField("事实规则", max_length=32, choices=RULE_CHOICES)
+    npc_scope = models.CharField("NPC通知范围", max_length=8, default="PERSONAL",
+        choices=[("PERSONAL", "个人：仅对应NPC"), ("PUBLIC", "公共：全村NPC")],
+        help_text="个人事件只通知对应NPC；玩家仍可通过现有事件入口查看和介入。开启后范围随事件保存。")
+    parameters = models.JSONField("规则参数", default=dict, blank=True)
+    invitation_minutes = models.PositiveIntegerField("邀请期（游戏分钟）", default=600)
+    cooldown_minutes = models.PositiveIntegerField("同一来源提醒间隔（游戏分钟）", default=1440)
+    summary = models.CharField("开启说明", max_length=256)
+    participation_hint = models.CharField("参与提示", max_length=256, blank=True)
+    resolved_summary = models.CharField("解决回顾", max_length=256)
+
+    class Meta:
+        verbose_name = "日常事件模板"
+        verbose_name_plural = "日常事件模板"
+        ordering = ["code"]
+        constraints = [models.CheckConstraint(condition=models.Q(invitation_minutes__gte=1),
+                                              name="daily_template_invitation_positive")]
+
+    def clean(self):
+        super().clean()
+        from .daily_events import validate_template
+        validate_template(self, check_references=True)
+
+    def __str__(self):
+        return f"{self.code} - {self.title}"
+
+
+class VillageDailyEvent(models.Model):
+    """Durable invitation and recap, linked to the existing business object."""
+
+    id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
+    template = models.ForeignKey(VillageDailyEventTemplate, on_delete=models.PROTECT)
+    source_id = models.CharField(max_length=128)
+    active_key = models.CharField(max_length=64, unique=True, null=True, blank=True)
+    status = models.CharField(max_length=16, default="OPEN", choices=[
+        ("OPEN", "邀请中"), ("RESOLVED", "已解决"), ("EXPIRED", "邀请已结束")])
+    title = models.CharField(max_length=100)
+    summary = models.CharField(max_length=256)
+    participation_hint = models.CharField(max_length=256, blank=True)
+    resolution_summary = models.CharField(max_length=256, blank=True)
+    npc_id = models.CharField(max_length=32, blank=True)
+    location_code = models.CharField(max_length=64, blank=True)
+    affair_id = models.CharField(max_length=64, blank=True)
+    rule_snapshot = models.JSONField(default=dict)
+    facts = models.JSONField(default=dict)
+    opened_world_minute = models.PositiveBigIntegerField()
+    invite_until_world_minute = models.PositiveBigIntegerField()
+    closed_world_minute = models.PositiveBigIntegerField(null=True, blank=True)
+
+    class Meta:
+        verbose_name = "日常事件与邀请"
+        verbose_name_plural = "日常事件与邀请"
+        ordering = ["-opened_world_minute", "-id"]
+        indexes = [models.Index(fields=["template", "source_id", "opened_world_minute"],
+                                name="daily_event_source_idx")]
+        constraints = [
+            models.CheckConstraint(condition=models.Q(invite_until_world_minute__gt=models.F("opened_world_minute")),
+                                   name="daily_event_window_positive"),
+            models.CheckConstraint(condition=(models.Q(status="OPEN", active_key__isnull=False, closed_world_minute__isnull=True)
+                | models.Q(status__in=["RESOLVED", "EXPIRED"], active_key__isnull=True, closed_world_minute__isnull=False)),
+                name="daily_event_lifecycle_valid"),
+        ]
 
 
 class VillageWorldEvent(models.Model):
@@ -1246,6 +1345,7 @@ class VillageCaravanRequest(models.Model):
 
 class VillageCaravanVisit(models.Model):
     day_index = models.BigIntegerField(primary_key=True)
+    created_world_minute = models.BigIntegerField(null=True, blank=True, help_text="真实生成批次的世界分钟；旧批次不推测到访时间。")
     route = models.CharField(max_length=16)
     location_code = models.CharField(max_length=64, blank=True)
     stock = models.JSONField(default=dict)
@@ -2159,7 +2259,6 @@ class VillageHuntAttempt(models.Model):
 
     class Meta:
         constraints = [
-            models.UniqueConstraint(fields=["actor_type", "actor_id"], condition=models.Q(status="ACTIVE"), name="wildlife_one_active_actor"),
             models.UniqueConstraint(fields=["prey"], condition=models.Q(status="ACTIVE"), name="wildlife_one_active_prey"),
             models.UniqueConstraint(fields=["prey"], condition=models.Q(status="SUCCEEDED"), name="wildlife_one_reward_per_life"),
         ]
@@ -2201,7 +2300,6 @@ class VillageChopAttempt(models.Model):
 
     class Meta:
         constraints = [
-            models.UniqueConstraint(fields=["actor_type", "actor_id"], condition=models.Q(status="ACTIVE"), name="forestry_one_active_actor"),
             models.UniqueConstraint(fields=["node"], condition=models.Q(status="ACTIVE"), name="forestry_one_active_tree"),
             models.UniqueConstraint(fields=["node", "generation"], condition=models.Q(status="SUCCEEDED"), name="forestry_one_reward_per_growth"),
             models.UniqueConstraint(fields=["command"], condition=models.Q(status="SUCCEEDED", command__isnull=False), name="forestry_one_reward_per_command"),

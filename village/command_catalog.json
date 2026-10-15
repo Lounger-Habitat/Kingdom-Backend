@@ -214,7 +214,7 @@
       "name": "MOVE",
       "phase": "阶段一",
       "label": "移动",
-      "description": "前往指定地点；以寻路到达为准，仅“导航超时（秒）”生效。location_code 必须是地点代码（如 BILL_FARM、GENERAL_STORE、BILL_HOME、MARKET_STREET），农田 plot_code 不能作为 location_code。",
+      "description": "移动到地点、指定NPC、附近观察返回的target_ref，或position世界坐标（x/y/z，单位米），四种目标只选一种。坐标必须在可达NavMesh上，环境最多小范围修正落点；返回实际落点。target_ref可指向玩家、NPC、树木、动物、设施；树木引用包含代次，失效须重新观察。仅负责接近，交谈、砍伐、交易仍须另行操作并校验权限。目标移动或消失可能失败，不无限追逐。移动按实际寻路完成，不接受时长。",
       "parameters": {
         "type": "object",
         "properties": {
@@ -225,6 +225,39 @@
           "target_npc_id": {
             "type": "string",
             "description": "要靠近的目标NPC ID"
+          },
+          "target_ref": {
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 256,
+            "description": "INSPECT_NEARBY或附近变化通知返回的目标引用，原样使用。"
+          },
+          "position": {
+            "type": "object",
+            "properties": {
+              "x": {
+                "type": "number",
+                "minimum": -100000,
+                "maximum": 100000
+              },
+              "y": {
+                "type": "number",
+                "minimum": -100000,
+                "maximum": 100000
+              },
+              "z": {
+                "type": "number",
+                "minimum": -100000,
+                "maximum": 100000
+              }
+            },
+            "required": [
+              "x",
+              "y",
+              "z"
+            ],
+            "additionalProperties": false,
+            "description": "Unity世界坐标，单位米；可从附近观察取得位置后选择可行走目标。"
           }
         },
         "required": [],
@@ -238,8 +271,19 @@
             "required": [
               "target_npc_id"
             ]
+          },
+          {
+            "required": [
+              "target_ref"
+            ]
+          },
+          {
+            "required": [
+              "position"
+            ]
           }
-        ]
+        ],
+        "additionalProperties": false
       }
     },
     {
@@ -1014,11 +1058,34 @@
       "name": "INSPECT_NEARBY",
       "phase": "查询",
       "label": "观察附近",
-      "description": "查看自身周围10米内的NPC、在线参与村庄的玩家和地点。nearby_players返回name、distance、within_speech_range、activity、movement_state、is_in_dialogue。activity可为IDLE空闲、MOVING移动、SOCIALIZING对话、WORKING劳动、REVIEWING品鉴、ACTING交互或UNKNOWN未知；movement_state区分WALKING行走和RUNNING奔跑。对话状态优先，移动状态单独保留；不返回聊天内容和私人资产。players_observation_available=false表示实时玩家观察不可用，不代表附近无人。",
+      "description": "观察自身周围10米内真实人物、树木/树桩、动物和已登记设施，返回名字、target_ref、世界坐标position（米）、距离、活动及可观察状态。可用MOVE(target_ref)靠近对象，或MOVE(position)前往可达坐标；观察不授予交互权限。categories可筛选people/trees/animals/facilities，limit默认30、最多100。truncated=true表示未列完；sources中false或observation_available=false表示不可用，不等于附近没有。观察按距离，不判断遮挡。附近普通变化由环境延迟合并为perception.updated通知，只陈述经过/停留/状态变化，是否回应由你决定；不必连续轮询。同一action.id重试重放原观察，刷新使用新id。",
       "parameters": {
         "type": "object",
-        "properties": {},
-        "required": []
+        "properties": {
+          "categories": {
+            "type": "array",
+            "items": {
+              "type": "string",
+              "enum": [
+                "people",
+                "trees",
+                "animals",
+                "facilities"
+              ]
+            },
+            "minItems": 1,
+            "maxItems": 4,
+            "uniqueItems": true
+          },
+          "limit": {
+            "type": "integer",
+            "minimum": 1,
+            "maximum": 100,
+            "default": 30
+          }
+        },
+        "required": [],
+        "additionalProperties": false
       }
     },
     {

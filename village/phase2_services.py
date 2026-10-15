@@ -910,6 +910,8 @@ class TickService:
         receipt.action_kind = "VILLAGE_TICK"
         receipt.response_data = data
         receipt.save(update_fields=["action_kind", "response_data"])
+        from .daily_events import evaluate_daily_events
+        evaluate_daily_events(state.world_minute)
         return _result(True, ResultCode.COMMAND_ACCEPTED, receipt=receipt,
                        world_minute=receipt.world_minute, time_revision=receipt.time_revision,
                        npc_results=npc_results, caravan=caravan, farm_plots=farm_plots)
@@ -1283,7 +1285,8 @@ class LifeActionService:
                 slot.item_amount -= 1; slot.save(update_fields=["item_amount"])
                 inventory.asset_version += 1; inventory.save(update_fields=["asset_version", "updated_at"])
                 effects = {
-                    "items": [{"owner_id": str(runtime.npc.agent_id), "item_id": slot.item_id, "delta": -1}],
+                    "items": [{"owner_id": str(runtime.npc.agent_id), "item_id": slot.item_id,
+                               "food_instance_id": str(food_id), "amount": 1, "delta": -1}],
                     "money": [], "needs": {}, "relationships": [],
                     "food_instance_id": str(food_id), "asset_version": inventory.asset_version,
                 }
@@ -1343,6 +1346,8 @@ class LifeActionService:
                 for name in NEEDS_FIELDS
                 if actor_end_needs[name] != action_start_needs[name]
             }
+        from .agent_feedback import add_item_names
+        add_item_names(effects)
         event = VillageWorldEvent.objects.create(
             dedupe_key=f"life:{request_id}", event_type="npc_action_completed", world_minute=time_state.world_minute,
             time_revision=time_state.time_revision, actor_npc=runtime.npc,
@@ -1368,6 +1373,8 @@ class LifeActionService:
         response_data.update(sleep_details)
         receipt = VillageActionReceipt.objects.create(request_id=request_id, command=command, npc=runtime.npc, action_kind=action, success=True, result_code=ResultCode.LIFE_ACTION_COMPLETED, response_data=response_data, world_minute=time_state.world_minute, time_revision=time_state.time_revision, state_version=runtime.state_version, world_event=event)
         cls._outbox(runtime, receipt, event, action, ResultCode.LIFE_ACTION_COMPLETED, effects, time_state, command_id, data=sleep_details)
+        from .daily_events import evaluate_daily_events
+        evaluate_daily_events(time_state.world_minute)
         public_response = {key: value for key, value in response_data.items() if key != "request_payload_sha256"}
         return _result(True, ResultCode.LIFE_ACTION_COMPLETED, receipt=receipt, world_event=event, **public_response)
 

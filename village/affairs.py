@@ -281,7 +281,24 @@ def validate_contribution(row, kind, quantity, item_id=None, condition_id=None):
     return condition
 
 
-def _event(row, world_minute, request_id, actor_npc=None, player_id=None):
+def project_affair_event(row, projection=None):
+    """Public facts at this version, without copying the authoritative progress."""
+    projection = project_affair(row) if projection is None else projection
+    needs = []
+    for condition in projection["conditions"]:
+        if not condition["available"]:
+            continue
+        items = condition.get("item_ids", [])
+        needs.append(dict(condition_id=condition["condition_id"], label=condition["label"],
+            kind=condition["type"], item_id=items[0] if len(items) == 1 else None,
+            remaining=condition["remaining"], unit_minutes=condition.get("unit_minutes"),
+            locations=list(condition["locations"])))
+    return dict(affair_id=row.code, stage_id=projection["active_stage_id"],
+        current_stage_title=projection["current_stage_title"], open_needs=needs,
+        completion_effect=projection["completion_effect"], version=row.version)
+
+
+def _event(row, world_minute, request_id, actor_npc=None, player_id=None, *, progress_only=False):
     from game_time.models import GlobalGameTimeState
     from .models import VillageWorldEvent
     from .phase4_visibility import enqueue_event_deliveries
@@ -293,13 +310,35 @@ def _event(row, world_minute, request_id, actor_npc=None, player_id=None):
     if stage is None and row.code == IRRIGATION_AFFAIR_CODE:
         summary += COMPLETION_EFFECT
     suffix = "COMPLETED" if stage is None else f"stage:{stage['id']}"
+    if progress_only:
+        suffix = f"progress:{row.version}"
+        summary = f"{row.title}进度已更新。"
+    projection = project_affair(row)
+    facts = project_affair_event(row, projection)
+    if row.code == BRIDGE_AFFAIR_CODE:
+        if stage is None:
+            from .models import VillageSimulationConfig
+            capacity = VillageSimulationConfig.objects.filter(config_key="default").values_list("caravan_normal_capacity", flat=True).first() or 60
+            summary = f"{row.title}已完成，旧桥恢复通行；后续商队使用正常商路，按当前配置每趟进口总量为{capacity}件。"
+        else:
+            remaining = "、".join(f"{need['remaining']}金币" if need['kind'] == "gold" else f"{need['label']}{need['remaining']}份"
+                for need in facts["open_needs"])
+            summary = f"{row.title}当前为“{facts['current_stage_title']}”阶段；尚需{remaining}。"
+        contribution = row.contributions.filter(request_id=request_id).order_by("pk").last()
+        if contribution:
+            label = next((condition["label"] for entry in projection["stages"]
+                for condition in entry["conditions"] if condition["condition_id"] == contribution.condition_id), contribution.kind)
+            actor = actor_npc.name if actor_npc else "一名玩家"
+            amount = f"{contribution.quantity}金币" if contribution.kind == "gold" else f"{label}{contribution.quantity}份"
+            summary = f"{actor}贡献了{amount}。" + summary
+    summary = summary[:256]
     event, created = VillageWorldEvent.objects.get_or_create(dedupe_key=f"affair:{row.code}:{suffix}", defaults=dict(
-        event_type="VILLAGE_AFFAIR_COMPLETED" if stage is None else "VILLAGE_AFFAIR_READY",
+        event_type="VILLAGE_AFFAIR_PROGRESS" if progress_only else "VILLAGE_AFFAIR_COMPLETED" if stage is None else "VILLAGE_AFFAIR_READY",
         world_minute=world_minute, time_revision=clock.time_revision, request_id=request_id, actor_npc=actor_npc,
         player_ids=[str(player_id)] if player_id is not None else [], participant_npc_ids=[str(actor_npc.agent_id)] if actor_npc else [],
         location_code=(event_stage["conditions"][0]["locations"] or [""])[0],
         visibility="PUBLIC", player_summary=summary, hub_summary=summary,
-        public_data={"affair_id": row.code, "status": row.status, "stage_id": stage["id"] if stage else None, "summary": summary,
+        public_data={**facts, "status": row.status, "summary": summary,
             "bridge_condition": "REPAIRED" if row.code == BRIDGE_AFFAIR_CODE and stage is None else None}))
     if created:
         enqueue_event_deliveries(event)
@@ -348,8 +387,8 @@ def contribute(row, kind, quantity, *, item_id=None, condition_id=None, world_mi
     VillageAffairContribution.objects.create(affair=row, request_id=request_id, condition_id=condition["id"], actor_type=actor_type,
         actor_id=actor_id, kind=kind, item_id=item_id or 0, quantity=quantity, world_minute=world_minute)
     sync_bridge_fact(row)
-    if (old_stage or {}).get("id") != (next_stage or {}).get("id"):
-        _event(row, world_minute, request_id, actor_npc, player_id)
+    _event(row, world_minute, request_id, actor_npc, player_id,
+           progress_only=(old_stage or {}).get("id") == (next_stage or {}).get("id"))
     return project_affair(row)
 
 

@@ -774,7 +774,8 @@ def commit_economy_action(payload: Dict[str, Any]) -> Dict[str, Any]:
                     item_name=result["data"].get("item_name"),
                     remaining_amount=sum(store_available(slot, world_minute) for slot in
                         VillageStoreInventorySlot.objects.filter(listing=listing, item_amount__gt=0)))
-                event_summary = (f"{listing.store.store_code}售出物品{listing.item_id}×{event_private_data['amount']}；"
+                sold_name = event_private_data.get("item_name") or "名称未取得的物品"
+                event_summary = (f"{listing.store.store_code}售出{sold_name}×{event_private_data['amount']}（物品编号：{listing.item_id}）；"
                     f"店款净入账{event_private_data['store_net_amount']}金币，"
                     f"该上架记录剩余{event_private_data['remaining_amount']}份。")
             event = gift_replay.world_event if gift_replay is not None else VillageWorldEvent.objects.create(
@@ -900,7 +901,8 @@ def commit_economy_action(payload: Dict[str, Any]) -> Dict[str, Any]:
                 world_minute=world_minute,
                 event=event,
             )
-
+            from .daily_events import evaluate_daily_events
+            evaluate_daily_events(world_minute)
             return result
 
     except IntegrityError:

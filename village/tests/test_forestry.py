@@ -122,15 +122,41 @@ class ForestryTests(PlayerFixture, TestCase):
         client.credentials(HTTP_AUTHORIZATION=f'Bearer {token}')
         self.assertEqual(client.get('/api/village/forestry/bootstrap').status_code,200)
 
-    def test_hunting_and_chopping_are_mutually_exclusive(self):
+    def test_partial_targets_do_not_lock_player_to_one_activity(self):
         prey=str(uuid.uuid4())
         def h(action,**params):return hunt(dict(action=action,request_id=str(uuid.uuid4()),prey_id=prey,**params))
         self.assertTrue(h('register',species='PIG',region_id='HUNTING_GROUNDS',position={'x':-120,'y':2.4,'z':100})['success'])
         attempt,version=self.begin()
-        self.assertEqual(h('begin',attempt_id=str(uuid.uuid4()),actor_type='PLAYER',actor_id=str(self.a.pk))['result_code'],'ACTOR_BUSY')
-        self.call('cancel',generation=1,attempt_id=attempt,claim_version=version)
         self.assertTrue(h('begin',attempt_id=str(uuid.uuid4()),actor_type='PLAYER',actor_id=str(self.a.pk))['success'])
-        self.assertEqual(self.call('begin',generation=1,attempt_id=str(uuid.uuid4()),actor_type='PLAYER',actor_id=str(self.a.pk))['result_code'],'ACTOR_BUSY')
+        other = uuid.uuid4()
+        self.assertTrue(self.call('register', node=other, species='BIRCH', position={'x':0,'y':0,'z':0})['success'])
+        self.assertTrue(self.call('begin', node=other, generation=1, attempt_id=str(uuid.uuid4()), actor_type='PLAYER', actor_id=str(self.a.pk))['success'])
+
+    def test_final_hit_replaces_legacy_owner_and_awards_only_last_hitter_once(self):
+        old, _ = self.begin(self.a)
+        payload = dict(action='finish', node_id=str(self.node), request_id=str(uuid.uuid4()),
+                       generation=1, attempt_id=str(uuid.uuid4()), actor_type='PLAYER',
+                       actor_id=str(self.b.pk), felled_world_minute=100)
+        self.clock.world_minute = 105
+        self.clock.save()
+        result = execute(payload)
+        self.assertTrue(result['success'], result)
+        self.assertEqual(execute(payload), result)
+        self.assertEqual(VillageChopAttempt.objects.get(pk=old).status, 'CANCELLED')
+        self.assertFalse(self.bag_a.slots.exists())
+        self.assertEqual(self.bag_b.slots.get(item_id=1002).item_amount, 4)
+        late = execute(dict(payload, request_id=str(uuid.uuid4()), attempt_id=str(uuid.uuid4()), actor_id=str(self.a.pk)))
+        self.assertFalse(late['success'])
+        self.assertFalse(self.bag_a.slots.exists())
+        self.assertEqual(VillageChopAttempt.objects.filter(status='SUCCEEDED').count(), 1)
+
+    def test_rejected_final_hit_preserves_legacy_claim_and_mints_nothing(self):
+        old, _ = self.begin()
+        result = self.call('finish', generation=1, attempt_id=str(uuid.uuid4()), actor_type='NPC',
+                           actor_id='10012', command_id=str(uuid.uuid4()), felled_world_minute=100)
+        self.assertFalse(result['success'])
+        self.assertEqual(VillageChopAttempt.objects.get(pk=old).status, 'ACTIVE')
+        self.assertFalse(self.bag_a.slots.exists())
 
 
 class NpcForestryTests(ProductionTestBase):
@@ -179,6 +205,16 @@ class NpcForestryTests(ProductionTestBase):
         self.assertEqual(VillageActionReceipt.objects.filter(command=command).count(),1)
         self.assertEqual(commit_economy_action(self.economy_payload(command))['result_code'],'OK')
         command.refresh_from_db();self.assertEqual(command.status,'SUCCEEDED')
+
+    def test_npc_final_hit_settles_atomically_with_its_command(self):
+        command, old = self.start()
+        result = self.call('finish', generation=1, attempt_id=str(uuid.uuid4()), actor_type='NPC',
+                           actor_id='10012', command_id=str(command.pk), felled_world_minute=700)
+        self.assertTrue(result['success'], result)
+        self.assertEqual(VillageChopAttempt.objects.get(pk=old).status, 'CANCELLED')
+        self.assertEqual(self.jack_inv.slots.get(item_id=1002).item_amount, 6)
+        command.refresh_from_db()
+        self.assertEqual(command.status, 'SUCCEEDED')
 
     def test_cancel_releases_tree_and_late_felling_gives_nothing(self):
         command,attempt=self.start()

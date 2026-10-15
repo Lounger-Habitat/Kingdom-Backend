@@ -18,6 +18,7 @@ from typing import Any, Dict, List, Tuple
 
 from django.db import models, transaction
 
+from game_time.models import GlobalGameTimeState
 from inventory.models import NpcGlobalInventory, NpcGlobalInventorySlot
 
 from .models import (
@@ -184,6 +185,8 @@ def handle_day_close(
         return _fail(ResultCode.P3_INVALID_PARAMS)
 
     with transaction.atomic():
+        # Keep the authority lock ahead of account locks, as in other settlements.
+        clock = GlobalGameTimeState.objects.select_for_update().filter(pk=1).first()
         # Lock account
         account = VillageAccount.objects.select_for_update().get(account_code="PUBLIC_FUND")
 
@@ -395,6 +398,10 @@ def handle_day_close(
             from .phase5_story import process_day_close
             story_result = process_day_close(day_index, world_minute, request_id)
             result["story"] = story_result.get("data", {})
+
+        if clock is not None:
+            from .daily_events import evaluate_daily_events
+            evaluate_daily_events(clock.world_minute)
 
         return result
 

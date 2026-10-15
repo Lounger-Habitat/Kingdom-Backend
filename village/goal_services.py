@@ -44,26 +44,27 @@ def _payload_hash(envelope: Mapping[str, Any]) -> str:
 
 
 @transaction.atomic
-def update_subjective_goal(envelope: Mapping[str, Any]) -> dict:
+def update_subjective_goal(envelope: Mapping[str, Any], *, action_task=None) -> dict:
     if not isinstance(envelope, Mapping):
         return _result(False, "INVALID_GOAL_SCHEMA")
     content = envelope.get("content")
     if not isinstance(content, Mapping):
         return _result(False, "INVALID_GOAL_SCHEMA")
     params = content.get("params")
-    if not isinstance(params, Mapping) or set(params) != {
+    if not isinstance(params, Mapping) or set(params) != ({
         "goal_id", "summary", "status", "visibility", "expected_goal_version"
-    }:
+    } if action_task is None else {"goal_id", "summary", "status", "visibility"}):
         return _result(False, "INVALID_GOAL_SCHEMA")
     sender = str(envelope.get("sender", ""))
     if sender not in FORMAL_NPC_IDS:
         return _result(False, "SENDER_BINDING_INVALID")
-    if content.get("schema_version") != "village.command.v1" or str(content.get("name", "")).upper() != ACTION:
+    if (action_task is None and content.get("schema_version") != "village.command.v1") or str(content.get("name", "")).upper() != ACTION:
         return _result(False, "INVALID_GOAL_SCHEMA")
     try:
         uuid.UUID(str(envelope.get("envelope_id", "")))
-        uuid.UUID(str(content.get("id", "")))
-        request_id = uuid.UUID(str(content.get("request_id", "")))
+        if action_task is None:
+            uuid.UUID(str(content.get("id", "")))
+        request_id = action_task.pk if action_task is not None else uuid.UUID(str(content.get("request_id", "")))
         goal_id = uuid.UUID(str(params.get("goal_id", "")))
     except (ValueError, TypeError, AttributeError):
         return _result(False, "INVALID_GOAL_SCHEMA")
@@ -73,8 +74,8 @@ def update_subjective_goal(envelope: Mapping[str, Any]) -> dict:
     expected = params.get("expected_goal_version")
     if (not isinstance(summary, str) or not summary.strip() or len(summary.strip()) > 120
             or status not in {"ACTIVE", "COMPLETED", "ABANDONED"}
-            or visibility != "PUBLIC" or isinstance(expected, bool)
-            or not isinstance(expected, int) or expected < 0):
+            or visibility != "PUBLIC" or action_task is None and (
+                isinstance(expected, bool) or not isinstance(expected, int) or expected < 0)):
         return _result(False, "INVALID_GOAL_SCHEMA")
 
     digest = _payload_hash(envelope)
@@ -92,7 +93,7 @@ def update_subjective_goal(envelope: Mapping[str, Any]) -> dict:
     if runtime is None:
         return _result(False, "NPC_NOT_FOUND")
     state, _ = NpcSubjectiveGoalState.objects.select_for_update().get_or_create(npc=runtime.npc)
-    if state.goal_version != expected:
+    if action_task is None and state.goal_version != expected:
         return _result(False, "GOAL_VERSION_CONFLICT", _state_data(state))
     if status != "ACTIVE" and (state.status != "ACTIVE" or state.goal_id != goal_id):
         return _result(False, "GOAL_NOT_FOUND", _state_data(state))
