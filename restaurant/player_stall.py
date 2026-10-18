@@ -231,6 +231,32 @@ def _upgrade_quote(player, bag, state, minute, read_only=False):
     return base, list(consumed.values())
 
 
+def business_trend(player, minute):
+    """All actual dated sales, grouped by world day; undated history stays separate."""
+    from django.db.models.functions import Cast
+    aggregates = dict(sold=models.Count("pk"), revenue=models.Sum("amount_paid"),
+        known_purchase_cost=models.Sum("unit_cost", filter=models.Q(unit_cost__gte=0)),
+        unknown_cost_count=models.Count("pk", filter=models.Q(unit_cost__isnull=True) | models.Q(unit_cost__lt=0)))
+
+    def project(row):
+        sold, revenue = row.get("sold", 0) or 0, row.get("revenue", 0) or 0
+        cost, unknown = row.get("known_purchase_cost", 0) or 0, row.get("unknown_cost_count", 0) or 0
+        return dict(sold=sold, revenue=revenue, known_purchase_cost=cost, unknown_cost_count=unknown,
+            purchase_margin_nullable=None if unknown else revenue-cost, cost_complete=unknown == 0)
+
+    today = minute // 1440
+    first_day = max(0, today - 6)
+    transactions = CustomerTransaction.objects.filter(player=player)
+    groups = transactions.filter(world_minute__gte=first_day*1440, world_minute__lte=minute).annotate(
+        day_index=Cast(models.F("world_minute") / models.Value(1440), output_field=models.BigIntegerField()))
+    groups = {row["day_index"]: row for row in groups.values("day_index").annotate(**aggregates).order_by("day_index")}
+    return dict(from_day_index=first_day, to_day_index=today, observed_world_minute=minute,
+        source="CUSTOMER_TRANSACTION", cost_basis="RECORDED_PURCHASE_COST_ONLY",
+        cost_basis_note="仅统计真实成交及已记录采购成本；未知成本不按零计算。采购毛利不包含人工、自产原料、工具、租金等成本，不代表净利润。",
+        days=[dict(day_index=day, **project(groups.get(day, {}))) for day in range(first_day, today+1)],
+        legacy_undated=project(transactions.filter(world_minute__isnull=True).aggregate(**aggregates)))
+
+
 def business_overview(player, bag, minute, read_only=False):
     state = PlayerRestaurantState.objects.filter(player=player).first()
     level, config = state.current_level if state else 1, _config()
@@ -281,6 +307,7 @@ def business_overview(player, bag, minute, read_only=False):
         upgrade=_upgrade_quote(player, bag, state, minute, read_only)[0],
         summary=dict(revenue=revenue, known_cost=known_cost, net_income_nullable=revenue-known_cost if complete else None,
             cost_complete=complete, sold_count=sold_count),
+        trend=business_trend(player, minute),
         history=[dict(id=t.pk, world_minute=t.world_minute, item_id=t.item_id, item_name=t.item_name,
             quantity=1, amount_paid=t.amount_paid, unit_cost=t.unit_cost, rating=t.rating,
             comment=t.review_comment, feedback_source=t.feedback_source) for t in rows])

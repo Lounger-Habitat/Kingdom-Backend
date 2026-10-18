@@ -100,13 +100,13 @@ class ProfessionalCooperationTests(PlayerFixture, TestCase):
         self.relationship(4)
         before = (dict(self.visit.stock), dict(self.visit.import_prices), dict(self.visit.export_prices), self.visit.export_capacity)
         result = self.prepare()
-        self.assertEqual((result["spent_gold"], len(result["published_commission_ids"])), (120, 2))
-        self.nora.refresh_from_db(); self.assertEqual(self.nora.money, 280)
-        self.assertEqual(sum(VillagePersonalCommission.objects.values_list("reserved_reward_gold", flat=True)), 120)
+        self.assertEqual((result["spent_gold"], len(result["published_commission_ids"])), (140, 2))
+        self.nora.refresh_from_db(); self.assertEqual(self.nora.money, 260)
+        self.assertEqual(sum(VillagePersonalCommission.objects.values_list("reserved_reward_gold", flat=True)), 140)
         row = VillageProfessionalContractLink.objects.get(template_code="FRESH_SUPPLY").commission
         withdraw_commission(row.pk, "NPC", self.nora.npc_id, uuid.uuid4(), 700)
         self.assertEqual(self.prepare()["spent_gold"], 0)
-        self.assertEqual(professional_contracts_overview(self.a, 700)["published_gold"], 120)
+        self.assertEqual(professional_contracts_overview(self.a, 700)["published_gold"], 140)
         self.assertEqual(VillageProfessionalContractLink.objects.count(), 2)
         self.visit.refresh_from_db()
         self.assertEqual((self.visit.stock, self.visit.import_prices, self.visit.export_prices, self.visit.export_capacity), before)
@@ -116,13 +116,13 @@ class ProfessionalCooperationTests(PlayerFixture, TestCase):
             produced_world_minute=600, expires_world_minute=2000)
         view = professional_contracts_overview(self.a, 700)
         fresh = next(t for t in view["templates"] if t["code"] == "FRESH_SUPPLY")
-        self.assertEqual((fresh["reward_gold"], sum(r["quantity"] for r in fresh["requirements"])), (43, 5))
-        self.assertEqual(self.prepare()["spent_gold"], 43)
+        self.assertEqual((fresh["reward_gold"], sum(r["quantity"] for r in fresh["requirements"])), (61, 5))
+        self.assertEqual(self.prepare()["spent_gold"], 61)
         row = VillageProfessionalContractLink.objects.get().commission
         self.assertEqual(next(c for c in row.requirements["stages"][0]["conditions"] if c["item_ids"] == [1001])["target"], 1)
 
     def test_wallet_normal_visit_and_real_accept_qualification_are_enforced(self):
-        self.nora.money = 51; self.nora.save()
+        self.nora.money = 71; self.nora.save()
         with self.assertRaises(ProfessionalContractsError) as caught:
             self.prepare()
         self.assertEqual(caught.exception.code, "NORA_BUDGET_UNAVAILABLE")
@@ -146,7 +146,7 @@ class ProfessionalCooperationTests(PlayerFixture, TestCase):
         for row in list(VillagePersonalCommission.objects.filter(publisher=self.nora.npc)):
             self.complete(row)
         self.nora.refresh_from_db(); self.bag_a.refresh_from_db(); self.visit.refresh_from_db()
-        self.assertEqual((self.nora.money, self.bag_a.money, self.visit.exported_amount), (280, 220, 0))
+        self.assertEqual((self.nora.money, self.bag_a.money, self.visit.exported_amount), (260, 240, 0))
         self.assertEqual(completed_professional_contracts(self.a, since_minute=700).count(), 2)
         self.assertEqual(completed_professional_contracts(self.a, since_minute=701).count(), 0)
         self.assertEqual(professional_contracts_overview(self.a, 700)["completed_today"], 2)
@@ -217,3 +217,57 @@ class ProfessionalCooperationTests(PlayerFixture, TestCase):
         self.assertFalse(view["can_claim"])
         self.complete(second)
         self.assertEqual(professional_contract_eligibility(second, self.a, 700), "PROFESSIONAL_DAILY_LIMIT")
+
+    def test_equipment_quote_weights_catalog_value_not_number_of_missing_pieces(self):
+        from village.professional_catalog import PROFESSIONAL_WOOD
+        from village.phase3_catalog import FEATHER, ROUGH_LEATHER
+        self.relationship(4)
+        for item_id, price in ((PROFESSIONAL_WOOD, 12), (ROUGH_LEATHER, 5), (FEATHER, 2)):
+            Item.objects.filter(pk=item_id).update(item_price=price)
+        for missing, expected, missing_value in ((PROFESSIONAL_WOOD, 42, 24), (FEATHER, 7, 4)):
+            with self.subTest(missing=missing):
+                self.nora.slots.all().delete()
+                for index, item_id in enumerate((PROFESSIONAL_WOOD, ROUGH_LEATHER, FEATHER)):
+                    if item_id != missing:
+                        self.nora.slots.create(slot_index=index, item_id=item_id, item_amount=2, quality=3)
+                view = professional_contracts_overview(self.a, 700)
+                equipment = next(t for t in view["templates"] if t["code"] == "EQUIPMENT_SUPPLY")
+                self.assertEqual(sum(r["quantity"] for r in equipment["requirements"]), 2)
+                self.assertEqual((equipment["reward_gold"], equipment["full_catalog_value"],
+                                  equipment["missing_catalog_value"]), (expected, 38, missing_value))
+
+    def test_missing_deleted_or_nonpositive_catalog_price_cannot_publish(self):
+        from village.professional_catalog import PROFESSIONAL_MUSHROOM
+        for price in (0, -1):
+            Item.objects.filter(pk=PROFESSIONAL_MUSHROOM).update(item_price=price)
+            view = professional_contracts_overview(self.a, 700)
+            self.assertEqual(view["templates"][0]["reason"], "ITEM_PRICE_UNAVAILABLE")
+            with self.assertRaises(ProfessionalContractsError) as caught:
+                self.prepare()
+            self.assertEqual(caught.exception.code, "ITEM_PRICE_UNAVAILABLE")
+        Item.objects.filter(pk=PROFESSIONAL_MUSHROOM).update(item_price=10, is_deleted=True)
+        with self.assertRaises(ProfessionalContractsError) as caught:
+            self.prepare()
+        self.assertEqual(caught.exception.code, "ITEM_CATALOG_MISSING")
+        self.assertFalse(VillageProfessionalContractLink.objects.exists())
+        self.nora.refresh_from_db(); self.assertEqual(self.nora.money, 400)
+
+    def test_pre_g7_signed_52_gold_contract_keeps_its_requirements_price_and_budget(self):
+        from village.professional_contracts import templates
+        self.relationship(4)
+        full = templates()[0]
+        old = publish_commission(self.nora.npc, dict(title="G6已签鲜供", reward_gold=52,
+            valid_for_minutes=200, default_location_code="GENERAL_STORE", stages=[dict(id="stock", conditions=[
+                dict(id=f"item_{item_id}", type="item", item_ids=[item_id], target=amount,
+                     min_quality=4, requires_freshness=True, min_remaining_minutes=300)
+                for item_id, amount in full["items"]])]), uuid.uuid4(), 700)
+        row = VillagePersonalCommission.objects.get(pk=old["commission_id"])
+        VillageProfessionalContractLink.objects.create(commission=row, visit=self.visit, template_code="FRESH_SUPPLY")
+        import copy
+        frozen = copy.deepcopy(row.requirements)
+        Item.objects.filter(pk=full["items"][0][0]).update(item_price=20)
+        self.assertEqual(self.prepare()["spent_gold"], 68)
+        row.refresh_from_db()
+        self.assertEqual((row.reward_gold, row.requirements), (52, frozen))
+        self.assertEqual(professional_contracts_overview(self.a, 700)["published_gold"], 120)
+        self.nora.refresh_from_db(); self.assertEqual(self.nora.money, 280)

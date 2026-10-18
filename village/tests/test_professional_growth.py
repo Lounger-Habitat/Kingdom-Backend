@@ -6,6 +6,7 @@ from unittest.mock import patch
 from django.db import connection, transaction
 from django.test import TestCase
 from django.test.utils import CaptureQueriesContext
+from django.utils import timezone
 from inventory.models import InventorySlot, NpcDefinition, NpcGlobalInventory, NpcGlobalInventorySlot
 from items.models import Item
 from player.mastery import mastery_overview
@@ -253,6 +254,9 @@ class ProfessionalGrowthTests(PlayerFixture, TestCase):
         self.assertTrue(claimed["success"], claimed)
         self.assertEqual(claimed["data"]["result"]["money_gained"], 0)
         self.assertEqual(PlayerTitle.objects.filter(title_id="master_gathering").count(), 1)
+        self.assertAlmostEqual(PlayerTitle.objects.get(title_id="master_gathering").obtained_at,
+                               timezone.now().timestamp(), delta=5)
+        self.assertEqual(PlayerMasteryChallenge.objects.get(player=self.a).claimed_world_minute, self.clock.world_minute)
         self.assertEqual(self.run_action("claim_mastery", dict(skill_code="gathering"))["result_code"], "ALREADY_CLAIMED")
         self.bag_a.refresh_from_db(); self.assertEqual(self.bag_a.money, money)
 

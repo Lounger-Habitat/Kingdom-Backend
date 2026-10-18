@@ -28,7 +28,7 @@ def templates():
     # Imported lazily so authoring ownership stays with the professional catalog.
     from .professional_catalog import PROFESSIONAL_MUSHROOM, FOREST_BERRY, PROFESSIONAL_WOOD, PUMPKIN
     return (
-        dict(code="FRESH_SUPPLY", title="正常商队专业鲜供", reward=52, score=0,
+        dict(code="FRESH_SUPPLY", title="正常商队专业鲜供", reward=72, score=0,
              items=((PROFESSIONAL_MUSHROOM, 2), (PUMPKIN, 2), (FOREST_BERRY, 2)), quality=4, remaining=300),
         dict(code="EQUIPMENT_SUPPLY", title="正常商队专业整备", reward=68, score=4,
              items=((PROFESSIONAL_WOOD, 2), (ROUGH_LEATHER, 2), (FEATHER, 2)), quality=3, remaining=0),
@@ -133,16 +133,25 @@ def _context(player, minute):
                 target_stock=target, quantity=gap, shortage=gap, available_stock=stock,
                 incoming_quantity=incoming.get(item_id, 0), min_quality=spec["quality"],
                 requires_freshness=bool(spec["remaining"]), min_remaining_minutes=spec["remaining"]))
-        missing_total = sum(r["quantity"] for r in requirements)
-        reward = max(1, spec["reward"] * missing_total // 6) if missing_total else 0
+        catalog_valid = all(i in catalog and not catalog[i].is_deleted and catalog[i].item_price > 0
+                            for i, _ in spec["items"])
+        full_value = sum(catalog[i].item_price * target for i, target in spec["items"]) if catalog_valid else 0
+        missing_value = sum(catalog[r["item_id"]].item_price * r["quantity"] for r in requirements) if catalog_valid else 0
+        reward = max(1, spec["reward"] * missing_value // full_value) if missing_value else 0
+        for requirement in requirements:
+            item = catalog.get(requirement["item_id"])
+            requirement["catalog_unit_price"] = item.item_price if item and not item.is_deleted else None
         reason = ("TEMPLATE_PREPARED" if spec["code"] in prior_codes else base_reason or
             ("COOPERATION_SCORE_REQUIRED" if score < spec["score"] else
              "ITEM_CATALOG_MISSING" if any(i not in catalog or catalog[i].is_deleted for i, _ in spec["items"]) else
+             "ITEM_PRICE_UNAVAILABLE" if not catalog_valid else
              "STOCK_SUFFICIENT" if not any(r["shortage"] for r in requirements) else
              "PROFESSIONAL_BUDGET_EXHAUSTED" if spent + reward > DAILY_BUDGET else
              "NORA_BUDGET_UNAVAILABLE" if available_gold < reward else ""))
         projected.append(dict(code=spec["code"], title=spec["title"], required_level=7,
             required_cooperation_score=spec["score"], base_reward_gold=spec["reward"], reward_gold=reward, requirements=requirements,
+            pricing_basis="MISSING_CATALOG_VALUE", full_catalog_value=full_value if catalog_valid else None,
+            missing_catalog_value=missing_value if catalog_valid else None,
             publishable=not reason, reason=reason))
     active = next((link.commission for link in links if link.commission.actor_type == "PLAYER"
                    and link.commission.actor_id == str(player.pk)), None)

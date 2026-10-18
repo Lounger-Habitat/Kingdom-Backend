@@ -23,6 +23,12 @@ TEMPLATES = (
 )
 
 
+def publication_templates(minute):
+    """World-day priority, never a player/request random draw."""
+    preferred, other = (TEMPLATES[2], TEMPLATES[3]) if minute // 1440 % 2 == 0 else (TEMPLATES[3], TEMPLATES[2])
+    return (preferred, TEMPLATES[0], TEMPLATES[1], other)
+
+
 class BusinessOrdersError(Exception):
     def __init__(self, code, message):
         self.code, self.message = code, message
@@ -125,7 +131,7 @@ def _context(player, minute):
         "BUSINESS_OPEN_LIMIT" if len(links) >= MAX_OPEN else
         "COMMISSION_LIMIT" if len(promised_orders) >= MAX_OPEN_PER_NPC else "")
     templates = []
-    for template in TEMPLATES:
+    for template in publication_templates(minute):
         requirements = []
         for item_id, quantity, fresh in template["items"]:
             item = catalog.get(item_id)
@@ -134,15 +140,22 @@ def _context(player, minute):
                 quantity=quantity, min_quality=3, requires_freshness=fresh, min_remaining_minutes=60 if fresh else 0,
                 available_stock=stock, incoming_quantity=promised, target_stock=quantity,
                 shortage=max(0, quantity - stock - promised)))
+        catalog_present = all(catalog.get(r["item_id"]) and not catalog[r["item_id"]].is_deleted for r in requirements)
+        valid_prices = catalog_present and all(catalog[r["item_id"]].item_price > 0 for r in requirements)
+        reference_value = sum(catalog[r["item_id"]].item_price * r["quantity"] for r in requirements) if valid_prices else None
+        # Exact integer ceil(value * 1.2); preview and publication use one quote.
+        reward = max(template["reward"], (reference_value * 6 + 4) // 5) if valid_prices else 0
         reason = ("TEMPLATE_PREPARED" if template["code"] in published else base_reason or
             ("BUSINESS_LEVEL_REQUIRED" if level < template["level"] else
-             "ITEM_CATALOG_MISSING" if any(not catalog.get(r["item_id"]) or catalog[r["item_id"]].is_deleted for r in requirements) else
+             "ITEM_CATALOG_MISSING" if not catalog_present else
+             "ITEM_PRICE_UNAVAILABLE" if not valid_prices else
              "STOCK_SUFFICIENT" if all(r["shortage"] == 0 for r in requirements) else
              "PARTIAL_STOCK_GAP" if any(r["shortage"] < r["quantity"] for r in requirements) else
-             "BUSINESS_BUDGET_EXHAUSTED" if spent + template["reward"] > DAILY_BUDGET else
-             "LUCY_BUDGET_UNAVAILABLE" if available_gold < template["reward"] else ""))
+             "BUSINESS_BUDGET_EXHAUSTED" if spent + reward > DAILY_BUDGET else
+             "LUCY_BUDGET_UNAVAILABLE" if available_gold < reward else ""))
         templates.append(dict(code=template["code"], title=template["title"], required_level=template["level"],
-            reward_gold=template["reward"], requirements=requirements, publishable=not reason, reason=reason))
+            reward_gold=reward, base_reward_gold=template["reward"], reference_value=reference_value,
+            pricing_basis="MAX_BASE_OR_120_PERCENT_CATALOG", requirements=requirements, publishable=not reason, reason=reason))
     return dict(day=day, today=today, publisher=publisher, inventory=inventory, available_gold=available_gold,
         links=links, level=level, completed=completed, active=active, spent=spent, templates=templates)
 
@@ -176,7 +189,9 @@ def business_orders_overview(player, minute, read_only=False):
         skill_level=ctx["level"], daily_limit=DAILY_COMPLETIONS, completed_today=ctx["completed"],
         remaining_completions=max(0, DAILY_COMPLETIONS - ctx["completed"]),
         active_commission_id=str(ctx["active"].pk) if ctx["active"] else None,
-        orders=orders, templates=ctx["templates"])
+        orders=orders, templates=ctx["templates"],
+        rotation=dict(day_index=ctx["day"], priority_template_code=publication_templates(minute)[0]["code"],
+                      publication_order=[t["code"] for t in publication_templates(minute)]))
 
 
 @transaction.atomic
@@ -190,7 +205,7 @@ def execute_business_orders(player, bag, params, rid, clock):
     from .personal_commissions import CommissionError, expire_commissions, publish_commission
     expire_commissions(minute)
     created_ids, spent = [], 0
-    for template in TEMPLATES:
+    for template in publication_templates(minute):
         ctx = _context(player, minute)
         projection = next(t for t in ctx["templates"] if t["code"] == template["code"])
         if not projection["publishable"]:
@@ -204,7 +219,7 @@ def execute_business_orders(player, bag, params, rid, clock):
         try:
             result = publish_commission(ctx["publisher"].npc, dict(title=template["title"],
                 description="真实库存缺口备货；整单达标后结算，允许采购合作。每人本线路每天最多完成2单。",
-                reward_gold=template["reward"], valid_for_minutes=LIFETIME, default_location_code=LOCATION,
+                reward_gold=projection["reward_gold"], valid_for_minutes=LIFETIME, default_location_code=LOCATION,
                 stages=[dict(id="stock", title="整单备齐后结算", conditions=conditions)]), request_id, minute)
         except CommissionError as exc:
             raise BusinessOrdersError(exc.code, exc.message) from exc

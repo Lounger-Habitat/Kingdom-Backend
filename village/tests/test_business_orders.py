@@ -67,22 +67,22 @@ class BusinessOrderTests(PlayerFixture, TestCase):
 
     def test_explicit_prepare_uses_real_lucy_budget_and_once_per_day_template_markers(self):
         result = self.prepare()
-        self.assertEqual(result["spent_gold"], 64)
+        self.assertEqual(result["spent_gold"], 72)
         self.assertEqual(len(result["published_commission_ids"]), 2)
         self.lucy.refresh_from_db()
-        self.assertEqual(self.lucy.money, 936)
-        self.assertEqual(sum(VillagePersonalCommission.objects.values_list("reserved_reward_gold", flat=True)), 64)
+        self.assertEqual(self.lucy.money, 928)
+        self.assertEqual(sum(VillagePersonalCommission.objects.values_list("reserved_reward_gold", flat=True)), 72)
         again = self.prepare(self.b, self.bag_b)
         self.assertEqual(again["published_commission_ids"], [])
         self.assertEqual(again["spent_gold"], 0)
-        self.assertEqual(VillageBusinessOrderDay.objects.get().published_gold, 64)
+        self.assertEqual(VillageBusinessOrderDay.objects.get().published_gold, 72)
         corn = self.row("CORN")
         self.accept(corn)
         abandon_commission(corn.pk, "PLAYER", self.a.pk, uuid.uuid4(), 100)
         self.lucy.refresh_from_db()
-        self.assertEqual(self.lucy.money, 960)
+        self.assertEqual(self.lucy.money, 952)
         self.assertEqual(self.prepare()["spent_gold"], 0)
-        self.assertEqual(VillageBusinessOrderDay.objects.get().published_gold, 64)
+        self.assertEqual(VillageBusinessOrderDay.objects.get().published_gold, 72)
         self.assertEqual(VillageBusinessOrderLink.objects.filter(template_code="CORN").count(), 1)
 
     def test_stock_and_incoming_needs_never_publish_fake_or_overfilled_demand(self):
@@ -122,20 +122,22 @@ class BusinessOrderTests(PlayerFixture, TestCase):
         first = self.prepare()
         self.assertLessEqual(first["spent_gold"], 120)
         self.assertLessEqual(first["business_orders"]["open_count"], 4)
-        self.assertEqual(first["spent_gold"], 112)
-        corn = self.row("CORN")
-        self.accept(corn)
-        self.fulfill(corn)
+        self.assertEqual(first["spent_gold"], 108)
+        combo = self.row("VEGETABLES")
+        self.accept(combo)
+        self.fulfill(combo)
         # Real NPC consumption removes its stock; this is still the same day,
         # so the template marker and spent budget cannot be refreshed.
         self.lucy.slots.filter(item_id=1030).update(item_amount=0)
         again = self.prepare()
         self.assertEqual(again["spent_gold"], 0)
-        self.assertEqual(again["business_orders"]["published_gold"], 112)
-        combo = next(t for t in again["business_orders"]["templates"] if t["code"] == "VEGETABLES")
-        self.assertEqual(combo["reason"], "BUSINESS_BUDGET_EXHAUSTED")
+        self.assertEqual(again["business_orders"]["published_gold"], 108)
+        basic = next(t for t in again["business_orders"]["templates"] if t["code"] == "CORN")
+        self.assertEqual(basic["reason"], "BUSINESS_BUDGET_EXHAUSTED")
 
     def test_line_level_and_one_active_are_backend_enforced_and_decorate_existing_board(self):
+        self.clock.world_minute = 1540
+        self.clock.save()
         self.level(self.b, 440)
         self.prepare(self.b, self.bag_b)
         meal = self.row("FRESH_MEALS")
@@ -146,13 +148,14 @@ class BusinessOrderTests(PlayerFixture, TestCase):
         with self.assertRaises(CommissionError) as error:
             self.accept(meal)
         self.assertEqual(error.exception.code, "BUSINESS_LEVEL_REQUIRED")
-        self.accept(self.row("CORN"))
+        self.accept(self.row("WOOD"))
+        self.level(self.a, 440)
         with self.assertRaises(CommissionError) as error:
-            self.accept(self.row("WOOD"))
+            self.accept(meal)
         self.assertEqual(error.exception.code, "BUSINESS_ORDER_ACTIVE")
         ordinary = publish_commission(self.npc, dict(title="普通自主委托", reward_gold=1, valid_for_minutes=100,
             default_location_code="RESTAURANT", stages=[dict(id="s", conditions=[
-                dict(id="wood", type="item", item_ids=[1002], target=1)])]), uuid.uuid4(), 100)
+                dict(id="wood", type="item", item_ids=[1002], target=1)])]), uuid.uuid4(), self.clock.world_minute)
         row = VillagePersonalCommission.objects.get(pk=ordinary["commission_id"])
         self.assertNotIn("business_order", project_commission(row, actor_type="PLAYER", actor_id=self.a.pk))
         self.accept(row)
@@ -170,7 +173,7 @@ class BusinessOrderTests(PlayerFixture, TestCase):
         self.assertEqual(SkillRewardReceipt.objects.filter(player=self.a, skill_code="business").count(), 2)
         self.assertEqual(PlayerSkillProgress.objects.get(player=self.a, skill_code="business").total_xp, 40)
         self.bag_a.refresh_from_db()
-        self.assertEqual(self.bag_a.money, 164)
+        self.assertEqual(self.bag_a.money, 172)
         self.level(self.b, 440)
         self.prepare(self.b, self.bag_b)
         meal = self.row("FRESH_MEALS")
@@ -244,7 +247,7 @@ class BusinessOrderTests(PlayerFixture, TestCase):
                 dict(id="corn", type="item", item_ids=[1030], target=4, min_quality=3,
                      requires_freshness=True, min_remaining_minutes=60)])]), uuid.uuid4(), 100)
         result = self.prepare()
-        self.assertEqual(result["spent_gold"], 40)
+        self.assertEqual(result["spent_gold"], 48)
         self.assertEqual(list(VillageBusinessOrderLink.objects.values_list("template_code", flat=True)), ["WOOD"])
         corn = next(t for t in result["business_orders"]["templates"] if t["code"] == "CORN")
         self.assertEqual(corn["requirements"][0]["incoming_quantity"], 4)

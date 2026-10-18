@@ -8,6 +8,7 @@ import uuid
 from django.conf import settings
 from django.db import transaction
 from django.db.models import Max
+from django.utils import timezone
 from account.models import GameAccount
 from game_time.models import GlobalGameTimeState
 from inventory.components import copy_batch_attributes
@@ -331,7 +332,8 @@ def execute_mastery_action(player, bag, action, params, rid, clock):
                 reject("MASTERY_LEVEL_REQUIRED" if level < 10 else "EVIDENCE_REQUIRED", "需要本路线10级并完成全部真实考核。")
             state, _ = PlayerState.objects.get_or_create(player_id=str(player.pk))
             title = deepcopy(challenge.rules_snapshot["title_reward"])
-            PlayerTitle.objects.get_or_create(player=state, title_id=title["code"], defaults=dict(title_name=title["name"], obtained_at=clock.world_minute))
+            PlayerTitle.objects.get_or_create(player=state, title_id=title["code"],
+                defaults=dict(title_name=title["name"], obtained_at=int(timezone.now().timestamp())))
             PlayerMilestoneProgress.objects.get_or_create(player=player, code=f"{skill}_mastery",
                 defaults=dict(title=title["name"], source_type="claim_mastery", source_id=str(challenge.pk)))
             challenge.claimed_world_minute = clock.world_minute
