@@ -1142,6 +1142,7 @@ class VillageFarmPlot(models.Model):
     planted_world_minute = models.BigIntegerField("播种世界分钟", null=True, blank=True)
     mature_world_minute = models.BigIntegerField("成熟世界分钟", null=True, blank=True)
     yield_seed = models.IntegerField("预期产量种子", null=True, blank=True)
+    production_rules_snapshot = models.JSONField(default=dict, blank=True)
     source_request_id = models.UUIDField("来源请求ID", null=True, blank=True)
     updated_at = models.DateTimeField("更新时间", auto_now=True)
 
@@ -2296,6 +2297,8 @@ class VillageChopAttempt(models.Model):
     started_world_minute = models.BigIntegerField()
     completed_world_minute = models.BigIntegerField(null=True, blank=True)
     wood_amount = models.PositiveIntegerField()
+    output_item_id = models.PositiveIntegerField(default=1002)
+    tool_instance_id = models.UUIDField(null=True, blank=True)
     result = models.JSONField(default=dict)
 
     class Meta:
@@ -2397,3 +2400,14 @@ class StarterReserveTransfer(models.Model):
     class Meta:
         verbose_name = "公共储备支用记录"
         verbose_name_plural = "公共储备支用记录"
+
+
+class VillageGatheringResourceState(models.Model):
+    code = models.CharField(max_length=40, primary_key=True)
+    remaining_quantity = models.PositiveIntegerField(default=120)
+    next_restore_world_minute = models.BigIntegerField()
+    revision = models.PositiveBigIntegerField(default=1)
+
+    class Meta:
+        verbose_name = "共享采集储量"
+        verbose_name_plural = "共享采集储量"

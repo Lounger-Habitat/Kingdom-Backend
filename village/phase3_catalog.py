@@ -20,6 +20,8 @@ CORN_BONUS_SEED_CHANCE = 0.25
 WHEAT_SEED_ITEM_ID = 29301
 CARROT_SEED_ITEM_ID = 29302
 POTATO_SEED_ITEM_ID = 29303
+ONION_SEED_ITEM_ID = 29304
+GREEN_RADISH_SEED_ITEM_ID = 29305
 
 FARM_CROP_RULES = {
     "CORN": {
@@ -62,12 +64,20 @@ FARM_CROP_RULES = {
         "guaranteed_seed_return": 1,
         "bonus_seed_chance": 0.25,
     },
+    "ONION": {"display_name": "洋葱", "seed_item_id": ONION_SEED_ITEM_ID, "output_item_id": 1038,
+              "growth_minutes": 720, "yield_min": 3, "yield_max": 4, "guaranteed_seed_return": 1,
+              "bonus_seed_chance": 0.25, "required_level": 4, "minimum_tool_tier": 2},
+    "GREEN_RADISH": {"display_name": "青萝卜", "seed_item_id": GREEN_RADISH_SEED_ITEM_ID, "output_item_id": 1043,
+                     "growth_minutes": 2160, "yield_min": 8, "yield_max": 10, "guaranteed_seed_return": 1,
+                     "bonus_seed_chance": 0.25, "required_level": 4, "minimum_tool_tier": 2},
 }
 
 FARM_SEED_ITEM_DEFINITIONS = {
     WHEAT_SEED_ITEM_ID: ("小麦种子", 5, "Bill农田种植小麦所需的种子，可由Nora通过商队进货。"),
     CARROT_SEED_ITEM_ID: ("胡萝卜种子", 5, "Bill农田种植胡萝卜所需的种子，可由Nora通过商队进货。"),
     POTATO_SEED_ITEM_ID: ("土豆种薯", 5, "Bill农田种植土豆所需的种薯，可由Nora通过商队进货。"),
+    ONION_SEED_ITEM_ID: ("洋葱种子", 5, "种植洋葱所需种子；玩家需种植4级及T2农具。"),
+    GREEN_RADISH_SEED_ITEM_ID: ("青萝卜种子", 8, "种植青萝卜所需种子；玩家需种植4级及T2农具。"),
 }
 
 
@@ -122,7 +132,7 @@ HUNT_TOOL_NAME = "阶段三猎具"
 HUNT_TOOL_ITEM_TYPE = "CollectTool"
 HUNT_TOOL_MAX_USE_COUNT = 20
 
-TOOL_ITEM_IDS = (FARM_TOOL_ITEM_ID, HUNT_TOOL_ITEM_ID)
+TOOL_ITEM_IDS = (FARM_TOOL_ITEM_ID, HUNT_TOOL_ITEM_ID, 4101, 4102, 4103, 4104, 4105)
 REPAIR_WOOD_ITEM_ID = 1002
 REPAIR_METAL_ITEM_ID = 4003
 
@@ -143,6 +153,8 @@ SAFE_STOCKS = {
     WHEAT_SEED_ITEM_ID: 10,
     CARROT_SEED_ITEM_ID: 10,
     POTATO_SEED_ITEM_ID: 10,
+    ONION_SEED_ITEM_ID: 10,
+    GREEN_RADISH_SEED_ITEM_ID: 10,
     1030: 10,   # 玉米
     1056: 8,    # 鸡肉
     1057: 8,    # 五花肉
@@ -171,6 +183,9 @@ BASE_PRICES = {
     WHEAT_SEED_ITEM_ID: 5,
     CARROT_SEED_ITEM_ID: 5,
     POTATO_SEED_ITEM_ID: 5,
+    ONION_SEED_ITEM_ID: 5,
+    GREEN_RADISH_SEED_ITEM_ID: 8,
+    29306: 12,
     1030: 8,    # 玉米
     1025: 4,    # 胡萝卜（与现有 Item 目录价格一致）
     1042: 4,    # 土豆（与现有 Item 目录价格一致）
@@ -200,7 +215,8 @@ BASE_PRICES = {
 
 # ── Import whitelist (item_id) ─────────────────────────────────────
 IMPORT_WHITELIST = frozenset({
-    1003, 1022, 1051, WHEAT_SEED_ITEM_ID, CARROT_SEED_ITEM_ID, POTATO_SEED_ITEM_ID,  # 种子
+    1003, 1022, 1051, WHEAT_SEED_ITEM_ID, CARROT_SEED_ITEM_ID, POTATO_SEED_ITEM_ID,
+    ONION_SEED_ITEM_ID, GREEN_RADISH_SEED_ITEM_ID,  # 种子
     1026, 1040, 1049, 1050, 1058, 1076, 1099,  # 奶酪和调味料
     FARM_TOOL_ITEM_ID, HUNT_TOOL_ITEM_ID,
     1033, 1038,  # 大蒜、洋葱供Lucy肉菜使用
@@ -208,7 +224,7 @@ IMPORT_WHITELIST = frozenset({
 # 种子和调味料来自当前 ItemDataList；工具为阶段三农具和阶段三猎具。
 
 # ── Export whitelist (item_id) ─────────────────────────────────────
-EXPORT_WHITELIST = frozenset({1005, 1009, 1025, 1030, 1034, 1042, 1056, 1057, 1077, 1053, 1067, FEATHER, ROUGH_LEATHER})
+EXPORT_WHITELIST = frozenset({1005, 1009, 1025, 1030, 1034, 1038, 1042, 1043, 1056, 1057, 1077, 1053, 1067, FEATHER, ROUGH_LEATHER, 29306})
 # 肉类、玉米及阶段三配方成品均可对外出货。
 
 # ── NPC starting money (from seed_data) ────────────────────────────

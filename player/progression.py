@@ -65,12 +65,12 @@ def growth_snapshot(player, *, read_only=False):
         equipment_definitions=[dict(item_id=d.item_id, item_name=d.item.item_name, capability_code=d.capability_code,
             tier=d.tier, required_skill=d.required_skill, required_level=d.required_level, effects=deepcopy(d.effects),
             maximum_uses=d.item.max_use_count, rules_version=d.rules_version,
-            runtime_enforced=d.capability_code == "targeted_gathering")
+            runtime_enforced=d.capability_code in {"targeted_gathering", "farming", "forestry"})
             for d in ItemGameplayDefinition.objects.select_related("item").filter(item__is_deleted=False).order_by("item_id")])
 
 
 @transaction.atomic
-def award_skill(player, *, source_type, source_id, skill_code, xp, milestone=None):
+def award_skill(player, *, source_type, source_id, skill_code, xp, milestone=None, facts=None):
     """Internal primitive for trusted business code, with no public XP endpoint.
 
     Source identity must be the durable business fact (not a new delivery ID on
@@ -86,6 +86,8 @@ def award_skill(player, *, source_type, source_id, skill_code, xp, milestone=Non
             or not isinstance(milestone.get("title"), str) or not 0 < len(milestone["title"]) <= 100
             or type(milestone.get("xp")) is not int or milestone["xp"] < 0):
         raise ValueError("Invalid growth milestone")
+    if facts is not None and not isinstance(facts, dict):
+        raise ValueError("Invalid production facts")
     state = ensure_growth(player)
     old = SkillRewardReceipt.objects.filter(player=player, source_type=source_type, source_id=source_id,
                                             skill_code=skill_code).first()
@@ -113,15 +115,17 @@ def award_skill(player, *, source_type, source_id, skill_code, xp, milestone=Non
     result = dict(skill_code=skill_code, xp_gained=actual, level_before=before,
                   level_after=level_for_xp(progress.total_xp), total_xp=progress.total_xp,
                   new_unlocks=[], milestones=milestones)
+    if facts is not None:
+        result["facts"] = deepcopy(facts)
     SkillRewardReceipt.objects.create(player=player, source_type=source_type, source_id=source_id,
         skill_code=skill_code, rules_version=RULES_VERSION, result=deepcopy(result))
     return result
 
 
-def settle_growth(player, *, source_type, source_id):
+def settle_growth(player, *, source_type, source_id, facts=None):
     """Live route wrapper: only server-defined, released event rules qualify."""
     if source_type not in REWARD_RULES:
         raise ValueError("Growth source is not released")
     rule = REWARD_RULES[source_type]
     return award_skill(player, source_type=source_type, source_id=source_id, skill_code=rule["skill_code"],
-        xp=rule["xp"], milestone=dict(code=rule["milestone_code"], title=rule["milestone_title"], xp=rule["milestone_xp"]))
+        xp=rule["xp"], milestone=dict(code=rule["milestone_code"], title=rule["milestone_title"], xp=rule["milestone_xp"]), facts=facts)

@@ -171,6 +171,9 @@ def _do_plant(
         batch_id = uuid.uuid4()
 
         plot.batch_id = batch_id
+        # NPC production retains its existing rules and never inherits a
+        # previous player's skill snapshot on a returned plot.
+        plot.production_rules_snapshot = {}
         plot.crop_code = crop_code
         plot.planted_world_minute = world_minute
         from .farm_irrigation import effective_growth_minutes

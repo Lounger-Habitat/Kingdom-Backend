@@ -69,7 +69,7 @@ class FarmIrrigationTests(TestCase):
         self.advance("water_labor", "labor", 1)
         self.assertEqual(project_irrigation()["visual_state"], "FLOWING")
         self.assertEqual(ensure_irrigation_affair(999).status, "COMPLETED")
-        self.assertEqual({v["growth_minutes"] for v in farm_crop_catalog().values()}, {1296})
+        self.assertEqual({v["growth_minutes"] for v in farm_crop_catalog().values()}, {648, 1296, 1944})
 
     def test_upgrade_retains_old_labor_and_explicit_sites_do_not_change_legacy_defaults(self):
         legacy = {"stages": [dict(id="clear_silt", title="清淤", location_code="BILL_FARM", conditions=[

@@ -10,24 +10,26 @@ from account.models import GameAccount
 from game_time.models import GlobalGameTimeState
 from inventory.models import InventoryBag, InventorySlot, NpcGlobalInventory
 from items.models import Item
-from marketplace.services import get_player_main_bag
 from .models import (NpcCommandState, NpcRuntimeState, VillageSimulationConfig,
                      VillageTreeNode, VillageChopAttempt, VillageForestryReceipt,
                      VillageHuntAttempt, VillageWorldEvent)
 
 WOOD = 1002
+HARDWOOD = 29306
 REGION = "FOREST_LOGGING"
 # Returned by bootstrap; clients and Env never choose yields or regrowth deadlines.
 RULES = {"species": {"BIRCH": {"hits": 4, "wood": 4}, "PINE": {"hits": 6, "wood": 6},
-                     "BROADLEAF": {"hits": 5, "wood": 5}, "DEADWOOD": {"hits": 3, "wood": 3}},
+                     "BROADLEAF": {"hits": 5, "wood": 5}, "DEADWOOD": {"hits": 3, "wood": 3},
+                     "HARDWOOD": {"hits": 8, "wood": 4, "output_item_id": HARDWOOD}},
          "range": 2.5, "cooldown_seconds": 1.0, "windup_seconds": .25,
          "claim_idle_seconds": 25, "regrow_minutes": 5 * 1440}
 FIELDS = {
+    "preflight": {"actor_type", "actor_id"},
     "register": {"species", "position"},
     "register_batch": {"trees"},
-    "begin": {"generation", "attempt_id", "actor_type", "actor_id", "command_id"},
+    "begin": {"generation", "attempt_id", "actor_type", "actor_id", "command_id", "tool_instance_id"},
     "complete": {"generation", "attempt_id", "claim_version", "felled_world_minute"},
-    "finish": {"generation", "attempt_id", "actor_type", "actor_id", "command_id", "felled_world_minute"},
+    "finish": {"generation", "attempt_id", "actor_type", "actor_id", "command_id", "felled_world_minute", "tool_instance_id"},
     "cancel": {"generation", "attempt_id", "claim_version"},
     "respawn": {"generation"},
 }
@@ -60,6 +62,31 @@ def attempt_data(attempt):
                 claim_version=attempt.claim_version, actor_type=attempt.actor_type, actor_id=attempt.actor_id,
                 command_id=str(attempt.command_id) if attempt.command_id else None,
                 status=attempt.status, started_world_minute=attempt.started_world_minute)
+
+
+def player_capability(actor_id, node, minute, tool_instance_id=None):
+    """Pure trusted preflight; the final transaction repeats these checks."""
+    from player.progression import growth_snapshot
+    from .production_tools import ToolError, resolve_tool
+    if type(actor_id) not in (str, int) or not str(actor_id).isascii() or not str(actor_id).isdigit() or len(str(actor_id)) > 18:
+        reject("PLAYER_NOT_FOUND")
+    player = GameAccount.objects.filter(pk=int(actor_id), is_active=True, is_ai=False).first()
+    if player is None:
+        reject("PLAYER_NOT_FOUND")
+    bag = InventoryBag.objects.filter(player=player, character_id=player.username).first()
+    if bag is None:
+        reject("TOOL_REQUIRED")
+    level = next(s["level"] for s in growth_snapshot(player, read_only=True)["skills"] if s["code"] == "forestry")
+    if node.species == "HARDWOOD" and level < 4:
+        reject("SKILL_LEVEL_REQUIRED")
+    try:
+        tool = resolve_tool(player, bag, "forestry", instance_id=tool_instance_id,
+                            minimum_tier=2 if node.species == "HARDWOOD" else 1, minute=minute)
+    except ToolError as exc:
+        reject(exc.code)
+    return player, bag, tool, dict(level=level, node_id=str(node.pk), tool_instance_id=str(tool.instance_id),
+        tier=2 if tool.item_id == 4105 else 1,
+        cooldown_seconds=.95 if level >= 2 and node.species != "HARDWOOD" else 1.0)
 
 
 def bootstrap():
@@ -99,12 +126,12 @@ def settle_npc_wood(npc_id, params, world_minute, request_id):
     if attempt is None:
         return _fail("TREE_FELL_REQUIRED")
     inventory = NpcGlobalInventory.objects.select_for_update().get(npc=command.npc)
-    batch = add_batch(inventory, WOOD, attempt.wood_amount, expires_world_minute=None,
+    batch = add_batch(inventory, attempt.output_item_id, attempt.wood_amount, expires_world_minute=None,
                       produced_world_minute=attempt.node.felled_world_minute, source_request_id=request_id)
     inventory.asset_version += 1
     inventory.save(update_fields=["asset_version"])
     return _ok(asset_versions={str(npc_id): inventory.asset_version},
-               effects={"items_added": [dict(item_id=WOOD, amount=attempt.wood_amount, instance_id=str(batch.instance_id))]},
+               effects={"items_added": [dict(item_id=attempt.output_item_id, amount=attempt.wood_amount, instance_id=str(batch.instance_id))]},
                data={"node_id": str(attempt.node_id), "generation": attempt.generation})
 
 
@@ -147,6 +174,13 @@ def _execute(action, p, clock):
         return dict(tree=tree_data(node))
     if node is None:
         reject("TREE_NOT_FOUND")
+    if action == "preflight":
+        if p.get("actor_type") != "PLAYER":
+            reject("INVALID_PARAMS")
+        if node.status not in ("STANDING", "CLAIMED"):
+            reject("TREE_NOT_READY")
+        _, _, _, capability = player_capability(p.get("actor_id"), node, clock.world_minute)
+        return dict(forestry=capability)
     generation = p.get("generation")
     if type(generation) is not int or generation < 1:
         reject("INVALID_PARAMS")
@@ -171,7 +205,8 @@ def _execute(action, p, clock):
             reject("INVALID_PARAMS")
         actor_id = str(int(actor_id))
         command_id = identifier(p.get("command_id")) if actor_type == "NPC" else None
-        if actor_type == "PLAYER" and p.get("command_id") is not None:
+        if (actor_type == "PLAYER" and p.get("command_id") is not None
+                or actor_type == "NPC" and p.get("tool_instance_id") is not None):
             reject("INVALID_PARAMS")
         if generation != node.generation:
             reject("STALE_GENERATION")
@@ -183,10 +218,9 @@ def _execute(action, p, clock):
             return dict(tree=tree_data(node), attempt=attempt_data(attempt))
         if node.status != "STANDING":
             reject("TREE_BUSY" if node.status == "CLAIMED" else "TREE_NOT_READY")
-        command = None
+        command, tool = None, None
         if actor_type == "PLAYER":
-            if not GameAccount.objects.filter(pk=int(actor_id), is_active=True, is_ai=False).exists():
-                reject("PLAYER_NOT_FOUND")
+            _, _, tool, _ = player_capability(actor_id, node, clock.world_minute, p.get("tool_instance_id"))
         else:
             from .runtime_services import CommandService
             command = NpcCommandState.objects.select_for_update().filter(pk=command_id, npc__agent_id=actor_id).first()
@@ -207,7 +241,9 @@ def _execute(action, p, clock):
         node.save(update_fields=["claim_version", "status", "active_attempt_id"])
         attempt = VillageChopAttempt.objects.create(attempt_id=attempt_id, node=node, generation=generation,
             actor_type=actor_type, actor_id=actor_id, command=command, claim_version=node.claim_version,
-            started_world_minute=clock.world_minute, wood_amount=RULES["species"][node.species]["wood"])
+            started_world_minute=clock.world_minute, wood_amount=RULES["species"][node.species]["wood"],
+            output_item_id=RULES["species"][node.species].get("output_item_id", WOOD),
+            tool_instance_id=tool.instance_id if tool else None)
         return dict(tree=tree_data(node), attempt=attempt_data(attempt))
     if attempt is None or attempt.node_id != node.pk or attempt.generation != generation:
         reject("ATTEMPT_NOT_FOUND")
@@ -225,7 +261,7 @@ def _execute(action, p, clock):
     minute = p.get("felled_world_minute")
     if type(minute) is not int or not attempt.started_world_minute <= minute <= clock.world_minute:
         reject("INVALID_FELL_TIME")
-    item = Item.objects.filter(pk=WOOD, is_deleted=False).first()
+    item = Item.objects.filter(pk=attempt.output_item_id, is_deleted=False).first()
     if item is None:
         reject("WOOD_ITEM_UNAVAILABLE")
     node.status, node.felled_world_minute = "FELLED", minute
@@ -247,24 +283,34 @@ def _execute(action, p, clock):
             reject(result.get("result_code", "SETTLEMENT_FAILED"))
         added = result.get("effects", {}).get("items_added", [])
     else:
-        player = GameAccount.objects.filter(pk=int(attempt.actor_id), is_active=True, is_ai=False).first()
-        if player is None:
-            reject("PLAYER_NOT_FOUND")
-        bag, _ = get_player_main_bag(player)
+        from player.progression import award_skill, growth_snapshot
+        from .production_tools import wear_tool
+        player, bag, tool, _ = player_capability(attempt.actor_id, node, clock.world_minute,
+                                                attempt.tool_instance_id)
         bag = InventoryBag.objects.select_for_update().get(pk=bag.pk)
         index = bag.slots.aggregate(n=models.Max("slot_index"))["n"]
         slot = InventorySlot.objects.create(bag=bag, slot_index=0 if index is None else index+1,
-            item_id=WOOD, item_amount=attempt.wood_amount, quality=0, produced_world_minute=minute,
+            item_id=attempt.output_item_id, item_amount=attempt.wood_amount, quality=0, produced_world_minute=minute,
             source_request_id=identifier(p["request_id"]), item_bag_name=item.item_name)
-        added = [dict(item_id=WOOD, item_name=item.item_name, amount=attempt.wood_amount, instance_id=str(slot.instance_id))]
+        added = [dict(item_id=attempt.output_item_id, item_name=item.item_name, amount=attempt.wood_amount, instance_id=str(slot.instance_id))]
+        tool_used = wear_tool(tool)
+        reward = award_skill(player, source_type="forestry", source_id=f"{node.pk}:{generation}",
+            skill_code="forestry", xp=4 if node.species == "HARDWOOD" else 2,
+            milestone=dict(code="first_forestry", title="第一次完成伐木", xp=20),
+            facts=dict(node_id=str(node.pk), generation=generation, species=node.species,
+                       output_item_id=attempt.output_item_id, output_quantity=attempt.wood_amount,
+                       tool_instance_id=tool_used["instance_id"]))
         VillageWorldEvent.objects.create(dedupe_key=f"forestry:{node.pk}:{generation}", event_type="PLAYER_CHOP_TREE",
             world_minute=minute, time_revision=clock.time_revision, player_ids=[attempt.actor_id],
-            request_id=identifier(p["request_id"]), location_code=REGION, effects={"items_added": added},
+            request_id=identifier(p["request_id"]), location_code=REGION,
+            effects={"items_added": [{key: value for key, value in entry.items() if key != "instance_id"} for entry in added]},
             visibility="PUBLIC", player_summary=f"砍树获得{item.item_name}×{attempt.wood_amount}", hub_summary="完成树木砍伐")
     node.status, node.regrow_world_minute = "STUMP", minute + RULES["regrow_minutes"]
     node.save(update_fields=["status", "regrow_world_minute"])
     attempt.status, attempt.completed_world_minute = "SUCCEEDED", minute
     data = dict(tree=tree_data(node), attempt=attempt_data(attempt), items_added=added)
+    if attempt.actor_type == "PLAYER":
+        data.update(tool_used=tool_used, growth_rewards=[reward], growth=growth_snapshot(player, read_only=True))
     if result is not None:
         data["economy_result"] = result
     attempt.result = data
@@ -284,6 +330,11 @@ def execute(payload):
             clock = GlobalGameTimeState.objects.select_for_update().filter(pk=1).first()
             if clock is None:
                 reject("WORLD_NOT_READY")
+            if action == "preflight":
+                if not VillageSimulationConfig.objects.filter(config_key="default", village_economy_enabled=True).exists():
+                    reject("FEATURE_DISABLED")
+                # No receipt or setup writes: this is a query before an Env-owned hit.
+                return dict(success=True, result_code="OK", request_id=str(rid), data=_execute(action, payload, clock))
             existing = VillageForestryReceipt.objects.filter(pk=rid).first()
             if existing:
                 if existing.payload_hash != digest:
