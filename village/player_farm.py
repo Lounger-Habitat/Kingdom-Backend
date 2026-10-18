@@ -15,6 +15,7 @@ from inventory.serializers import serialize_bag
 from .models import EconomicLedgerEntry, VillageFarmPlot, VillageSimulationConfig, VillageWorldEvent
 from .phase3_catalog import FARM_CROP_RULES, FARM_TOOL_ITEM_ID, farm_crop_catalog
 from .phase3_asset_service import deterministic_rng
+from .professional_catalog import batch_evidence
 
 BILL_ID = "10011"
 DAY = 1440
@@ -135,7 +136,7 @@ def farm_overview(player, bag, minute, *, read_only=False):
     limits = rules(cfg)
     plots = [project_plot(p, minute) for p in VillageFarmPlot.objects.select_related("lessee_player").order_by("plot_code")]
     count = sum(p["lessee_player_id"] == str(player.pk) for p in plots)
-    tools = list(bag.slots.filter(item_id__in=[FARM_TOOL_ITEM_ID, 4103], item_amount__gt=0)) if bag.pk else []
+    tools = list(bag.slots.filter(item_id__in=[FARM_TOOL_ITEM_ID, 4103, 4121], item_amount__gt=0)) if bag.pk else []
     remaining = sum(s.remaining_uses * s.item_amount for s in tools
         if s.remaining_uses is not None and s.remaining_uses > 0 and _usable(s, minute))
     enabled = bool(cfg and cfg.village_economy_enabled and cfg.farm_leasing_enabled)
@@ -172,11 +173,11 @@ def farm_overview(player, bag, minute, *, read_only=False):
             reason = "SEED_REQUIRED"
         crop.update(can_plant=not reason, reason=reason)
     tool_rows = [dict(instance_id=str(s.instance_id), item_id=s.item_id,
-        item_name="改良农具" if s.item_id == 4103 else "农具", tier=2 if s.item_id == 4103 else 1,
-        remaining_uses=s.remaining_uses, maximum_uses=50 if s.item_id == 4103 else 20,
-        required_level=4 if s.item_id == 4103 else 1,
-        usable=type(s.remaining_uses) is int and 0 < s.remaining_uses <= (50 if s.item_id == 4103 else 20)
-               and _usable(s, minute) and level >= (4 if s.item_id == 4103 else 1)) for s in tools]
+        item_name="专业农具" if s.item_id == 4121 else "改良农具" if s.item_id == 4103 else "农具", tier=3 if s.item_id == 4121 else 2 if s.item_id == 4103 else 1,
+        remaining_uses=s.remaining_uses, maximum_uses=100 if s.item_id == 4121 else 50 if s.item_id == 4103 else 20,
+        required_level=7 if s.item_id == 4121 else 4 if s.item_id == 4103 else 1,
+        usable=type(s.remaining_uses) is int and 0 < s.remaining_uses <= (100 if s.item_id == 4121 else 50 if s.item_id == 4103 else 20)
+               and _usable(s, minute) and level >= (7 if s.item_id == 4121 else 4 if s.item_id == 4103 else 1)) for s in tools]
     return dict(rules=limits, plots=plots, my_plot_count=count, tool_remaining_uses=remaining,
                 tools=tool_rows, farming_level=level, crops=crops, irrigation=irrigation)
 
@@ -304,9 +305,11 @@ def execute_farm_action(player, bag, action, p, rid, clock):
             if level < rule.get("required_level", 1):
                 fail("SKILL_LEVEL_REQUIRED", "种植达到4级后开放该作物。")
             rule = deepcopy(rule)
-            rule.update(rule_version=2, bonus_seed_chance=.30 if level >= 2 else .25,
-                        quality=4 if level >= 5 else 3, output_freshness_minutes=2880,
-                        harvest_xp=20, first_harvest_bonus=20)
+            rule.update(rule_version=3 if crop == "PUMPKIN" else 2,
+                        bonus_seed_chance=.30 if level >= 2 else .25,
+                        quality=rule.get("quality", 4 if level >= 5 else 3),
+                        output_freshness_minutes=rule.get("output_freshness_minutes", 2880),
+                        harvest_xp=rule.get("harvest_xp", 20), first_harvest_bonus=20)
             cost = limits["plant_action_cost"]
         else:
             if not plot.batch_id or str(plot.batch_id) != p.get("expected_batch_id"):
@@ -360,18 +363,20 @@ def execute_farm_action(player, bag, action, p, rid, clock):
             next_index = (bag.slots.aggregate(n=Max("slot_index"))["n"] or 0) + 1
             for item_id, amount in ((rule["output_item_id"], output), (rule["seed_item_id"], seeds)):
                 freshness = rule.get("output_freshness_minutes") if item_id == rule["output_item_id"] else None
-                InventorySlot.objects.create(bag=bag, slot_index=next_index, item_id=item_id,
+                slot = InventorySlot.objects.create(bag=bag, slot_index=next_index, item_id=item_id,
                     item_amount=amount, quality=quality if item_id == rule["output_item_id"] else 3,
                     produced_world_minute=minute, source_request_id=rid,
                     expires_world_minute=minute + freshness if freshness is not None else None)
                 next_index += 1
-                result["items_added"].append(dict(item_id=item_id, amount=amount))
+                result["items_added"].append(dict(batch_evidence(slot), amount=amount))
             from player.progression import award_skill
             result["growth_rewards"] = [award_skill(player, source_type="farm_harvest", source_id=batch_id,
                 skill_code="farming", xp=rule.get("harvest_xp", 20),
                 milestone=dict(code="first_farming_harvest", title="完成第一次收获", xp=rule.get("first_harvest_bonus", 20)),
                 facts=dict(crop_code=crop, batch_id=batch_id, output_item_id=rule["output_item_id"],
-                           amount=output, quality=quality))]
+                           amount=output, quality=quality, source_request_id=str(rid), produced_world_minute=minute,
+                           tool_tier=3 if result["tool_used"]["item_id"] == 4121 else 2 if result["tool_used"]["item_id"] == 4103 else 1,
+                           outputs=[i for i in result["items_added"] if i["item_id"] == rule["output_item_id"]]))]
             clear_crop(plot)
             if state == "HARVEST_ONLY":
                 clear_lease(plot)

@@ -22,6 +22,8 @@ from .production_tools import resolve_tool, wear_tool, tools_overview, ToolError
 from .player_cooking_rules import (VILLAGE_RECIPES, NONPERISHABLE_IDS, RULE_VERSION,
     XP_PER_BATCH, FIRST_COOK_BONUS, AP_PER_BATCH, SHELF_LIFE)
 
+from .professional_catalog import PROFESSIONAL_RECIPES, batch_evidence
+
 class CookingError(Exception):
     def __init__(self, code, message):
         self.code, self.message = code, message
@@ -128,7 +130,7 @@ def cooking_overview(player, bag, minute, read_only=False):
         ("first_player_cooking", "亲自制作合格料理", "RESTAURANT"),
         ("first_formal_dish_review", "完成本人料理的正式点评", "RECORD_HALL"))]
     return dict(revision=PlayerGrowthState.objects.filter(player=player).values_list("revision", flat=True).first() or 0,
-        observed_world_minute=minute, level=level, max_batches=3 if level >= 4 and any(t["usable"] and t["tier"] >= 2 for t in tools) else 1,
+        observed_world_minute=minute, level=level, max_batches=5 if level >= 7 and any(t["usable"] and t["tier"] >= 3 for t in tools) else 3 if level >= 4 and any(t["usable"] and t["tier"] >= 2 for t in tools) else 1,
         recipes=recipes, ingredients=ingredients, tools=tools, goals=goals, pity_policy=PITY_POLICY)
 
 
@@ -139,8 +141,8 @@ def _prepare(player, bag, params, minute, *, execute=False):
     if not bag.pk or bag.player_id != player.pk or bag.character_id != player.username:
         reject("INGREDIENT_NOT_OWNED", "只能使用本人主背包中的食材。")
     batches = params.get("batches", 1)
-    if type(batches) is not int or not 1 <= batches <= 3:
-        reject("INVALID_PARAMS", "每次请选择1至3个标准批次。")
+    if type(batches) is not int or not 1 <= batches <= 5:
+        reject("INVALID_PARAMS", "每次请选择1至5个标准批次。")
     selected = params.get("selections")
     if not isinstance(selected, list) or not 0 < len(selected) <= 64:
         reject("INVALID_PARAMS", "请选择实际食材批次和数量。")
@@ -186,12 +188,14 @@ def _prepare(player, bag, params, minute, *, execute=False):
     level = _level(player)
     if level < required:
         reject("SKILL_LEVEL_REQUIRED", "烹饪等级未达到配方要求。")
+    if batches > 3 and level < 7:
+        reject("SKILL_LEVEL_REQUIRED", "5批专业制作需要烹饪7级及T3炊具。")
     if batches > 1 and (level < 4 or not visible):
         reject("BATCH_RECIPE_KNOWLEDGE_REQUIRED", "多批制作需要烹饪4级及已明确数量的标准配方。")
     if not params.get("tool_instance_id"):
         reject("TOOL_MISSING", "请选择本人实际持有的炊具。")
     try:
-        tool = resolve_tool(player, bag, "cooking", params["tool_instance_id"], max(tier, 2 if batches > 1 else 1), minute=minute)
+        tool = resolve_tool(player, bag, "cooking", params["tool_instance_id"], max(tier, 3 if batches > 3 else 2 if batches > 1 else 1), minute=minute)
     except ToolError as exc:
         reject(exc.code, exc.message)
     if tool.remaining_uses < batches:
@@ -253,7 +257,7 @@ def _visible_missing(player, bag, params, minute):
     if not bag.pk or not isinstance(params, dict) or type(params.get("recipe_id")) is not int:
         return []
     batches = params.get("batches", 1)
-    if type(batches) is not int or not 1 <= batches <= 3:
+    if type(batches) is not int or not 1 <= batches <= 5:
         return []
     recipe = Recipe.objects.prefetch_related("ingredients").filter(pk=params["recipe_id"]).first()
     if not recipe or not _visibility(recipe, _knowledge(player))[1]:
@@ -314,7 +318,7 @@ def execute_player_cooking(player, bag, params, rid, clock):
     amounts = {key: value / plan["batches"] for key, value in plan["amounts"].items()}
     quality = calculate_quality(recipe, amounts, plan["exact"], seconds, rng) if recipe else 1
     if recipe and plan["exact"] and plan["level"] >= 2 and not plan["legacy"]:
-        quality = max(3, quality)
+        quality = max(4 if recipe.pk in PROFESSIONAL_RECIPES else 3, quality)
     pity_counts, pity_changed = None, False
     if recipe and not recipe.village_only and plan["exact"] and not plan["legacy"] and plan["batches"] == 1:
         # Keep the original player's counters/config and the original tier rules.
@@ -352,7 +356,9 @@ def execute_player_cooking(player, bag, params, rid, clock):
             xp=XP_PER_BATCH * plan["batches"], milestone=dict(code="first_player_cooking", title="亲自制作合格料理", xp=FIRST_COOK_BONUS),
             facts=dict(recipe_id=recipe.pk, recipe_version=recipe.version, production_batch_id=batch_id,
                 output_item_id=item_id, output_instance_id=str(slot.instance_id), quantity=slot.item_amount,
-                quality=quality, standard_batches=plan["batches"], freshness_unknown=slot.freshness_unknown))]
+                quality=quality, standard_batches=plan["batches"], freshness_unknown=slot.freshness_unknown,
+                source_request_id=str(rid), produced_world_minute=clock.world_minute,
+                tool_tier=3 if tool.item_id == 4123 else 2 if tool.item_id == 4107 else 1, outputs=[batch_evidence(slot)]))]
     EconomicLedgerEntry.objects.create(request_id=uuid.uuid5(uuid.NAMESPACE_URL, f"player-cooking-ledger:{player.pk}:{rid}"),
         entry_type="PLAYER_COOK", world_minute=clock.world_minute,
         changes={"player_id": str(player.pk), "inputs": consumed, "output": dish, "tool_used": used})

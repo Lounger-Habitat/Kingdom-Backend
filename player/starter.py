@@ -66,8 +66,34 @@ def record_order_completion(player, source_type, order_id):
         raise StarterError("INVALID_PARAMS", "经营经验来源无效。")
     if not order:
         raise StarterError("ORDER_NOT_COMPLETED", "订单尚未由该玩家完成。")
+    from copy import deepcopy
+    from village.models import VillageProfessionalContractLink, EconomicLedgerEntry
+    facts = dict(source_type=source_type, order_id=str(order.pk), player_id=str(player.pk),
+                 professional_contract=False, publisher_npc_id=None, completed_world_minute=None,
+                 delivered_batches=[])
+    if source_type == "personal_commission":
+        facts.update(publisher_npc_id=str(order.publisher.agent_id), completed_world_minute=order.completed_world_minute)
+        facts["delivered_batches"] = [dict(deepcopy(batch.batch_snapshot), condition_id=batch.condition_id,
+            item_id=batch.item_id, quantity=batch.quantity, source_instance_id=str(batch.source_instance_id))
+            for batch in order.escrow_batches.filter(status="DELIVERED").order_by("pk")]
+        link = VillageProfessionalContractLink.objects.filter(commission=order).first()
+        if link:
+            facts.update(professional_contract=True, template_code=link.template_code, visit_day_index=link.visit_id)
+    else:
+        # Starter orders predate a completed-minute column; only their actual paid ledger proves the time.
+        paid = EconomicLedgerEntry.objects.filter(entry_type="STARTER_DELIVERY", changes__order_id=str(order.pk),
+            changes__STARTER_ESCROW__money__lt=0).order_by("world_minute", "pk").first()
+        facts["completed_world_minute"] = paid.world_minute if paid else None
+        facts["publisher_account_code"] = order.batch.fund_id
+        from inventory.components import BATCH_COPY_FIELDS
+        for delivery in order.deliveries.filter(status="RESERVED").select_related("slot").order_by("pk"):
+            attrs = {key: deepcopy(getattr(delivery.slot, key)) for key in BATCH_COPY_FIELDS}
+            if attrs["source_request_id"] is not None:
+                attrs["source_request_id"] = str(attrs["source_request_id"])
+            facts["delivered_batches"].append(dict(attrs, item_id=delivery.slot.item_id, quantity=delivery.quantity,
+                source_instance_id=str(delivery.source_instance_id)))
     return award_skill(player, source_type=source_type, source_id=str(order.pk), skill_code="business",
-        xp=BUSINESS_ORDER_XP, milestone=dict(code="first_supply", title=GOAL_MAP["first_supply"][0], xp=0))
+        xp=BUSINESS_ORDER_XP, milestone=dict(code="first_supply", title=GOAL_MAP["first_supply"][0], xp=0), facts=facts)
 
 
 @transaction.atomic

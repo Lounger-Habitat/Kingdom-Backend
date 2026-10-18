@@ -14,11 +14,12 @@ from player.progression import ensure_growth, growth_snapshot
 from .models import (EconomicLedgerEntry, VillageStore, VillageStoreAccount,
                      VillageStoreInventorySlot, VillageStoreListing)
 from .phase3_catalog import HUNTING_WEAPONS, FEATHER, ROUGH_LEATHER
+from .professional_catalog import T3_UPGRADES, PROFESSIONAL_WOOD, PUMPKIN_SEED
 
 UPGRADES = {4101: (4102, 6), 4001: (4103, 8), 4104: (4105, 10), 4106: (4107, 8),
-            4110: (4111, 8), 4112: (4113, 8)}
+            4110: (4111, 8), 4112: (4113, 8), **T3_UPGRADES}
 AXE_MILESTONE = "starter_axe_claimed"
-STOCK_ITEMS = (1051, 29301, 29302, 29303, 29304, 29305, 4001, 4106)
+STOCK_ITEMS = (1051, 29301, 29302, 29303, 29304, 29305, 4001, 4106, PUMPKIN_SEED)
 
 
 class ToolError(Exception):
@@ -134,15 +135,18 @@ def _quote(player, bag, slot, operation, minute):
         return weapon_repair_quote(player, bag, slot, minute)
     target_id, material_quantity = UPGRADES.get(slot.item_id, (None, 0))
     tier = definition.tier if definition else 0
-    gold = 100 if operation == "upgrade" else 5 if tier == 1 else 15
-    material = 1002 if operation == "upgrade" or tier == 1 else 29306
+    professional_upgrade = operation == "upgrade" and tier == 2
+    gold = (200 if professional_upgrade else 100) if operation == "upgrade" else 25 if tier == 3 else 5 if tier == 1 else 15
+    material = 29306 if professional_upgrade else PROFESSIONAL_WOOD if tier == 3 else 1002 if operation == "upgrade" or tier == 1 else 29306
     material_quantity = material_quantity if operation == "upgrade" else 1
     target = Item.objects.filter(pk=target_id, is_deleted=False).first() if target_id else None
-    required = 4 if operation == "upgrade" else definition.required_level if definition else 1
+    required = (7 if professional_upgrade else 4) if operation == "upgrade" else definition.required_level if definition else 1
     skill = definition.required_skill if definition else ""
     level = _level(player, skill) if skill else 1
     available_material = sum(s.item_amount for s in _material_slots(bag, material, minute))
     requirements = [(material, material_quantity)]
+    if professional_upgrade:
+        requirements += [(ROUGH_LEATHER, 2)] + ([(FEATHER, 4)] if slot.item_id == 4113 else [])
     if operation == "upgrade" and slot.item_id in (4110, 4112):
         requirements += [(ROUGH_LEATHER, 2)] + ([(FEATHER, 2)] if slot.item_id == 4112 else [])
     materials = [dict(item_id=key, item_name=Item.objects.filter(pk=key).values_list("item_name", flat=True).first() or str(key),
@@ -151,7 +155,7 @@ def _quote(player, bag, slot, operation, minute):
     store = _store()
     account = VillageStoreAccount.objects.filter(store=store).first() if store else None
     reason = ("TOOL_UNAVAILABLE" if not definition or definition.capability_code not in {"farming", "forestry", "targeted_gathering", "cooking", "hunting_spear", "hunting_bow", "hunting_sword"}
-        or definition.tier not in (1, 2) else "NO_UPGRADE" if operation == "upgrade" and not target else
+        or definition.tier not in (1, 2, 3) else "NO_UPGRADE" if operation == "upgrade" and not target else
         "TOOL_DURABILITY_UNKNOWN" if type(slot.remaining_uses) is not int or not 0 <= slot.remaining_uses <= definition.item.max_use_count else
         "TOOL_EXPIRED" if not _fresh(slot, minute) else "TOOL_ALREADY_FULL" if operation == "repair" and slot.remaining_uses == definition.item.max_use_count else
         "SKILL_LEVEL_REQUIRED" if level < required else "STORE_UNAVAILABLE" if not account else
@@ -282,6 +286,7 @@ def ensure_production_catalog(minute):
     installed = []
     for item_id in STOCK_ITEMS:
         marker = uuid.uuid5(uuid.NAMESPACE_URL, "kingdom:g3:cooking-stock:4106:v1" if item_id == 4106
+                            else "kingdom:g6:pumpkin-stock:29307:v1" if item_id == PUMPKIN_SEED
                             else f"kingdom:g2:production-stock:{item_id}:v1")
         if EconomicLedgerEntry.objects.filter(request_id=marker).exists():
             continue
@@ -297,9 +302,9 @@ def ensure_production_catalog(minute):
             VillageStoreInventorySlot.objects.create(instance_id=uuid.uuid5(marker, str(index)), store=store,
                 listing=listing, item_id=item_id, item_amount=1 if is_tool else count,
                 remaining_uses=item.max_use_count if is_tool else None, quality=3,
-                produced_world_minute=minute, common_attributes={"initial_stock_code": "G3_COOKING" if item_id == 4106 else "G2_PRODUCTION"})
-        EconomicLedgerEntry.objects.create(request_id=marker, entry_type="G3_INITIAL_STOCK" if item_id == 4106 else "G2_INITIAL_STOCK", world_minute=minute,
-            changes={"STORE:GENERAL_STORE": {str(item_id): count}, "source": "G3_FINITE_COOKING_STOCK" if item_id == 4106 else "G2_FINITE_PRODUCTION_STOCK"})
+                produced_world_minute=minute, common_attributes={"initial_stock_code": "G3_COOKING" if item_id == 4106 else "G6_PRODUCTION" if item_id == PUMPKIN_SEED else "G2_PRODUCTION"})
+        EconomicLedgerEntry.objects.create(request_id=marker, entry_type="G3_INITIAL_STOCK" if item_id == 4106 else "G6_INITIAL_STOCK" if item_id == PUMPKIN_SEED else "G2_INITIAL_STOCK", world_minute=minute,
+            changes={"STORE:GENERAL_STORE": {str(item_id): count}, "source": "G3_FINITE_COOKING_STOCK" if item_id == 4106 else "G6_FINITE_PRODUCTION_STOCK" if item_id == PUMPKIN_SEED else "G2_FINITE_PRODUCTION_STOCK"})
         installed.append(str(listing.pk))
     if installed:
         store.inventory_version += 1

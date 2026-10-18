@@ -18,9 +18,10 @@ from marketplace.services import get_player_main_bag
 from .models import (NpcCommandState, NpcRuntimeState, VillageHuntAttempt,
                      VillageSimulationConfig, VillageWildlife, VillageWildlifeReceipt,
                      VillageWorldEvent)
+from .professional_catalog import PREY_BOAR, batch_evidence
 from .phase3_catalog import PREY_CHICKEN, PREY_PIG, PREY_CATTLE, PREY_DEER, HUNT_MEAT_SPOILAGE_MINUTES, HUNTING_KILL_XP, HUNTING_WEAPONS
 
-SPECIES = {"CHICKEN": PREY_CHICKEN, "PIG": PREY_PIG, "CATTLE": PREY_CATTLE, "DEER": PREY_DEER}
+SPECIES = {"CHICKEN": PREY_CHICKEN, "PIG": PREY_PIG, "CATTLE": PREY_CATTLE, "DEER": PREY_DEER, "BOAR": PREY_BOAR}
 FIELDS = {
     "register": {"species", "region_id", "position"},
     "begin": {"attempt_id", "actor_type", "actor_id", "command_id"},
@@ -119,7 +120,7 @@ def _execute(action, p, clock):
         species, region, position = p.get("species"), p.get("region_id"), p.get("position")
         if not isinstance(species, str) or species not in SPECIES or not isinstance(region, str) or not 0 < len(region) <= 64:
             reject("INVALID_PARAMS")
-        if species == "DEER" and region != "DEEP_FOREST":
+        if species == "DEER" and region != "DEEP_FOREST" or species == "BOAR" and region != "NORTH_SLOPE":
             reject("SPECIES_REGION_INVALID")
         if not isinstance(position, dict) or set(position) != {"x", "y", "z"} or any(
             type(v) not in (float, int) or not math.isfinite(v) for v in position.values()
@@ -230,8 +231,7 @@ def _execute(action, p, clock):
             item_id=item_id, item_amount=1, quality=3, produced_world_minute=death,
             expires_world_minute=death+HUNT_MEAT_SPOILAGE_MINUTES, source_request_id=identifier(p['request_id']),
             item_bag_name=item.item_name)
-        added = [dict(item_id=item_id, item_name=item.item_name, amount=1, instance_id=str(slot.instance_id),
-                      produced_world_minute=death, expires_world_minute=slot.expires_world_minute)]
+        added = [dict(batch_evidence(slot), item_name=item.item_name, amount=1)]
         result = None
         VillageWorldEvent.objects.create(dedupe_key=f"wildlife:{prey.pk}", event_type="PLAYER_WILDLIFE_HUNT",
             world_minute=death, time_revision=clock.time_revision, player_ids=[attempt.actor_id],
@@ -270,7 +270,9 @@ def _kill_rewards(player, prey, attack_id, added):
     return [award_skill(player, source_type="wildlife_kill", source_id=prey.pk, skill_code="hunting",
         xp=HUNTING_KILL_XP[prey.species], milestone=dict(code="first_wildlife_kill", title="完成首次有效狩猎", xp=20),
         facts=dict(prey_id=str(prey.pk), species=prey.species, region_id=prey.region_id,
-                   attack_id=str(attack_id), weapon=copy.deepcopy(weapon), outputs=copy.deepcopy(added)))]
+                   attack_id=str(attack_id), weapon=copy.deepcopy(weapon), tool_tier=weapon.get("tier"),
+                   source_request_id=added[0].get("source_request_id") if added else None,
+                   produced_world_minute=prey.death_world_minute, outputs=copy.deepcopy(added)))]
 
 
 def execute(payload):

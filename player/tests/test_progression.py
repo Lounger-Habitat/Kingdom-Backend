@@ -45,13 +45,9 @@ class GrowthServiceTests(TestCase):
             self.assertEqual(skill["progression_enabled"], skill["code"] in {code for code, _ in SKILLS})
             for node in skill["unlocks"]:
                 self.assertFalse(node["available"])
-                if node["code"] in {"targeted_gathering", "advanced_gathering", "seed_return",
-                                     "advanced_crops", "crop_quality", "felling_efficiency", "hardwood", "basic_quality", "advanced_cooking", "combined_orders", "player_stall", "bow_preparation", "deer_challenge"}:
-                    self.assertTrue(node["implemented"])
-                    self.assertEqual(node["reason"], "SKILL_LEVEL_REQUIRED")
-                else:
-                    self.assertFalse(node["implemented"])
-                    self.assertEqual(node["reason"], "CONTENT_NOT_RELEASED")
+                # G6 releases all six professional branches and independent mastery.
+                self.assertTrue(node["implemented"])
+                self.assertEqual(node["reason"], "SKILL_LEVEL_REQUIRED")
 
     def test_generic_award_cross_level_replay_and_account_isolation(self):
         other = GameAccount.objects.create(username="growth-other")

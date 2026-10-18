@@ -21,7 +21,7 @@ from leaderboard.models import LeaderboardEntry, PendingReward, ReportEvent
 from marketplace.models import MarketListing, MarketTransaction
 from player.models import (DefaultRecipe, PlayerRecipe, PlayerState, PlayerGrowthState,
                            PlayerSkillProgress, SkillRewardReceipt, PlayerMilestoneProgress,
-                           PlayerHuntingState, PlayerCombatReceipt)
+                           PlayerHuntingState, PlayerCombatReceipt, PlayerMasteryChallenge)
 from recipes.models import Recipe
 from restaurant.models import (
     CustomerTransaction, DailyBusinessLog, MenuItem, PlayerRestaurantState,
@@ -63,6 +63,9 @@ from village.models import (
     VillageBusinessOrderDay,
     VillagePlayerDishReview,
     VillagePlayerProcessingJob,
+    VillagePlayerNpcRelationshipChange,
+    VillagePlayerNpcRelationship,
+    VillageProfessionalContractLink,
     StarterSupplyReceipt,
     StarterSupplyDelivery,
     StarterSupplyOrder,
@@ -213,6 +216,9 @@ class Command(BaseCommand):
 
         # Clear children that protect or feed the event/command history first.
         for model in (
+            VillagePlayerNpcRelationshipChange,  # PROTECTs relation and completed commission.
+            VillagePlayerNpcRelationship,
+            VillageProfessionalContractLink,  # PROTECTs both commission and frozen caravan visit.
             VillagePlayerProcessingJob,  # Private processing slots and tools precede inventory deletion.
             VillagePlayerDishReview,  # PROTECTs its private InventorySlot sample.
             StarterSupplyReceipt,
@@ -410,7 +416,7 @@ class Command(BaseCommand):
         """Reset progress through current templates, without minting money-change reports."""
         cleared = 0
         for model in (
-            PlayerCombatReceipt, PlayerHuntingState,
+            PlayerMasteryChallenge, PlayerCombatReceipt, PlayerHuntingState,
             SkillRewardReceipt, PlayerMilestoneProgress, PlayerSkillProgress, PlayerGrowthState,
             EnvActionReceipt, AutoBuyPurchase, RestaurantHourlySlot,
             CustomerTransaction, DailyBusinessLog, MenuItem, PlayerRestaurantState,

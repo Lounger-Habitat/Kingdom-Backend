@@ -40,14 +40,28 @@ def production_overview(player, bag, minute, *, read_only=False):
             requirements=["\u63a8\u8350\u72e9\u730e4\u7ea7\u4e0eT2\u6b66\u5668\uff0c\u533a\u57df\u4e0d\u8bbe\u4e2a\u4eba\u7a7a\u6c14\u5899\u3002"],
             uses=["\u9e7f\u8089\u53ef\u5236\u4f5c\u73b0\u6709\u4e24\u79cd\u8089\u6c64\uff1b\u7c97\u76ae\u7528\u4e8e\u6b66\u5668\u5347\u7ea7\u3002"], available=True,
             remaining_quantity=None, next_restore_world_minute=None)])
+    from .professional_catalog import PROFESSIONAL_COLLECT_TYPES
+    from .advanced_gathering import professional_resource_overview
+    for collect_type, spec in PROFESSIONAL_COLLECT_TYPES.items():
+        resources.append(dict(code=spec["code"], title=spec["title"], location_code="DEEP_FOREST",
+            description="\u6df1\u6797\u4e13\u4e1a\u5171\u4eab\u8d44\u6e90\uff0c\u6bcf\u6b21\u4e24\u4efd\u54c1\u8d284\u3002",
+            requirements=["\u91c7\u96c67\u7ea7\u3001T3\u91c7\u96c6\u5305\u300120AP\u30011\u8010\u4e45\u3002"],
+            uses=["\u4e13\u4e1a\u6599\u7406\u3001\u5b9e\u9645\u5408\u540c\u3001\u672c\u4eba\u7cbe\u901a\u8003\u6838\u3002"], available=levels["gathering"] >= 7,
+            **professional_resource_overview(collect_type, minute)))
+    resources.extend([
+        dict(code="durable_wood", title="\u97e7\u6728", location_code="DEEP_FOREST", description="\u4e24\u68f5\u72ec\u7acb\u4e13\u4e1a\u6811\uff0c10\u6b21\u6709\u6548\u547d\u4e2d\u4ea7\u51fa3\u4efd\u3002",
+            requirements=["\u4f10\u67287\u7ea7\u3001T3\u65a7\u3002"], uses=["T3\u7ef4\u4fee\u3001\u5b9e\u9645\u8d38\u6613\u4e0e\u8003\u6838\u3002"], available=levels["forestry"] >= 7),
+        dict(code="boar", title="\u5317\u5761\u91ce\u732a", location_code="NORTH_SLOPE", description="\u6709\u8d77\u624b\u63d0\u793a\u7684\u76f4\u7ebf\u51b2\u649e\uff0c\u547d\u4e2d\u626330\u751f\u547d\u3002",
+            requirements=["\u63a8\u8350T3\u5f13\u77db\uff0cG\u6b63\u9762\u683c\u6321\u6216R\u7ffb\u6eda\u3002"], uses=["Jack\u6536\u8d398\u91d1\u52a0\u5de5\u51fa\u771f\u5b9e\u8089\u76ae\u3002"], available=True)])
     for code, rule in FARM_CROP_RULES.items():
+        professional = code == "PUMPKIN"
         advanced = code in {"ONION", "GREEN_RADISH"}
         resources.append(dict(code="crop_" + code, title=rule["display_name"], location_code="BILL_FARM",
             description=f"基础生长 {rule['growth_minutes']} 世界分钟；水渠效果以新播种批次为准。",
             requirements=["本人有效租田、种子和可用农具。",
-                "种植 4 级及 T2 农具。" if advanced else "基础作物在种植 1 级开放。"],
+                "\u79cd\u690d7\u7ea7\u53caT3\u519c\u5177\u3002" if professional else "种植 4 级及 T2 农具。" if advanced else "基础作物在种植 1 级开放。"],
             uses=["可按真实报价出售、交付合格订单或用于已有配方。"],
-            available=not advanced or levels["farming"] >= 4,
+            available=levels["farming"] >= (7 if professional else 4 if advanced else 1),
             remaining_quantity=None, next_restore_world_minute=None))
     point = CollectionPoint.objects.filter(collect_type="采集林下食材").first()
     if point is None:

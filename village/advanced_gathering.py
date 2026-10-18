@@ -1,5 +1,6 @@
 """One shared undergrowth stock, restored by world time, never by UI queries."""
 from .models import VillageGatheringResourceState
+from .professional_catalog import PROFESSIONAL_COLLECT_TYPES
 
 COLLECT_TYPE = "采集林下食材"
 LOCATION = "FOREST_UNDERGROWTH"
@@ -72,6 +73,59 @@ def consume_resource(row, quantity):
     row.save(update_fields=["remaining_quantity", "revision"])
 
 
+def is_professional_collection(collect_type):
+    return collect_type in PROFESSIONAL_COLLECT_TYPES
+
+
+def professional_resource_overview(collect_type, minute):
+    spec = PROFESSIONAL_COLLECT_TYPES[collect_type]
+    row = VillageGatheringResourceState.objects.filter(pk=spec["code"]).first()
+    remaining = row.remaining_quantity if row else 90
+    restore = row.next_restore_world_minute if row else None
+    if restore is not None and minute >= restore:
+        remaining, restore = 90, restore + ((minute-restore)//1440+1)*1440
+    return dict(remaining_quantity=remaining, capacity=90, next_restore_world_minute=restore,
+        restore_minutes=1440, revision=row.revision if row else 0, observed_world_minute=minute)
+
+
+def prepare_professional_collection(player, bag, params, minute):
+    from .production_tools import ToolError, resolve_tool
+    from player.progression import growth_snapshot
+    from items.models import Item
+    spec = PROFESSIONAL_COLLECT_TYPES.get(params.get("collect_type"))
+    if spec is None:
+        raise AdvancedGatheringError("INVALID_PARAMS", "请选择明确的专业采集点。")
+    if params.get("category") is not None:
+        raise AdvancedGatheringError("INVALID_PARAMS", "专业采集点只产对应的一种原料。")
+    level = next(s["level"] for s in growth_snapshot(player, read_only=True)["skills"] if s["code"] == "gathering")
+    if level < 7:
+        raise AdvancedGatheringError("SKILL_LEVEL_REQUIRED", "专业采集需要采集7级。")
+    if not params.get("tool_instance_id"):
+        raise AdvancedGatheringError("TOOL_MISSING", "请选择本人T3专业采集包。")
+    try:
+        tool = resolve_tool(player, bag, "targeted_gathering", params["tool_instance_id"], minimum_tier=3, minute=minute)
+    except ToolError as exc:
+        raise AdvancedGatheringError(exc.code, exc.message) from exc
+    if not Item.objects.filter(pk=spec["item_id"], is_deleted=False).exists():
+        raise AdvancedGatheringError("COLLECTION_EMPTY", "该专业原料目录尚未就绪。")
+    row, _ = VillageGatheringResourceState.objects.select_for_update().get_or_create(code=spec["code"],
+        defaults=dict(remaining_quantity=90, next_restore_world_minute=minute+1440))
+    view = professional_resource_overview(params["collect_type"], minute)
+    if view["remaining_quantity"] < 2:
+        raise AdvancedGatheringError("RESOURCE_DEPLETED", "该专业资源不足两份，请等待自然恢复。")
+    if (row.remaining_quantity, row.next_restore_world_minute) != (view["remaining_quantity"], view["next_restore_world_minute"]):
+        row.remaining_quantity, row.next_restore_world_minute = view["remaining_quantity"], view["next_restore_world_minute"]
+        row.revision += 1
+        row.save(update_fields=["remaining_quantity", "next_restore_world_minute", "revision"])
+    return dict(item_id=spec["item_id"], quantity=2, quality=4, freshness_minutes=2880, tool=tool, resource=row)
+
+
+def finish_professional_collection(resource, quantity=2):
+    if quantity != 2:
+        raise ValueError("Professional collection produces exactly two units")
+    consume_resource(resource, quantity)
+
+
 def collection_points_projection(player, bag, minute):
     from inventory.models import CollectionPoint
     from .player_actions import COLLECTION_LOCATIONS
@@ -89,5 +143,11 @@ def collection_points_projection(player, bag, minute):
                                  available=bool(ids.intersection(items))) for code, title, items in CATEGORIES],
                 tools=[t for t in tools_overview(player, bag, minute)["tools"]
                        if t["capability"] == "targeted_gathering" and t["tier"] >= 2], **resource_overview(minute))
+        elif is_professional_collection(point.collect_type):
+            entry.update(tool_required=True, required_level=7, minimum_tool_tier=3, action_cost=20,
+                collect_count=1, output_quantity=2, quality=4, freshness_minutes=2880,
+                tools=[t for t in tools_overview(player, bag, minute)["tools"]
+                       if t["capability"] == "targeted_gathering" and t["tier"] >= 3],
+                **professional_resource_overview(point.collect_type, minute))
         result.append(entry)
     return result

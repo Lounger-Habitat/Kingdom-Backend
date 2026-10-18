@@ -207,3 +207,17 @@ class PlayerCombatReceipt(models.Model):
 
     class Meta:
         constraints = [models.UniqueConstraint(fields=["player", "request_id"], name="player_combat_request_unique")]
+
+
+class PlayerMasteryChallenge(models.Model):
+    player = models.ForeignKey(GameAccount, on_delete=models.CASCADE, related_name="mastery_challenges")
+    skill_code = models.CharField(max_length=20, choices=PlayerSkillProgress.SKILLS)
+    started_world_minute = models.BigIntegerField()
+    rule_version = models.PositiveIntegerField(default=1)
+    rules_snapshot = models.JSONField(default=dict)
+    contributed_world_minute = models.BigIntegerField(null=True, blank=True)
+    contribution_snapshot = models.JSONField(default=list)
+    claimed_world_minute = models.BigIntegerField(null=True, blank=True)
+
+    class Meta:
+        constraints = [models.UniqueConstraint(fields=["player", "skill_code"], name="player_mastery_skill_unique")]

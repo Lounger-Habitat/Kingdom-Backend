@@ -133,7 +133,7 @@ def _pool_item_ids(player, collect_type="采集食材"):
 
 
 def _usable(slot, minute):
-    maximum = 50 if slot.item_id == 4102 else TOOL_MAX_USES
+    maximum = {4102: 50, 4120: 100}.get(slot.item_id, TOOL_MAX_USES)
     return (slot.item_amount > 0 and not slot.freshness_unknown
             and (slot.expires_world_minute is None or slot.expires_world_minute > minute)
             and type(slot.remaining_uses) is int and 0 < slot.remaining_uses <= maximum)
@@ -173,11 +173,11 @@ def gathering_overview(player, bag, minute):
     ids = _pool_item_ids(player)
     categories = [dict(code=code, title=title, item_ids=sorted(ids.intersection(items)),
                        available=bool(ids.intersection(items))) for code, title, items in CATEGORIES]
-    items = {i.pk: i for i in Item.objects.filter(pk__in=[TOOL_ITEM_ID, 4102], is_deleted=False)}
+    items = {i.pk: i for i in Item.objects.filter(pk__in=[TOOL_ITEM_ID, 4102, 4120], is_deleted=False)}
     slots = list(bag.slots.filter(item_id__in=items, item_amount__gt=0).order_by("slot_index")) if bag.pk else []
     tools = [dict(instance_id=str(s.instance_id), item_id=s.item_id, item_name=items[s.item_id].item_name,
                   remaining_uses=s.remaining_uses, maximum_uses=items[s.item_id].max_use_count,
-                  usable=_usable(s, minute) and (s.item_id != 4102 or level >= 4)) for s in slots]
+                  usable=_usable(s, minute) and level >= {4102: 4, 4120: 7}.get(s.item_id, REQUIRED_LEVEL)) for s in slots]
     usable = any(tool["usable"] for tool in tools)
     reason = ("SKILL_LEVEL_REQUIRED" if level < REQUIRED_LEVEL else "GATHERING_TOOL_REQUIRED" if not usable
               else "COLLECTION_CATEGORY_EMPTY" if not any(c["available"] for c in categories) else None)
@@ -206,9 +206,11 @@ def prepare_targeted_collection(player, bag, params, pool, weights, *, minute=No
     if not Item.objects.filter(pk=TOOL_ITEM_ID, is_deleted=False).exists():
         reject("GATHERING_TOOL_UNAVAILABLE", "采集工具包尚未开放。")
     tool = InventorySlot.objects.select_for_update().filter(
-        bag=bag, item_id__in=[TOOL_ITEM_ID, 4102], instance_id=instance_id, item_amount__gt=0).first()
+        bag=bag, item_id__in=[TOOL_ITEM_ID, 4102, 4120], instance_id=instance_id, item_amount__gt=0).first()
     if tool is None:
         reject("GATHERING_TOOL_REQUIRED", "本人背包中没有这件采集工具包。")
+    if tool.item_id == 4120 and _level(player) < 7:
+        reject("SKILL_LEVEL_REQUIRED", "T3 gathering requires level 7.")
     if tool.item_id == 4102 and _level(player) < 4:
         reject("SKILL_LEVEL_REQUIRED", "采集达到4级后可使用T2采集工具包。")
     if minute is None:

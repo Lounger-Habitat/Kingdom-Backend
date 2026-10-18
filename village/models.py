@@ -2500,3 +2500,39 @@ class VillagePlayerProcessingJob(models.Model):
             models.UniqueConstraint(fields=["player"], condition=models.Q(status__in=["RUNNING", "READY", "FAILED"]), name="processing_one_unfinished_player"),
             models.UniqueConstraint(fields=["status"], condition=models.Q(status="RUNNING"), name="processing_one_jack_job"),
         ]
+
+
+class VillagePlayerNpcRelationship(models.Model):
+    player = models.ForeignKey("account.GameAccount", on_delete=models.PROTECT)
+    npc = models.ForeignKey("inventory.NpcDefinition", on_delete=models.PROTECT)
+    score = models.PositiveSmallIntegerField(default=0)
+    revision = models.PositiveBigIntegerField(default=0)
+    last_changed_world_minute = models.BigIntegerField(default=0)
+
+    class Meta:
+        constraints = [
+            models.UniqueConstraint(fields=["player", "npc"], name="player_npc_cooperation_unique"),
+            models.CheckConstraint(condition=models.Q(score__lte=100), name="player_npc_cooperation_bounded"),
+        ]
+
+
+class VillagePlayerNpcRelationshipChange(models.Model):
+    relationship = models.ForeignKey(VillagePlayerNpcRelationship, on_delete=models.PROTECT, related_name="changes")
+    commission = models.OneToOneField(VillagePersonalCommission, on_delete=models.PROTECT)
+    requested_delta = models.PositiveSmallIntegerField(default=2)
+    applied_delta = models.PositiveSmallIntegerField(default=0)
+    before_score = models.PositiveSmallIntegerField()
+    after_score = models.PositiveSmallIntegerField()
+    world_minute = models.BigIntegerField()
+    world_day = models.BigIntegerField()
+
+
+class VillageProfessionalContractLink(models.Model):
+    commission = models.OneToOneField(VillagePersonalCommission, primary_key=True, on_delete=models.PROTECT, related_name="professional_contract")
+    visit = models.ForeignKey(VillageCaravanVisit, on_delete=models.PROTECT)
+    template_code = models.CharField(max_length=32)
+    required_business_level = models.PositiveSmallIntegerField(default=7)
+    required_cooperation_score = models.PositiveSmallIntegerField(default=0)
+
+    class Meta:
+        constraints = [models.UniqueConstraint(fields=["visit", "template_code"], name="professional_template_once_visit")]

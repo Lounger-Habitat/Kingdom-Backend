@@ -16,6 +16,7 @@ from .models import (
     VillageStoryFact, VillageStore, VillageStoreAccount, VillageStoreInventorySlot,
 )
 from .phase3_catalog import IMPORT_WHITELIST, EXPORT_WHITELIST, SAFE_STOCKS, TOOL_ITEM_IDS
+from .professional_catalog import PROFESSIONAL_IMPORT_LIMITS
 
 ARRIVAL = 660
 DEPARTURE = 900
@@ -85,7 +86,11 @@ def sync_visit(minute):
         selected = requested or rng.sample(valid_pool, rng.randint(1, min(len(valid_pool), capacity)))
         amounts = [1] * len(selected)
         for _ in range(capacity - len(selected)):
-            amounts[rng.randrange(len(amounts))] += 1
+            eligible = [index for index, key in enumerate(selected)
+                        if amounts[index] < PROFESSIONAL_IMPORT_LIMITS.get(key, capacity)]
+            if not eligible:
+                break
+            amounts[rng.choice(eligible)] += 1
         stock = {str(i): n for i, n in zip(selected, amounts)}
     elif route != "NONE" and not error:
         error = "CARAVAN_SUPPLY_UNAVAILABLE"

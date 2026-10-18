@@ -747,7 +747,8 @@ def _social_state(npc: NpcDefinition, query_params=None) -> dict:
     result = inspect_social_state(npc.agent_id)
     if result["status"] != "SUCCEEDED":
         raise AgentQueryError(result["result_code"], result["data"])
-    return result["data"]
+    from .cooperation import npc_cooperation_history
+    return dict(result["data"], player_cooperations=npc_cooperation_history(npc))
 
 
 def _personal_commissions(npc, query_params=None):

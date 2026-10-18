@@ -46,6 +46,10 @@ LOCATIONS = {
         "withdraw_stall_dish", "upgrade_player_stall", "prepare_business_orders")},
 }
 PARAMS = {
+    "start_mastery": {"skill_code"},
+    "contribute_mastery": {"skill_code", "selections", "expected_quote"},
+    "claim_mastery": {"skill_code"},
+    "prepare_professional_contracts": set(),
     "claim_starter_hunting_kit": set(),
     "repair_hunting_weapon": {"instance_id", "expected_quote"},
     "start_safe_rest": set(),
@@ -86,6 +90,9 @@ PARAMS = {
     "prepare_business_orders": set(),
 }
 COLLECTION_LOCATIONS = {"采集食材": "FOREST_EDGE", "采集林下食材": "FOREST_UNDERGROWTH"}
+from .professional_catalog import PROFESSIONAL_COLLECT_TYPES
+COLLECTION_LOCATIONS.update({name: "DEEP_FOREST" for name in PROFESSIONAL_COLLECT_TYPES})
+LOCATIONS["prepare_professional_contracts"] = {"GENERAL_STORE"}
 from .player_farm import ACTIONS as FARM_ACTIONS
 PARAMS.update(FARM_ACTIONS)
 LOCATIONS.update({action: {"BILL_FARM"} for action in FARM_ACTIONS})
@@ -128,6 +135,7 @@ def _batch_data(slot, minute, names=None):
     return dict(instance_id=str(slot.instance_id), item_id=slot.item_id,
         item_name=(names or {}).get(slot.item_id, str(slot.item_id)), quantity=slot.item_amount,
         quality=slot.quality, remaining_uses=slot.remaining_uses, expires_world_minute=slot.expires_world_minute,
+        produced_world_minute=slot.produced_world_minute, source_request_id=str(slot.source_request_id) if slot.source_request_id else None,
         remaining_freshness_minutes=None if slot.expires_world_minute is None else max(0, slot.expires_world_minute-minute),
         freshness_unknown=slot.freshness_unknown,
         usable=not slot.freshness_unknown and (slot.expires_world_minute is None or slot.expires_world_minute > minute))
@@ -211,6 +219,9 @@ def _get_affair(params, minute):
 
 def overview(player, bag, minute, *, read_only=False):
     from player.progression import growth_snapshot
+    from player.mastery import mastery_overview
+    from .cooperation import cooperation_overview
+    from .professional_contracts import professional_contracts_overview
     from player.starter import starter_overview
     from .player_gathering import gathering_overview
     from .production_guide import production_overview
@@ -275,6 +286,9 @@ def overview(player, bag, minute, *, read_only=False):
         action_points=state.action_points, action_points_max=state.action_points_max,
         growth=growth_snapshot(player, read_only=read_only),
         starter=starter,
+        mastery=mastery_overview(player, bag, minute, read_only=read_only),
+        cooperation=cooperation_overview(player, minute, read_only=read_only),
+        professional_contracts=professional_contracts_overview(player, minute, read_only=read_only),
         production=production_overview(player, bag, minute, read_only=read_only),
         collection_points=collection_points_projection(player, bag, minute),
         cooking=cooking_overview(player, bag, minute, read_only=read_only),
@@ -303,6 +317,22 @@ def _execute(player, bag, action, p, rid, location, clock, authority_session_id=
         fail("LOCATION_INVALID", "请前往对应地点再操作。")
     if action == "overview":
         return {}
+    if action in {"start_mastery", "contribute_mastery", "claim_mastery"}:
+        from player.mastery import MasteryError, execute_mastery_action
+        if action == "contribute_mastery":
+            sites = {"gathering": "GENERAL_STORE", "farming": "BILL_FARM", "forestry": "BUTCHER_YARD", "cooking": "RESTAURANT"}
+            if p.get("skill_code") not in sites or location != sites[p["skill_code"]]:
+                fail("LOCATION_INVALID", "Mastery samples require the actual recipient location.")
+        try:
+            return execute_mastery_action(player, bag, action, p, rid, clock)
+        except MasteryError as exc:
+            fail(exc.code, exc.message)
+    if action == "prepare_professional_contracts":
+        from .professional_contracts import ProfessionalContractsError, execute_prepare_professional_contracts
+        try:
+            return execute_prepare_professional_contracts(player, bag, p, rid, clock)
+        except ProfessionalContractsError as exc:
+            fail(exc.code, exc.message)
     if action in {"claim_starter_hunting_kit", "repair_hunting_weapon", "start_safe_rest", "finish_safe_rest"}:
         from .player_hunting import HuntingError, execute_hunting_action
         try:
@@ -401,14 +431,27 @@ def _execute(player, bag, action, p, rid, location, clock, authority_session_id=
         recover_action_points(state)
         if state.action_points < point.action_cost:
             fail("INSUFFICIENT_ACTION_POINTS", "行动力不足。")
-        pool, weights, error = _build_collect_pool(player, point)
+        from .advanced_gathering import is_professional_collection, prepare_professional_collection, finish_professional_collection
+        professional = None
+        if is_professional_collection(collect_type):
+            from .advanced_gathering import AdvancedGatheringError
+            try:
+                professional = prepare_professional_collection(player, bag, dict(p, collect_type=collect_type), minute)
+            except AdvancedGatheringError as exc:
+                fail(exc.code, exc.message)
+            item = Item.objects.get(pk=professional["item_id"], is_deleted=False)
+            pool, weights, error = [dict(item=item, min_amount=professional["quantity"], max_amount=professional["quantity"])], [1], None
+        else:
+            pool, weights, error = _build_collect_pool(player, point)
         if error:
             fail("COLLECTION_UNAVAILABLE", "当前等级没有可采集物品。")
         from .player_gathering import GatheringError, prepare_targeted_collection, wear_tool
         from .advanced_gathering import COLLECT_TYPE, AdvancedGatheringError, prepare_collection, consume_resource
         resource = None
         try:
-            if collect_type == COLLECT_TYPE:
+            if professional:
+                tool, resource = professional["tool"], professional["resource"]
+            elif collect_type == COLLECT_TYPE:
                 pool, weights, tool, resource = prepare_collection(player, bag, p, pool, weights, minute)
             else:
                 pool, weights, tool = prepare_targeted_collection(player, bag, p, pool, weights, minute=minute)
@@ -438,19 +481,25 @@ def _execute(player, bag, action, p, rid, location, clock, authority_session_id=
             # New production has explicit server provenance and freshness. Never
             # merge it into a historical/expired stack or refresh old shelf life.
             slot = InventorySlot.objects.create(bag=bag, slot_index=next_index, item_id=item.pk,
-                item_amount=amount, quality=3, produced_world_minute=minute,
-                expires_world_minute=minute+2880, source_request_id=rid,
+                item_amount=amount, quality=professional["quality"] if professional else 3, produced_world_minute=minute,
+                expires_world_minute=minute+(professional["freshness_minutes"] if professional else 2880), source_request_id=rid,
                 item_bag_name=f"{item.item_name}_{next_index}")
             next_index += 1
             collected.append(_batch_data(slot, minute, {item.pk: item.item_name}))
         from player.progression import settle_growth
-        if resource:
+        if professional:
+            finish_professional_collection(resource, sum(b["quantity"] for b in collected))
+        elif resource:
             consume_resource(resource, sum(b["quantity"] for b in collected))
+        from player.models import ItemGameplayDefinition
+        tool_tier = ItemGameplayDefinition.objects.filter(item_id=tool.item_id).values_list("tier", flat=True).first() if tool else None
         return dict(collected_items=collected, action_points=state.action_points, action_cost=point.action_cost,
                     category=p.get("category"), tool_used=wear_tool(tool) if tool is not None else None,
-                    growth_rewards=[settle_growth(player, source_type="advanced_collect" if resource else "collect", source_id=rid,
+                    growth_rewards=[settle_growth(player, source_type="professional_collect" if professional else "advanced_collect" if resource else "collect", source_id=rid,
                         facts=dict(collect_type=collect_type, category=p.get("category"),
-                                   tool_item_id=tool.item_id if tool is not None else None))])
+                                   tool_item_id=tool.item_id if tool is not None else None,
+                                   tool_tier=tool_tier, source_request_id=str(rid), produced_world_minute=minute,
+                                   outputs=[{key: batch.get(key) for key in ("instance_id", "item_id", "quantity", "quality", "produced_world_minute", "expires_world_minute", "source_request_id")} for batch in collected]))])
     if action == "contribute":
         from .affairs import AffairError, contribute, validate_contribution
         kind, quantity = p.get("kind"), positive(p.get("quantity"))

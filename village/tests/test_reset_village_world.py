@@ -655,7 +655,40 @@ class ResetVillageWorldTests(TestCase):
             escrow_bag=held_bag, input_slot=carcass, source_instance_id=uuid.uuid4(),
             tool_instance_id=uuid.uuid4(), fee_gold=5, duration_minutes=5,
             started_world_minute=minute, ready_world_minute=minute+5, needs_until=minute)
-        tracked = (PlayerHuntingState, PlayerCombatReceipt, VillagePlayerProcessingJob,
+        # G6 authentic funded contract completion creates both protected relation rows.
+        from player.models import PlayerMasteryChallenge
+        from village.models import (VillagePlayerNpcRelationship, VillagePlayerNpcRelationshipChange,
+            VillageProfessionalContractLink, VillageAffair)
+        from village.professional_contracts import execute_prepare_professional_contracts
+        from village.personal_commissions import accept_commission, contribute_commission
+        from village.caravan import sync_visit
+        PlayerMasteryChallenge.objects.create(player=player, skill_code="business", started_world_minute=minute,
+            rules_snapshot={"version": 1})
+        PlayerSkillProgress.objects.update_or_create(player=player, skill_code="business", defaults=dict(total_xp=1980))
+        Item.objects.get_or_create(pk=1001, defaults=dict(item_name="南瓜", item_type="蔬菜", item_price=8))
+        now = minute // 1440 * 1440 + 700
+        clock.world_minute = now; clock.save()
+        VillageSimulationConfig.objects.filter(config_key="default").update(village_economy_enabled=True)
+        VillageAffair.objects.update_or_create(code="BRIDGE_REPAIR", defaults=dict(title="旧桥",
+            status="COMPLETED", opened_world_minute=now-100, completed_world_minute=now-1))
+        nora_profile = NpcProfile.objects.get(npc__agent_id="10015")
+        nora_profile.capabilities = list(set(nora_profile.capabilities) | {"PUBLISH_PERSONAL_COMMISSION"})
+        nora_profile.save(update_fields=["capabilities"])
+        visit = sync_visit(now)
+        self.assertEqual(visit.route, "NORMAL")
+        professional = execute_prepare_professional_contracts(player, bag, {}, uuid.uuid4(), clock)
+        link = VillageProfessionalContractLink.objects.get(commission_id=professional["published_commission_ids"][0])
+        order = link.commission
+        accept_commission(order.pk, "PLAYER", player.pk, uuid.uuid4(), now)
+        for condition in order.requirements["stages"][0]["conditions"]:
+            material = InventorySlot.objects.create(bag=bag,
+                slot_index=max(bag.slots.values_list("slot_index", flat=True), default=-1)+1,
+                item_id=condition["item_ids"][0], item_amount=condition["target"], quality=4,
+                produced_world_minute=now, expires_world_minute=now+1000, source_request_id=uuid.uuid4())
+            contribute_commission(order.pk, "PLAYER", player.pk, condition["id"], condition["target"], uuid.uuid4(), now,
+                item_id=material.item_id, instance_id=material.instance_id, location="GENERAL_STORE")
+        tracked = (PlayerMasteryChallenge, VillagePlayerNpcRelationshipChange, VillagePlayerNpcRelationship,
+            VillageProfessionalContractLink, PlayerHuntingState, PlayerCombatReceipt, VillagePlayerProcessingJob,
             SkillRewardReceipt, PlayerMilestoneProgress, PlayerSkillProgress, PlayerGrowthState,
             StarterSupplyReceipt, StarterSupplyDelivery, StarterReserveTransfer, StarterSupplyOrder, StarterSupplyBatch,
             VillageGatheringResourceState, VillagePlayerDishReview, VillageBusinessOrderLink, VillageBusinessOrderDay,
@@ -673,6 +706,8 @@ class ResetVillageWorldTests(TestCase):
         self.assertEqual(player.password, "keep-password")
         self.assertEqual(InventoryBag.objects.filter(player=player).count(), 1)
         self.assertEqual(InventoryBag.objects.get(player=player).money, 123)
+        self.assertEqual(sum(VillageStoreInventorySlot.objects.filter(store_id="GENERAL_STORE", item_id=29307)
+                             .values_list("item_amount", flat=True)), 30)
         cooking_stock = VillageStoreInventorySlot.objects.filter(store_id="GENERAL_STORE", item_id=4106)
         self.assertEqual(cooking_stock.count(), 20)
         self.assertTrue(all(slot.item_amount == 1 and slot.remaining_uses == 20 for slot in cooking_stock))

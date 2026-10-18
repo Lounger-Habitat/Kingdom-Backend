@@ -9,6 +9,8 @@ Do NOT add database-backed configuration admin for these values.
 # Corn keeps the shipped balance exactly.  The other three crops deliberately
 # use the same first-pass timing/yield/seed-return rules so balancing stays in
 # this one small catalog instead of leaking into the transaction handler.
+from .professional_catalog import PUMPKIN, PUMPKIN_SEED, PREY_BOAR, T3_TOOLS, PROFESSIONAL_EXPORT_PRICES
+
 CORN_SEED_ITEM_ID = 1051
 CORN_OUTPUT_ITEM_ID = 1030
 CORN_GROWTH_MINUTES = 1440
@@ -24,6 +26,10 @@ ONION_SEED_ITEM_ID = 29304
 GREEN_RADISH_SEED_ITEM_ID = 29305
 
 FARM_CROP_RULES = {
+    "PUMPKIN": dict(display_name="南瓜", seed_item_id=PUMPKIN_SEED, output_item_id=PUMPKIN,
+        growth_minutes=2880, yield_min=6, yield_max=8, guaranteed_seed_return=1,
+        bonus_seed_chance=.30, required_level=7, minimum_tool_tier=3, quality=4,
+        output_freshness_minutes=5760, harvest_xp=30),
     "CORN": {
         "display_name": "玉米",
         "seed_item_id": CORN_SEED_ITEM_ID,
@@ -73,6 +79,7 @@ FARM_CROP_RULES = {
 }
 
 FARM_SEED_ITEM_DEFINITIONS = {
+    PUMPKIN_SEED: ("南瓜种子", 8, "专业南瓜种子；种植7级及T3农具。"),
     WHEAT_SEED_ITEM_ID: ("小麦种子", 5, "Bill农田种植小麦所需的种子，可由Nora通过商队进货。"),
     CARROT_SEED_ITEM_ID: ("胡萝卜种子", 5, "Bill农田种植胡萝卜所需的种子，可由Nora通过商队进货。"),
     POTATO_SEED_ITEM_ID: ("土豆种薯", 5, "Bill农田种植土豆所需的种薯，可由Nora通过商队进货。"),
@@ -108,6 +115,7 @@ PREY_CHICKEN, PREY_PIG, PREY_CATTLE = 29101, 29102, 29103
 FEATHER, ROUGH_LEATHER = 29104, 29105
 PREY_DEER, VENISON = 29106, 29107
 PREY_RECIPES = {
+    PREY_BOAR: {"name": "野猪（待处理猎物）", "weight": 0, "outputs": {1057: 4, 1034: 2, ROUGH_LEATHER: 2}},
     PREY_CHICKEN: {"name": "鸡（待处理猎物）", "weight": 60, "outputs": {1056: 3, FEATHER: 1}},
     PREY_PIG: {"name": "猪（待处理猎物）", "weight": 30, "outputs": {1009: 1, 1034: 1, 1057: 2, ROUGH_LEATHER: 1}},
     PREY_CATTLE: {"name": "牛（待处理猎物）", "weight": 10, "outputs": {1077: 6, ROUGH_LEATHER: 2}},
@@ -116,6 +124,7 @@ PREY_RECIPES = {
 PREY_ITEM_IDS = frozenset(PREY_RECIPES)
 BYPRODUCT_ITEM_IDS = frozenset({FEATHER, ROUGH_LEATHER})
 JACK_ITEM_DEFINITIONS = {
+    PREY_BOAR: ("野猪（待处理猎物）", 70, "北坡真实野猪；Jack加工为五花肉、排骨和粗皮革。"),
     PREY_CHICKEN: ("鸡（待处理猎物）", 12, "猎获的鸡。由Jack在屠宰棚处理为鸡肉和羽毛；不可直接食用。"),
     PREY_PIG: ("猪（待处理猎物）", 30, "猎获的猪。由Jack处理为里脊、排骨、五花肉和粗皮革；不可直接食用。"),
     PREY_CATTLE: ("牛（待处理猎物）", 70, "猎获的牛。由Jack处理为牛肉和粗皮革；不可直接食用。"),
@@ -126,13 +135,15 @@ JACK_ITEM_DEFINITIONS = {
 }
 
 HUNTING_WEAPONS = {
+    **{key: dict(name=spec["name"], weapon=spec["weapon"], capability=spec["capability"],
+                tier=3, uses=spec["uses"], level=7) for key, spec in T3_TOOLS.items() if "weapon" in spec},
     4110: {"name": "基础长矛", "weapon": 0, "capability": "hunting_spear", "tier": 1, "uses": 60, "level": 1},
     4111: {"name": "改良长矛", "weapon": 0, "capability": "hunting_spear", "tier": 2, "uses": 120, "level": 4},
     4112: {"name": "基础弓", "weapon": 2, "capability": "hunting_bow", "tier": 1, "uses": 60, "level": 1},
     4113: {"name": "改良弓", "weapon": 2, "capability": "hunting_bow", "tier": 2, "uses": 120, "level": 4},
     4114: {"name": "基础剑", "weapon": 1, "capability": "hunting_sword", "tier": 1, "uses": 60, "level": 1},
 }
-HUNTING_KILL_XP = {"CHICKEN": 2, "PIG": 5, "CATTLE": 8, "DEER": 12}
+HUNTING_KILL_XP = {"CHICKEN": 2, "PIG": 5, "CATTLE": 8, "DEER": 12, "BOAR": 20}
 
 # ── Tools ──────────────────────────────────────────────────────────
 FARM_TOOL_ITEM_ID = 4001
@@ -158,6 +169,7 @@ DISH_SPOILAGE_MINUTES = 2880
 
 # ── Safe stocks (item_id → safe_stock) ─────────────────────────────
 SAFE_STOCKS = {
+    **{key: 0 for key in PROFESSIONAL_EXPORT_PRICES},
     1009: 8,    # 里脊肉
     1034: 8,    # 排骨
     1003: 10,   # 南瓜种子
@@ -187,6 +199,7 @@ SAFE_STOCKS = {
 
 # ── Base prices (item_id → base_price) ─────────────────────────────
 BASE_PRICES = {
+    **PROFESSIONAL_EXPORT_PRICES, PUMPKIN_SEED: 8,
     1005: 6,    # 小麦（与现有 Item 目录价格一致）
     1009: 12,   # 里脊肉
     1034: 12,   # 排骨
@@ -228,6 +241,7 @@ BASE_PRICES = {
 
 # ── Import whitelist (item_id) ─────────────────────────────────────
 IMPORT_WHITELIST = frozenset({
+    PUMPKIN_SEED,
     1003, 1022, 1051, WHEAT_SEED_ITEM_ID, CARROT_SEED_ITEM_ID, POTATO_SEED_ITEM_ID,
     ONION_SEED_ITEM_ID, GREEN_RADISH_SEED_ITEM_ID,  # 种子
     1026, 1040, 1049, 1050, 1058, 1076, 1099,  # 奶酪和调味料
@@ -237,7 +251,7 @@ IMPORT_WHITELIST = frozenset({
 # 种子和调味料来自当前 ItemDataList；工具为阶段三农具和阶段三猎具。
 
 # ── Export whitelist (item_id) ─────────────────────────────────────
-EXPORT_WHITELIST = frozenset({1005, 1009, 1025, 1030, 1034, 1038, 1042, 1043, 1056, 1057, 1077, 1053, 1067, FEATHER, ROUGH_LEATHER, 29306})
+EXPORT_WHITELIST = frozenset({1005, 1009, 1025, 1030, 1034, 1038, 1042, 1043, 1056, 1057, 1077, 1053, 1067, FEATHER, ROUGH_LEATHER, 29306}) | frozenset(PROFESSIONAL_EXPORT_PRICES)
 # 肉类、玉米及阶段三配方成品均可对外出货。
 
 # ── NPC starting money (from seed_data) ────────────────────────────

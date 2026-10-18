@@ -14,11 +14,13 @@ from .models import (NpcCommandState, NpcRuntimeState, VillageSimulationConfig,
                      VillageTreeNode, VillageChopAttempt, VillageForestryReceipt,
                      VillageHuntAttempt, VillageWorldEvent)
 
+from .professional_catalog import PROFESSIONAL_WOOD, batch_evidence
+
 WOOD = 1002
 HARDWOOD = 29306
 REGION = "FOREST_LOGGING"
 # Returned by bootstrap; clients and Env never choose yields or regrowth deadlines.
-RULES = {"species": {"BIRCH": {"hits": 4, "wood": 4}, "PINE": {"hits": 6, "wood": 6},
+RULES = {"species": {"DURABLE_OAK": {"hits": 10, "wood": 3, "output_item_id": PROFESSIONAL_WOOD, "regrow_minutes": 10080}, "BIRCH": {"hits": 4, "wood": 4}, "PINE": {"hits": 6, "wood": 6},
                      "BROADLEAF": {"hits": 5, "wood": 5}, "DEADWOOD": {"hits": 3, "wood": 3},
                      "HARDWOOD": {"hits": 8, "wood": 4, "output_item_id": HARDWOOD}},
          "range": 2.5, "cooldown_seconds": 1.0, "windup_seconds": .25,
@@ -77,16 +79,16 @@ def player_capability(actor_id, node, minute, tool_instance_id=None):
     if bag is None:
         reject("TOOL_REQUIRED")
     level = next(s["level"] for s in growth_snapshot(player, read_only=True)["skills"] if s["code"] == "forestry")
-    if node.species == "HARDWOOD" and level < 4:
+    if level < (7 if node.species == "DURABLE_OAK" else 4 if node.species == "HARDWOOD" else 1):
         reject("SKILL_LEVEL_REQUIRED")
     try:
         tool = resolve_tool(player, bag, "forestry", instance_id=tool_instance_id,
-                            minimum_tier=2 if node.species == "HARDWOOD" else 1, minute=minute)
+                            minimum_tier=3 if node.species == "DURABLE_OAK" else 2 if node.species == "HARDWOOD" else 1, minute=minute)
     except ToolError as exc:
         reject(exc.code)
     return player, bag, tool, dict(level=level, node_id=str(node.pk), tool_instance_id=str(tool.instance_id),
-        tier=2 if tool.item_id == 4105 else 1,
-        cooldown_seconds=.95 if level >= 2 and node.species != "HARDWOOD" else 1.0)
+        tier=3 if tool.item_id == 4122 else 2 if tool.item_id == 4105 else 1,
+        cooldown_seconds=.95 if level >= 2 and node.species not in {"HARDWOOD", "DURABLE_OAK"} else 1.0)
 
 
 def bootstrap():
@@ -290,22 +292,24 @@ def _execute(action, p, clock):
         bag = InventoryBag.objects.select_for_update().get(pk=bag.pk)
         index = bag.slots.aggregate(n=models.Max("slot_index"))["n"]
         slot = InventorySlot.objects.create(bag=bag, slot_index=0 if index is None else index+1,
-            item_id=attempt.output_item_id, item_amount=attempt.wood_amount, quality=0, produced_world_minute=minute,
+            item_id=attempt.output_item_id, item_amount=attempt.wood_amount, quality=4 if node.species == "DURABLE_OAK" else 0, produced_world_minute=minute,
             source_request_id=identifier(p["request_id"]), item_bag_name=item.item_name)
-        added = [dict(item_id=attempt.output_item_id, item_name=item.item_name, amount=attempt.wood_amount, instance_id=str(slot.instance_id))]
+        added = [dict(batch_evidence(slot), item_name=item.item_name, amount=attempt.wood_amount)]
         tool_used = wear_tool(tool)
         reward = award_skill(player, source_type="forestry", source_id=f"{node.pk}:{generation}",
-            skill_code="forestry", xp=4 if node.species == "HARDWOOD" else 2,
+            skill_code="forestry", xp=6 if node.species == "DURABLE_OAK" else 4 if node.species == "HARDWOOD" else 2,
             milestone=dict(code="first_forestry", title="第一次完成伐木", xp=20),
             facts=dict(node_id=str(node.pk), generation=generation, species=node.species,
                        output_item_id=attempt.output_item_id, output_quantity=attempt.wood_amount,
-                       tool_instance_id=tool_used["instance_id"]))
+                       tool_instance_id=tool_used["instance_id"], source_request_id=str(p["request_id"]),
+                       produced_world_minute=minute, quality=slot.quality,
+                       tool_tier=3 if tool.item_id == 4122 else 2 if tool.item_id == 4105 else 1, outputs=added))
         VillageWorldEvent.objects.create(dedupe_key=f"forestry:{node.pk}:{generation}", event_type="PLAYER_CHOP_TREE",
             world_minute=minute, time_revision=clock.time_revision, player_ids=[attempt.actor_id],
             request_id=identifier(p["request_id"]), location_code=REGION,
             effects={"items_added": [{key: value for key, value in entry.items() if key != "instance_id"} for entry in added]},
             visibility="PUBLIC", player_summary=f"砍树获得{item.item_name}×{attempt.wood_amount}", hub_summary="完成树木砍伐")
-    node.status, node.regrow_world_minute = "STUMP", minute + RULES["regrow_minutes"]
+    node.status, node.regrow_world_minute = "STUMP", minute + RULES["species"][node.species].get("regrow_minutes", RULES["regrow_minutes"])
     node.save(update_fields=["status", "regrow_world_minute"])
     attempt.status, attempt.completed_world_minute = "SUCCEEDED", minute
     data = dict(tree=tree_data(node), attempt=attempt_data(attempt), items_added=added)

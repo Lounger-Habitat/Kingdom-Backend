@@ -239,6 +239,10 @@ def accept_commission(commission_id, actor_type, actor_id, request_id, world_min
     eligibility = business_order_eligibility(row, _actor(actor_type, actor_id), world_minute, accepting=True)
     if eligibility:
         _fail(eligibility, "当前经营等级、每日次数或正在承接的备货不满足资格。")
+    from .professional_contracts import professional_contract_eligibility
+    eligibility = professional_contract_eligibility(row, _actor(actor_type, actor_id), world_minute, accepting=True)
+    if eligibility:
+        _fail(eligibility, "当前经营等级、合作关系或专业合同次数不满足资格。")
     _bag(actor_type, actor_id)
     row.actor_type, row.actor_id, row.status = actor_type, str(actor_id), "ACTIVE"
     row.version += 1
@@ -379,6 +383,10 @@ def _advance(row, condition, quantity, request_id, world_minute):
         eligibility = business_order_eligibility(row, _actor(row.actor_type, row.actor_id), world_minute)
         if eligibility:
             _fail(eligibility, "当前经营备货的每日完成资格已变化，请刷新状态。")
+        from .professional_contracts import professional_contract_eligibility
+        eligibility = professional_contract_eligibility(row, _actor(row.actor_type, row.actor_id), world_minute)
+        if eligibility:
+            _fail(eligibility, "当前专业合同完成资格已变化，请刷新状态。")
         publisher = _bag("NPC", row.publisher_id)
         assignee = _bag(row.actor_type, row.actor_id)
         _release_items(row, publisher, "DELIVERED")
@@ -391,6 +399,8 @@ def _advance(row, condition, quantity, request_id, world_minute):
         _stop_labor(row, "COMPLETED")
     row.save(update_fields=["progress", "version", "escrow_gold", "reserved_reward_gold", "status", "completed_world_minute"])
     if row.status == "COMPLETED":
+        from .cooperation import record_commission_completion
+        record_commission_completion(row, world_minute)
         _event(row, "COMPLETED", request_id, world_minute)
     return earned
 
@@ -544,6 +554,8 @@ def project_commission(row, *, actor_type=None, actor_id=None):
                     condition["available"] = False
     from .business_orders import decorate_commission
     decorate_commission(data, row, actor_type, actor_id)
+    from .professional_contracts import decorate_professional_contract
+    decorate_professional_contract(data, row, actor_type, actor_id)
     return data
 
 

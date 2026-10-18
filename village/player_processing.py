@@ -17,7 +17,9 @@ from .models import (EconomicLedgerEntry, NpcRuntimeState, VillageActionDuration
 from .phase3_catalog import (BYPRODUCT_ITEM_IDS, HUNT_TOOL_ITEM_ID, PREY_RECIPES,
                             PREY_CHICKEN, PREY_PIG, PREY_CATTLE, PREY_DEER)
 
-FEES = {PREY_CHICKEN: 2, PREY_PIG: 4, PREY_CATTLE: 6, PREY_DEER: 5}
+from .professional_catalog import PREY_BOAR
+
+FEES = {PREY_CHICKEN: 2, PREY_PIG: 4, PREY_CATTLE: 6, PREY_DEER: 5, PREY_BOAR: 8}
 UNFINISHED = ("RUNNING", "READY", "FAILED")
 
 

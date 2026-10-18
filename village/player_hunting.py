@@ -26,6 +26,8 @@ REGIONS = [
         radius=35, recommended_level=1, recommended_tier=1, species=["CHICKEN", "PIG", "CATTLE"]),
     dict(code="DEEP_FOREST", title="深林", center=dict(x=-145, y=6.35, z=125), radius=18,
         recommended_level=4, recommended_tier=2, species=["DEER"]),
+    dict(code="NORTH_SLOPE", title="北坡", center=dict(x=-115, y=7.56, z=148), radius=15,
+        recommended_level=7, recommended_tier=3, species=["BOAR"]),
 ]
 
 
@@ -77,11 +79,11 @@ def _combat_ready(state):
 
 def _weapon_data(slot, weapon, level):
     spec = HUNTING_WEAPONS.get(slot.item_id)
-    tier = spec["tier"] if spec else 2 if slot.item_id == 4105 else 1
+    tier = spec["tier"] if spec else 3 if slot.item_id == 4122 else 2 if slot.item_id == 4105 else 1
     item = Item.objects.filter(pk=slot.item_id).first()
     return dict(weapon=weapon, instance_id=str(slot.instance_id), item_id=slot.item_id, name=item.item_name if item else str(slot.item_id),
         tier=tier, remaining_uses=slot.remaining_uses, max_uses=item.max_use_count if item else 0,
-        damage_multiplier=1.2 if tier == 2 and spec else 1.0,
+        damage_multiplier=1.4 if tier == 3 and spec else 1.2 if tier == 2 and spec else 1.0,
         draw_duration=1.2 * (.95 if level >= 2 else 1))
 
 
@@ -95,7 +97,7 @@ def resolve_player_weapon(player, bag, weapon, instance_id, minute):
     except ToolError as exc:
         reject(exc.code, exc.message)
     if (weapon != 3 and (slot.item_id not in HUNTING_WEAPONS or HUNTING_WEAPONS[slot.item_id]["weapon"] != weapon)
-            or weapon == 3 and slot.item_id not in (4104, 4105)):
+            or weapon == 3 and slot.item_id not in (4104, 4105, 4122)):
         reject("TOOL_UNAVAILABLE", "该物品不是当前开放的真实武器。")
     return slot, _weapon_data(slot, weapon, _level(player))
 
@@ -121,7 +123,7 @@ def weapon_repair_quote(player, bag, slot, minute):
 def hunting_overview(player, bag, minute, read_only=False):
     state = PlayerHuntingState.objects.filter(player=player).first()
     level, weapons = _level(player), []
-    for slot in bag.slots.filter(item_amount__gt=0, item_id__in=[*HUNTING_WEAPONS, 4104, 4105]).order_by("slot_index") if bag.pk else []:
+    for slot in bag.slots.filter(item_amount__gt=0, item_id__in=[*HUNTING_WEAPONS, 4104, 4105, 4122]).order_by("slot_index") if bag.pk else []:
         weapon = HUNTING_WEAPONS[slot.item_id]["weapon"] if slot.item_id in HUNTING_WEAPONS else 3
         data = _weapon_data(slot, weapon, level)
         try:
@@ -150,7 +152,8 @@ def hunting_overview(player, bag, minute, read_only=False):
             duration_minutes=REST_MINUTES, location_code=SAFE_LOCATION),
         rules=dict(kill_xp=deepcopy(HUNTING_KILL_XP), first_kill_bonus=20, attack_wear=1,
             starter_kit_location="HUNTING_GATE", t1_repair_location="BUTCHER_YARD", t1_repair_gold=0,
-            t2_minimum_level=4, t2_damage_multiplier=1.2, health_maximum=100, safe_rest_minutes=REST_MINUTES),
+            t2_minimum_level=4, t2_damage_multiplier=1.2, t3_minimum_level=7, t3_damage_multiplier=1.4,
+            boar_health=180, boar_hit_damage=30, boar_defense_outcomes=["BLOCKED", "DODGED"], health_maximum=100, safe_rest_minutes=REST_MINUTES),
         regions=deepcopy(REGIONS))
 
 
@@ -222,7 +225,7 @@ def execute_combat(payload):
             reject("INVALID_PARAMS", "战斗请求无效。")
         action = payload.get("action")
         common = {"action", "player_id", "request_id", "authority_session_id"}
-        extra = {"weapon", "instance_id"} if action in {"resolve_weapon", "authorize_attack"} else {"damage", "source_kind", "prey_id"} if action == "damage" else set()
+        extra = {"weapon", "instance_id"} if action in {"resolve_weapon", "authorize_attack"} else {"damage", "source_kind", "prey_id", "outcome", "impact_world_minute"} if action == "damage" else set()
         if action not in {"inspect_state", "resolve_weapon", "authorize_attack", "damage"} or set(payload) - common - extra:
             reject("INVALID_PARAMS", "战斗请求字段无效。")
         rid = _uuid(payload.get("request_id"))
@@ -257,7 +260,7 @@ def execute_combat(payload):
             state, _ = PlayerHuntingState.objects.select_for_update().get_or_create(player=player)
             old = PlayerCombatReceipt.objects.filter(player=player, request_id=rid).first()
             if old:
-                if old.authority_session_id != session or state.authority_session_id != session:
+                if action != "damage" and (old.authority_session_id != session or state.authority_session_id != session):
                     reject("STALE_AUTHORITY_SESSION", "旧Env会话的攻击许可不能重放。")
                 if old.payload_hash != digest:
                     reject("REQUEST_CONFLICT", "同一战斗请求编号不能用于不同动作。")
@@ -278,19 +281,29 @@ def execute_combat(payload):
             else:
                 damage = payload.get("damage")
                 prey_id = _uuid(payload.get("prey_id"))
-                if payload.get("source_kind") != "BOAR_CHARGE" or type(damage) is not int or not 1 <= damage <= 100:
-                    reject("INVALID_DAMAGE", "可信伤害事件无效。")
-                if not VillageWildlife.objects.filter(pk=prey_id, species="BOAR", status__in=["ALIVE", "CLAIMED"]).exists():
-                    reject("DAMAGE_SOURCE_UNAVAILABLE", "该真实野猪攻击来源尚不可用。")
+                outcome = payload.get("outcome", "HIT")
+                impact = payload.get("impact_world_minute", clock.world_minute)
+                legacy = "outcome" not in payload
+                valid_damage = (type(damage) is int and
+                    (1 <= damage <= 100 if legacy else damage == (30 if outcome == "HIT" else 0)))
+                if payload.get("source_kind") != "BOAR_CHARGE" or outcome not in {"HIT", "BLOCKED", "DODGED"} or not valid_damage:
+                    reject("INVALID_DAMAGE", "可信伤害或防御事件无效。")
+                prey = VillageWildlife.objects.select_for_update().filter(pk=prey_id, species="BOAR").first()
+                if (not prey or type(impact) is not int or not prey.born_world_minute <= impact <= clock.world_minute
+                        or prey.death_world_minute is not None and impact > prey.death_world_minute):
+                    reject("DAMAGE_SOURCE_UNAVAILABLE", "事件不在该真实野猪的生命时间内。")
                 state.current_health = max(0, state.current_health-damage)
-                state.recovery_ready_world_minute = None
+                if damage:
+                    state.recovery_ready_world_minute = None
                 if state.current_health == 0:
                     from .wildlife import _cancel
                     for attempt in VillageHuntAttempt.objects.select_for_update().filter(actor_type="PLAYER", actor_id=str(player.pk), status="ACTIVE"):
                         prey = VillageWildlife.objects.select_for_update().get(pk=attempt.prey_id)
                         _cancel(prey, attempt)
-                result = dict(damage=damage, source_kind="BOAR_CHARGE", prey_id=str(prey_id))
-            state.authority_session_id = session
+                result = dict(damage=damage, source_kind="BOAR_CHARGE", prey_id=str(prey_id),
+                              outcome=outcome, impact_world_minute=impact)
+            if action == "authorize_attack" or not state.authority_session_id:
+                state.authority_session_id = session
             _bump(player, state)
             result["health"] = _health(state)
             answer = dict(success=True, result_code="OK", data=result)
