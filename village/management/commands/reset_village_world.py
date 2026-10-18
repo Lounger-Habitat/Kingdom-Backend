@@ -19,7 +19,8 @@ from inventory.models import (
 from items.models import Item
 from leaderboard.models import LeaderboardEntry, PendingReward, ReportEvent
 from marketplace.models import MarketListing, MarketTransaction
-from player.models import DefaultRecipe, PlayerRecipe, PlayerState
+from player.models import (DefaultRecipe, PlayerRecipe, PlayerState, PlayerGrowthState,
+                           PlayerSkillProgress, SkillRewardReceipt, PlayerMilestoneProgress)
 from recipes.models import Recipe
 from restaurant.models import (
     CustomerTransaction, DailyBusinessLog, MenuItem, PlayerRestaurantState,
@@ -57,6 +58,18 @@ from village.models import (
     VillagePersonalCommission,
     VillagePersonalCommissionEscrow,
     VillagePersonalCommissionReceipt,
+    VillageBusinessOrderLink,
+    VillageBusinessOrderDay,
+    VillagePlayerDishReview,
+    StarterSupplyReceipt,
+    StarterSupplyDelivery,
+    StarterSupplyOrder,
+    StarterReserveTransfer,
+    StarterSupplyBatch,
+    VillageGatheringResourceState,
+    VillageForestryReceipt,
+    VillageChopAttempt,
+    VillageTreeNode,
     VillageHuntAttempt,
     VillageWildlife,
     VillageWildlifeReceipt,
@@ -198,6 +211,18 @@ class Command(BaseCommand):
 
         # Clear children that protect or feed the event/command history first.
         for model in (
+            VillagePlayerDishReview,  # PROTECTs its private InventorySlot sample.
+            StarterSupplyReceipt,
+            StarterSupplyDelivery,  # PROTECTs both order and actual held slot.
+            StarterReserveTransfer,
+            StarterSupplyOrder,  # PROTECTs batch and its private escrow bag.
+            StarterSupplyBatch,  # PROTECTs the public reserve bag/account.
+            VillageBusinessOrderLink,  # PROTECTs commission and day budget.
+            VillageBusinessOrderDay,
+            VillageGatheringResourceState,
+            VillageForestryReceipt,
+            VillageChopAttempt,  # PROTECTs tree and NPC command rows.
+            VillageTreeNode,
             VillageWildlifeReceipt,
             VillageHuntAttempt,  # PROTECTs both wildlife and NPC command rows.
             VillageWildlife,
@@ -298,6 +323,7 @@ class Command(BaseCommand):
             mature_world_minute=None,
             yield_seed=None,
             source_request_id=None,
+            production_rules_snapshot={},
         )
         farm_counts = self._seed_farm_plot_states(time_state.world_minute)
         VillageStore.objects.update(status="OPEN", inventory_version=0)
@@ -328,6 +354,12 @@ class Command(BaseCommand):
         }
         seed_command._seed_phase3_grants(summary)
         seed_command._seed_phase4_social(summary)
+        # Full reset explicitly rebuilds finite starting assets. Ordinary
+        # observation never calls these catalog installers or refreshes stock.
+        from village.player_gathering import ensure_gathering_catalog
+        from village.production_tools import ensure_production_catalog
+        ensure_gathering_catalog(time_state.world_minute)
+        ensure_production_catalog(time_state.world_minute)
         from village.affairs import ensure_bridge_affair
         from village.farm_irrigation import ensure_irrigation_affair
         ensure_bridge_affair(time_state.world_minute)
@@ -375,6 +407,7 @@ class Command(BaseCommand):
         """Reset progress through current templates, without minting money-change reports."""
         cleared = 0
         for model in (
+            SkillRewardReceipt, PlayerMilestoneProgress, PlayerSkillProgress, PlayerGrowthState,
             EnvActionReceipt, AutoBuyPurchase, RestaurantHourlySlot,
             CustomerTransaction, DailyBusinessLog, MenuItem, PlayerRestaurantState,
             PlayerCollectionPoint, PityCounter, InventoryBag, PlayerState,

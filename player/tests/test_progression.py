@@ -46,7 +46,7 @@ class GrowthServiceTests(TestCase):
             for node in skill["unlocks"]:
                 self.assertFalse(node["available"])
                 if node["code"] in {"targeted_gathering", "advanced_gathering", "seed_return",
-                                     "advanced_crops", "crop_quality", "felling_efficiency", "hardwood", "basic_quality", "advanced_cooking"}:
+                                     "advanced_crops", "crop_quality", "felling_efficiency", "hardwood", "basic_quality", "advanced_cooking", "combined_orders", "player_stall"}:
                     self.assertTrue(node["implemented"])
                     self.assertEqual(node["reason"], "SKILL_LEVEL_REQUIRED")
                 else:

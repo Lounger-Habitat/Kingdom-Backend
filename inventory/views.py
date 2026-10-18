@@ -98,6 +98,11 @@ def inventory_detail(request, character_id):
 @extend_schema(responses={200: InventoryResponseSerializer, 400: ErrorResponseSerializer})
 @api_view(["POST"])
 def inventory_add(request, character_id):
+    from village.player_legacy_production import legacy_production_guard
+    guard = legacy_production_guard()
+    if guard is not None:
+        return guard
+
     bag = get_or_create_bag(request.user, character_id)
     item_id = request.data.get("itemId")
     amount = request.data.get("amount", 1)
@@ -169,6 +174,11 @@ def inventory_add(request, character_id):
 @api_view(["POST"])
 @transaction.atomic
 def inventory_rate(request, character_id):
+    from village.player_legacy_production import legacy_production_guard
+    guard = legacy_production_guard()
+    if guard is not None:
+        return guard
+
     bag = get_or_create_bag(request.user, character_id)
     bag = InventoryBag.objects.select_for_update().get(pk=bag.pk)
     instance_id = request.data.get("instanceId")
@@ -215,6 +225,9 @@ def inventory_rate(request, character_id):
 @extend_schema(responses={200: InventoryResponseSerializer, 400: ErrorResponseSerializer})
 @api_view(["POST"])
 def inventory_remove(request, character_id):
+    amount = request.data.get("amount", 1)
+    if type(amount) is not int or amount <= 0:
+        return Response(error_response("Amount must be a positive integer."), status=400)
     bag = get_or_create_bag(request.user, character_id)
     instance_id = request.data.get("instanceId")
     item_id = request.data.get("itemId")
@@ -350,6 +363,11 @@ def inventory_compact(request, character_id):
 @extend_schema(responses={200: InventoryResponseSerializer, 400: ErrorResponseSerializer})
 @api_view(["POST"])
 def inventory_money(request, character_id):
+    from village.player_legacy_production import legacy_production_guard
+    guard = legacy_production_guard()
+    if guard is not None:
+        return guard
+
     bag = get_or_create_bag(request.user, character_id)
     amount = request.data.get("amount", 0)
     bag.money += amount
@@ -543,6 +561,11 @@ def inventory_use(request, character_id):
 
 @api_view(["POST"])
 def inventory_bulk_push(request):
+    from village.player_legacy_production import legacy_production_guard
+    guard = legacy_production_guard()
+    if guard is not None:
+        return guard
+
     """批量上传多个背包数据（玩家背包 + NPC 背包）。
 
     请求格式：
@@ -681,6 +704,10 @@ def inventory_collect(request, character_id):
         from village.models import VillageSimulationConfig
         if VillageSimulationConfig.objects.filter(config_key="default", village_economy_enabled=True).exists():
             return Response({"code": "REAL_HUNT_REQUIRED", "message": "请在猎场攻击真实动物，击杀后自动获得猎物。"}, status=403)
+    from village.player_legacy_production import legacy_production_guard
+    guard = legacy_production_guard()
+    if guard is not None:
+        return guard
     try:
         collection_point = CollectionPoint.objects.get(collect_type=collect_type)
     except CollectionPoint.DoesNotExist:

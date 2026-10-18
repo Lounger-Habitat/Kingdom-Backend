@@ -213,6 +213,19 @@ class RestaurantService:
         except MenuItem.DoesNotExist:
             return False, "菜单菜品不存在"
 
+        if menu_item.batch_slot_id:
+            from .player_stall import StallError, withdraw_menu_batch
+            with transaction.atomic():
+                menu_item = MenuItem.objects.select_for_update().get(pk=menu_item.pk)
+                bag = InventoryBag.objects.select_for_update().filter(player=player, character_id=player.username).first()
+                if not bag:
+                    return False, "背包不存在"
+                try:
+                    withdraw_menu_batch(player, bag, menu_item)
+                except StallError as exc:
+                    return False, exc.message
+            return True, "下架成功"
+
         with transaction.atomic():
             # 退回背包
             bag, _ = InventoryBag.objects.get_or_create(
@@ -266,6 +279,9 @@ class RestaurantService:
     @staticmethod
     def process_global_time(global_time):
         """由全局时间同步触发：在 10:00（含）到 19:00（不含）随机自动售卖。"""
+        from village.models import VillageSimulationConfig
+        if VillageSimulationConfig.objects.filter(config_key="default", village_economy_enabled=True).exists():
+            return []
         config = RestaurantConfig.get_instance()
         if not config.opening_hour <= global_time.game_hour < config.closing_hour:
             return []
@@ -288,6 +304,8 @@ class RestaurantService:
     @staticmethod
     def _process_player_hour(player, global_time, config):
         state = RestaurantService.get_or_create_state(player)
+        if state.stall_opened_world_minute is not None:
+            return None
         level_bonus = sum(row.reward_customer_bonus for row in RestaurantLevelConfig.objects.filter(level__lte=state.current_level))
         quota = config.base_hourly_sales + max(0, state.current_level - 1) * config.hourly_sales_per_level + level_bonus
         sold_count = 0

@@ -77,6 +77,8 @@ class PlayerRestaurantState(models.Model):
     dishes_sold_set = models.JSONField("已售卖菜品ID集合", default=list, blank=True,
                                        help_text="[101, 102, ...]")
     season_id = models.CharField("所属赛季ID", max_length=50, default="", blank=True)
+    stall_opened_world_minute = models.BigIntegerField(null=True, blank=True)
+    last_stall_tick_world_minute = models.BigIntegerField(null=True, blank=True)
 
     class Meta:
         verbose_name = "玩家餐厅状态"
@@ -100,6 +102,11 @@ class MenuItem(models.Model):
     ingredient = models.CharField("原料信息", max_length=200, default="", blank=True)
     cook_time = models.IntegerField("烹饪时长", default=0)
     quantity = models.IntegerField("可售卖数量", default=1)
+    batch_slot = models.OneToOneField("inventory.InventorySlot", on_delete=models.SET_NULL,
+        null=True, blank=True, related_name="stall_menu_item")
+    listed_world_minute = models.BigIntegerField(null=True, blank=True)
+    purchase_unit_cost = models.IntegerField(null=True, blank=True)
+    cost_provenance = models.JSONField(default=dict, blank=True)
 
     class Meta:
         verbose_name = "菜单菜品"
@@ -127,6 +134,10 @@ class CustomerTransaction(models.Model):
     rating = models.IntegerField("LLM评分", default=3, help_text="1-5")
     review_comment = models.TextField("LLM评语", default="", blank=True)
     created_at = models.DateTimeField("创建时间", auto_now_add=True)
+    world_minute = models.BigIntegerField(null=True, blank=True)
+    feedback_source = models.CharField(max_length=32, default="LEGACY_LLM_OR_UNKNOWN")
+    batch_snapshot = models.JSONField(default=dict, blank=True)
+    unit_cost = models.IntegerField(null=True, blank=True)
 
     class Meta:
         verbose_name = "顾客交易记录"

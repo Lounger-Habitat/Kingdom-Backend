@@ -386,10 +386,12 @@ class ResetVillageWorldTests(TestCase):
             item_id: (amount, remaining_uses)
             for item_id, amount, remaining_uses in GENERAL_STORE_INITIAL_STOCK
         }
+        reset_stock_ids = [uuid.uuid5(uuid.NAMESPACE_URL, f"village-reset:general-store-listing:{item_id}")
+                           for item_id in expected_stock]
         actual_stock = {
             slot.item_id: (slot.item_amount, slot.remaining_uses)
             for slot in VillageStoreInventorySlot.objects.filter(
-                store_id="GENERAL_STORE"
+                store_id="GENERAL_STORE", listing__created_request_id__in=reset_stock_ids
             ).order_by("item_id")
         }
         self.assertEqual(actual_stock, expected_stock)
@@ -406,7 +408,7 @@ class ResetVillageWorldTests(TestCase):
                     listing.status,
                 )
                 for listing in VillageStoreListing.objects.filter(
-                    store_id="GENERAL_STORE"
+                    store_id="GENERAL_STORE", created_request_id__in=reset_stock_ids
                 )
             },
             {
@@ -560,6 +562,114 @@ class ResetVillageWorldTests(TestCase):
         for model in (PlayerCollectionPoint, PityCounter, PlayerRestaurantState, MenuItem, DailyBusinessLog,
                       CustomerTransaction, RestaurantHourlySlot, RestaurantSaleEvent, PendingReward, ReportEvent, LeaderboardEntry):
             self.assertFalse(model.objects.exists(), model.__name__)
+
+    def test_full_reset_clears_g0_to_g4_protected_records_and_frozen_farm_rules(self):
+        # This destructive command is exercised only against the explicitly
+        # configured in-memory test database, never the saved village.
+        self.assertIn("memory", connection.settings_dict["NAME"])
+        from inventory.models import CollectionPointLevel, CollectionPointLevelItem
+        from player.models import (PlayerGrowthState, PlayerSkillProgress, PlayerMilestoneProgress,
+                                   SkillRewardReceipt, ItemGameplayDefinition)
+        from player.progression import award_skill
+        from village.business_orders import execute_business_orders
+        from village.player_dish_reviews import execute_review_action
+        from village.starter_supply import ensure_supply_batch, execute_supply, spend_reserve
+        from village.models import (NpcProfile, StarterSupplyBatch, StarterSupplyOrder, StarterSupplyDelivery,
+            StarterSupplyReceipt, StarterReserveTransfer, VillageGatheringResourceState,
+            VillagePlayerDishReview, VillageBusinessOrderDay, VillageBusinessOrderLink,
+            VillageTreeNode, VillageChopAttempt, VillageForestryReceipt)
+
+        clock = GlobalGameTimeState.get_instance()
+        minute = clock.world_minute
+        player = GameAccount.objects.create(username="growth-reset-player", password="keep-password")
+        PlayerState.objects.create(player_id=str(player.pk))
+        bag = InventoryBag.objects.create(player=player, character_id=player.username, money=100)
+        award_skill(player, source_type="collect", source_id=uuid.uuid4(), skill_code="gathering", xp=10,
+            milestone=dict(code="first_gathering", title="首次采集", xp=20))
+        static_definitions = ItemGameplayDefinition.objects.count()
+
+        # Real G1-funded reserve plus a real transfer/receipt keep the relevant
+        # PROTECT references to both public/private bags and InventorySlot.
+        Item.objects.update_or_create(pk=1030, defaults=dict(item_name="玉米", item_type="蔬菜", item_price=5))
+        point, _ = CollectionPoint.objects.get_or_create(collect_type="采集食材", defaults=dict(
+            name="reset-food-source", item_type="食材"))
+        level, _ = CollectionPointLevel.objects.get_or_create(collection_point=point, level=1)
+        CollectionPointLevelItem.objects.get_or_create(level=level, item_id=1030,
+            defaults=dict(collect_weight=100, collect_min_amount=2, collect_max_amount=2))
+        VillageAccount.objects.filter(account_code="PUBLIC_FUND").update(balance=1000)
+        batch = ensure_supply_batch(minute)
+        order = batch.orders.first()
+        execute_supply(player, bag, "supply_accept", dict(order_id=str(order.pk)), uuid.uuid4(), minute)
+        corn = InventorySlot.objects.create(bag=bag, slot_index=0, item_id=1030, item_amount=6,
+            quality=3, produced_world_minute=minute, expires_world_minute=minute+2000, source_request_id=uuid.uuid4())
+        execute_supply(player, bag, "supply_deliver", dict(order_id=str(order.pk),
+            instance_id=str(corn.instance_id), quantity=6), uuid.uuid4(), minute)
+        reserved = batch.reserve_bag.slots.get(item_amount=6)
+        spend_reserve(batch.pk, bag, [dict(instance_id=str(reserved.instance_id), quantity=1)],
+                      uuid.uuid4(), minute, "reset-test-real-reserve-transfer")
+        VillageGatheringResourceState.objects.create(code="FOREST_UNDERGROWTH",
+            remaining_quantity=1, next_restore_world_minute=minute+60)
+
+        # G2 forestry attempts really PROTECT the command. Clearing only
+        # command/receipt history would fail, or leave a claimed authored tree.
+        jack = NpcDefinition.objects.get(agent_id="10012")
+        command = NpcCommandState.objects.create(npc=jack, message_id=uuid.uuid4(), request_id=uuid.uuid4(),
+            sender_id="reset-test", recipient_id="10012", kind="CHOP_TREE", payload_sha256="f"*64, status="RUNNING")
+        node = VillageTreeNode.objects.create(node_id=uuid.uuid4(), species="BIRCH", position={"x": 1},
+            status="CLAIMED", claim_version=1)
+        VillageChopAttempt.objects.create(attempt_id=uuid.uuid4(), node=node, generation=1, claim_version=1,
+            actor_type="NPC", actor_id="10012", command=command, started_world_minute=minute, wood_amount=4)
+        VillageForestryReceipt.objects.create(request_id=uuid.uuid4(), payload_hash="f"*64,
+            response={"success": True}, world_minute=minute)
+        VillageFarmPlot.objects.filter(plot_code="FARM_PLOT_D_01").update(
+            production_rules_snapshot={"old_player_quality": 5, "old_tool_tier": 2})
+
+        # A purchased, actually held G3 sample needs no fabricated author fact.
+        Item.objects.update_or_create(pk=29201, defaults=dict(item_name="清蒸玉米", item_type="食物", item_price=11))
+        NpcRuntimeState.objects.filter(npc__agent_id="10013").update(action_status="IDLE", health_fp=1000,
+                                                                    away_until_world_minute=None)
+        sample = InventorySlot.objects.create(bag=bag, slot_index=20, item_id=29201, item_amount=1,
+            quality=3, produced_world_minute=minute, expires_world_minute=minute+720, source_request_id=uuid.uuid4())
+        execute_review_action(player, bag, "request_dish_review", dict(instance_id=str(sample.instance_id)), uuid.uuid4(), clock)
+
+        # G4 publication uses Lucy's actual existing purse and commission reserve.
+        lucy = NpcDefinition.objects.get(agent_id="10014")
+        profile = NpcProfile.objects.get(npc=lucy)
+        profile.capabilities = list(dict.fromkeys([*profile.capabilities, "PUBLISH_PERSONAL_COMMISSION"]))
+        profile.save(update_fields=["capabilities"])
+        NpcGlobalInventory.objects.filter(npc=lucy).update(money=1000)
+        NpcGlobalInventory.objects.get(npc=lucy).slots.filter(item_id=1002).update(item_amount=0)
+        result = execute_business_orders(player, bag, {}, uuid.uuid4(), clock)
+        self.assertTrue(result["published_commission_ids"])
+        tracked = (SkillRewardReceipt, PlayerMilestoneProgress, PlayerSkillProgress, PlayerGrowthState,
+            StarterSupplyReceipt, StarterSupplyDelivery, StarterReserveTransfer, StarterSupplyOrder, StarterSupplyBatch,
+            VillageGatheringResourceState, VillagePlayerDishReview, VillageBusinessOrderLink, VillageBusinessOrderDay,
+            VillageForestryReceipt, VillageChopAttempt, VillageTreeNode)
+        for model in tracked:
+            self.assertTrue(model.objects.exists(), model.__name__)
+
+        call_command("reset_village_world", "--confirm", "RESET_WUXI_VILLAGE", stdout=StringIO())
+        for model in tracked:
+            self.assertFalse(model.objects.exists(), model.__name__)
+        self.assertFalse(NpcCommandState.objects.exists())
+        self.assertFalse(VillageFarmPlot.objects.exclude(production_rules_snapshot={}).exists())
+        self.assertEqual(ItemGameplayDefinition.objects.count(), static_definitions)
+        player.refresh_from_db()
+        self.assertEqual(player.password, "keep-password")
+        self.assertEqual(InventoryBag.objects.filter(player=player).count(), 1)
+        self.assertEqual(InventoryBag.objects.get(player=player).money, 123)
+        cooking_stock = VillageStoreInventorySlot.objects.filter(store_id="GENERAL_STORE", item_id=4106)
+        self.assertEqual(cooking_stock.count(), 20)
+        self.assertTrue(all(slot.item_amount == 1 and slot.remaining_uses == 20 for slot in cooking_stock))
+        # A sold-out finite catalog remains sold out when merely observed.
+        cooking_stock.update(item_amount=0)
+        from village.player_actions import overview
+        main_bag = InventoryBag.objects.get(player=player)
+        current = GlobalGameTimeState.get_instance()
+        for _ in range(2):
+            overview(player, main_bag, current.world_minute)
+        self.assertEqual(sum(cooking_stock.values_list("item_amount", flat=True)), 0)
+        self.assertFalse(StarterSupplyBatch.objects.exists())
 
     def test_dry_run_rolls_back_all_new_state_and_player_assets(self):
         self._create_current_progress()

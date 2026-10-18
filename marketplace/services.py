@@ -655,9 +655,8 @@ def _buy_listing_for_owner(buyer_owner, listing_id, amount, *, expected_asset_ve
     )
 
     result = {"bag": buyer_owner["bag"], "transaction": tx, "listing": listing}
-    if buyer_owner["kind"] == "npc":
-        from village.agent_feedback import received_batch
-        result["purchased_batches"] = [received_batch(received, amount)]
+    from village.agent_feedback import received_batch
+    result["purchased_batches"] = [received_batch(received, amount)]
     return result, None
 
 

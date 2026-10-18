@@ -36,6 +36,8 @@ LOCATIONS = {
     "upgrade_tool": {"GENERAL_STORE"},
     "cook_dish": {"RESTAURANT"},
     "request_dish_review": {"RECORD_HALL"},
+    **{action: {"RESTAURANT"} for action in ("open_player_stall", "list_stall_dish",
+        "withdraw_stall_dish", "upgrade_player_stall", "prepare_business_orders")},
 }
 PARAMS = {
     "overview": set(),
@@ -63,6 +65,11 @@ PARAMS = {
     "request_dish_review": {"instance_id"},
     "cancel_dish_review": {"review_id"},
     "claim_dish_review": {"review_id"},
+    "open_player_stall": set(),
+    "list_stall_dish": {"instance_id", "quantity"},
+    "withdraw_stall_dish": {"menu_id"},
+    "upgrade_player_stall": {"expected_quote"},
+    "prepare_business_orders": set(),
 }
 COLLECTION_LOCATIONS = {"采集食材": "FOREST_EDGE", "采集林下食材": "FOREST_UNDERGROWTH"}
 from .player_farm import ACTIONS as FARM_ACTIONS
@@ -195,6 +202,8 @@ def overview(player, bag, minute, *, read_only=False):
     from .production_guide import production_overview
     from .player_cooking import cooking_overview
     from .player_dish_reviews import review_overview
+    from restaurant.player_stall import business_overview
+    from .business_orders import business_orders_overview
     from .advanced_gathering import collection_points_projection
     from .daily_events import project_daily_events
     from inventory.batches import project_batch
@@ -254,6 +263,8 @@ def overview(player, bag, minute, *, read_only=False):
         collection_points=collection_points_projection(player, bag, minute),
         cooking=cooking_overview(player, bag, minute, read_only=read_only),
         reviews=review_overview(player, bag, minute, read_only=read_only),
+        business=business_overview(player, bag, minute, read_only=read_only),
+        business_orders=business_orders_overview(player, minute, read_only=read_only),
         contributions=contributions, project=_project(minute)[0], market=market,
         commissions=commissions, my_commissions=[c for c in commissions
             if c.get("actor_type") == "PLAYER" and str(c.get("actor_id")) == str(player.pk)],
@@ -274,6 +285,18 @@ def _execute(player, bag, action, p, rid, location, clock, authority_session_id=
         fail("LOCATION_INVALID", "请前往对应地点再操作。")
     if action == "overview":
         return {}
+    if action in {"open_player_stall", "list_stall_dish", "withdraw_stall_dish", "upgrade_player_stall"}:
+        from restaurant.player_stall import StallError, execute_stall_action
+        try:
+            return execute_stall_action(player, bag, action, p, rid, clock)
+        except StallError as exc:
+            fail(exc.code, exc.message)
+    if action == "prepare_business_orders":
+        from .business_orders import BusinessOrdersError, execute_business_orders
+        try:
+            return execute_business_orders(player, bag, p, rid, clock)
+        except BusinessOrdersError as exc:
+            fail(exc.code, exc.message)
     if action == "cook_dish":
         from .player_cooking import CookingError, execute_player_cooking
         try:
@@ -475,6 +498,7 @@ def _execute(player, bag, action, p, rid, location, clock, authority_session_id=
                     unit_price=listing.price, total_price=result["transaction"].total_price,
                     transaction=serialize_transaction(result["transaction"]),
                     listing=serialize_listing(result["listing"], player), bag=serialize_bag(result["bag"]),
+                    purchased_batches=result.get("purchased_batches", []),
                     affected_npc_ids=[listing.seller_npc.agent_id] if listing.seller_npc_id else [])
 
 

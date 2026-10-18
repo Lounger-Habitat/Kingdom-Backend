@@ -2235,6 +2235,31 @@ class VillagePersonalCommission(models.Model):
         ]
 
 
+class VillageBusinessOrderDay(models.Model):
+    """Gross published budget; refunds never reopen the same day's allowance."""
+    day_index = models.BigIntegerField(primary_key=True)
+    published_gold = models.PositiveIntegerField(default=0)
+    revision = models.PositiveBigIntegerField(default=1)
+    last_prepared_world_minute = models.BigIntegerField()
+
+    class Meta:
+        constraints = [models.CheckConstraint(condition=models.Q(published_gold__lte=120),
+                                              name="business_daily_budget_bounded")]
+
+
+class VillageBusinessOrderLink(models.Model):
+    """Controlled templates only; the commission owns the real money and goods."""
+    commission = models.OneToOneField(VillagePersonalCommission, on_delete=models.PROTECT,
+                                     primary_key=True, related_name="business_order")
+    day = models.ForeignKey(VillageBusinessOrderDay, on_delete=models.PROTECT, related_name="orders")
+    template_code = models.CharField(max_length=32)
+    required_business_level = models.PositiveSmallIntegerField(default=1)
+
+    class Meta:
+        constraints = [models.UniqueConstraint(fields=["day", "template_code"],
+                                               name="business_template_once_per_day")]
+
+
 class VillagePersonalCommissionEscrow(models.Model):
     """An immutable copy of each real delivery batch until transfer/refund."""
     commission = models.ForeignKey(VillagePersonalCommission, on_delete=models.PROTECT, related_name="escrow_batches")

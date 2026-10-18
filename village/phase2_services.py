@@ -800,6 +800,8 @@ class TickService:
 
         from .caravan import sync_visit
         sync_visit(state.world_minute)
+        from restaurant.player_stall import process_stall_tick
+        restaurant_updates = process_stall_tick(state)
 
         receipt = VillageActionReceipt.objects.create(
             request_id=request_id,
@@ -903,6 +905,7 @@ class TickService:
             "caravan": caravan,
             "farm_plots": farm_plots,
             "request_payload_sha256": payload_hash,
+            "restaurant_updates": restaurant_updates,
             "world_minute": receipt.world_minute,
             "time_revision": receipt.time_revision,
             "npc_results": npc_results,
@@ -914,7 +917,8 @@ class TickService:
         evaluate_daily_events(state.world_minute)
         return _result(True, ResultCode.COMMAND_ACCEPTED, receipt=receipt,
                        world_minute=receipt.world_minute, time_revision=receipt.time_revision,
-                       npc_results=npc_results, caravan=caravan, farm_plots=farm_plots)
+                       npc_results=npc_results, caravan=caravan, farm_plots=farm_plots,
+                       restaurant_updates=restaurant_updates)
 
 
 class LifeActionService:

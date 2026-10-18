@@ -228,6 +228,22 @@ def transition_player_to_season(player_state):
     if player_state.current_season_id == active_season.season_id:
         return active_season  # Already on current season
 
+    # Village assets, knowledge and facilities are persistent world facts. Both
+    # the public refresh and the scheduled transition must use the same policy.
+    from village.models import VillageSimulationConfig
+    if VillageSimulationConfig.objects.filter(config_key="default", village_economy_enabled=True).exists():
+        from game_time.models import GlobalGameTimeState
+        from player.services import recover_action_points
+        with transaction.atomic():
+            GlobalGameTimeState.objects.select_for_update().filter(pk=1).first()
+            current = PlayerState.objects.select_for_update().get(pk=player_state.pk)
+            if current.current_season_id != active_season.season_id:
+                recover_action_points(current)
+                current.current_season_id = active_season.season_id
+                current.save(update_fields=["current_season_id"])
+            player_state.refresh_from_db()
+        return active_season
+
     old_season_id = player_state.current_season_id
     logger.info("[transition] Player %s: %s -> %s", player_state.player_id, old_season_id, active_season.season_id)
 

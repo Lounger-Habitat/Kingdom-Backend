@@ -40,6 +40,11 @@ def restaurant_state(request):
 
 @api_view(["POST"])
 def menu_exhibit(request):
+    from village.player_legacy_production import legacy_production_guard
+    guard = legacy_production_guard()
+    if guard is not None:
+        return guard
+
     """上架菜品。"""
     player_id = get_player_id(request)
     if not player_id:
@@ -79,6 +84,11 @@ def menu_exhibit(request):
 
 @api_view(["POST"])
 def menu_withdraw(request):
+    from village.player_legacy_production import legacy_production_guard
+    guard = legacy_production_guard()
+    if guard is not None:
+        return guard
+
     """下架菜品。"""
     player_id = get_player_id(request)
     if not player_id:
@@ -139,6 +149,11 @@ def review_history(request):
 
 @api_view(["POST"])
 def upgrade_restaurant(request):
+    from village.player_legacy_production import legacy_production_guard
+    guard = legacy_production_guard()
+    if guard is not None:
+        return guard
+
     """升级餐厅。"""
     player_id = get_player_id(request)
     if not player_id:

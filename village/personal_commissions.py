@@ -235,6 +235,10 @@ def accept_commission(commission_id, actor_type, actor_id, request_id, world_min
         _fail("COMMISSION_SELF_ACCEPT", "不能认领自己发布的委托。")
     if VillagePersonalCommission.objects.filter(actor_type=actor_type, actor_id=str(actor_id), status="ACTIVE").count() >= MAX_ACTIVE_PER_ACTOR:
         _fail("COMMISSION_LIMIT", "正在承接的个人委托已达上限。")
+    from .business_orders import business_order_eligibility
+    eligibility = business_order_eligibility(row, _actor(actor_type, actor_id), world_minute, accepting=True)
+    if eligibility:
+        _fail(eligibility, "当前经营等级、每日次数或正在承接的备货不满足资格。")
     _bag(actor_type, actor_id)
     row.actor_type, row.actor_id, row.status = actor_type, str(actor_id), "ACTIVE"
     row.version += 1
@@ -301,6 +305,36 @@ def _take_items(row, condition, bag, quantity, item_id, instance_id, world_minut
     _save_bag(bag)
 
 
+def held_batch_issues(row, world_minute):
+    """Read-only diagnosis of immutable held batches against frozen terms."""
+    from .affairs import definition
+    conditions = {c["id"]: c for stage in definition(row)["stages"] for c in stage["conditions"]}
+    issues = []
+    for batch in row.escrow_batches.filter(status="HELD").order_by("pk"):
+        condition = conditions.get(batch.condition_id)
+        snapshot = batch.batch_snapshot
+        reason = ""
+        if (not condition or condition["type"] != "item" or batch.item_id not in condition["item_ids"]
+                or batch.quantity <= 0 or not isinstance(snapshot, dict)):
+            reason = "HELD_BATCH_INVALID"
+        elif snapshot.get("freshness_unknown"):
+            reason = "FRESHNESS_UNKNOWN"
+        elif type(snapshot.get("quality")) is not int or snapshot["quality"] < condition["min_quality"]:
+            reason = "QUALITY_REQUIRED"
+        else:
+            expiry = snapshot.get("expires_world_minute")
+            if expiry is None and (condition["requires_freshness"] or condition["min_remaining_minutes"] > 0):
+                reason = "FRESHNESS_REQUIRED"
+            elif expiry is not None and (type(expiry) is not int or expiry <= world_minute
+                    or expiry < world_minute + condition["min_remaining_minutes"]):
+                reason = "FRESHNESS_REQUIRED"
+        if reason:
+            issues.append(dict(condition_id=batch.condition_id, item_id=batch.item_id,
+                quantity=batch.quantity, reason=reason,
+                expires_world_minute=snapshot.get("expires_world_minute") if isinstance(snapshot, dict) else None))
+    return issues
+
+
 def _release_items(row, bag, status):
     slot_model = NpcGlobalInventorySlot if isinstance(bag, NpcGlobalInventory) else InventorySlot
     for batch in row.escrow_batches.select_for_update().filter(status="HELD").order_by("pk"):
@@ -339,6 +373,12 @@ def _advance(row, condition, quantity, request_id, world_minute):
     row.version += 1
     earned = 0
     if active_stage(row) is None:
+        if held_batch_issues(row, world_minute):
+            _fail("HELD_BATCH_NO_LONGER_ELIGIBLE", "先前托管批次已不符合品质或鲜期，请弃单原样取回。")
+        from .business_orders import business_order_eligibility
+        eligibility = business_order_eligibility(row, _actor(row.actor_type, row.actor_id), world_minute)
+        if eligibility:
+            _fail(eligibility, "当前经营备货的每日完成资格已变化，请刷新状态。")
         publisher = _bag("NPC", row.publisher_id)
         assignee = _bag(row.actor_type, row.actor_id)
         _release_items(row, publisher, "DELIVERED")
@@ -493,6 +533,17 @@ def project_commission(row, *, actor_type=None, actor_id=None):
         available=row.status in OPEN_STATUSES, labor_available=row.status == "ACTIVE" and data["labor_available"])
     if mine or publisher:
         data.update(reserved_reward_gold=row.reserved_reward_gold, escrow_gold=row.escrow_gold)
+        clock = GlobalGameTimeState.objects.filter(pk=1).first()
+        issues = held_batch_issues(row, clock.world_minute if clock else row.opened_world_minute)
+        data.update(held_stale=bool(issues), held_reason=issues[0]["reason"] if issues else "",
+            held_batch_issues=issues, advice="先前托管物资已不满足要求，请弃单原样取回。" if issues else "")
+        if issues:
+            data["can_act"] = False
+            for stage in data["stages"]:
+                for condition in stage["conditions"]:
+                    condition["available"] = False
+    from .business_orders import decorate_commission
+    decorate_commission(data, row, actor_type, actor_id)
     return data
 
 

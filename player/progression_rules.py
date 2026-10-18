@@ -1,7 +1,7 @@
 """Versioned G0 rules. Unreleased content is descriptive, never an active bonus."""
 from copy import deepcopy
 
-RULES_VERSION = 4
+RULES_VERSION = 5
 SKILLS = (
     ("gathering", "采集"), ("farming", "种植"), ("forestry", "伐木"),
     ("hunting", "狩猎"), ("cooking", "烹饪"), ("business", "经营"),
@@ -65,10 +65,16 @@ def skill_data(code, name, total_xp):
         effects.append(dict(code="advanced_cooking", title="\u914d\u5408T2\u708a\u5177\u5f00\u653e\u6c64\u54c1\u4e0e\u6700\u591a3\u6807\u51c6\u6279\u6b21"))
     if code == "business":
         effects.append(dict(code="supply_experience", title="完成真实需求订单可积累经营经验"))
+    if code == "business":
+        effects.append(dict(code="basic_stall", title="\u53ef\u5f00\u529e\u57fa\u7840\u644a\u4f4d\uff0c\u771f\u5b9e\u987e\u5ba2\u8d2d\u4e70\u589e\u52a0\u7ecf\u8425\u7ecf\u9a8c"))
+        if level >= 2:
+            effects.append(dict(code="combined_orders", title="\u5f00\u653e\u7ec4\u5408\u5907\u8d27\u548c\u9996\u6b21\u8bbe\u65bd\u6539\u826f\u8d44\u683c"))
+        if level >= 4:
+            effects.append(dict(code="player_stall", title="\u5f00\u653e\u9c9c\u9910\u5907\u8d27\u548c\u540e\u7eed\u6b63\u89c4\u644a\u4f4d\u8bbe\u65bd\u8d44\u683c"))
     unlocks = []
     for required, key, title in _UNLOCKS[code]:
         implemented = key in {"targeted_gathering", "advanced_gathering", "seed_return", "advanced_crops",
-                              "crop_quality", "felling_efficiency", "hardwood", "basic_quality", "advanced_cooking"}
+                              "crop_quality", "felling_efficiency", "hardwood", "basic_quality", "advanced_cooking", "combined_orders", "player_stall"}
         available = implemented and level >= required
         unlocks.append(dict(code=key, title=title, required_level=required, implemented=implemented,
                             available=available, reason=None if available else
