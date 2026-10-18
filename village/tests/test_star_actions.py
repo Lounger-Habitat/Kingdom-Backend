@@ -29,6 +29,54 @@ class StarActionTests(TestCase):
                 "recipient": environment, "payload": {"type": "action", "content": {
                     "id": action_id, "name": name, "params": params if params is not None else {"location_code": "BILL_HOME"}}}}
 
+    def test_scene_move_persists_actual_failed_position_and_replay_cannot_settle_twice(self):
+        from village.runtime_services import ActionService
+        position = {"x": 12.25, "y": 0, "z": 8}
+        original = self.message("coordinate-1", params={"position": position})
+        ok, code, task, _ = accept_action(original)
+        self.assertTrue(ok, code)
+        self.assertEqual(task.command.sanitized_parameters, {"position": position})
+        self.assertTrue(CommandService.start_command(task.command_id, 0)[0])
+        actual = {"x": 4, "y": 0, "z": 5}
+        result = ActionService.complete_action(task.command_id, task.pk, False, "TARGET_UNREACHABLE", data={
+            "current_location_code": "OUTDOORS", "world_position": actual})
+        self.assertTrue(result[0], result[1])
+        runtime = NpcRuntimeState.objects.get(npc=self.npc)
+        self.assertEqual(runtime.current_location_code, "OUTDOORS")
+        self.assertEqual(runtime.world_position, actual)
+        ActionService.complete_action(task.command_id, task.pk, True, "MOVE_COMPLETED", data={
+            "current_location_code": "BILL_HOME", "world_position": position})
+        runtime.refresh_from_db()
+        self.assertEqual(runtime.world_position, actual)
+        self.assertEqual(task_context(accept_action(original)[2])["action"], original)
+
+    def test_scene_move_target_reference_and_invalid_coordinates_are_validated(self):
+        from village.scene_navigation import validate_move
+        from village.models import VillageTreeNode
+        node = VillageTreeNode.objects.create(node_id=uuid.uuid4(), species="PINE", position={}, generation=2)
+        self.assertIsNone(validate_move({"target_ref": f"tree:{node.pk}:2"}, "10011"))
+        self.assertEqual(validate_move({"target_ref": f"tree:{node.pk}:1"}, "10011"), "TARGET_STALE")
+        for index, params in enumerate([
+            {"position": {"x": True, "y": 0, "z": 0}}, {"position": {"x": 1e300, "y": 0, "z": 0}},
+            {"position": {"x": 0, "y": 0}},
+            {"position": {"x": 0, "y": 0, "z": 0}, "location_code": "BILL_HOME"},
+        ]):
+            self.assertEqual(accept_action(self.message(f"invalid-position-{index}", params=params))[:2],
+                (False, "INVALID_COMMAND_SCHEMA"))
+        self.assertEqual(validate_move({"position": {"x": float("nan"), "y": 0, "z": 0}}, "10011"), "INVALID_COMMAND_SCHEMA")
+
+    def test_scene_query_options_remain_available_while_body_is_busy(self):
+        self.assertTrue(accept_action(self.message())[0])
+        profile = NpcProfile.objects.get(npc=self.npc)
+        profile.capabilities += ["INSPECT_NEARBY"]
+        profile.save()
+        ok, code, task, _ = accept_action(self.message("nearby-1", "INSPECT_NEARBY", {"categories": ["trees"], "limit": 5}))
+        self.assertTrue(ok, code)
+        self.assertIsNone(task.command_id)
+        self.assertFalse(task.result["data"]["observation_available"], "Only Unity can confirm live scene facts.")
+        self.assertEqual(accept_action(self.message("nearby-invalid", "INSPECT_NEARBY", {"limit": True}))[:2],
+            (False, "INVALID_QUERY_PARAMS"))
+
     def test_raw_move_and_replay_preserve_content_and_create_one_private_task(self):
         original = self.message()
         before = deepcopy(original)

@@ -314,6 +314,7 @@ def _nearby(npc: NpcDefinition, query_params=None) -> dict:
         "nearby_npcs": nearby_npcs,
         # Live player presence belongs to the Unity Env server, not this database.
         "nearby_players": [],
+        "observation_available": False,
         "players_observation_available": False,
         "nearby_locations": locations[:5],
     }

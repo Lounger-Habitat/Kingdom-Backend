@@ -6,20 +6,21 @@ from uuid import UUID
 
 def valid_position(value):
     return (isinstance(value, dict) and set(value) == {"x", "y", "z"}
-            and all(type(v) in (int, float) and math.isfinite(v) and abs(v) <= 100_000
+            and all(type(v) in (int, float) and abs(v) <= 100_000 and math.isfinite(v)
                     for v in value.values()))
 
 
 def validate_move(params, sender):
-    from .models import NpcDefinition, VillageLocationDefinition, VillageTreeNode, VillageWildlife
+    from inventory.models import NpcDefinition
+    from .models import VillageLocationDefinition, VillageTreeNode, VillageWildlife
     if not isinstance(params, dict) or len(params) != 1:
         return "INVALID_COMMAND_SCHEMA"
     if "position" in params:
         return None if valid_position(params["position"]) else "INVALID_COMMAND_SCHEMA"
     if "location_code" in params:
         code = params["location_code"]
-        return None if isinstance(code, str) and VillageLocationDefinition.objects.filter(
-            location_code=code, is_active=True).exists() else "INVALID_LOCATION"
+        # Preserve legacy admission: Unity resolves the authored location anchor.
+        return None if isinstance(code, str) and 0 < len(code) <= 64 else "INVALID_LOCATION"
     if "target_npc_id" in params:
         target = params["target_npc_id"]
         return None if isinstance(target, str) and target != str(sender) and NpcDefinition.objects.filter(
@@ -33,10 +34,13 @@ def validate_move(params, sender):
     if kind == "npc":
         return validate_move({"target_npc_id": key}, sender)
     if kind == "location":
-        return validate_move({"location_code": key}, sender)
+        return None if VillageLocationDefinition.objects.filter(location_code=key, is_active=True).exists() else "INVALID_LOCATION"
     if kind == "player":
         from account.models import GameAccount
         return None if GameAccount.objects.filter(username=unquote(key), is_active=True).exists() else "TARGET_NOT_FOUND"
+    if kind == "plot":
+        from .models import VillageFarmPlot
+        return None if VillageFarmPlot.objects.filter(plot_code=key).exists() else "TARGET_NOT_FOUND"
     try:
         if kind == "tree":
             identifier, generation = key.rsplit(":", 1)

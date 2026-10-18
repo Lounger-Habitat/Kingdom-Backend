@@ -1967,12 +1967,18 @@ class ActionService:
         # The authenticated Unity completion reports actual arrival. Persist it
         # with completion so a following repair command need not wait for the
         # periodic checkpoint (which is blocked while this write is in flight).
-        if success and command.kind in {"MOVE", "GO_HOME"} and data:
+        if command.kind in {"MOVE", "GO_HOME"} and data:
             from .models import VillageLocationDefinition
+            from .scene_navigation import valid_position
             arrived = data.get("current_location_code")
-            if arrived == "OUTDOORS" or (arrived and VillageLocationDefinition.objects.filter(location_code=arrived, is_active=True).exists()):
+            position = data.get("world_position")
+            scene_move = command.kind == "MOVE" and bool(set(command.sanitized_parameters or {}) & {"position", "target_ref"})
+            if (success or (scene_move and valid_position(position))) and (arrived == "OUTDOORS" or (
+                    arrived and VillageLocationDefinition.objects.filter(location_code=arrived, is_active=True).exists())):
                 rt.current_location_code = arrived
                 rt.current_point_code = data.get("current_point_code") or arrived
+            if valid_position(position):
+                rt.world_position = position
 
         # 创建世界事件
         event_type = "NPC_ACTION_COMPLETED" if success else "NPC_ACTION_FAILED"

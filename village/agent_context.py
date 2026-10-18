@@ -62,7 +62,9 @@ def build_agent_context(actions, profile=None):
         "需求数值由环境计算，不能通过行动参数直接修改。普通行动受忙碌状态限制，只读查询不会占用行动队列或结算资产。",
     ]
     if "INSPECT_NEARBY" in actions:
-        common.append("INSPECT_NEARBY分别返回nearby_npcs、nearby_players和nearby_locations，默认半径10米。玩家仅包含在线、已完成初始化且参与村庄的角色；activity是公开状态，movement_state区分行走和奔跑，is_in_dialogue表示是否正在对话。SOCIALIZING优先于移动，二者可同时成立；UNKNOWN表示无法确认状态。players_observation_available=false时不能把空列表理解为附近没有玩家。")
+        common.append("INSPECT_NEARBY按场景中实际距离观察周围10米，包含人物、树木/树桩、动物、已登记设施和农田，带position、target_ref、状态和活动。categories筛选people/trees/animals/facilities，limit默认30、最多100；truncated表示未列完，sources中false表示该类信息未知，不代表没有。玩家仅包含在线、已初始化且参与村庄的角色；activity是公开状态，movement_state区分行走和奔跑，is_in_dialogue表示是否正在对话。普通变化经延迟合并以perception.updated通知，经过者可能已离开；是否回应由你决定，通知不会取消正在进行的动作。同一action.id只重放原观察，刷新使用新id；不必连续轮询。")
+    if "MOVE" in actions:
+        common.append('MOVE四选一：地点location_code、角色target_npc_id、观察所得target_ref，或世界坐标position（x/y/z，米）。例如{"position":{"x":12,"y":0,"z":8}}，或{"target_ref":"npc:10012"}。只前往可达位置，返回实际落点；对象消失或树木代次变化须重新观察。靠近对象不代表已经交谈、采集或取得经营权限。')
     if profile is not None:
         common.append(f"你的 NPC 编号：{profile.npc.agent_id}；姓名：{profile.display_name}。消息中的 actor_npc_id 与此编号相同表示你自己的事件。")
         location_parts = []
@@ -180,7 +182,7 @@ def build_agent_context(actions, profile=None):
     if actions & {"PLANT", "HARVEST"}:
         rules.append(
             "农田：农田地点代码是 BILL_FARM；播种和收获必须先 MOVE 到 BILL_FARM。"
-            "plot_code 从 INSPECT_FARM_STATE 返回的地块中选择，不能作为 MOVE 地点。"
+            "plot_code 从 INSPECT_FARM_STATE 返回的地块中选择；靠近某块农田可用 MOVE 的 target_ref=plot:地块代码，但耕作仍需满足农田地点和权限规则。"
             "只有空地可以播种，只有成熟地块可以收获；播种需要对应种子和可用农具，"
             "播种和收获都消耗农具使用次数。调用 INSPECT_FARM_STATE 获取当前地块状态；"
             "查询结果中的 path_distance 是从你当前位置到田边可达作业位置的导航路径距离（米），"
