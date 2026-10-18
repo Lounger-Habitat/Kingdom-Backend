@@ -182,3 +182,28 @@ class ItemGameplayDefinition(models.Model):
         ]
         verbose_name = "物品玩法能力定义"
         verbose_name_plural = "物品玩法能力定义"
+
+
+class PlayerHuntingState(models.Model):
+    player = models.OneToOneField(GameAccount, on_delete=models.CASCADE, related_name="hunting_state")
+    current_health = models.PositiveSmallIntegerField(default=100)
+    revision = models.PositiveBigIntegerField(default=0)
+    recovery_ready_world_minute = models.BigIntegerField(null=True, blank=True)
+    authority_session_id = models.CharField(max_length=128, default="", blank=True)
+
+    class Meta:
+        constraints = [models.CheckConstraint(condition=models.Q(current_health__lte=100), name="player_health_maximum")]
+
+
+class PlayerCombatReceipt(models.Model):
+    player = models.ForeignKey(GameAccount, on_delete=models.PROTECT, related_name="combat_receipts")
+    request_id = models.UUIDField()
+    authority_session_id = models.CharField(max_length=128)
+    payload_hash = models.CharField(max_length=64)
+    action = models.CharField(max_length=32)
+    response = models.JSONField(default=dict)
+    world_minute = models.BigIntegerField()
+    created_at = models.DateTimeField(auto_now_add=True)
+
+    class Meta:
+        constraints = [models.UniqueConstraint(fields=["player", "request_id"], name="player_combat_request_unique")]

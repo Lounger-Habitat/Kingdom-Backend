@@ -9,6 +9,7 @@ from cooking.views import cook, pity_check
 from inventory.models import InventoryBag, InventorySlot
 from inventory.views import (inventory_judge, inventory_judge_by_agent, inventory_add, inventory_money,
     inventory_rate, inventory_bulk_push, inventory_collect, inventory_remove)
+from player.views import player_recipes
 from restaurant.views import menu_exhibit, menu_withdraw, upgrade_restaurant
 from items.models import Item
 from restaurant.services import RestaurantService
@@ -47,7 +48,7 @@ class PlayerProductionBoundaryTests(TestCase):
     def test_old_asset_adjustments_and_menu_writes_cannot_bypass_the_village_economy(self):
         for view,args in ((inventory_add,(self.player.username,)),(inventory_money,(self.player.username,)),
                           (inventory_rate,(self.player.username,)),(inventory_bulk_push,()),
-                          (menu_exhibit,()),(menu_withdraw,()),(upgrade_restaurant,())):
+                          (menu_exhibit,()),(menu_withdraw,()),(upgrade_restaurant,()),(player_recipes,())):
             request=APIRequestFactory().post("/unused", {"amount":100000,"instanceId":str(self.slot.instance_id)},format="json")
             force_authenticate(request,user=self.player)
             reply=view(request,*args)

@@ -29,6 +29,17 @@ def production_overview(player, bag, minute, *, read_only=False):
         requirements=["伐木 4 级、本人可用 T2 斧。"],
         uses=["T2 工具维修；交易或按实际报价出售。"], available=levels["forestry"] >= 4,
         remaining_quantity=None, next_restore_world_minute=None)]
+    resources.extend([
+        dict(code="basic_hunting", title="\u57fa\u7840\u730e\u573a", location_code="HUNTING_GATE",
+            description="\u771f\u5b9e\u72e9\u730e\u9e21\u3001\u732a\u4e0e\u725b\uff0c\u51fb\u6740\u540e\u83b7\u5f97\u5f85\u52a0\u5de5\u730e\u7269\u3002",
+            requirements=["\u5148\u9886\u53d6\u4e00\u6b21\u6027\u57fa\u7840\u6b66\u5668\u3001\u6301\u6709\u5e76\u4fdd\u6301\u53ef\u7528\u8010\u4e45\u3002"],
+            uses=["Jack\u52a0\u5de5\u540e\u53ef\u7528\u4e8e\u6599\u7406\u3001\u4ea4\u6613\u4e0e\u771f\u5b9e\u8ba2\u5355\u3002"], available=True,
+            remaining_quantity=None, next_restore_world_minute=None),
+        dict(code="deer", title="\u6df1\u6797\u9e7f", location_code="DEEP_FOREST",
+            description="\u9e7f\u4f1a\u63d0\u524d\u611f\u77e5\u8fd1\u5904\u73a9\u5bb6\u5e76\u5feb\u901f\u9003\u8dd1\u3002",
+            requirements=["\u63a8\u8350\u72e9\u730e4\u7ea7\u4e0eT2\u6b66\u5668\uff0c\u533a\u57df\u4e0d\u8bbe\u4e2a\u4eba\u7a7a\u6c14\u5899\u3002"],
+            uses=["\u9e7f\u8089\u53ef\u5236\u4f5c\u73b0\u6709\u4e24\u79cd\u8089\u6c64\uff1b\u7c97\u76ae\u7528\u4e8e\u6b66\u5668\u5347\u7ea7\u3002"], available=True,
+            remaining_quantity=None, next_restore_world_minute=None)])
     for code, rule in FARM_CROP_RULES.items():
         advanced = code in {"ONION", "GREEN_RADISH"}
         resources.append(dict(code="crop_" + code, title=rule["display_name"], location_code="BILL_FARM",

@@ -1,5 +1,5 @@
 """Village-only basic meals. Ingredients are existing item IDs, never prey/seeds."""
-MEAT_IDS = (1056, 1009, 1034, 1057, 1077)
+MEAT_IDS = (1056, 1009, 1034, 1057, 1077, 29107)
 STEAMED_CORN, CORN_SOUP, MEAT_SOUP, VEGETABLE_SOUP, RELIEF_PACK = range(29201, 29206)
 MEALS = {
     STEAMED_CORN: ("清蒸玉米", 11, 2, 60, {1030: 2}),

@@ -20,7 +20,8 @@ from items.models import Item
 from leaderboard.models import LeaderboardEntry, PendingReward, ReportEvent
 from marketplace.models import MarketListing, MarketTransaction
 from player.models import (DefaultRecipe, PlayerRecipe, PlayerState, PlayerGrowthState,
-                           PlayerSkillProgress, SkillRewardReceipt, PlayerMilestoneProgress)
+                           PlayerSkillProgress, SkillRewardReceipt, PlayerMilestoneProgress,
+                           PlayerHuntingState, PlayerCombatReceipt)
 from recipes.models import Recipe
 from restaurant.models import (
     CustomerTransaction, DailyBusinessLog, MenuItem, PlayerRestaurantState,
@@ -61,6 +62,7 @@ from village.models import (
     VillageBusinessOrderLink,
     VillageBusinessOrderDay,
     VillagePlayerDishReview,
+    VillagePlayerProcessingJob,
     StarterSupplyReceipt,
     StarterSupplyDelivery,
     StarterSupplyOrder,
@@ -211,6 +213,7 @@ class Command(BaseCommand):
 
         # Clear children that protect or feed the event/command history first.
         for model in (
+            VillagePlayerProcessingJob,  # Private processing slots and tools precede inventory deletion.
             VillagePlayerDishReview,  # PROTECTs its private InventorySlot sample.
             StarterSupplyReceipt,
             StarterSupplyDelivery,  # PROTECTs both order and actual held slot.
@@ -407,6 +410,7 @@ class Command(BaseCommand):
         """Reset progress through current templates, without minting money-change reports."""
         cleared = 0
         for model in (
+            PlayerCombatReceipt, PlayerHuntingState,
             SkillRewardReceipt, PlayerMilestoneProgress, PlayerSkillProgress, PlayerGrowthState,
             EnvActionReceipt, AutoBuyPurchase, RestaurantHourlySlot,
             CustomerTransaction, DailyBusinessLog, MenuItem, PlayerRestaurantState,

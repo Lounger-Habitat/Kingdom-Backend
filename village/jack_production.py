@@ -38,7 +38,10 @@ def reserved_amount(slot, exclude_command_id=None):
     if exclude_command_id is not None:
         rows = rows.exclude(command_id=exclude_command_id)
     instance = str(slot.instance_id)
-    return sum(
+    from .models import VillagePlayerProcessingJob
+    player_reserved = VillagePlayerProcessingJob.objects.filter(
+        status="RUNNING", tool_instance_id=slot.instance_id).count() if str(slot.bag.npc.agent_id) == "10012" else 0
+    return player_reserved + sum(
         int(state.get("tool_instance_id") == instance) + int(state.get("prey_instance_id") == instance)
         for state in rows.values_list("production_state", flat=True)
         if state.get("rule_version") == RULE_VERSION
@@ -87,7 +90,8 @@ def start_work(runtime, command, minute):
     error = work_unavailable(runtime, command, minute, resources=False)
     if error:
         return error
-    if runtime.active_command_id is not None:
+    from .player_processing import jack_processing_busy
+    if runtime.active_command_id is not None or jack_processing_busy(runtime.npc.agent_id):
         return "NPC_BUSY"
     inventory = NpcGlobalInventory.objects.select_for_update().get(npc=runtime.npc)
     expected = command.sanitized_parameters.get("expected_asset_version")

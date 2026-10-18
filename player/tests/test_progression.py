@@ -42,11 +42,11 @@ class GrowthServiceTests(TestCase):
         self.assertEqual(PlayerSkillProgress.objects.filter(player=self.player).count(), 6)
         self.assertEqual(first, growth_snapshot(GameAccount.objects.get(pk=self.player.pk)))
         for skill in first["skills"]:
-            self.assertEqual(skill["progression_enabled"], skill["code"] in {"gathering", "business", "farming", "forestry", "cooking"})
+            self.assertEqual(skill["progression_enabled"], skill["code"] in {code for code, _ in SKILLS})
             for node in skill["unlocks"]:
                 self.assertFalse(node["available"])
                 if node["code"] in {"targeted_gathering", "advanced_gathering", "seed_return",
-                                     "advanced_crops", "crop_quality", "felling_efficiency", "hardwood", "basic_quality", "advanced_cooking", "combined_orders", "player_stall"}:
+                                     "advanced_crops", "crop_quality", "felling_efficiency", "hardwood", "basic_quality", "advanced_cooking", "combined_orders", "player_stall", "bow_preparation", "deer_challenge"}:
                     self.assertTrue(node["implemented"])
                     self.assertEqual(node["reason"], "SKILL_LEVEL_REQUIRED")
                 else:
@@ -66,9 +66,9 @@ class GrowthServiceTests(TestCase):
         award_skill(other, source_type="trusted-future-harvest", source_id=source, skill_code="farming", xp=80)
         self.assertEqual(PlayerSkillProgress.objects.get(player=self.player, skill_code="farming").total_xp, 450)
         self.assertEqual(PlayerSkillProgress.objects.get(player=other, skill_code="farming").total_xp, 80)
-        # G2 has released farming; unrelated hunting remains unopened.
+        # G5 has released both independent production routes.
         self.assertTrue(growth_snapshot(self.player)["skills"][1]["progression_enabled"])
-        self.assertFalse(growth_snapshot(self.player)["skills"][3]["progression_enabled"])
+        self.assertTrue(growth_snapshot(self.player)["skills"][3]["progression_enabled"])
 
     def test_first_real_source_bonus_once_and_snapshot_is_not_shared(self):
         source = str(uuid.uuid4())

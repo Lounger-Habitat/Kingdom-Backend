@@ -563,7 +563,7 @@ class ResetVillageWorldTests(TestCase):
                       CustomerTransaction, RestaurantHourlySlot, RestaurantSaleEvent, PendingReward, ReportEvent, LeaderboardEntry):
             self.assertFalse(model.objects.exists(), model.__name__)
 
-    def test_full_reset_clears_g0_to_g4_protected_records_and_frozen_farm_rules(self):
+    def test_full_reset_clears_g0_to_g5_protected_records_and_frozen_farm_rules(self):
         # This destructive command is exercised only against the explicitly
         # configured in-memory test database, never the saved village.
         self.assertIn("memory", connection.settings_dict["NAME"])
@@ -641,7 +641,22 @@ class ResetVillageWorldTests(TestCase):
         NpcGlobalInventory.objects.get(npc=lucy).slots.filter(item_id=1002).update(item_amount=0)
         result = execute_business_orders(player, bag, {}, uuid.uuid4(), clock)
         self.assertTrue(result["published_commission_ids"])
-        tracked = (SkillRewardReceipt, PlayerMilestoneProgress, PlayerSkillProgress, PlayerGrowthState,
+        # G5 has independent protected processing escrow and combat history.
+        from player.models import PlayerHuntingState, PlayerCombatReceipt
+        from village.models import VillagePlayerProcessingJob
+        PlayerHuntingState.objects.create(player=player, current_health=40)
+        PlayerCombatReceipt.objects.create(player=player, request_id=uuid.uuid4(),
+            authority_session_id="reset-env", payload_hash="reset", action="authorize_attack",
+            response={}, world_minute=minute)
+        held_bag = InventoryBag.objects.create(player=player, character_id="jack-processing:reset", money=5)
+        carcass = InventorySlot.objects.create(bag=held_bag, slot_index=0, item_id=29106,
+            item_amount=1, quality=3, produced_world_minute=minute, expires_world_minute=minute+100)
+        VillagePlayerProcessingJob.objects.create(player=player, request_id=uuid.uuid4(),
+            escrow_bag=held_bag, input_slot=carcass, source_instance_id=uuid.uuid4(),
+            tool_instance_id=uuid.uuid4(), fee_gold=5, duration_minutes=5,
+            started_world_minute=minute, ready_world_minute=minute+5, needs_until=minute)
+        tracked = (PlayerHuntingState, PlayerCombatReceipt, VillagePlayerProcessingJob,
+            SkillRewardReceipt, PlayerMilestoneProgress, PlayerSkillProgress, PlayerGrowthState,
             StarterSupplyReceipt, StarterSupplyDelivery, StarterReserveTransfer, StarterSupplyOrder, StarterSupplyBatch,
             VillageGatheringResourceState, VillagePlayerDishReview, VillageBusinessOrderLink, VillageBusinessOrderDay,
             VillageForestryReceipt, VillageChopAttempt, VillageTreeNode)

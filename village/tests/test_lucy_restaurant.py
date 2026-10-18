@@ -39,7 +39,7 @@ class LucyRestaurantTests(TestCase):
             NpcProfile.objects.update_or_create(npc=npc, defaults=dict(display_name=name, occupation="test", home_location_code="RESTAURANT",
                 work_location_code="RESTAURANT", social_location_code="VILLAGE_SQUARE", capabilities=[]))
         for item_id in {i for spec in RECIPE_DEFINITIONS.values() for i in spec["ingredients"]}:
-            Item.objects.create(item_id=item_id, item_name=f"ingredient-{item_id}", item_price=8, item_type="食材")
+            Item.objects.get_or_create(item_id=item_id, defaults=dict(item_name=f"ingredient-{item_id}", item_price=8, item_type="食材"))
         self.fund = VillageAccount.objects.create(account_code="PUBLIC_FUND", balance=0, audit_opening_balance=0)
         self.store, _ = VillageStore.objects.update_or_create(store_code="RESTAURANT_STORE", defaults=dict(display_name="Lucy饭店",
             location_code="RESTAURANT", operator_npc=self.npcs["10014"], status="OPEN", minimum_fee=1))
@@ -93,7 +93,7 @@ class LucyRestaurantTests(TestCase):
                 self.assertEqual(slot.expires_world_minute, 3480)
                 for item_id, count in spec["ingredients"].items():
                     self.assertEqual(before[item_id] - sum(self.lucy.slots.filter(item_id=item_id).values_list("item_amount", flat=True)), count)
-        self.assertEqual(Recipe.objects.filter(village_only=True).count(), 13)
+        self.assertEqual(Recipe.objects.filter(village_only=True).count(), len(RECIPE_DEFINITIONS))
 
     def test_personal_procurement_from_three_suppliers_and_next_round(self):
         self.lucy.slots.all().delete()
@@ -481,7 +481,7 @@ class LucyRestaurantTests(TestCase):
         self.assertIn("dish_metadata",data["items"][0]["batches"][0])
         from village.agent_queries import _cooking_recipes
         self.assertNotIn("recipes", _restaurant_state(self.npcs["10014"]))
-        self.assertEqual(len(_cooking_recipes()), 13)
+        self.assertEqual(len(_cooking_recipes()), len(RECIPE_DEFINITIONS))
         self.assertEqual(_rateable_dishes(self.npcs["10013"]), {
             "filter": {"review_status": "PENDING_UNEXPIRED"}, "reviews": [], "total_count": 0, "has_more": False})
 

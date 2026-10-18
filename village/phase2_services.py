@@ -802,6 +802,9 @@ class TickService:
         sync_visit(state.world_minute)
         from restaurant.player_stall import process_stall_tick
         restaurant_updates = process_stall_tick(state)
+        from .player_processing import settle_processing_jobs
+        restaurant_updates = list(dict.fromkeys(str(player_id) for player_id in
+            restaurant_updates + settle_processing_jobs(state.world_minute)))
 
         receipt = VillageActionReceipt.objects.create(
             request_id=request_id,

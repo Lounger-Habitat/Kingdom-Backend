@@ -1,7 +1,7 @@
 """Versioned G0 rules. Unreleased content is descriptive, never an active bonus."""
 from copy import deepcopy
 
-RULES_VERSION = 5
+RULES_VERSION = 6
 SKILLS = (
     ("gathering", "采集"), ("farming", "种植"), ("forestry", "伐木"),
     ("hunting", "狩猎"), ("cooking", "烹饪"), ("business", "经营"),
@@ -59,6 +59,10 @@ def skill_data(code, name, total_xp):
         effects.append(dict(code="felling_efficiency", title="普通砍伐作业间隔缩短5%"))
     if code == "forestry" and level >= 4:
         effects.append(dict(code="hardwood", title="配合T2斧可采硬木，用于T2工具维修"))
+    if code == "hunting" and level >= 2:
+        effects.append(dict(code="bow_preparation", title="\u6ee1\u5f26\u51c6\u5907\u65f6\u95f4\u7f29\u77ed5%"))
+    if code == "hunting" and level >= 4:
+        effects.append(dict(code="deer_challenge", title="\u53ef\u4f7f\u7528T2\u5f13\u77db\uff0c\u6df1\u6797\u9e7f\u53ef\u63d0\u4f9b\u730e\u7269\u4e0e\u5b9e\u9645\u7ecf\u9a8c"))
     if code == "cooking" and level >= 2:
         effects.append(dict(code="basic_quality", title="\u6b63\u786e\u914d\u6bd4\u4e14\u9c9c\u671f\u5408\u683c\u7684\u6599\u7406\u54c1\u8d28\u81f3\u5c113"))
     if code == "cooking" and level >= 4:
@@ -74,7 +78,7 @@ def skill_data(code, name, total_xp):
     unlocks = []
     for required, key, title in _UNLOCKS[code]:
         implemented = key in {"targeted_gathering", "advanced_gathering", "seed_return", "advanced_crops",
-                              "crop_quality", "felling_efficiency", "hardwood", "basic_quality", "advanced_cooking", "combined_orders", "player_stall"}
+                              "crop_quality", "felling_efficiency", "hardwood", "basic_quality", "advanced_cooking", "combined_orders", "player_stall", "bow_preparation", "deer_challenge"}
         available = implemented and level >= required
         unlocks.append(dict(code=key, title=title, required_level=required, implemented=implemented,
                             available=available, reason=None if available else
@@ -82,7 +86,7 @@ def skill_data(code, name, total_xp):
     return dict(code=code, name=name, level=level, total_xp=total_xp,
                 xp_in_level=total_xp - LEVEL_TOTALS[level - 1] if level < 10 else 0,
                 xp_to_next_level=LEVEL_COSTS[level - 1] if level < 10 else 0,
-                max_level=10, progression_enabled=code in {"gathering", "business", "farming", "forestry", "cooking"}, effects=effects,
+                max_level=10, progression_enabled=code in SKILL_CODES, effects=effects,
                 unlocks=unlocks)
 
 
@@ -90,4 +94,4 @@ def legacy_entitlements(points):
     """Retain source records; this snapshot grants no new hunting/cooking facts."""
     return dict(collection_points=deepcopy(points), collection_pool_policy="PRESERVE_EXISTING",
                 recipes_policy="PRESERVE_KNOWN_AND_VISIBILITY", restaurant_policy="PRESERVE_FACILITY_LEVEL",
-                weapon_policy="PRESERVE_LEGACY_CONTROLS", tool_durability_policy="EXISTING_USAGE_COMPONENT")
+                weapon_policy="CLAIM_ONCE_REAL_STARTER_KIT_PRESERVE_CONTROLS", tool_durability_policy="EXISTING_USAGE_COMPONENT")

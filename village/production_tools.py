@@ -13,8 +13,10 @@ from player.models import ItemGameplayDefinition, PlayerMilestoneProgress
 from player.progression import ensure_growth, growth_snapshot
 from .models import (EconomicLedgerEntry, VillageStore, VillageStoreAccount,
                      VillageStoreInventorySlot, VillageStoreListing)
+from .phase3_catalog import HUNTING_WEAPONS, FEATHER, ROUGH_LEATHER
 
-UPGRADES = {4101: (4102, 6), 4001: (4103, 8), 4104: (4105, 10), 4106: (4107, 8)}
+UPGRADES = {4101: (4102, 6), 4001: (4103, 8), 4104: (4105, 10), 4106: (4107, 8),
+            4110: (4111, 8), 4112: (4113, 8)}
 AXE_MILESTONE = "starter_axe_claimed"
 STOCK_ITEMS = (1051, 29301, 29302, 29303, 29304, 29305, 4001, 4106)
 
@@ -127,6 +129,9 @@ def _store():
 
 def _quote(player, bag, slot, operation, minute):
     definition = _definition(slot)
+    if operation == "repair" and slot.item_id in HUNTING_WEAPONS and HUNTING_WEAPONS[slot.item_id]["tier"] == 1:
+        from .player_hunting import weapon_repair_quote
+        return weapon_repair_quote(player, bag, slot, minute)
     target_id, material_quantity = UPGRADES.get(slot.item_id, (None, 0))
     tier = definition.tier if definition else 0
     gold = 100 if operation == "upgrade" else 5 if tier == 1 else 15
@@ -137,28 +142,35 @@ def _quote(player, bag, slot, operation, minute):
     skill = definition.required_skill if definition else ""
     level = _level(player, skill) if skill else 1
     available_material = sum(s.item_amount for s in _material_slots(bag, material, minute))
+    requirements = [(material, material_quantity)]
+    if operation == "upgrade" and slot.item_id in (4110, 4112):
+        requirements += [(ROUGH_LEATHER, 2)] + ([(FEATHER, 2)] if slot.item_id == 4112 else [])
+    materials = [dict(item_id=key, item_name=Item.objects.filter(pk=key).values_list("item_name", flat=True).first() or str(key),
+        quantity=quantity, available_quantity=sum(s.item_amount for s in _material_slots(bag, key, minute)))
+        for key, quantity in requirements]
     store = _store()
     account = VillageStoreAccount.objects.filter(store=store).first() if store else None
-    reason = ("TOOL_UNAVAILABLE" if not definition or definition.capability_code not in {"farming", "forestry", "targeted_gathering", "cooking"}
+    reason = ("TOOL_UNAVAILABLE" if not definition or definition.capability_code not in {"farming", "forestry", "targeted_gathering", "cooking", "hunting_spear", "hunting_bow", "hunting_sword"}
         or definition.tier not in (1, 2) else "NO_UPGRADE" if operation == "upgrade" and not target else
         "TOOL_DURABILITY_UNKNOWN" if type(slot.remaining_uses) is not int or not 0 <= slot.remaining_uses <= definition.item.max_use_count else
         "TOOL_EXPIRED" if not _fresh(slot, minute) else "TOOL_ALREADY_FULL" if operation == "repair" and slot.remaining_uses == definition.item.max_use_count else
         "SKILL_LEVEL_REQUIRED" if level < required else "STORE_UNAVAILABLE" if not account else
-        "INSUFFICIENT_MONEY" if bag.money < gold else "INSUFFICIENT_MATERIALS" if available_material < material_quantity else "")
+        "INSUFFICIENT_MONEY" if bag.money < gold else "INSUFFICIENT_MATERIALS" if any(m["available_quantity"] < m["quantity"] for m in materials) else "")
     payload = dict(operation=operation, instance_id=str(slot.instance_id), item_id=slot.item_id,
         amount=slot.item_amount, remaining=slot.remaining_uses, money=bag.money, material_available=available_material,
         gold=gold, material=material, material_quantity=material_quantity, target_id=target_id,
         level=level, account_id=account.pk if account else None, definition_version=definition.rules_version if definition else 0,
         maximum_uses=definition.item.max_use_count if definition else None,
-        target_maximum_uses=target.max_use_count if target else None)
+        target_maximum_uses=target.max_use_count if target else None, materials=materials)
     return dict(available=not reason, reason=reason, quote_hash=hashlib.sha256(json.dumps(payload, sort_keys=True).encode()).hexdigest(),
         gold_cost=gold, material_item_id=material, material_quantity=material_quantity,
-        target_item_id=target_id if operation == "upgrade" else slot.item_id, required_level=required)
+        target_item_id=target_id if operation == "upgrade" else slot.item_id, required_level=required,
+        materials=materials, location_code="GENERAL_STORE", action="upgrade_tool" if operation == "upgrade" else "repair_tool")
 
 
 def tools_overview(player, bag, minute, read_only=False):
     definitions = {d.item_id: d for d in ItemGameplayDefinition.objects.select_related("item").filter(
-        capability_code__in=["farming", "forestry", "targeted_gathering", "cooking"], item__is_deleted=False)}
+        capability_code__in=["farming", "forestry", "targeted_gathering", "cooking", "hunting_spear", "hunting_bow", "hunting_sword"], item__is_deleted=False)}
     tools = []
     for slot in bag.slots.filter(item_id__in=definitions, item_amount__gt=0).order_by("slot_index") if bag.pk else []:
         definition = definitions[slot.item_id]
@@ -220,22 +232,25 @@ def execute_tool_action(player, bag, action, params, rid, clock):
         slot = InventorySlot.objects.select_for_update().filter(bag=bag, instance_id=_uuid(params["instance_id"]), item_amount__gt=0).first()
         if not slot:
             reject("TOOL_MISSING", "本人背包中没有该工具实例。")
+        if action == "repair_tool" and slot.item_id in HUNTING_WEAPONS and HUNTING_WEAPONS[slot.item_id]["tier"] == 1:
+            reject("FREE_REPAIR_AT_JACK", "基础狩猎武器请到Jack屠宰棚免费整修。")
         quote = _quote(player, bag, slot, "repair" if action == "repair_tool" else "upgrade", clock.world_minute)
         if not isinstance(params["expected_quote"], str) or params["expected_quote"] != quote["quote_hash"]:
             reject("QUOTE_CHANGED", "工具或材料、资金条件已变化，请刷新报价。")
         if not quote["available"]:
             reject(quote["reason"], "当前条件不满足工具维修或升级。")
         account = VillageStoreAccount.objects.select_for_update().get(store_id="GENERAL_STORE")
-        remaining = quote["material_quantity"]
-        for material in _material_slots(bag, quote["material_item_id"], clock.world_minute):
-            count = min(material.item_amount, remaining)
-            material.item_amount -= count
-            material.save(update_fields=["item_amount"])
-            remaining -= count
-            if not remaining:
-                break
-        if remaining:
-            reject("INSUFFICIENT_MATERIALS", "维修材料已变化。")
+        for requirement in quote["materials"]:
+            remaining = requirement["quantity"]
+            for material in _material_slots(bag, requirement["item_id"], clock.world_minute):
+                count = min(material.item_amount, remaining)
+                material.item_amount -= count
+                material.save(update_fields=["item_amount"])
+                remaining -= count
+                if not remaining:
+                    break
+            if remaining:
+                reject("INSUFFICIENT_MATERIALS", "维修材料已变化。")
         original_item = slot.item_id
         _single_in_place(slot)
         slot.item_id = quote["target_item_id"]
@@ -249,8 +264,8 @@ def execute_tool_action(player, bag, action, params, rid, clock):
         account.save(update_fields=["balance", "account_version", "updated_at"])
         result = dict(instance_id=str(slot.instance_id), item_id=slot.item_id, previous_item_id=original_item,
             remaining_uses=slot.remaining_uses, spent_gold=quote["gold_cost"],
-            materials_consumed=[dict(item_id=quote["material_item_id"], quantity=quote["material_quantity"])])
-        changes = {f"PLAYER:{player.pk}": {"money": -quote["gold_cost"], str(quote["material_item_id"]): -quote["material_quantity"]},
+            materials_consumed=[dict(item_id=m["item_id"], quantity=m["quantity"]) for m in quote["materials"]])
+        changes = {f"PLAYER:{player.pk}": {"money": -quote["gold_cost"], **{str(m["item_id"]): -m["quantity"] for m in quote["materials"]}},
             "STORE:GENERAL_STORE": {"money": quote["gold_cost"]}, "tool": result}
     EconomicLedgerEntry.objects.create(request_id=uuid.uuid5(uuid.NAMESPACE_URL, f"production-tools:{player.pk}:{rid}"),
         entry_type=action.upper(), world_minute=clock.world_minute, changes=deepcopy(changes))

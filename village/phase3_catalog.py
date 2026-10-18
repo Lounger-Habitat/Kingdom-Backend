@@ -106,10 +106,12 @@ HUNT_MEAT_SPOILAGE_MINUTES = 2880
 HUNT_ANIMALS_CODE = "HUNT_ANIMALS"
 PREY_CHICKEN, PREY_PIG, PREY_CATTLE = 29101, 29102, 29103
 FEATHER, ROUGH_LEATHER = 29104, 29105
+PREY_DEER, VENISON = 29106, 29107
 PREY_RECIPES = {
     PREY_CHICKEN: {"name": "鸡（待处理猎物）", "weight": 60, "outputs": {1056: 3, FEATHER: 1}},
     PREY_PIG: {"name": "猪（待处理猎物）", "weight": 30, "outputs": {1009: 1, 1034: 1, 1057: 2, ROUGH_LEATHER: 1}},
     PREY_CATTLE: {"name": "牛（待处理猎物）", "weight": 10, "outputs": {1077: 6, ROUGH_LEATHER: 2}},
+    PREY_DEER: {"name": "鹿（待处理猎物）", "weight": 0, "outputs": {VENISON: 4, ROUGH_LEATHER: 1}},
 }
 PREY_ITEM_IDS = frozenset(PREY_RECIPES)
 BYPRODUCT_ITEM_IDS = frozenset({FEATHER, ROUGH_LEATHER})
@@ -119,7 +121,18 @@ JACK_ITEM_DEFINITIONS = {
     PREY_CATTLE: ("牛（待处理猎物）", 70, "猎获的牛。由Jack处理为牛肉和粗皮革；不可直接食用。"),
     FEATHER: ("羽毛", 3, "整理成包的羽毛，可出售给杂货店或有实际需求的买家。"),
     ROUGH_LEATHER: ("粗皮革", 8, "猎物加工时整理出的皮材，可出售给杂货店或用于贸易。"),
+    PREY_DEER: ("鹿（待处理猎物）", 50, "深林真实猎获的鹿。交由Jack加工为鹿肉和粗皮革。"),
+    VENISON: ("鹿肉", 12, "Jack加工鹿得到的生鲜食材；继承原猎物鲜期。"),
 }
+
+HUNTING_WEAPONS = {
+    4110: {"name": "基础长矛", "weapon": 0, "capability": "hunting_spear", "tier": 1, "uses": 60, "level": 1},
+    4111: {"name": "改良长矛", "weapon": 0, "capability": "hunting_spear", "tier": 2, "uses": 120, "level": 4},
+    4112: {"name": "基础弓", "weapon": 2, "capability": "hunting_bow", "tier": 1, "uses": 60, "level": 1},
+    4113: {"name": "改良弓", "weapon": 2, "capability": "hunting_bow", "tier": 2, "uses": 120, "level": 4},
+    4114: {"name": "基础剑", "weapon": 1, "capability": "hunting_sword", "tier": 1, "uses": 60, "level": 1},
+}
+HUNTING_KILL_XP = {"CHICKEN": 2, "PIG": 5, "CATTLE": 8, "DEER": 12}
 
 # ── Tools ──────────────────────────────────────────────────────────
 FARM_TOOL_ITEM_ID = 4001

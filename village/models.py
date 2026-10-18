@@ -2471,3 +2471,32 @@ class VillageGatheringResourceState(models.Model):
     class Meta:
         verbose_name = "共享采集储量"
         verbose_name_plural = "共享采集储量"
+
+
+class VillagePlayerProcessingJob(models.Model):
+    """One physical carcass and its service fee, held until real Jack work settles."""
+    job_id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
+    player = models.ForeignKey("account.GameAccount", on_delete=models.PROTECT)
+    request_id = models.UUIDField(unique=True)
+    escrow_bag = models.OneToOneField("inventory.InventoryBag", on_delete=models.PROTECT)
+    input_slot = models.ForeignKey("inventory.InventorySlot", on_delete=models.PROTECT)
+    source_instance_id = models.UUIDField()
+    input_snapshot = models.JSONField(default=dict)
+    output_spec = models.JSONField(default=dict)
+    output_snapshot = models.JSONField(default=list)
+    tool_instance_id = models.UUIDField()
+    fee_gold = models.PositiveIntegerField()
+    duration_minutes = models.PositiveIntegerField()
+    status = models.CharField(max_length=16, default="RUNNING")
+    started_world_minute = models.BigIntegerField()
+    ready_world_minute = models.BigIntegerField()
+    needs_until = models.BigIntegerField()
+    completed_world_minute = models.BigIntegerField(null=True, blank=True)
+    claimed_world_minute = models.BigIntegerField(null=True, blank=True)
+    failure_reason = models.CharField(max_length=64, default="", blank=True)
+
+    class Meta:
+        constraints = [
+            models.UniqueConstraint(fields=["player"], condition=models.Q(status__in=["RUNNING", "READY", "FAILED"]), name="processing_one_unfinished_player"),
+            models.UniqueConstraint(fields=["status"], condition=models.Q(status="RUNNING"), name="processing_one_jack_job"),
+        ]

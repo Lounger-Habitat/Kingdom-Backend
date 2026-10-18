@@ -8,6 +8,14 @@ from .models import PlayerState, PlayerRecipe, PlayerTitle, DefaultRecipe, Actio
 from .services import recover_action_points, spend_action_points, NATURAL_ACTION_POINT_CAP
 
 
+def _hunting_health(account):
+    from village.models import VillageSimulationConfig
+    if not VillageSimulationConfig.objects.filter(config_key="default", village_economy_enabled=True).exists():
+        return None
+    from village.player_hunting import health_snapshot
+    return health_snapshot(account)
+
+
 def get_or_create_player(player_id):
     player, _ = PlayerState.objects.get_or_create(player_id=player_id)
     return player
@@ -26,6 +34,7 @@ def player_state(request):
     return Response({
         "code": 0,
         "data": {
+            "hunting_health": _hunting_health(request.user),
             "action_points": player.action_points,
             "action_points_max": player.action_points_max,
             "action_points_natural_max": NATURAL_ACTION_POINT_CAP,
@@ -81,6 +90,11 @@ def _serialize_catalog_ingredients(catalog_recipe):
 
 @api_view(["GET", "POST"])
 def player_recipes(request):
+    if request.method == "POST":
+        from village.player_legacy_production import legacy_production_guard
+        guard = legacy_production_guard()
+        if guard is not None:
+            return guard
     player_id = get_player_id(request)
     player = get_or_create_player(player_id)
 

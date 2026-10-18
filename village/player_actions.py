@@ -26,6 +26,12 @@ from .lucy_catalog import MEALS
 
 
 LOCATIONS = {
+    "claim_starter_hunting_kit": {"HUNTING_GATE"},
+    "repair_hunting_weapon": {"BUTCHER_YARD"},
+    "start_safe_rest": {"VILLAGE_SQUARE"},
+    "finish_safe_rest": {"VILLAGE_SQUARE"},
+    "start_game_processing": {"BUTCHER_YARD"},
+    "claim_game_processing": {"BUTCHER_YARD"},
     "buy_marketplace": {"MARKET_STREET"},
     "list_marketplace": {"MARKET_STREET"},
     "delist_marketplace": {"MARKET_STREET"},
@@ -40,6 +46,14 @@ LOCATIONS = {
         "withdraw_stall_dish", "upgrade_player_stall", "prepare_business_orders")},
 }
 PARAMS = {
+    "claim_starter_hunting_kit": set(),
+    "repair_hunting_weapon": {"instance_id", "expected_quote"},
+    "start_safe_rest": set(),
+    "finish_safe_rest": set(),
+    "preview_game_processing": {"prey_instance_id"},
+    "start_game_processing": {"prey_instance_id", "expected_quote"},
+    "cancel_game_processing": {"job_id"},
+    "claim_game_processing": {"job_id"},
     "overview": set(),
     "contribute": {"affair_id", "condition_id", "kind", "item_id", "quantity", "instance_id"},
     "labor_start": {"affair_id", "condition_id"}, "labor_cancel": set(),
@@ -202,6 +216,8 @@ def overview(player, bag, minute, *, read_only=False):
     from .production_guide import production_overview
     from .player_cooking import cooking_overview
     from .player_dish_reviews import review_overview
+    from .player_hunting import hunting_overview
+    from .player_processing import processing_overview
     from restaurant.player_stall import business_overview
     from .business_orders import business_orders_overview
     from .advanced_gathering import collection_points_projection
@@ -263,6 +279,8 @@ def overview(player, bag, minute, *, read_only=False):
         collection_points=collection_points_projection(player, bag, minute),
         cooking=cooking_overview(player, bag, minute, read_only=read_only),
         reviews=review_overview(player, bag, minute, read_only=read_only),
+        hunting=hunting_overview(player, bag, minute, read_only=read_only),
+        processing=processing_overview(player, bag, minute, read_only=read_only),
         business=business_overview(player, bag, minute, read_only=read_only),
         business_orders=business_orders_overview(player, minute, read_only=read_only),
         contributions=contributions, project=_project(minute)[0], market=market,
@@ -285,6 +303,18 @@ def _execute(player, bag, action, p, rid, location, clock, authority_session_id=
         fail("LOCATION_INVALID", "请前往对应地点再操作。")
     if action == "overview":
         return {}
+    if action in {"claim_starter_hunting_kit", "repair_hunting_weapon", "start_safe_rest", "finish_safe_rest"}:
+        from .player_hunting import HuntingError, execute_hunting_action
+        try:
+            return execute_hunting_action(player, bag, action, p, rid, clock)
+        except HuntingError as exc:
+            fail(exc.code, exc.message)
+    if action in {"start_game_processing", "cancel_game_processing", "claim_game_processing"}:
+        from .player_processing import ProcessingError, execute_processing_action
+        try:
+            return execute_processing_action(player, bag, action, p, rid, clock)
+        except ProcessingError as exc:
+            fail(exc.code, exc.message)
     if action in {"open_player_stall", "list_stall_dish", "withdraw_stall_dish", "upgrade_player_stall"}:
         from restaurant.player_stall import StallError, execute_stall_action
         try:
@@ -546,6 +576,17 @@ def execute_player_action(payload):
             return answer
         if "read_only" in payload and type(payload["read_only"]) is not bool:
             fail("INVALID_PARAMS", "观察上下文无效。")
+        if action == "preview_game_processing":
+            if not VillageSimulationConfig.objects.filter(config_key="default", village_economy_enabled=True).exists():
+                return response(rid, "FEATURE_DISABLED", "Village economy is unavailable.")
+            from .player_processing import ProcessingError, execute_processing_action
+            bag = InventoryBag.objects.filter(player=player, character_id=player.username).first()
+            bag = bag or InventoryBag(player=player, character_id=player.username)
+            try:
+                preview = execute_processing_action(player, bag, action, params, rid, clock)
+            except ProcessingError as exc:
+                return response(rid, exc.code, exc.message)
+            return response(rid, data=dict(result=preview))
         if action == "preview_cooking":
             if not VillageSimulationConfig.objects.filter(config_key="default", village_economy_enabled=True).exists():
                 return response(rid, "FEATURE_DISABLED", "Village economy is unavailable.")

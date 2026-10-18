@@ -18,14 +18,14 @@ from marketplace.services import get_player_main_bag
 from .models import (NpcCommandState, NpcRuntimeState, VillageHuntAttempt,
                      VillageSimulationConfig, VillageWildlife, VillageWildlifeReceipt,
                      VillageWorldEvent)
-from .phase3_catalog import PREY_CHICKEN, PREY_PIG, PREY_CATTLE, HUNT_MEAT_SPOILAGE_MINUTES
+from .phase3_catalog import PREY_CHICKEN, PREY_PIG, PREY_CATTLE, PREY_DEER, HUNT_MEAT_SPOILAGE_MINUTES, HUNTING_KILL_XP, HUNTING_WEAPONS
 
-SPECIES = {"CHICKEN": PREY_CHICKEN, "PIG": PREY_PIG, "CATTLE": PREY_CATTLE}
+SPECIES = {"CHICKEN": PREY_CHICKEN, "PIG": PREY_PIG, "CATTLE": PREY_CATTLE, "DEER": PREY_DEER}
 FIELDS = {
     "register": {"species", "region_id", "position"},
     "begin": {"attempt_id", "actor_type", "actor_id", "command_id"},
-    "complete": {"attempt_id", "claim_version", "death_world_minute"},
-    "finish": {"attempt_id", "actor_type", "actor_id", "command_id", "death_world_minute"},
+    "complete": {"attempt_id", "claim_version", "death_world_minute", "attack_id"},
+    "finish": {"attempt_id", "actor_type", "actor_id", "command_id", "death_world_minute", "attack_id"},
     "cancel": {"attempt_id", "claim_version"},
 }
 
@@ -119,6 +119,8 @@ def _execute(action, p, clock):
         species, region, position = p.get("species"), p.get("region_id"), p.get("position")
         if not isinstance(species, str) or species not in SPECIES or not isinstance(region, str) or not 0 < len(region) <= 64:
             reject("INVALID_PARAMS")
+        if species == "DEER" and region != "DEEP_FOREST":
+            reject("SPECIES_REGION_INVALID")
         if not isinstance(position, dict) or set(position) != {"x", "y", "z"} or any(
             type(v) not in (float, int) or not math.isfinite(v) for v in position.values()
         ):
@@ -239,11 +241,36 @@ def _execute(action, p, clock):
     prey.save(update_fields=["status", "updated_at"])
     attempt.completed_world_minute = death
     data = dict(prey=prey_data(prey), attempt=attempt_data(attempt), items_added=added)
+    if attempt.actor_type == "PLAYER":
+        data["growth_rewards"] = _kill_rewards(player, prey, p.get("attack_id"), added)
+        if p.get("attack_id") is not None:
+            data["attack_id"] = p["attack_id"]
     if result is not None:
         data["economy_result"] = result
     attempt.result = data
     attempt.save(update_fields=["status", "completed_world_minute", "result"])
     return data
+
+
+def _kill_rewards(player, prey, attack_id, added):
+    """Old death outboxes retain loot; only a durable authorized attack earns XP."""
+    from player.models import PlayerCombatReceipt, SkillRewardReceipt
+    from player.progression import award_skill
+    try:
+        attack_id = uuid.UUID(str(attack_id))
+    except (ValueError, TypeError, AttributeError):
+        return []
+    receipt = PlayerCombatReceipt.objects.filter(player=player, request_id=attack_id, action="authorize_attack").first()
+    data = receipt.response.get("data", {}) if receipt and receipt.response.get("success") else {}
+    weapon = data.get("weapon") or {}
+    spec = HUNTING_WEAPONS.get(weapon.get("item_id"))
+    if (not spec or weapon.get("weapon") != spec["weapon"] or weapon.get("weapon") not in (0, 1, 2)
+            or SkillRewardReceipt.objects.filter(player=player, source_type="wildlife_kill", result__facts__attack_id=str(attack_id)).exists()):
+        return []
+    return [award_skill(player, source_type="wildlife_kill", source_id=prey.pk, skill_code="hunting",
+        xp=HUNTING_KILL_XP[prey.species], milestone=dict(code="first_wildlife_kill", title="完成首次有效狩猎", xp=20),
+        facts=dict(prey_id=str(prey.pk), species=prey.species, region_id=prey.region_id,
+                   attack_id=str(attack_id), weapon=copy.deepcopy(weapon), outputs=copy.deepcopy(added)))]
 
 
 def execute(payload):

@@ -5,6 +5,7 @@ from . import phase3_views
 from . import phase4_views
 from . import phase5_views
 from . import phase7_views
+from . import player_combat_views
 from . import player_views
 from . import wildlife_views
 from . import forestry_views
@@ -13,6 +14,7 @@ from . import action_lifecycle
 
 
 urlpatterns = [
+    path("api/village/player/combat/", player_combat_views.player_combat, name="village-player-combat"),
     path("api/village/npcs/<str:npc_id>/operation", action_lifecycle.runtime_operation),
     path("api/village/npcs/<str:npc_id>/resources", action_lifecycle.runtime_resources),
     path("api/village/runtime/daily-record", daily_record_views.write_record, name="village-daily-record-write"),
