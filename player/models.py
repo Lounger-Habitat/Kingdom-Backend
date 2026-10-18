@@ -100,3 +100,84 @@ class PlayerResetProxy(GameAccount):
         proxy = True
         verbose_name = "玩家重置"
         verbose_name_plural = "玩家重置"
+
+
+class PlayerGrowthState(models.Model):
+    player = models.OneToOneField(GameAccount, on_delete=models.CASCADE, related_name="growth_state")
+    revision = models.PositiveBigIntegerField(default=0)
+    legacy_migration_version = models.PositiveIntegerField(default=0)
+    legacy_entitlements = models.JSONField(default=dict, blank=True)
+
+    class Meta:
+        verbose_name = "玩家成长档案"
+        verbose_name_plural = "玩家成长档案"
+
+
+class PlayerSkillProgress(models.Model):
+    from .progression_rules import SKILLS
+
+    player = models.ForeignKey(GameAccount, on_delete=models.CASCADE, related_name="skill_progress")
+    skill_code = models.CharField(max_length=20, choices=SKILLS)
+    total_xp = models.PositiveBigIntegerField(default=0)
+    rules_version = models.PositiveIntegerField(default=1)
+
+    class Meta:
+        constraints = [models.UniqueConstraint(fields=["player", "skill_code"], name="player_skill_unique")]
+        verbose_name = "玩家技能进度"
+        verbose_name_plural = "玩家技能进度"
+
+    @property
+    def level(self):
+        from .progression_rules import level_for_xp
+        return level_for_xp(self.total_xp)
+
+
+class SkillRewardReceipt(models.Model):
+    player = models.ForeignKey(GameAccount, on_delete=models.CASCADE, related_name="skill_reward_receipts")
+    source_type = models.CharField(max_length=40)
+    source_id = models.CharField(max_length=128)
+    skill_code = models.CharField(max_length=20, choices=PlayerSkillProgress.SKILLS)
+    rules_version = models.PositiveIntegerField(default=1)
+    result = models.JSONField(default=dict)
+    created_at = models.DateTimeField(auto_now_add=True)
+
+    class Meta:
+        constraints = [models.UniqueConstraint(fields=["player", "source_type", "source_id", "skill_code"],
+                                               name="player_skill_reward_source_unique")]
+        verbose_name = "技能奖励回执"
+        verbose_name_plural = "技能奖励回执"
+
+
+class PlayerMilestoneProgress(models.Model):
+    player = models.ForeignKey(GameAccount, on_delete=models.CASCADE, related_name="growth_milestones")
+    code = models.CharField(max_length=50)
+    title = models.CharField(max_length=100)
+    source_type = models.CharField(max_length=40)
+    source_id = models.CharField(max_length=128)
+    rules_version = models.PositiveIntegerField(default=1)
+    completed_at = models.DateTimeField(auto_now_add=True)
+
+    class Meta:
+        constraints = [models.UniqueConstraint(fields=["player", "code"], name="player_milestone_unique")]
+        verbose_name = "玩家成长里程碑"
+        verbose_name_plural = "玩家成长里程碑"
+
+
+class ItemGameplayDefinition(models.Model):
+    """Static capabilities only. G0 does not enforce new equipment gates."""
+    item = models.OneToOneField("items.Item", on_delete=models.CASCADE, related_name="gameplay_definition")
+    capability_code = models.CharField(max_length=40)
+    tier = models.PositiveSmallIntegerField(default=1, choices=[(1, "基础"), (2, "改良"), (3, "专业")])
+    required_skill = models.CharField(max_length=20, choices=PlayerSkillProgress.SKILLS, blank=True, default="")
+    required_level = models.PositiveSmallIntegerField(default=1)
+    effects = models.JSONField(default=list, blank=True)
+    rules_version = models.PositiveIntegerField(default=1)
+
+    class Meta:
+        constraints = [
+            models.CheckConstraint(condition=models.Q(tier__gte=1, tier__lte=3), name="item_gameplay_valid_tier"),
+            models.CheckConstraint(condition=models.Q(required_level__gte=1, required_level__lte=10),
+                                   name="item_gameplay_valid_level"),
+        ]
+        verbose_name = "物品玩法能力定义"
+        verbose_name_plural = "物品玩法能力定义"

@@ -172,6 +172,7 @@ def _get_affair(params, minute):
 
 
 def overview(player, bag, minute, *, read_only=False):
+    from player.progression import growth_snapshot
     from .daily_events import project_daily_events
     from inventory.batches import project_batch
     from .lucy_restaurant import public_meal_quota
@@ -222,6 +223,7 @@ def overview(player, bag, minute, *, read_only=False):
         bag.refresh_from_db()
     return dict(world_minute=minute, player_id=str(player.pk), player_name=player.username, money=bag.money,
         action_points=state.action_points, action_points_max=state.action_points_max,
+        growth=growth_snapshot(player, read_only=read_only),
         collection_points=[dict(collect_type=c.collect_type, location_code=COLLECTION_LOCATIONS[c.collect_type],
             action_cost=c.action_cost, collect_count=c.collect_count) for c in CollectionPoint.objects.filter(collect_type__in=COLLECTION_LOCATIONS)],
         contributions=contributions, project=_project(minute)[0], market=market,
@@ -314,7 +316,9 @@ def _execute(player, bag, action, p, rid, location, clock, authority_session_id=
                 item_bag_name=f"{item.item_name}_{next_index}")
             next_index += 1
             collected.append(_batch_data(slot, minute, {item.pk: item.item_name}))
-        return dict(collected_items=collected, action_points=state.action_points, action_cost=point.action_cost)
+        from player.progression import settle_growth
+        return dict(collected_items=collected, action_points=state.action_points, action_cost=point.action_cost,
+                    growth_rewards=[settle_growth(player, source_type="collect", source_id=rid)])
     if action == "contribute":
         from .affairs import AffairError, contribute, validate_contribution
         kind, quantity = p.get("kind"), positive(p.get("quantity"))

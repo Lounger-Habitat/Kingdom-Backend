@@ -4,6 +4,8 @@ from django.shortcuts import render, redirect
 from django.urls import path
 from account.models import GameAccount
 from .models import PlayerState, PlayerRecipe, PlayerTitle, DefaultRecipe, PlayerResetProxy, ActionPointCostConfig
+from .models import (PlayerGrowthState, PlayerSkillProgress, SkillRewardReceipt,
+                     PlayerMilestoneProgress, ItemGameplayDefinition)
 
 
 class PlayerRecipeInline(admin.TabularInline):
@@ -172,3 +174,47 @@ class PlayerResetAdmin(admin.ModelAdmin):
 
     def changelist_view(self, request, extra_context=None):
         return redirect("player-admin-reset-list")
+
+
+class GrowthAuditAdmin(admin.ModelAdmin):
+    """Settlement-owned records must not be edited around receipts/revisions."""
+    search_fields = ["player__username"]
+
+    def has_add_permission(self, request):
+        return False
+
+    def has_change_permission(self, request, obj=None):
+        return False
+
+    def has_delete_permission(self, request, obj=None):
+        return False
+
+
+@admin.register(PlayerGrowthState)
+class PlayerGrowthStateAdmin(GrowthAuditAdmin):
+    list_display = ["player", "revision", "legacy_migration_version"]
+
+
+@admin.register(PlayerSkillProgress)
+class PlayerSkillProgressAdmin(GrowthAuditAdmin):
+    list_display = ["player", "skill_code", "level", "total_xp", "rules_version"]
+    list_filter = ["skill_code"]
+
+
+@admin.register(SkillRewardReceipt)
+class SkillRewardReceiptAdmin(GrowthAuditAdmin):
+    list_display = ["player", "skill_code", "source_type", "source_id", "rules_version", "created_at"]
+    list_filter = ["skill_code", "source_type"]
+
+
+@admin.register(PlayerMilestoneProgress)
+class PlayerMilestoneProgressAdmin(GrowthAuditAdmin):
+    list_display = ["player", "code", "title", "source_type", "source_id", "completed_at"]
+    list_filter = ["code"]
+
+
+@admin.register(ItemGameplayDefinition)
+class ItemGameplayDefinitionAdmin(admin.ModelAdmin):
+    list_display = ["item", "capability_code", "tier", "required_skill", "required_level", "rules_version"]
+    list_filter = ["capability_code", "tier", "required_skill"]
+    search_fields = ["item__item_name", "capability_code"]
