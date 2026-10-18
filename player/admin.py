@@ -192,7 +192,7 @@ class GrowthAuditAdmin(admin.ModelAdmin):
 
 @admin.register(PlayerGrowthState)
 class PlayerGrowthStateAdmin(GrowthAuditAdmin):
-    list_display = ["player", "revision", "legacy_migration_version"]
+    list_display = ["player", "revision", "legacy_migration_version", "tracked_goal_code"]
 
 
 @admin.register(PlayerSkillProgress)

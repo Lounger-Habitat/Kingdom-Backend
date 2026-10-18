@@ -159,6 +159,7 @@ def tick_player_labor(payload):
         labor.last_seen_at = now
         labor.location_code = payload["current_location_code"]
         credited = 0
+        growth_rewards = []
         affected_npcs, earned_gold = [], 0
         while labor.accumulated_minutes >= labor.unit_minutes:
             # Stable per-unit key makes a response loss/retry harmless. The clock
@@ -172,6 +173,8 @@ def tick_player_labor(payload):
                     finished = result.get("status") == "COMPLETED"
                     if finished:
                         earned_gold = result.get("reward_gold", 0)
+                        from player.starter import record_order_completion
+                        growth_rewards.append(record_order_completion(labor.player, "personal_commission", labor.commission_id))
                     condition_closed = finished or not any(c.get("id") == labor.condition_id and c.get("available")
                                                           for c in result.get("conditions", []))
                 else:
@@ -194,6 +197,7 @@ def tick_player_labor(payload):
             from .daily_events import evaluate_daily_events
             evaluate_daily_events(clock.world_minute)
         return response(labor_id, data=dict(labor=labor_data(labor), credited_units=credited,
-                                           earned_gold=earned_gold, affected_npc_ids=affected_npcs))
+                                           earned_gold=earned_gold, affected_npc_ids=affected_npcs,
+                                           growth_rewards=growth_rewards))
     except ActionError as exc:
         return response(payload.get("labor_id", "") if isinstance(payload, dict) else "", exc.code, exc.message)

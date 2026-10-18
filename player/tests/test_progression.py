@@ -36,16 +36,21 @@ class GrowthServiceTests(TestCase):
     def setUp(self):
         self.player = GameAccount.objects.create(username="growth-service")
 
-    def test_six_skills_persist_and_only_gathering_live(self):
+    def test_six_skills_persist_and_only_released_routes_are_live(self):
         first = growth_snapshot(self.player)
         self.assertEqual([s["code"] for s in first["skills"]], [code for code, _ in SKILLS])
         self.assertEqual(PlayerSkillProgress.objects.filter(player=self.player).count(), 6)
         self.assertEqual(first, growth_snapshot(GameAccount.objects.get(pk=self.player.pk)))
         for skill in first["skills"]:
-            self.assertEqual(skill["progression_enabled"], skill["code"] == "gathering")
-            self.assertEqual(skill["effects"], [])
-            self.assertTrue(all(not n["implemented"] and not n["available"]
-                                and n["reason"] == "CONTENT_NOT_RELEASED" for n in skill["unlocks"]))
+            self.assertEqual(skill["progression_enabled"], skill["code"] in {"gathering", "business"})
+            for node in skill["unlocks"]:
+                self.assertFalse(node["available"])
+                if node["code"] == "targeted_gathering":
+                    self.assertTrue(node["implemented"])
+                    self.assertEqual(node["reason"], "SKILL_LEVEL_REQUIRED")
+                else:
+                    self.assertFalse(node["implemented"])
+                    self.assertEqual(node["reason"], "CONTENT_NOT_RELEASED")
 
     def test_generic_award_cross_level_replay_and_account_isolation(self):
         other = GameAccount.objects.create(username="growth-other")
@@ -106,7 +111,7 @@ class GrowthServiceTests(TestCase):
         item = Item.objects.create(item_id=30001, item_name="测试工具", max_use_count=50)
         ItemGameplayDefinition.objects.create(item=item, capability_code="gathering", tier=2,
                                                required_skill="gathering", required_level=4)
-        data = growth_snapshot(self.player)["equipment_definitions"][0]
+        data = next(row for row in growth_snapshot(self.player)["equipment_definitions"] if row["item_id"] == item.pk)
         self.assertEqual((data["item_id"], data["maximum_uses"], data["tier"]), (30001, 50, 2))
         self.assertFalse(data["runtime_enforced"])
 

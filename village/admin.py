@@ -2,6 +2,8 @@ from django import forms
 from django.contrib import admin
 
 from .command_catalog import command_admin_label, command_admin_sort_key
+from .models import (StarterSupplyBatch, StarterSupplyOrder, StarterSupplyDelivery,
+                     StarterSupplyReceipt, StarterReserveTransfer)
 from .models import (
     DailyPriceSnapshot,
     EconomicLedgerEntry,
@@ -553,3 +555,30 @@ class VillageCaravanVisitAdmin(StoryReadOnlyAdmin):
 @admin.register(VillageCaravanRequest)
 class VillageCaravanRequestAdmin(StoryReadOnlyAdmin):
     list_display = ("day_index", "item_ids", "submitted_world_minute")
+
+
+@admin.register(StarterSupplyBatch)
+class StarterSupplyBatchAdmin(StoryReadOnlyAdmin):
+    list_display = ("code", "status", "reserved_gold", "escrow_gold", "paid_gold", "refunded_gold", "revision")
+
+
+@admin.register(StarterSupplyOrder)
+class StarterSupplyOrderAdmin(StoryReadOnlyAdmin):
+    list_display = ("order_id", "batch", "status", "actor_player", "delivered_quantity", "reward_gold")
+    list_filter = ("status",)
+
+
+@admin.register(StarterSupplyDelivery)
+class StarterSupplyDeliveryAdmin(StoryReadOnlyAdmin):
+    list_display = ("order", "source_instance_id", "slot", "quantity", "status")
+    list_filter = ("status",)
+
+
+@admin.register(StarterSupplyReceipt)
+class StarterSupplyReceiptAdmin(StoryReadOnlyAdmin):
+    list_display = ("player", "request_id", "action")
+
+
+@admin.register(StarterReserveTransfer)
+class StarterReserveTransferAdmin(StoryReadOnlyAdmin):
+    list_display = ("request_id", "batch", "beneficiary", "purpose", "world_minute")

@@ -107,6 +107,7 @@ class PlayerGrowthState(models.Model):
     revision = models.PositiveBigIntegerField(default=0)
     legacy_migration_version = models.PositiveIntegerField(default=0)
     legacy_entitlements = models.JSONField(default=dict, blank=True)
+    tracked_goal_code = models.CharField(max_length=50, default="", blank=True)
 
     class Meta:
         verbose_name = "玩家成长档案"

@@ -64,7 +64,8 @@ def growth_snapshot(player, *, read_only=False):
         legacy_entitlements=deepcopy(state.legacy_entitlements) if points is None else legacy_entitlements(points),
         equipment_definitions=[dict(item_id=d.item_id, item_name=d.item.item_name, capability_code=d.capability_code,
             tier=d.tier, required_skill=d.required_skill, required_level=d.required_level, effects=deepcopy(d.effects),
-            maximum_uses=d.item.max_use_count, rules_version=d.rules_version, runtime_enforced=False)
+            maximum_uses=d.item.max_use_count, rules_version=d.rules_version,
+            runtime_enforced=d.capability_code == "targeted_gathering")
             for d in ItemGameplayDefinition.objects.select_related("item").filter(item__is_deleted=False).order_by("item_id")])
 
 

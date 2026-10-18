@@ -758,6 +758,9 @@ def inventory_collect(request, character_id):
 @api_view(["POST"])
 def inventory_collect_upgrade(request, character_id):
     """采集点升级接口：消耗资源，提升采集点等级。"""
+    retired = _village_collection_upgrade_retired()
+    if retired is not None:
+        return retired
     from player.models import PlayerState
 
     collect_type = request.data.get("collectType", "")
@@ -876,9 +879,21 @@ def _get_level_benefits(collection_point, level):
     }
 
 
+def _village_collection_upgrade_retired():
+    from village.models import VillageSimulationConfig
+    if VillageSimulationConfig.objects.filter(config_key="default", village_economy_enabled=True).exists():
+        return Response({"code": "COLLECTION_UPGRADE_RETIRED",
+                         "message": "采集技能通过真实采集自动成长，旧金币和菜品升级已停售；已购采集权益保留。",
+                         "data": {"canUpgrade": False, "replacement": "player_growth"}}, status=403)
+    return None
+
+
 @api_view(["GET"])
 def inventory_collect_upgrade_info(request, character_id):
     """查询采集点升级消耗，供客户端展示确认框。"""
+    retired = _village_collection_upgrade_retired()
+    if retired is not None:
+        return retired
     collect_type = request.query_params.get("collectType", "")
     try:
         collection_point = CollectionPoint.objects.get(collect_type=collect_type)

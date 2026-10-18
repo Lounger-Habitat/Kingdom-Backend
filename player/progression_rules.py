@@ -1,7 +1,7 @@
 """Versioned G0 rules. Unreleased content is descriptive, never an active bonus."""
 from copy import deepcopy
 
-RULES_VERSION = 1
+RULES_VERSION = 2
 SKILLS = (
     ("gathering", "采集"), ("farming", "种植"), ("forestry", "伐木"),
     ("hunting", "狩猎"), ("cooking", "烹饪"), ("business", "经营"),
@@ -14,11 +14,12 @@ LEGACY_FOOD_LEVELS = {1: 1, 2: 2, 3: 4, 4: 6, 5: 7}
 COLLECT_XP = 10
 FIRST_GATHERING_XP = 20
 FIRST_GATHERING = "first_gathering"
+BUSINESS_ORDER_XP = 20
 REWARD_RULES = {"collect": {"skill_code": "gathering", "xp": COLLECT_XP,
     "milestone_code": FIRST_GATHERING, "milestone_title": "第一次采集", "milestone_xp": FIRST_GATHERING_XP}}
 
 _UNLOCKS = {
-    "gathering": ((2, "targeted_gathering", "按食材类别采集"), (4, "advanced_gathering", "进阶资源与改良工具包"),
+    "gathering": ((2, "targeted_gathering", "类别采集资格（需采集工具包）"), (4, "advanced_gathering", "进阶资源与改良工具包"),
                   (7, "professional_gathering", "深林原料与专业工具包"), (10, "gathering_mastery", "采集精通挑战")),
     "farming": ((2, "seed_return", "返种概率改善"), (4, "advanced_crops", "新作物与改良农具"),
                 (7, "professional_crops", "专业作物与农具"), (10, "farming_mastery", "种植精通挑战")),
@@ -40,13 +41,23 @@ def level_for_xp(total_xp):
 def skill_data(code, name, total_xp):
     total_xp = min(MAX_XP, max(0, total_xp))
     level = level_for_xp(total_xp)
+    effects = []
+    if code == "gathering" and level >= 2:
+        effects.append(dict(code="targeted_gathering", title="可使用有耐久的采集工具包选择食材类别"))
+    if code == "business":
+        effects.append(dict(code="supply_experience", title="完成真实需求订单可积累经营经验"))
+    unlocks = []
+    for required, key, title in _UNLOCKS[code]:
+        implemented = key == "targeted_gathering"
+        available = implemented and level >= required
+        unlocks.append(dict(code=key, title=title, required_level=required, implemented=implemented,
+                            available=available, reason=None if available else
+                            "SKILL_LEVEL_REQUIRED" if implemented else "CONTENT_NOT_RELEASED"))
     return dict(code=code, name=name, level=level, total_xp=total_xp,
                 xp_in_level=total_xp - LEVEL_TOTALS[level - 1] if level < 10 else 0,
                 xp_to_next_level=LEVEL_COSTS[level - 1] if level < 10 else 0,
-                max_level=10, progression_enabled=code == "gathering", effects=[],
-                unlocks=[dict(code=key, title=title, required_level=required, implemented=False,
-                              available=False, reason="CONTENT_NOT_RELEASED")
-                         for required, key, title in _UNLOCKS[code]])
+                max_level=10, progression_enabled=code in {"gathering", "business"}, effects=effects,
+                unlocks=unlocks)
 
 
 def legacy_entitlements(points):

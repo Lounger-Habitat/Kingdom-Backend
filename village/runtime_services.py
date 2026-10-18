@@ -496,6 +496,8 @@ class TimeService:
         DialogueService.expire_active(state.world_minute)
         from .personal_commissions import expire_commissions
         expire_commissions(state.world_minute)
+        from .starter_supply import expire_supply
+        expire_supply(state.world_minute)
         from .player_farm import maintain_leases
         maintain_leases(state.world_minute, state.time_revision)
 
@@ -543,6 +545,8 @@ class TimeService:
             DialogueService.expire_active(state.world_minute)
             from .personal_commissions import expire_commissions
             expire_commissions(state.world_minute)
+            from .starter_supply import expire_supply
+            expire_supply(state.world_minute)
             from .player_farm import maintain_leases
             maintain_leases(state.world_minute, state.time_revision)
             from .daily_events import evaluate_daily_events
@@ -586,6 +590,8 @@ class BootstrapService:
         time_state = GlobalGameTimeState.objects.select_for_update().get(pk=1)
         from .personal_commissions import expire_commissions
         expire_commissions(time_state.world_minute)
+        from .starter_supply import expire_supply
+        expire_supply(time_state.world_minute)
         from .player_farm import maintain_leases
         maintain_leases(time_state.world_minute, time_state.time_revision)
         from .dialogue_service import DialogueService

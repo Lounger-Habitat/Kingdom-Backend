@@ -31,6 +31,7 @@ LOCATIONS = {
     "delist_marketplace": {"MARKET_STREET"},
     "buy_store": {"GENERAL_STORE", "RESTAURANT"},
     "sell_store": {"GENERAL_STORE"},
+    "supply_deliver": {"GENERAL_STORE"},
 }
 PARAMS = {
     "overview": set(),
@@ -45,7 +46,11 @@ PARAMS = {
     "delist_marketplace": {"listing_id"},
     "buy_store": {"listing_id", "quantity", "expected_unit_price"},
     "sell_store": {"instance_id", "quantity", "expected_unit_price"},
-    "collect": {"collect_type"},
+    "collect": {"collect_type", "category", "tool_instance_id"},
+    "supply_accept": {"order_id"},
+    "supply_deliver": {"order_id", "instance_id", "quantity"},
+    "supply_abandon": {"order_id"},
+    "track_goal": {"goal_code"},
 }
 COLLECTION_LOCATIONS = {"采集食材": "FOREST_EDGE"}
 from .player_farm import ACTIONS as FARM_ACTIONS
@@ -173,6 +178,8 @@ def _get_affair(params, minute):
 
 def overview(player, bag, minute, *, read_only=False):
     from player.progression import growth_snapshot
+    from player.starter import starter_overview
+    from .player_gathering import gathering_overview
     from .daily_events import project_daily_events
     from inventory.batches import project_batch
     from .lucy_restaurant import public_meal_quota
@@ -221,9 +228,12 @@ def overview(player, bag, minute, *, read_only=False):
             remaining_quantity=listing.remaining_amount, unit_price=listing.price, quality=listing.quality, expires_world_minute=expiry))
     if bag.pk:
         bag.refresh_from_db()
+    starter = starter_overview(player, bag, minute, read_only=read_only)
+    starter["gathering"] = gathering_overview(player, bag, minute)
     return dict(world_minute=minute, player_id=str(player.pk), player_name=player.username, money=bag.money,
         action_points=state.action_points, action_points_max=state.action_points_max,
         growth=growth_snapshot(player, read_only=read_only),
+        starter=starter,
         collection_points=[dict(collect_type=c.collect_type, location_code=COLLECTION_LOCATIONS[c.collect_type],
             action_cost=c.action_cost, collect_count=c.collect_count) for c in CollectionPoint.objects.filter(collect_type__in=COLLECTION_LOCATIONS)],
         contributions=contributions, project=_project(minute)[0], market=market,
@@ -246,6 +256,18 @@ def _execute(player, bag, action, p, rid, location, clock, authority_session_id=
         fail("LOCATION_INVALID", "请前往对应地点再操作。")
     if action == "overview":
         return {}
+    if action == "track_goal":
+        from player.starter import StarterError, track_goal
+        try:
+            return track_goal(player, p.get("goal_code"))
+        except StarterError as exc:
+            fail(exc.code, exc.message)
+    if action.startswith("supply_"):
+        from .starter_supply import SupplyError, execute_supply
+        try:
+            return execute_supply(player, bag, action, p, rid, minute)
+        except SupplyError as exc:
+            fail(exc.code, exc.message)
     if action in FARM_ACTIONS:
         from .player_farm import execute_farm_action
         return execute_farm_action(player, bag, action, p, rid, clock)
@@ -293,6 +315,11 @@ def _execute(player, bag, action, p, rid, location, clock, authority_session_id=
         pool, weights, error = _build_collect_pool(player, point)
         if error:
             fail("COLLECTION_UNAVAILABLE", "当前等级没有可采集物品。")
+        from .player_gathering import GatheringError, prepare_targeted_collection, wear_tool
+        try:
+            pool, weights, tool = prepare_targeted_collection(player, bag, p, pool, weights, minute=minute)
+        except GatheringError as exc:
+            fail(exc.code, exc.message)
         valid = [(entry, weight) for entry, weight in zip(pool, weights)
                  if weight > 0 and not entry["item"].is_deleted and 0 < entry["min_amount"] <= entry["max_amount"]]
         if not valid:
@@ -318,6 +345,7 @@ def _execute(player, bag, action, p, rid, location, clock, authority_session_id=
             collected.append(_batch_data(slot, minute, {item.pk: item.item_name}))
         from player.progression import settle_growth
         return dict(collected_items=collected, action_points=state.action_points, action_cost=point.action_cost,
+                    category=p.get("category"), tool_used=wear_tool(tool) if tool is not None else None,
                     growth_rewards=[settle_growth(player, source_type="collect", source_id=rid)])
     if action == "contribute":
         from .affairs import AffairError, contribute, validate_contribution
@@ -461,6 +489,8 @@ def execute_player_action(payload):
         # Expiry is world maintenance: it survives a rejected player action.
         from .personal_commissions import expire_commissions
         expire_commissions(clock.world_minute)
+        from .starter_supply import expire_supply
+        expire_supply(clock.world_minute)
         from .player_farm import maintain_leases
         maintain_leases(clock.world_minute, clock.time_revision)
         try:
@@ -469,6 +499,18 @@ def execute_player_action(payload):
                 bag = InventoryBag.objects.select_for_update().get(pk=bag.pk)
                 result = _execute(player, bag, action, params, rid, payload.get("current_location_code", ""), clock, payload.get("authority_session_id"))
                 if action != "overview":
+                    from player.starter import post_action_progress
+                    progress = post_action_progress(player, bag, action, params, result, rid, clock.world_minute)
+                    result.setdefault("growth_rewards", []).extend(progress.pop("growth_rewards", []))
+                    result.update(progress)
+                    if action == "collect":
+                        from .starter_supply import ensure_supply_batch
+                        from .player_gathering import GatheringError, ensure_gathering_catalog
+                        ensure_supply_batch(clock.world_minute)
+                        try:
+                            ensure_gathering_catalog(clock.world_minute)
+                        except GatheringError as exc:
+                            fail(exc.code, exc.message)
                     from .daily_events import evaluate_daily_events
                     evaluate_daily_events(clock.world_minute)
             answer = response(rid, data=dict(result=result, overview=overview(player, bag, clock.world_minute)))

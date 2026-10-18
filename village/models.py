@@ -2311,3 +2311,89 @@ class VillageForestryReceipt(models.Model):
     payload_hash = models.CharField(max_length=64)
     response = models.JSONField(default=dict)
     world_minute = models.BigIntegerField()
+
+
+class StarterSupplyBatch(models.Model):
+    """One finite public procurement campaign; funds never refill on queries."""
+    code = models.CharField(max_length=40, primary_key=True)
+    status = models.CharField(max_length=24, default="OPEN")
+    unavailable_reason = models.CharField(max_length=50, default="", blank=True)
+    fund = models.ForeignKey(VillageAccount, null=True, blank=True, on_delete=models.PROTECT)
+    reserve_bag = models.OneToOneField("inventory.InventoryBag", null=True, blank=True, on_delete=models.PROTECT)
+    opened_world_minute = models.BigIntegerField()
+    expires_world_minute = models.BigIntegerField()
+    reserved_gold = models.PositiveIntegerField(default=0)
+    escrow_gold = models.PositiveIntegerField(default=0)
+    paid_gold = models.PositiveIntegerField(default=0)
+    refunded_gold = models.PositiveIntegerField(default=0)
+    revision = models.PositiveBigIntegerField(default=1)
+
+    class Meta:
+        verbose_name = "入门公共采购批次"
+        verbose_name_plural = "入门公共采购批次"
+        constraints = [models.CheckConstraint(condition=models.Q(
+            reserved_gold=models.F("escrow_gold") + models.F("paid_gold") + models.F("refunded_gold")),
+            name="starter_supply_gold_conserved")]
+
+
+class StarterSupplyOrder(models.Model):
+    order_id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
+    batch = models.ForeignKey(StarterSupplyBatch, on_delete=models.PROTECT, related_name="orders")
+    status = models.CharField(max_length=16, default="OPEN")
+    actor_player = models.ForeignKey("account.GameAccount", null=True, blank=True, on_delete=models.PROTECT)
+    escrow_bag = models.OneToOneField("inventory.InventoryBag", on_delete=models.PROTECT)
+    required_quantity = models.PositiveIntegerField(default=6)
+    delivered_quantity = models.PositiveIntegerField(default=0)
+    reward_gold = models.PositiveIntegerField(default=54)
+    accepted_item_ids = models.JSONField(default=list)
+
+    class Meta:
+        verbose_name = "入门公共采购订单"
+        verbose_name_plural = "入门公共采购订单"
+        constraints = [
+            models.UniqueConstraint(fields=["batch", "actor_player"], condition=models.Q(status="COMPLETED"),
+                                    name="starter_supply_one_completed"),
+            models.UniqueConstraint(fields=["actor_player"], condition=models.Q(status="ACTIVE"),
+                                    name="starter_supply_one_active"),
+            models.CheckConstraint(condition=models.Q(delivered_quantity__lte=models.F("required_quantity")),
+                                   name="starter_supply_quantity_bounded"),
+        ]
+
+
+class StarterSupplyDelivery(models.Model):
+    order = models.ForeignKey(StarterSupplyOrder, on_delete=models.PROTECT, related_name="deliveries")
+    source_instance_id = models.UUIDField()
+    slot = models.ForeignKey("inventory.InventorySlot", on_delete=models.PROTECT)
+    quantity = models.PositiveIntegerField()
+    status = models.CharField(max_length=16, default="HELD")
+
+    class Meta:
+        verbose_name = "公共采购交付批次"
+        verbose_name_plural = "公共采购交付批次"
+
+
+class StarterSupplyReceipt(models.Model):
+    player = models.ForeignKey("account.GameAccount", on_delete=models.PROTECT)
+    request_id = models.UUIDField()
+    action = models.CharField(max_length=24)
+    payload_hash = models.CharField(max_length=64)
+    result = models.JSONField(default=dict)
+
+    class Meta:
+        verbose_name = "公共采购操作回执"
+        verbose_name_plural = "公共采购操作回执"
+        constraints = [models.UniqueConstraint(fields=["player", "request_id"], name="starter_supply_request_once")]
+
+
+class StarterReserveTransfer(models.Model):
+    request_id = models.UUIDField(primary_key=True)
+    batch = models.ForeignKey(StarterSupplyBatch, on_delete=models.PROTECT)
+    purpose = models.CharField(max_length=200)
+    beneficiary = models.CharField(max_length=100)
+    world_minute = models.BigIntegerField()
+    payload_hash = models.CharField(max_length=64)
+    result = models.JSONField(default=dict)
+
+    class Meta:
+        verbose_name = "公共储备支用记录"
+        verbose_name_plural = "公共储备支用记录"

@@ -100,6 +100,10 @@ class PlayerCommissionTests(PlayerFixture, TestCase):
         self.assertEqual(done["data"]["earned_gold"], 80)
         self.assertEqual(done["data"]["labor"]["status"], "COMPLETED")
         self.assertEqual(self.tick(labor)["data"]["credited_units"], 0)
+        from player.models import PlayerSkillProgress, SkillRewardReceipt
+        self.assertEqual(done["data"]["growth_rewards"][0]["xp_gained"], 20)
+        self.assertEqual(PlayerSkillProgress.objects.get(player=self.a, skill_code="business").total_xp, 20)
+        self.assertEqual(SkillRewardReceipt.objects.filter(player=self.a, source_type="personal_commission").count(), 1)
         self.bag_a.refresh_from_db(); self.lucy.refresh_from_db()
         self.assertEqual((self.bag_a.money, self.lucy.money), (180, 920))
         self.assertEqual(self.lucy.slots.get(item_id=1002).item_amount, 2)
