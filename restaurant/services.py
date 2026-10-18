@@ -137,6 +137,10 @@ class RestaurantService:
     @staticmethod
     def exhibit_dish(player, data):
         """上架菜品到菜单。"""
+        from village.player_legacy_production import needs_batch_safe_stall
+        protected = InventorySlot.objects.filter(bag__player=player, instance_id=data["instance_id"]).first()
+        if needs_batch_safe_stall(protected):
+            return False, "\u6b64\u83dc\u54c1\u9700\u8981\u4fdd\u7559\u5b8c\u6574\u6279\u6b21\uff0c\u8bf7\u5148\u4f7f\u7528\u6751\u5e84\u4f9b\u8d27\u6216\u4ea4\u6613\u3002"
         instance_id = data["instance_id"]
         item_id = data["item_id"]
         quantity = data["quantity"]

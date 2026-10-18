@@ -65,7 +65,7 @@ def growth_snapshot(player, *, read_only=False):
         equipment_definitions=[dict(item_id=d.item_id, item_name=d.item.item_name, capability_code=d.capability_code,
             tier=d.tier, required_skill=d.required_skill, required_level=d.required_level, effects=deepcopy(d.effects),
             maximum_uses=d.item.max_use_count, rules_version=d.rules_version,
-            runtime_enforced=d.capability_code in {"targeted_gathering", "farming", "forestry"})
+            runtime_enforced=d.capability_code in {"targeted_gathering", "farming", "forestry", "cooking"})
             for d in ItemGameplayDefinition.objects.select_related("item").filter(item__is_deleted=False).order_by("item_id")])
 
 

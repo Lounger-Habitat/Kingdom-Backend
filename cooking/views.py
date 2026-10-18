@@ -58,6 +58,11 @@ def pity_check(request):
     if not player_id:
         return Response({"success": False, "message": "未登录"}, status=401)
 
+    from village.player_legacy_production import legacy_production_guard
+    guard = legacy_production_guard()
+    if guard is not None:
+        return guard
+
     data = request.data
     normal_quality = data.get("normalQuality", 3)
     cook_time = data.get("cookTime", 0)
@@ -173,6 +178,11 @@ def cook(request):
     player_id = get_player_id(request)
     if not player_id:
         return Response({"success": False, "message": "未登录"}, status=401)
+
+    from village.player_legacy_production import legacy_production_guard
+    guard = legacy_production_guard()
+    if guard is not None:
+        return guard
 
     character_id = request.data.get("characterId", "player")
     ingredients_raw = request.data.get("ingredients", [])

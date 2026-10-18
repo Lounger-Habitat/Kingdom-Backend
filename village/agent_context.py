@@ -210,7 +210,7 @@ def build_agent_context(actions, profile=None):
     if "REQUEST_DISH_REVIEW" in actions:
         rules.append("Lucy制作产物先归个人，可留餐自食再上架。到RECORD_HALL用REQUEST_DISH_REVIEW(food_instance_id)提交具体1份给Mark；待评预留180分钟，不可重复吃卖，可CANCEL_DISH_REVIEW(review_id)。未评可按默认价值卖，评后按点评价卖。配方及产量查GET_RULE.cooking_recipes，再对照INSPECT_INVENTORY的可用量判断缺料；cook_time_seconds是工艺随机秒数，不是工作游戏分钟。")
     if "RATE_DISH" in actions:
-        rules.append("Mark先INSPECT_RATEABLE_DISHES读取Lucy实际送来的review_id及完整菜品快照，用本人LLM判断色color、香aroma、味taste、摆盘presentation四项1–10分及comment。RATE_DISH提交review_id、scores对象、comment，不传总分/价格；后台按加权总分与默认价值计算价格。历史资料不完整须在评语说明，不编造原料。")
+        rules.append("Mark收到玩家送评通知或Lucy委托后，先INSPECT_RATEABLE_DISHES读取实际托管样品的review_id及菜品资料；owner_type=PLAYER为玩家样品，与Lucy的NPC样品同样正式点评，用本人LLM判断色color、香aroma、味taste、摆盘presentation四项1–10分及comment。RATE_DISH提交review_id、scores对象、comment，不传总分/价格；后台按加权总分与默认价值计算价格。历史资料不完整须在评语说明，不编造原料。")
     if actions & {"BUY_FROM_STORE", "LIST_STORE_ITEM"}:
         rules.append("公共餐由Lucy实际制作后在饭店用ORIGINAL加public_meal_code=C1/C2/R1上架，无需授权，顾客价格0。按真实领取向饭店补贴9/12/9金；三类共享每人每个游戏日1份、全村每天10份，NPC（包括Lucy）和参与村庄生活的玩家共同占用总额度，游戏日零点重置。缺公款整笔失败。先BUY_FROM_STORE领取，再EAT个人食物，吃饭不再次发补贴。")
     if "DEPOSIT_STORE_FUNDS" in actions:

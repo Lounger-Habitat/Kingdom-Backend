@@ -42,11 +42,11 @@ class GrowthServiceTests(TestCase):
         self.assertEqual(PlayerSkillProgress.objects.filter(player=self.player).count(), 6)
         self.assertEqual(first, growth_snapshot(GameAccount.objects.get(pk=self.player.pk)))
         for skill in first["skills"]:
-            self.assertEqual(skill["progression_enabled"], skill["code"] in {"gathering", "business", "farming", "forestry"})
+            self.assertEqual(skill["progression_enabled"], skill["code"] in {"gathering", "business", "farming", "forestry", "cooking"})
             for node in skill["unlocks"]:
                 self.assertFalse(node["available"])
                 if node["code"] in {"targeted_gathering", "advanced_gathering", "seed_return",
-                                     "advanced_crops", "crop_quality", "felling_efficiency", "hardwood"}:
+                                     "advanced_crops", "crop_quality", "felling_efficiency", "hardwood", "basic_quality", "advanced_cooking"}:
                     self.assertTrue(node["implemented"])
                     self.assertEqual(node["reason"], "SKILL_LEVEL_REQUIRED")
                 else:

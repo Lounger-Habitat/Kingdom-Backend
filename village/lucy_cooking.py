@@ -118,8 +118,11 @@ def cook(npc_id, params, minute, request_id):
         metadata = dict(rule_version="lucy-dish-v1", maker_npc_id=str(npc_id), recipe_id=recipe.pk,
             recipe_name=recipe.recipe_name, recipe=recipe_info, ingredients=inputs, base_quality=3,
             cook_time_source="NO_HEAT" if cold else "RECIPE_RANDOM_SECONDS", production_request_id=str(request_id))
+        input_expiries = [batch["expires_world_minute"] for ingredient in inputs for batch in ingredient["batches"]
+                          if batch["expires_world_minute"] is not None]
+        expires = min([minute + DISH_SPOILAGE_MINUTES, *input_expiries])
         slot = add_batch(inventory, recipe.item_id, recipe.output_quantity, minute,
-            minute + DISH_SPOILAGE_MINUTES, request_id, item_attributes=dict(dish_metadata=metadata,
+            expires, request_id, item_attributes=dict(dish_metadata=metadata,
             dish_quality=quality, cook_time=seconds, ingredient="、".join(f"{i.item_name}×{i.count}" for i in ingredients),
             item_bag_name=recipe.recipe_name, rated=False, rating_price=-1))
         inventory.asset_version += 1
@@ -229,6 +232,17 @@ def rate_dish(npc_id, params, minute, request_id):
     feedback = params.get("customer_feedback", "")
     if not isinstance(feedback, str) or len(feedback) > 2000:
         return _fail("DISH_REVIEW_INVALID_COMMENT")
+    # Player samples use the same authenticated Mark command, with separate
+    # ownership/escrow and private growth settlement.
+    from .models import VillagePlayerDishReview
+    if VillagePlayerDishReview.objects.filter(pk=_id(params.get("review_id"))).exists():
+        from .player_dish_reviews import ReviewError, complete_player_review
+        try:
+            data = complete_player_review(npc_id, params, minute, request_id)
+        except ReviewError as exc:
+            return _fail(exc.code, data={"message": exc.message})
+        return _ok(data=data, effects={"dish_rated": data}, participant_npc_ids=["10013"],
+                   event_visibility="PARTICIPANTS", external_delta=0)
     row = VillageDishReview.objects.select_for_update().filter(pk=_id(params.get("review_id")), target_npc_id=str(npc_id)).first()
     if not row or row.status != "PENDING":
         return _fail("DISH_REVIEW_NOT_PENDING", data={"review_id": str(params.get("review_id", "")),
@@ -261,6 +275,11 @@ def rate_dish(npc_id, params, minute, request_id):
 
 
 def pending_reviews(npc, minute, review_id=None):
+    from .player_dish_reviews import mark_player_reviews
+    player_reviews = mark_player_reviews(npc, minute, review_id)
+    if review_id is not None and player_reviews:
+        return {"filter": {"review_id": str(review_id)}, "reviews": player_reviews,
+                "total_count": len(player_reviews), "has_more": False}
     rows = VillageDishReview.objects.select_related("owner", "slot")
     rows = rows.filter(target_npc_id="10013") if str(npc.agent_id) == "10013" else rows.filter(owner=npc)
     if review_id is not None:
@@ -285,5 +304,6 @@ def pending_reviews(npc, minute, review_id=None):
     reviews = [dict(review_id=str(r.pk), owner_npc_id=str(r.owner.agent_id), dish=r.snapshot,
         expires_world_minute=r.expires_world_minute, response_action="RATE_DISH",
         response_fields={"scores": {k: "1–10" for k in ("color", "aroma", "taste", "presentation")}, "comment": "必填评语"}) for r in rows]
+    reviews.extend(player_reviews)
     return {"filter": {"review_status": "PENDING_UNEXPIRED"}, "reviews": reviews,
             "total_count": len(reviews), "has_more": False}

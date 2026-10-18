@@ -1,7 +1,7 @@
 """Versioned G0 rules. Unreleased content is descriptive, never an active bonus."""
 from copy import deepcopy
 
-RULES_VERSION = 3
+RULES_VERSION = 4
 SKILLS = (
     ("gathering", "采集"), ("farming", "种植"), ("forestry", "伐木"),
     ("hunting", "狩猎"), ("cooking", "烹饪"), ("business", "经营"),
@@ -59,12 +59,16 @@ def skill_data(code, name, total_xp):
         effects.append(dict(code="felling_efficiency", title="普通砍伐作业间隔缩短5%"))
     if code == "forestry" and level >= 4:
         effects.append(dict(code="hardwood", title="配合T2斧可采硬木，用于T2工具维修"))
+    if code == "cooking" and level >= 2:
+        effects.append(dict(code="basic_quality", title="\u6b63\u786e\u914d\u6bd4\u4e14\u9c9c\u671f\u5408\u683c\u7684\u6599\u7406\u54c1\u8d28\u81f3\u5c113"))
+    if code == "cooking" and level >= 4:
+        effects.append(dict(code="advanced_cooking", title="\u914d\u5408T2\u708a\u5177\u5f00\u653e\u6c64\u54c1\u4e0e\u6700\u591a3\u6807\u51c6\u6279\u6b21"))
     if code == "business":
         effects.append(dict(code="supply_experience", title="完成真实需求订单可积累经营经验"))
     unlocks = []
     for required, key, title in _UNLOCKS[code]:
         implemented = key in {"targeted_gathering", "advanced_gathering", "seed_return", "advanced_crops",
-                              "crop_quality", "felling_efficiency", "hardwood"}
+                              "crop_quality", "felling_efficiency", "hardwood", "basic_quality", "advanced_cooking"}
         available = implemented and level >= required
         unlocks.append(dict(code=key, title=title, required_level=required, implemented=implemented,
                             available=available, reason=None if available else
@@ -72,7 +76,7 @@ def skill_data(code, name, total_xp):
     return dict(code=code, name=name, level=level, total_xp=total_xp,
                 xp_in_level=total_xp - LEVEL_TOTALS[level - 1] if level < 10 else 0,
                 xp_to_next_level=LEVEL_COSTS[level - 1] if level < 10 else 0,
-                max_level=10, progression_enabled=code in {"gathering", "business", "farming", "forestry"}, effects=effects,
+                max_level=10, progression_enabled=code in {"gathering", "business", "farming", "forestry", "cooking"}, effects=effects,
                 unlocks=unlocks)
 
 

@@ -34,6 +34,8 @@ LOCATIONS = {
     "supply_deliver": {"GENERAL_STORE"},
     "repair_tool": {"GENERAL_STORE"},
     "upgrade_tool": {"GENERAL_STORE"},
+    "cook_dish": {"RESTAURANT"},
+    "request_dish_review": {"RECORD_HALL"},
 }
 PARAMS = {
     "overview": set(),
@@ -56,6 +58,11 @@ PARAMS = {
     "repair_tool": {"instance_id", "expected_quote"},
     "upgrade_tool": {"instance_id", "expected_quote"},
     "claim_starter_axe": set(),
+    "preview_cooking": {"recipe_id", "batches", "selections", "tool_instance_id"},
+    "cook_dish": {"recipe_id", "batches", "selections", "tool_instance_id", "expected_quote"},
+    "request_dish_review": {"instance_id"},
+    "cancel_dish_review": {"review_id"},
+    "claim_dish_review": {"review_id"},
 }
 COLLECTION_LOCATIONS = {"采集食材": "FOREST_EDGE", "采集林下食材": "FOREST_UNDERGROWTH"}
 from .player_farm import ACTIONS as FARM_ACTIONS
@@ -186,6 +193,8 @@ def overview(player, bag, minute, *, read_only=False):
     from player.starter import starter_overview
     from .player_gathering import gathering_overview
     from .production_guide import production_overview
+    from .player_cooking import cooking_overview
+    from .player_dish_reviews import review_overview
     from .advanced_gathering import collection_points_projection
     from .daily_events import project_daily_events
     from inventory.batches import project_batch
@@ -243,6 +252,8 @@ def overview(player, bag, minute, *, read_only=False):
         starter=starter,
         production=production_overview(player, bag, minute, read_only=read_only),
         collection_points=collection_points_projection(player, bag, minute),
+        cooking=cooking_overview(player, bag, minute, read_only=read_only),
+        reviews=review_overview(player, bag, minute, read_only=read_only),
         contributions=contributions, project=_project(minute)[0], market=market,
         commissions=commissions, my_commissions=[c for c in commissions
             if c.get("actor_type") == "PLAYER" and str(c.get("actor_id")) == str(player.pk)],
@@ -263,6 +274,18 @@ def _execute(player, bag, action, p, rid, location, clock, authority_session_id=
         fail("LOCATION_INVALID", "请前往对应地点再操作。")
     if action == "overview":
         return {}
+    if action == "cook_dish":
+        from .player_cooking import CookingError, execute_player_cooking
+        try:
+            return execute_player_cooking(player, bag, p, rid, clock)
+        except CookingError as exc:
+            fail(exc.code, exc.message)
+    if action in {"request_dish_review", "cancel_dish_review", "claim_dish_review"}:
+        from .player_dish_reviews import ReviewError, execute_review_action
+        try:
+            return execute_review_action(player, bag, action, p, rid, clock)
+        except ReviewError as exc:
+            fail(exc.code, exc.message)
     if action in {"repair_tool", "upgrade_tool", "claim_starter_axe"}:
         from .production_tools import ToolError, execute_tool_action
         try:
@@ -499,6 +522,17 @@ def execute_player_action(payload):
             return answer
         if "read_only" in payload and type(payload["read_only"]) is not bool:
             fail("INVALID_PARAMS", "观察上下文无效。")
+        if action == "preview_cooking":
+            if not VillageSimulationConfig.objects.filter(config_key="default", village_economy_enabled=True).exists():
+                return response(rid, "FEATURE_DISABLED", "Village economy is unavailable.")
+            from .player_cooking import CookingError, preview_cooking
+            bag = InventoryBag.objects.filter(player=player, character_id=player.username).first()
+            bag = bag or InventoryBag(player=player, character_id=player.username)
+            try:
+                preview = preview_cooking(player, bag, params, clock.world_minute)
+            except CookingError as exc:
+                return response(rid, exc.code, exc.message)
+            return response(rid, data=dict(result=dict(preview=preview)))
         if payload.get("read_only") is True:
             if action != "overview":
                 fail("MODE_READ_ONLY", "观察模式不能发起交易。")

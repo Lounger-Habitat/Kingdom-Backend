@@ -2102,6 +2102,41 @@ class VillageDishReview(models.Model):
     completed_request_id = models.UUIDField(null=True, blank=True, unique=True)
 
 
+class VillagePlayerDishReview(models.Model):
+    """One real player-owned sample held outside the main inventory."""
+    review_id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
+    player = models.ForeignKey("account.GameAccount", on_delete=models.PROTECT)
+    sample_slot = models.OneToOneField("inventory.InventorySlot", on_delete=models.PROTECT)
+    source_instance_id = models.UUIDField()
+    request_id = models.UUIDField()
+    target_npc_id = models.CharField(max_length=32, default="10013")
+    status = models.CharField(max_length=16, default="PENDING")
+    snapshot = models.JSONField(default=dict)
+    scores = models.JSONField(default=dict)
+    comment = models.TextField(blank=True)
+    customer_feedback = models.TextField(blank=True)
+    overall_score = models.FloatField(default=0)
+    rating_price = models.IntegerField(default=-1)
+    own_production_verified = models.BooleanField(default=False)
+    growth_reward = models.JSONField(default=dict)
+    created_world_minute = models.BigIntegerField()
+    expires_world_minute = models.BigIntegerField()
+    completed_world_minute = models.BigIntegerField(null=True, blank=True)
+    completed_request_id = models.UUIDField(null=True, blank=True)
+    cancelled_world_minute = models.BigIntegerField(null=True, blank=True)
+    cancel_request_id = models.UUIDField(null=True, blank=True)
+    claimed_world_minute = models.BigIntegerField(null=True, blank=True)
+    claim_request_id = models.UUIDField(null=True, blank=True)
+    claimed_instance_id = models.UUIDField(null=True, blank=True)
+
+    class Meta:
+        constraints = [
+            models.UniqueConstraint(fields=["player", "request_id"], name="player_dish_review_request_unique"),
+            models.UniqueConstraint(fields=["player"], condition=models.Q(status="PENDING"),
+                                    name="player_one_pending_dish_review"),
+        ]
+
+
 class VillageStoreInventorySlotUsage(UsageFields):
     owner = models.OneToOneField(VillageStoreInventorySlot, on_delete=models.CASCADE, primary_key=True, related_name="usage")
 

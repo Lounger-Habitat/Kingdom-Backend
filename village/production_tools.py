@@ -14,9 +14,9 @@ from player.progression import ensure_growth, growth_snapshot
 from .models import (EconomicLedgerEntry, VillageStore, VillageStoreAccount,
                      VillageStoreInventorySlot, VillageStoreListing)
 
-UPGRADES = {4101: (4102, 6), 4001: (4103, 8), 4104: (4105, 10)}
+UPGRADES = {4101: (4102, 6), 4001: (4103, 8), 4104: (4105, 10), 4106: (4107, 8)}
 AXE_MILESTONE = "starter_axe_claimed"
-STOCK_ITEMS = (1051, 29301, 29302, 29303, 29304, 29305, 4001)
+STOCK_ITEMS = (1051, 29301, 29302, 29303, 29304, 29305, 4001, 4106)
 
 
 class ToolError(Exception):
@@ -139,7 +139,7 @@ def _quote(player, bag, slot, operation, minute):
     available_material = sum(s.item_amount for s in _material_slots(bag, material, minute))
     store = _store()
     account = VillageStoreAccount.objects.filter(store=store).first() if store else None
-    reason = ("TOOL_UNAVAILABLE" if not definition or definition.capability_code not in {"farming", "forestry", "targeted_gathering"}
+    reason = ("TOOL_UNAVAILABLE" if not definition or definition.capability_code not in {"farming", "forestry", "targeted_gathering", "cooking"}
         or definition.tier not in (1, 2) else "NO_UPGRADE" if operation == "upgrade" and not target else
         "TOOL_DURABILITY_UNKNOWN" if type(slot.remaining_uses) is not int or not 0 <= slot.remaining_uses <= definition.item.max_use_count else
         "TOOL_EXPIRED" if not _fresh(slot, minute) else "TOOL_ALREADY_FULL" if operation == "repair" and slot.remaining_uses == definition.item.max_use_count else
@@ -158,7 +158,7 @@ def _quote(player, bag, slot, operation, minute):
 
 def tools_overview(player, bag, minute, read_only=False):
     definitions = {d.item_id: d for d in ItemGameplayDefinition.objects.select_related("item").filter(
-        capability_code__in=["farming", "forestry", "targeted_gathering"], item__is_deleted=False)}
+        capability_code__in=["farming", "forestry", "targeted_gathering", "cooking"], item__is_deleted=False)}
     tools = []
     for slot in bag.slots.filter(item_id__in=definitions, item_amount__gt=0).order_by("slot_index") if bag.pk else []:
         definition = definitions[slot.item_id]
@@ -266,7 +266,8 @@ def ensure_production_catalog(minute):
         return []
     installed = []
     for item_id in STOCK_ITEMS:
-        marker = uuid.uuid5(uuid.NAMESPACE_URL, f"kingdom:g2:production-stock:{item_id}:v1")
+        marker = uuid.uuid5(uuid.NAMESPACE_URL, "kingdom:g3:cooking-stock:4106:v1" if item_id == 4106
+                            else f"kingdom:g2:production-stock:{item_id}:v1")
         if EconomicLedgerEntry.objects.filter(request_id=marker).exists():
             continue
         item = Item.objects.filter(pk=item_id, is_deleted=False).first()
@@ -275,14 +276,15 @@ def ensure_production_catalog(minute):
         listing = VillageStoreListing.objects.create(listing_id=uuid.uuid5(marker, "listing"), store=store,
             item_id=item_id, unit_price=max(1, item.item_price), price_mode="ORIGINAL", status="ACTIVE",
             listed_by_npc=store.operator_npc, created_request_id=marker, listed_world_minute=minute)
-        count = 20 if item_id == 4001 else 30
-        for index in range(count if item_id == 4001 else 1):
+        is_tool = item_id in (4001, 4106)
+        count = 20 if is_tool else 30
+        for index in range(count if is_tool else 1):
             VillageStoreInventorySlot.objects.create(instance_id=uuid.uuid5(marker, str(index)), store=store,
-                listing=listing, item_id=item_id, item_amount=1 if item_id == 4001 else count,
-                remaining_uses=item.max_use_count if item_id == 4001 else None, quality=3,
-                produced_world_minute=minute, common_attributes={"initial_stock_code": "G2_PRODUCTION"})
-        EconomicLedgerEntry.objects.create(request_id=marker, entry_type="G2_INITIAL_STOCK", world_minute=minute,
-            changes={"STORE:GENERAL_STORE": {str(item_id): count}, "source": "G2_FINITE_PRODUCTION_STOCK"})
+                listing=listing, item_id=item_id, item_amount=1 if is_tool else count,
+                remaining_uses=item.max_use_count if is_tool else None, quality=3,
+                produced_world_minute=minute, common_attributes={"initial_stock_code": "G3_COOKING" if item_id == 4106 else "G2_PRODUCTION"})
+        EconomicLedgerEntry.objects.create(request_id=marker, entry_type="G3_INITIAL_STOCK" if item_id == 4106 else "G2_INITIAL_STOCK", world_minute=minute,
+            changes={"STORE:GENERAL_STORE": {str(item_id): count}, "source": "G3_FINITE_COOKING_STOCK" if item_id == 4106 else "G2_FINITE_PRODUCTION_STOCK"})
         installed.append(str(listing.pk))
     if installed:
         store.inventory_version += 1

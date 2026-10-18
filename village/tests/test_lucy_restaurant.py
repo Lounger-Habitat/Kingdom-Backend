@@ -286,6 +286,14 @@ class LucyRestaurantTests(TestCase):
         self.assertEqual(first["data"], second["data"])
         self.assertEqual(counter, list(NpcCookingCounter.objects.values()))
 
+    def test_cooking_preserves_earliest_real_ingredient_expiry(self):
+        self.lucy.slots.filter(item_id=1030).update(expires_world_minute=650)
+        slot = self.cook(29211)
+        self.assertEqual(slot.produced_world_minute, 600)
+        self.assertEqual(slot.expires_world_minute, 650)
+        self.assertEqual(min(batch["expires_world_minute"] for ingredient in slot.dish_metadata["ingredients"]
+            for batch in ingredient["batches"]), 650)
+
     def test_expired_ingredient_fails_without_partial_consumption(self):
         self.lucy.slots.filter(item_id=1049).update(expires_world_minute=600)
         before = list(self.lucy.slots.order_by("pk").values_list("item_amount",flat=True))

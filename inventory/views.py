@@ -1130,6 +1130,10 @@ def _build_judge_prompt(item_detail, slot, recipe):
 
 @api_view(["POST"])
 def inventory_judge(request, character_id):
+    from village.player_legacy_production import legacy_production_guard
+    guard = legacy_production_guard()
+    if guard is not None:
+        return guard
     """AI点评接口：接收instanceId，后端查询数据、调用AI、保存结果。"""
     from player.models import PlayerState
     from recipes.models import Recipe
@@ -1279,6 +1283,10 @@ def inventory_judge(request, character_id):
 @authentication_classes([GameJWTAuthentication])
 @permission_classes([IsAuthenticated])
 def inventory_judge_by_agent(request, character_id):
+    from village.player_legacy_production import legacy_production_guard
+    guard = legacy_production_guard()
+    if guard is not None:
+        return guard
     """Agent点评接口：接收Agent生成的评语和评分，后端计算并保存最终结果。"""
     from player.models import PlayerState
     from recipes.models import Recipe
