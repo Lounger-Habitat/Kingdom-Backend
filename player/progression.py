@@ -119,6 +119,8 @@ def award_skill(player, *, source_type, source_id, skill_code, xp, milestone=Non
         result["facts"] = deepcopy(facts)
     SkillRewardReceipt.objects.create(player=player, source_type=source_type, source_id=source_id,
         skill_code=skill_code, rules_version=RULES_VERSION, result=deepcopy(result))
+    from .tutorials import observe_skill
+    observe_skill(player, source_type, source_id, result)
     return result
 
 

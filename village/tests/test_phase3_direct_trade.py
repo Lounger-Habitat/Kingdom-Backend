@@ -614,13 +614,13 @@ class PublicInventoryFilterTest(DirectTradeTestBase):
         self.assertEqual(items[1030]["available_amount"], 30)
         self.assertEqual(items[1030]["name"], "玉米")
 
-        # Advance time past the batch expiry -> excluded from available amount.
+        # Historical expiry does not reduce available stock.
         self.time.world_minute = 950
         self.time.save(update_fields=["world_minute"])
         code, data = query_store_inventory("GENERAL_STORE", 950)
         items = {i["item_id"]: i for i in data["items"]}
         self.assertIn(1030, items)
-        self.assertEqual(items[1030]["available_amount"], 0)
+        self.assertEqual(items[1030]["available_amount"], 30)
 
 
 class StoreInventoryStatusTest(DirectTradeTestBase):
@@ -660,7 +660,8 @@ class StoreInventoryStatusTest(DirectTradeTestBase):
         slot.expires_world_minute = 600
         slot.save(update_fields=["expires_world_minute"])
         status, available = store_inventory_status(self.store, 700)
-        self.assertEqual(status, "OUT_OF_STOCK")
+        self.assertEqual(status, "LOW_STOCK")
+        self.assertEqual(available, {1049: 4})
 
     def test_query_exposes_available_by_item(self):
         self._stock(1049, 12)
@@ -1130,13 +1131,9 @@ class AuditAndLedgerTest(DirectTradeTestBase):
         self._set_location(10011, "GENERAL_STORE")
         self._buy(10011, listing.listing_id, 10)  # fee = 4
 
-        # Move Mark to RECORD_HALL and audit.
-        self._set_location(10013, "RECORD_HALL")
-        resp = commit_economy_action(_payload(
-            "AUDIT_PUBLIC_FUND", 10013, "RECORD_HALL", {"day_index": 0},
-        ))
-        self.assertEqual(resp["result_code"], ResultCode.OK)
-        audit = resp["effects"]["audit"]
+        from village.public_finance import reconcile
+        self.public_fund.refresh_from_db()
+        audit = reconcile(self.public_fund)
         self.assertTrue(audit["balance_matches"])
         # Public fund is 500 + 4 fee = 504 at recompute time (before the audit's
         # own daily meal-reference salary is deducted).

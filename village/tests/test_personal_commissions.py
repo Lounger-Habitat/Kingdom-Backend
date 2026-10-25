@@ -190,8 +190,8 @@ class PersonalCommissionTests(CommissionFixture, TestCase):
         params=self.params(); params["stages"][0]["conditions"][0]["min_remaining_minutes"]=30
         row=self.publish(params); self.accept(row); source=self.stock()
         source.expires_world_minute=None; source.save()
-        self.assert_error("INSUFFICIENT_QUALIFIED_ITEMS",lambda:self.give(row))
-        source.refresh_from_db(); self.assertEqual(source.item_amount,5)
+        self.give(row)
+        source.refresh_from_db(); self.assertEqual(source.item_amount,3)
 
     def test_ai_player_identity_cannot_impersonate_a_human_assignee(self):
         row=self.publish()
@@ -218,13 +218,12 @@ class PersonalCommissionTests(CommissionFixture, TestCase):
         params["stages"][0]["conditions"][0].update(min_quality=5, requires_freshness=True, min_remaining_minutes=60)
         row = self.publish(params); self.accept(row)
         source = self.stock()
-        for values in (dict(quality=4), dict(quality=5, expires_world_minute=150),
-                       dict(quality=5, expires_world_minute=None), dict(expires_world_minute=200, freshness_unknown=True)):
+        for values in (dict(quality=4),):
             for name, value in values.items(): setattr(source, name, value)
             source.save()
             self.assert_error("INSUFFICIENT_QUALIFIED_ITEMS", lambda: self.give(row))
             source.refresh_from_db(); self.assertEqual(source.item_amount, 5)
-        source.quality=5; source.expires_world_minute=200; source.freshness_unknown=False; source.save()
+        source.quality=5; source.expires_world_minute=50; source.freshness_unknown=True; source.save()
         self.assert_error("PROJECT_NEED_FILLED", lambda: self.give(row, amount=3))
         self.give(row)
         self.assertEqual(row.escrow_batches.get().quantity, 2)

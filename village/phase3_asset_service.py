@@ -205,11 +205,6 @@ def get_available_slot_amount(slot: NpcGlobalInventorySlot, world_minute=None, e
     """Return *slot* amount minus ACTIVE delivery reservations."""
     from .models import NpcTradeDelivery
 
-    if getattr(slot, "freshness_unknown", False) or (
-        world_minute is not None and slot.expires_world_minute is not None
-        and slot.expires_world_minute <= world_minute
-    ):
-        return 0
     reserved = (
         NpcTradeDelivery.objects.filter(
             seller_slot_instance_id=slot.instance_id, status="ACTIVE"
@@ -255,7 +250,7 @@ def consume_fefo(
         NpcGlobalInventorySlot.objects.select_for_update()
         .filter(bag=inventory, item_id__in=allowed_item_ids, item_amount__gt=0)
         .order_by(
-            models.F("expires_world_minute").asc(nulls_last=True),
+            "quality",
             models.F("produced_world_minute").asc(nulls_last=True),
             "instance_id",
         )
@@ -281,7 +276,7 @@ def consume_fefo(
     return consumed
 
 
-BATCH_ITEM_ATTRIBUTES = ("rated", "rating_price", "overall_score", "ingredient", "item_bag_name",
+BATCH_ITEM_ATTRIBUTES = ("quality", "equipment_level", "rated", "rating_price", "overall_score", "ingredient", "item_bag_name",
                          "cook_time", "dish_quality", "hide_in_shop", "review_comment", "freshness_unknown", "dish_metadata")
 
 
@@ -318,11 +313,14 @@ def add_batch(
 
 def get_usable_tool_slot(inventory, tool_item_id, world_minute, *, exclude_command_id=None, slot_instance_id=None):
     """Select a usable physical tool without changing its quantity or wear."""
+    from player.models import EquipmentDefinition
+    profile = EquipmentDefinition.objects.filter(item_id=tool_item_id).first()
+    tool_ids = EquipmentDefinition.objects.filter(category=profile.category, enabled=True).values_list("item_id", flat=True) if profile else [tool_item_id]
     slots = (
         NpcGlobalInventorySlot.objects.select_for_update()
         .filter(
             bag=inventory,
-            item_id=tool_item_id,
+            item_id__in=tool_ids,
             item_amount__gt=0,
         )
         .filter(usage__remaining__gt=0)
@@ -350,7 +348,7 @@ def consume_tool_use(npc_id: int, tool_item_id: int, world_minute=None, *, exclu
         slot.item_amount -= 1
         slot.save(update_fields=["item_amount"])
         slot = add_batch(
-            inventory, tool_item_id, 1, slot.produced_world_minute,
+            inventory, slot.item_id, 1, slot.produced_world_minute,
             slot.expires_world_minute, slot.source_request_id,
             remaining_uses=slot.remaining_uses,
             item_attributes={key: getattr(slot, key) for key in BATCH_ITEM_ATTRIBUTES},

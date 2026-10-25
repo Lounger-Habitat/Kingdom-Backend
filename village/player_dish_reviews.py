@@ -42,6 +42,8 @@ def _mark_reason(minute):
         return "NPC_AWAY"
     if runtime.health_fp <= 300 or runtime.action_status == "SLEEPING":
         return "MARK_UNAVAILABLE"
+    if runtime.current_location_code != "RECORD_HALL":
+        return "MARK_NOT_AT_WORK"
     return ""
 
 
@@ -54,10 +56,6 @@ def _sample_reason(slot, item, minute):
         return "DISH_ALREADY_REVIEWED"
     if not isinstance(slot.dish_metadata, dict):
         return "DISH_METADATA_INVALID"
-    if slot.freshness_unknown:
-        return "DISH_FRESHNESS_UNKNOWN"
-    if slot.expires_world_minute is not None and slot.expires_world_minute <= minute:
-        return "DISH_REVIEW_SAMPLE_EXPIRED"
     if type(slot.dish_quality) is not int or slot.dish_quality not in range(1, 7):
         return "DISH_QUALITY_INVALID"
     return ""
@@ -69,8 +67,8 @@ def _dish(slot, item=None, *, own=False):
         dish_quality=slot.dish_quality, quality=slot.quality, rated=slot.rated,
         overall_score=slot.overall_score, rating_price=slot.rating_price,
         ingredient=slot.ingredient, cook_time=slot.cook_time,
-        produced_world_minute=slot.produced_world_minute, expires_world_minute=slot.expires_world_minute,
-        freshness_unknown=slot.freshness_unknown, own_production_verified=own)
+        produced_world_minute=slot.produced_world_minute, expires_world_minute=None,
+        freshness_unknown=False, own_production_verified=own)
 
 
 def _status(row, minute):
@@ -107,7 +105,8 @@ def review_overview(player, bag, minute, read_only=False):
             item = items.get(slot.item_id)
             if not item or item.item_type != ItemType.FOOD:
                 continue
-            blocked = _sample_reason(slot, item, minute) or ("DISH_REVIEW_PENDING" if pending else reason)
+            # Drop-off is independent of Mark's presence; only the sample and queue limit gate it.
+            blocked = _sample_reason(slot, item, minute) or ("DISH_REVIEW_PENDING" if pending else "")
             sample = _dish(slot, item)
             sample.update(eligible=not blocked and not read_only, reason="MODE_READ_ONLY" if read_only and not blocked else blocked)
             samples.append(sample)
@@ -171,9 +170,6 @@ def execute_review_action(player, bag, action, params, rid, clock):
             if old.source_instance_id != source_id:
                 _fail("REQUEST_CONFLICT", "同一请求不能更换样品。")
             return dict(review=_entry(old, minute))
-        reason = _mark_reason(minute)
-        if reason:
-            _fail(reason, "Mark目前无法接受点评，请稍后再来。")
         pending = VillagePlayerDishReview.objects.select_for_update().filter(player=player, status="PENDING")
         pending.filter(expires_world_minute__lte=minute).update(status="EXPIRED")
         if pending.exists():
@@ -191,10 +187,13 @@ def execute_review_action(player, bag, action, params, rid, clock):
                              item_amount=1, item_bag_name=slot.item_bag_name, hide_in_shop=slot.hide_in_shop)
         copy_batch_attributes(slot, held)
         held.save()
+        # Leave a full review window after a known absence, so queued samples survive his return.
+        return_minute = NpcRuntimeState.objects.filter(npc__agent_id="10013").values_list(
+            "away_until_world_minute", flat=True).first() or minute
         row = VillagePlayerDishReview.objects.create(review_id=review_id, player=player, sample_slot=held,
             source_instance_id=source_id, request_id=rid, snapshot=_snapshot(slot, item),
             created_world_minute=minute,
-            expires_world_minute=min(minute + 180, slot.expires_world_minute) if slot.expires_world_minute is not None else minute + 180)
+            expires_world_minute=max(minute, return_minute) + 180)
         slot.item_amount -= 1
         slot.save(update_fields=["item_amount"])
         _bump(player)
@@ -320,5 +319,8 @@ def complete_player_review(npc_id, params, minute, request_id):
     row.save()
     # Polling exposes the durable result to the owner. No private batch or XP is
     # put in NPC events, and no repeat action is invented for reward delivery.
+    if not own:
+        from player.tutorials import observe_skill
+        observe_skill(player, "dish_review", str(row.pk), {})
     return dict(review_id=str(row.pk), owner_type="PLAYER", status=row.status, item_id=slot.item_id,
                 overall_score=score, rating_price=price, scores=copy.deepcopy(scores), comment=comment)

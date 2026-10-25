@@ -113,7 +113,7 @@ class ProfessionalCooperationTests(PlayerFixture, TestCase):
 
     def test_partial_gap_is_exact_and_price_is_proportional_not_full_pack(self):
         self.nora.slots.create(slot_index=0, item_id=1001, item_amount=1, quality=4,
-            produced_world_minute=600, expires_world_minute=2000)
+            produced_world_minute=600, expires_world_minute=650, freshness_unknown=True)
         view = professional_contracts_overview(self.a, 700)
         fresh = next(t for t in view["templates"] if t["code"] == "FRESH_SUPPLY")
         self.assertEqual((fresh["reward_gold"], sum(r["quantity"] for r in fresh["requirements"])), (61, 5))
@@ -163,7 +163,7 @@ class ProfessionalCooperationTests(PlayerFixture, TestCase):
         self.assertEqual(own[0]["completed_count"], 2)
         self.assertEqual(other, [])
 
-    def test_earlier_held_fresh_supply_is_rechecked_before_final_delivery(self):
+    def test_earlier_held_supply_survives_legacy_freshness_limit(self):
         self.prepare(); row = VillageProfessionalContractLink.objects.get().commission
         accept_commission(row.pk, "PLAYER", self.a.pk, uuid.uuid4(), 700)
         conditions = row.requirements["stages"][0]["conditions"]
@@ -178,13 +178,11 @@ class ProfessionalCooperationTests(PlayerFixture, TestCase):
                 contribute_commission(row.pk, "PLAYER", self.a.pk, condition["id"], 2, uuid.uuid4(), 850,
                     item_id=material.item_id, instance_id=material.instance_id, location="GENERAL_STORE")
             else:
-                with self.assertRaises(CommissionError) as caught:
-                    contribute_commission(row.pk, "PLAYER", self.a.pk, condition["id"], 2, uuid.uuid4(), 850,
-                        item_id=material.item_id, instance_id=material.instance_id, location="GENERAL_STORE")
-                self.assertEqual(caught.exception.code, "HELD_BATCH_NO_LONGER_ELIGIBLE")
-        row.refresh_from_db(); self.assertEqual(row.status, "ACTIVE")
-        self.assertFalse(completed_professional_contracts(self.a).exists())
-        self.assertEqual(cooperation_score(self.a, "10015"), 0)
+                contribute_commission(row.pk, "PLAYER", self.a.pk, condition["id"], 2, uuid.uuid4(), 850,
+                    item_id=material.item_id, instance_id=material.instance_id, location="GENERAL_STORE")
+        row.refresh_from_db(); self.assertEqual(row.status, "COMPLETED")
+        self.assertEqual(completed_professional_contracts(self.a).count(), 1)
+        self.assertEqual(cooperation_score(self.a, "10015"), 2)
 
     def test_late_player_recap_uses_permanent_contributions_without_reopening_world_work(self):
         bridge = VillageAffair.objects.create(code="BRIDGE_REPAIR", title="旧桥", status="COMPLETED",

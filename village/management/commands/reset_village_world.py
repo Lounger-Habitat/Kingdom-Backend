@@ -21,7 +21,8 @@ from leaderboard.models import LeaderboardEntry, PendingReward, ReportEvent
 from marketplace.models import MarketListing, MarketTransaction
 from player.models import (DefaultRecipe, PlayerRecipe, PlayerState, PlayerGrowthState,
                            PlayerSkillProgress, SkillRewardReceipt, PlayerMilestoneProgress,
-                           PlayerHuntingState, PlayerCombatReceipt, PlayerMasteryChallenge)
+                           PlayerHuntingState, PlayerCombatReceipt, PlayerMasteryChallenge, PlayerTutorialState,
+                           PlayerArrivalState)
 from recipes.models import Recipe
 from restaurant.models import (
     CustomerTransaction, DailyBusinessLog, MenuItem, PlayerRestaurantState,
@@ -72,6 +73,8 @@ from village.models import (
     StarterReserveTransfer,
     StarterSupplyBatch,
     VillageGatheringResourceState,
+    VillagePlantNode,
+    VillagePlayerGathering,
     VillageForestryReceipt,
     VillageChopAttempt,
     VillageTreeNode,
@@ -229,6 +232,8 @@ class Command(BaseCommand):
             VillageBusinessOrderLink,  # PROTECTs commission and day budget.
             VillageBusinessOrderDay,
             VillageGatheringResourceState,
+            VillagePlayerGathering,
+            VillagePlantNode,
             VillageForestryReceipt,
             VillageChopAttempt,  # PROTECTs tree and NPC command rows.
             VillageTreeNode,
@@ -416,7 +421,7 @@ class Command(BaseCommand):
         """Reset progress through current templates, without minting money-change reports."""
         cleared = 0
         for model in (
-            PlayerMasteryChallenge, PlayerCombatReceipt, PlayerHuntingState,
+            PlayerArrivalState, PlayerTutorialState, PlayerMasteryChallenge, PlayerCombatReceipt, PlayerHuntingState,
             SkillRewardReceipt, PlayerMilestoneProgress, PlayerSkillProgress, PlayerGrowthState,
             EnvActionReceipt, AutoBuyPurchase, RestaurantHourlySlot,
             CustomerTransaction, DailyBusinessLog, MenuItem, PlayerRestaurantState,
@@ -432,6 +437,9 @@ class Command(BaseCommand):
         default_recipes = list(DefaultRecipe.objects.values_list("recipe_name", flat=True))
         catalogs = dict(Recipe.objects.filter(recipe_name__in=default_recipes).values_list("recipe_name", "pk"))
         for account in GameAccount.objects.all():
+            # Missing arrival rows deliberately suppress the opening for legacy
+            # accounts. A full reset must explicitly opt human accounts back in.
+            PlayerArrivalState.objects.create(player=account, eligible=not account.is_ai)
             state = PlayerState.objects.create(player_id=str(account.pk))
             PlayerRecipe.objects.bulk_create([
                 PlayerRecipe(player=state, recipe_name=name, catalog_recipe_id=catalogs.get(name))

@@ -8,10 +8,12 @@ import hashlib
 import json
 import math
 import uuid
+from .phase3_asset_service import deterministic_rng
 
 from django.db import models, transaction
 from account.models import GameAccount
 from game_time.models import GlobalGameTimeState
+from items.quality import production_quality, player_skill_level, quality_rng
 from inventory.models import InventoryBag, InventorySlot
 from items.models import Item
 from marketplace.services import get_player_main_bag
@@ -228,8 +230,9 @@ def _execute(action, p, clock):
             reject("PREY_ITEM_UNAVAILABLE")
         index = bag.slots.aggregate(n=models.Max("slot_index"))["n"]
         slot = InventorySlot.objects.create(bag=bag, slot_index=0 if index is None else index+1,
-            item_id=item_id, item_amount=1, quality=3, produced_world_minute=death,
-            expires_world_minute=death+HUNT_MEAT_SPOILAGE_MINUTES, source_request_id=identifier(p['request_id']),
+            item_id=item_id, item_amount=1, quality=production_quality(player_skill_level(player, "hunting"),
+                quality_rng(prey.pk, "HUNT")), produced_world_minute=death,
+            expires_world_minute=None, source_request_id=identifier(p['request_id']),
             item_bag_name=item.item_name)
         added = [dict(batch_evidence(slot), item_name=item.item_name, amount=1)]
         result = None
@@ -264,7 +267,11 @@ def _kill_rewards(player, prey, attack_id, added):
     data = receipt.response.get("data", {}) if receipt and receipt.response.get("success") else {}
     weapon = data.get("weapon") or {}
     spec = HUNTING_WEAPONS.get(weapon.get("item_id"))
-    if (not spec or weapon.get("weapon") != spec["weapon"] or weapon.get("weapon") not in (0, 1, 2)
+    from player.equipment import WEAPONS
+    configured = (weapon.get("category") in WEAPONS and weapon.get("weapon") == WEAPONS[weapon["category"]]
+                  and type(weapon.get("attack_base")) is int and weapon["attack_base"] > 0)
+    legacy = bool(spec and weapon.get("weapon") == spec["weapon"] and weapon.get("weapon") in (0, 1, 2))
+    if (not (configured or legacy)
             or SkillRewardReceipt.objects.filter(player=player, source_type="wildlife_kill", result__facts__attack_id=str(attack_id)).exists()):
         return []
     return [award_skill(player, source_type="wildlife_kill", source_id=prey.pk, skill_code="hunting",

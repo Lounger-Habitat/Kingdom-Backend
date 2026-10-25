@@ -20,7 +20,7 @@ from village.models import EconomicLedgerEntry, VillagePlayerActionReceipt, Vill
 from village.phase3_asset_service import deterministic_rng
 from .models import (CustomerTransaction, DailyBusinessLog, MenuItem, PlayerRestaurantState,
                      RestaurantConfig, RestaurantHourlySlot, RestaurantLevelConfig, RestaurantSaleEvent)
-from .services import _get_quality_coeff
+from items.quality import quality_price
 
 
 class StallError(Exception):
@@ -70,9 +70,11 @@ def _price(slot, item, level):
             return None
         base = slot.rating_price
     else:
-        base = int(item.item_price * _get_quality_coeff(slot.quality))
+        if item.item_price <= 0:
+            return None
+        base = quality_price(item.item_price, slot.quality, dish=True)
     bonus = sum(row.reward_price_bonus_pct for row in RestaurantLevelConfig.objects.filter(level__lte=level))
-    return max(0, int(base * (100 + bonus) / 100))
+    return max(1, int(base * (100 + bonus) / 100))
 
 
 def _reason(slot, item, minute):
@@ -82,13 +84,7 @@ def _reason(slot, item, minute):
         return "BATCH_EMPTY"
     if not 1 <= slot.quality <= 6:
         return "DISH_QUALITY_INVALID"
-    if slot.freshness_unknown:
-        return "FRESHNESS_UNKNOWN"
-    if slot.expires_world_minute is None:
-        return "FRESHNESS_REQUIRED"
-    if slot.expires_world_minute <= minute:
-        return "ITEM_EXPIRED"
-    if slot.produced_world_minute is None or slot.produced_world_minute > minute or not slot.source_request_id:
+    if slot.produced_world_minute is not None and slot.produced_world_minute > minute:
         return "PROVENANCE_REQUIRED"
     metadata = slot.dish_metadata or {}
     if metadata.get("public_meal_claim") or metadata.get("public_meal_code") or slot.item_id == 29205:
@@ -128,7 +124,7 @@ def _row(slot, item, minute, level, cost=None, provenance=None):
     return dict(instance_id=str(slot.instance_id), item_id=slot.item_id, item_name=item.item_name if item else str(slot.item_id),
         quantity=slot.item_amount, quality=slot.quality, rated=slot.rated, score=slot.overall_score,
         unit_price=price, produced_world_minute=slot.produced_world_minute,
-        expires_world_minute=slot.expires_world_minute, freshness_unknown=slot.freshness_unknown,
+        expires_world_minute=None, freshness_unknown=False,
         usable=not reason, reason=reason, purchase_unit_cost=cost,
         total_purchase_cost=cost * slot.item_amount if cost is not None else None,
         cost_source=(provenance or {}).get("source", "UNKNOWN"))
@@ -136,7 +132,7 @@ def _row(slot, item, minute, level, cost=None, provenance=None):
 
 def _material_rows(bag, item_id, minute):
     return [s for s in bag.slots.filter(item_id=item_id, item_amount__gt=0).order_by("slot_index")
-            if not s.freshness_unknown and (s.expires_world_minute is None or s.expires_world_minute > minute)] if bag.pk else []
+            if True] if bag.pk else []
 
 
 def _configured_items(rows):

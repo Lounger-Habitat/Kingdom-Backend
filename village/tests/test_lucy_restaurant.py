@@ -90,10 +90,10 @@ class LucyRestaurantTests(TestCase):
                 self.assertEqual(slot.dish_metadata["base_quality"], 3)
                 self.assertEqual(slot.dish_metadata["recipe_id"], recipe_id)
                 self.assertIn(slot.dish_quality, range(2,7))
-                self.assertEqual(slot.expires_world_minute, 3480)
+                self.assertIsNone(slot.expires_world_minute)
                 for item_id, count in spec["ingredients"].items():
                     self.assertEqual(before[item_id] - sum(self.lucy.slots.filter(item_id=item_id).values_list("item_amount", flat=True)), count)
-        self.assertEqual(Recipe.objects.filter(village_only=True).count(), len(RECIPE_DEFINITIONS))
+        self.assertEqual(Recipe.objects.filter(pk__in=RECIPE_DEFINITIONS, village_only=True).count(), len(RECIPE_DEFINITIONS))
 
     def test_personal_procurement_from_three_suppliers_and_next_round(self):
         self.lucy.slots.all().delete()
@@ -184,13 +184,14 @@ class LucyRestaurantTests(TestCase):
         self.assertEqual((decision.spent_gold, self.fund.balance), (100, 82))
         self.assertEqual(VillageCommunityMealDailyUsage.objects.get(day_index=0).total_meals, 2)
 
-    def test_unlisted_or_unknown_freshness_store_food_is_not_sellable_stock(self):
+    def test_legacy_unknown_food_is_sellable_but_unlisted_stock_is_not(self):
         from village.phase3_direct_trade import store_inventory_status
         listing=self.listing(self.cook(),2)
         slot=VillageStoreInventorySlot.objects.get(listing_id=listing)
         slot.item_attributes=dict(slot.item_attributes,freshness_unknown=True);slot.save()
-        self.assertEqual(store_inventory_status(self.store,600)[1],{})
-        self.act("BUY_FROM_STORE",{"listing_id":listing,"amount":1},npc="10011",expect="TRADE_INSUFFICIENT_ITEM")
+        self.assertEqual(store_inventory_status(self.store,600)[1],{slot.item_id: 2})
+        self.act("BUY_FROM_STORE",{"listing_id":listing,"amount":1},npc="10011")
+        slot.refresh_from_db()
         slot.item_attributes.pop("freshness_unknown");slot.listing=None;slot.save()
         self.assertEqual(store_inventory_status(self.store,600)[1],{})
 
@@ -237,8 +238,8 @@ class LucyRestaurantTests(TestCase):
         from village.runtime_services import CommandService
         NpcProfile.objects.filter(npc=self.npcs["10014"]).update(capabilities=["COOK"])
         VillageActionDurationConfig.objects.update_or_create(action_name="COOK", defaults={"duration_minutes": 5})
-        # Expired salt is not usable, even though the bag's raw quantity is ample.
-        self.lucy.slots.filter(item_id=1049).update(expires_world_minute=600)
+        # A real quantity shortage must reject before the timed action starts.
+        self.lucy.slots.filter(item_id=1049).update(item_amount=0)
         before_items = list(self.lucy.slots.order_by("pk").values())
         before_needs = NpcRuntimeState.objects.get(npc=self.npcs["10014"])
 
@@ -286,19 +287,20 @@ class LucyRestaurantTests(TestCase):
         self.assertEqual(first["data"], second["data"])
         self.assertEqual(counter, list(NpcCookingCounter.objects.values()))
 
-    def test_cooking_preserves_earliest_real_ingredient_expiry(self):
+    def test_cooking_preserves_input_expiry_in_audit_only(self):
         self.lucy.slots.filter(item_id=1030).update(expires_world_minute=650)
         slot = self.cook(29211)
         self.assertEqual(slot.produced_world_minute, 600)
-        self.assertEqual(slot.expires_world_minute, 650)
+        self.assertIsNone(slot.expires_world_minute)
         self.assertEqual(min(batch["expires_world_minute"] for ingredient in slot.dish_metadata["ingredients"]
             for batch in ingredient["batches"]), 650)
 
-    def test_expired_ingredient_fails_without_partial_consumption(self):
+    def test_old_ingredient_cooks_with_exact_consumption(self):
         self.lucy.slots.filter(item_id=1049).update(expires_world_minute=600)
-        before = list(self.lucy.slots.order_by("pk").values_list("item_amount",flat=True))
-        self.act("COOK",{"recipe_id":29211},expect="P3_INSUFFICIENT_ITEM")
-        self.assertEqual(before,list(self.lucy.slots.order_by("pk").values_list("item_amount",flat=True)))
+        before = self.lucy.slots.get(item_id=1049).item_amount
+        slot = self.cook(29211)
+        self.assertEqual(self.lucy.slots.get(item_id=1049).item_amount, before - 1)
+        self.assertIsNone(slot.expires_world_minute)
 
     def test_selling_then_withdrawing_funds_restarts_personal_cycle(self):
         slot = self.cook()
@@ -552,7 +554,7 @@ class LucyRestaurantTests(TestCase):
         nora = self.agent_query("INSPECT_INVENTORY", "10015")["items"][0]
         self.assertEqual(nora["sale"], {"allowed": False, "reason": "TRADE_STORE_FORBIDDEN"})
 
-    def test_inventory_listing_flags_reject_expired_unknown_and_reserved_batches(self):
+    def test_inventory_accepts_old_food_but_rejects_reserved_samples(self):
         slot = self.cook()
         for changes, reason in (({"expires_world_minute": 600}, "ITEM_EXPIRED"),
                 ({"expires_world_minute": 3500, "freshness_unknown": True}, "FRESHNESS_UNKNOWN")):
@@ -561,7 +563,8 @@ class LucyRestaurantTests(TestCase):
             slot.save()
             row = next(r for r in self.agent_query("INSPECT_INVENTORY")["items"]
                 if r.get("food_instance_id") == str(slot.instance_id))
-            self.assertEqual(row["sale"], {"allowed": False, "reason": reason})
+            self.assertEqual(row["sale"]["target"], "GENERAL_STORE")
+            self.assertGreater(row["sale"]["unit_price"], 0)
         slot.freshness_unknown = False; slot.save()
         review_id = self.act("REQUEST_DISH_REVIEW", {"food_instance_id": str(slot.instance_id)})["data"]["review_id"]
         sample = VillageDishReview.objects.get(pk=review_id).slot
@@ -597,8 +600,8 @@ class LucyRestaurantTests(TestCase):
 
     def test_general_store_sale_flag_respects_existing_tool_durability_rules(self):
         from items.models import ItemType
-        Item.objects.create(item_id=4002, item_name="tool", item_type=ItemType.COLLECT_TOOL,
-            item_price=20, max_use_count=20)
+        Item.objects.update_or_create(item_id=4002, defaults=dict(item_name="tool", item_type=ItemType.COLLECT_TOOL,
+            item_price=20, max_use_count=20))
         slot = add_batch(self.lucy, 4002, 1, 500, None, uuid.uuid4(), remaining_uses=20)
         for uses, reason in ((20, None), (10, "TOOL_NOT_FULL_DURABILITY"),
                 (0, "TOOL_BROKEN"), (None, "TOOL_DURABILITY_UNKNOWN")):
@@ -688,4 +691,4 @@ class LucyRestaurantTests(TestCase):
         self.assertEqual(summary["menu"][0]["listed_portions"], 2)
         self.assertTrue(summary["can_prepare_and_serve"])
         VillageStoreInventorySlot.objects.filter(listing_id=listing).update(expires_world_minute=600)
-        self.assertFalse(self.meal_summary()["can_prepare_and_serve"])
+        self.assertTrue(self.meal_summary()["can_prepare_and_serve"])

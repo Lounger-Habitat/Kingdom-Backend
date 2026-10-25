@@ -106,11 +106,11 @@ class PlayerDishReviewTests(PlayerFixture, TestCase):
 
     def test_expiry_projects_without_writes_then_claims_still_expired_and_releases_pending_limit(self):
         row = self.request(self.dish(expires_world_minute=120))
-        self.clock.world_minute = 120
+        self.clock.world_minute = 280
         before = PlayerGrowthState.objects.get(player=self.a).revision
         with CaptureQueriesContext(connection) as queries:
-            projected = review_overview(self.a, self.bag_a, 120, read_only=True)
-            mark = pending_reviews(self.mark, 120)
+            projected = review_overview(self.a, self.bag_a, 280, read_only=True)
+            mark = pending_reviews(self.mark, 280)
         self.assertTrue(all(q["sql"].lstrip().upper().startswith("SELECT") for q in queries))
         self.assertEqual(projected["entries"][0]["status"], "EXPIRED")
         self.assertTrue(projected["entries"][0]["can_claim"])
@@ -126,7 +126,7 @@ class PlayerDishReviewTests(PlayerFixture, TestCase):
         self.assertEqual(returned.produced_world_minute, 90)
         self.assertFalse(returned.rated)
 
-    def test_ownership_one_pending_and_unavailable_mark_have_no_partial_writes(self):
+    def test_ownership_and_one_pending_are_enforced_while_sleeping_mark_accepts_dropoff(self):
         other = self.dish(bag=self.bag_b)
         with self.assertRaises(ReviewError):
             self.request(other)
@@ -141,16 +141,44 @@ class PlayerDishReviewTests(PlayerFixture, TestCase):
         self.assertEqual(review_overview(self.b, self.bag_b, 100)["entries"], [])
         self.act("cancel_dish_review", dict(review_id=str(row.pk)))
         NpcRuntimeState.objects.filter(npc=self.mark).update(action_status="SLEEPING")
-        before = (InventoryBag.objects.count(), VillagePlayerDishReview.objects.count())
-        with self.assertRaises(ReviewError) as error:
-            self.request(slot)
-        self.assertEqual(error.exception.code, "MARK_UNAVAILABLE")
-        self.assertEqual(before, (InventoryBag.objects.count(), VillagePlayerDishReview.objects.count()))
+        queued = self.request(slot)
+        self.assertEqual(queued.status, "PENDING")
+        self.assertEqual(self.reply(queued)["result_code"], "MARK_UNAVAILABLE")
+        NpcRuntimeState.objects.filter(npc=self.mark).update(action_status="IDLE")
+        self.assertEqual(self.reply(queued)["result_code"], "OK")
+
+    def test_away_mark_accepts_real_sample_and_reviews_it_after_return(self):
+        NpcRuntimeState.objects.filter(npc=self.mark).update(
+            action_status="AWAY", current_location_code="TRADE_ROAD", away_until_world_minute=1000)
+        slot = self.dish()
+        overview = review_overview(self.a, self.bag_a, 100)
+        self.assertFalse(overview["mark_available"])
+        self.assertTrue(overview["samples"][0]["eligible"])
+        row = self.request(slot)
+        slot.refresh_from_db()
+        self.assertEqual(slot.item_amount, 1)
+        self.assertEqual(row.expires_world_minute, 1180)
+        self.assertEqual(pending_reviews(self.mark, 500)["reviews"][0]["review_id"], str(row.pk))
+        self.assertEqual(self.reply(row)["result_code"], "NPC_AWAY")
+        self.clock.world_minute = 1000
+        NpcRuntimeState.objects.filter(npc=self.mark).update(
+            action_status="IDLE", current_location_code="RECORD_HALL", away_until_world_minute=None)
+        self.assertEqual(self.reply(row)["result_code"], "OK")
+        row.refresh_from_db()
+        self.assertEqual(row.status, "COMPLETED")
+        self.assertEqual(row.scores, self.scores)
+
+    def test_mark_outside_record_hall_cannot_score_but_does_not_block_dropoff(self):
+        NpcRuntimeState.objects.filter(npc=self.mark).update(current_location_code="VILLAGE_SQUARE")
+        slot = self.dish()
+        self.assertTrue(review_overview(self.a, self.bag_a, 100)["samples"][0]["eligible"])
+        row = self.request(slot)
+        self.assertEqual(self.reply(row)["result_code"], "MARK_NOT_AT_WORK")
+        NpcRuntimeState.objects.filter(npc=self.mark).update(current_location_code="RECORD_HALL")
+        self.assertEqual(self.reply(row)["result_code"], "OK")
 
     def test_invalid_samples_scores_and_actor_do_not_mutate_or_award(self):
-        for attrs, code in [(dict(freshness_unknown=True), "DISH_FRESHNESS_UNKNOWN"),
-                            (dict(expires_world_minute=100), "DISH_REVIEW_SAMPLE_EXPIRED"),
-                            (dict(rated=True), "DISH_ALREADY_REVIEWED")]:
+        for attrs, code in [(dict(rated=True), "DISH_ALREADY_REVIEWED")]:
             with self.subTest(code=code), self.assertRaises(ReviewError) as error:
                 self.request(self.dish(**attrs))
             self.assertEqual(error.exception.code, code)

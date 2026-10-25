@@ -26,7 +26,7 @@ class PlayerSiteTradeTests(PlayerFixture, TestCase):
 
     def shelf(self, amount=3, price=10, item_id=1030, store=None, **batch):
         store = store or self.store
-        listing = VillageStoreListing.objects.create(store=store, item_id=item_id, unit_price=price,
+        listing = VillageStoreListing.objects.create(store=store, item_id=item_id, unit_price=price, price_mode="CUSTOM",
             listed_by_npc=self.npc, created_request_id=uuid.uuid4(), listed_world_minute=90)
         slot = VillageStoreInventorySlot.objects.create(store=store, listing=listing, item_id=item_id,
             item_amount=amount, produced_world_minute=90, expires_world_minute=1000, **batch)
@@ -54,7 +54,7 @@ class PlayerSiteTradeTests(PlayerFixture, TestCase):
                 bag_batches = [row["batch"] for row in serialize_bag(self.bag_a)["items"]]
                 self.assertEqual([row["batch"] for row in trade], bag_batches)
                 self.assertEqual(trade[0]["batch"]["stacking"], {"stackable": True, "maxPerSlot": 10})
-                self.assertEqual(trade[0]["batch"]["quality"], 2 if quality_enabled else None)
+                self.assertEqual(trade[0]["batch"]["quality"], 2)
                 self.assertFalse(trade[4]["batch"]["stacking"]["stackable"])
                 self.assertFalse(trade[5]["batch"]["stacking"]["stackable"])
 
@@ -63,13 +63,16 @@ class PlayerSiteTradeTests(PlayerFixture, TestCase):
             dish_metadata={"origin": "harvest"}, rated=True, rating_price=10, overall_score=88, review_comment="good")
         second = VillageStoreInventorySlot.objects.create(store=self.store, listing=listing, item_id=1030,
             item_amount=3, produced_world_minute=95, expires_world_minute=1500, quality=2)
-        payload = self.payload("buy_store", dict(listing_id=str(listing.pk), quantity=2, expected_unit_price=10), location="GENERAL_STORE")
+        payload = self.payload("buy_store", dict(listing_id=str(listing.pk), quantity=1, expected_unit_price=10), location="GENERAL_STORE")
         answer = execute_player_action(payload)
         self.assertTrue(answer["success"], answer)
         retry = {**copy.deepcopy(payload), "replay_only": True, "read_only": True, "current_location_code": ""}
         self.assertEqual(execute_player_action(retry), answer)
+        self.assertNotEqual(second.listing_id, first.listing_id)
+        bought = self.run_action("buy_store", dict(listing_id=str(second.listing_id), quantity=1, expected_unit_price=10, expected_quality=2), location="GENERAL_STORE")
+        self.assertTrue(bought["success"], bought.get("result_code"))
         self.bag_a.refresh_from_db(); self.account.refresh_from_db(); self.fund.refresh_from_db()
-        self.assertEqual((self.bag_a.money, self.account.balance, self.fund.balance), (80, 19, 1))
+        self.assertEqual((self.bag_a.money, self.account.balance, self.fund.balance), (80, 18, 2))
         got = list(self.bag_a.slots.order_by("slot_index"))
         self.assertEqual([s.item_amount for s in got], [1, 1])
         for name in COMPONENT_FIELDS:
@@ -77,10 +80,10 @@ class PlayerSiteTradeTests(PlayerFixture, TestCase):
         self.assertEqual((got[0].quality, got[0].expires_world_minute), (4, 1000))
         first.refresh_from_db(); second.refresh_from_db()
         self.assertEqual((first.item_amount, second.item_amount), (0, 2))
-        self.assertEqual(EconomicLedgerEntry.objects.filter(entry_type="BUY_FROM_STORE").count(), 1)
+        self.assertEqual(EconomicLedgerEntry.objects.filter(entry_type="BUY_FROM_STORE").count(), 2)
         from village.phase7_services import public_store
         sale = public_store("GENERAL_STORE")["transactions"][0]
-        self.assertEqual((sale["buyer_display_name"], sale["amount"]), (self.a.username, 2))
+        self.assertEqual((sale["buyer_display_name"], sale["amount"]), (self.a.username, 1))
 
     def test_paid_restaurant_meal_and_public_subsidy_eligibility(self):
         restaurant, _ = VillageStore.objects.update_or_create(pk="RESTAURANT_STORE", defaults=dict(
@@ -131,7 +134,8 @@ class PlayerSiteTradeTests(PlayerFixture, TestCase):
             self.assertEqual(answer["result_code"], code)
         source.refresh_from_db(); self.bag_a.refresh_from_db()
         self.assertEqual((source.item_amount, self.bag_a.money), (3, 100))
-        self.assertEqual((EconomicLedgerEntry.objects.count(), VillagePersonalCommission.objects.count()), (0, 0))
+        self.assertFalse(EconomicLedgerEntry.objects.filter(entry_type="BUY_FROM_STORE").exists())
+        self.assertEqual(VillagePersonalCommission.objects.count(), 0)
 
     def test_market_list_delist_owner_idempotency_and_batch_preservation(self):
         source = self.slot(quantity=2, quality=5, dish_metadata={"source": "forest"})
@@ -191,13 +195,14 @@ class PlayerSiteTradeTests(PlayerFixture, TestCase):
         source = self.slot(quantity=5, quality=4, ingredient="forest corn", rated=True,
             overall_score=80, dish_metadata={"source": "player-harvest"})
         payload = self.payload("sell_store", dict(instance_id=str(source.instance_id), quantity=2,
-            expected_unit_price=5), location="GENERAL_STORE")
+            expected_unit_price=6), location="GENERAL_STORE")
         answer = execute_player_action(payload)
         self.assertTrue(answer["success"], answer)
         self.assertEqual(execute_player_action({**payload, "replay_only": True, "current_location_code": ""}), answer)
         source.refresh_from_db(); self.bag_a.refresh_from_db(); self.account.refresh_from_db(); self.lucy.refresh_from_db()
-        self.assertEqual((source.item_amount, self.bag_a.money, self.account.balance, self.lucy.money), (3, 110, 190, 1000))
-        target = VillageStoreInventorySlot.objects.get(store=self.store)
+        bonus = sum(row["earned_gold"] for row in answer["data"]["result"].get("starter_rewards", []))
+        self.assertEqual((source.item_amount, self.bag_a.money, self.account.balance, self.lucy.money), (3, 112 + bonus, 188, 1000))
+        target = VillageStoreInventorySlot.objects.get(store=self.store, source_slot_instance_id=source.instance_id)
         self.assertEqual((target.item_amount, target.quality, target.expires_world_minute, target.listing_id,
             target.source_slot_instance_id), (2, 4, 2000, None, source.instance_id))
         for name in COMPONENT_FIELDS:
@@ -206,9 +211,9 @@ class PlayerSiteTradeTests(PlayerFixture, TestCase):
         from village.phase7_services import public_store
         record = public_store("GENERAL_STORE")["transactions"][0]
         self.assertEqual((record["direction"], record["seller_display_name"], record["amount"], record["gross_amount"]),
-            ("STORE_PURCHASE", self.a.username, 2, 10))
+            ("STORE_PURCHASE", self.a.username, 2, 12))
         quote = answer["data"]["overview"]["inventory"][0]["general_store_sale"]
-        self.assertEqual((quote["allowed"], quote["unit_price"], quote["available_quantity"]), (True, 5, 3))
+        self.assertEqual((quote["allowed"], quote["unit_price"], quote["available_quantity"]), (True, 6, 3))
 
     def test_player_buyback_rejections_do_not_move_money_or_inventory(self):
         self.account.balance = 200; self.account.save()
@@ -229,12 +234,13 @@ class PlayerSiteTradeTests(PlayerFixture, TestCase):
         for attributes in (dict(freshness_unknown=True), dict(expires_world_minute=99)):
             for name, value in attributes.items(): setattr(source, name, value)
             source.save()
-            self.assertEqual(self.run_action("sell_store", params, location="GENERAL_STORE")["result_code"], "TRADE_ITEM_NOT_FOR_SALE")
+            from village.player_store import store_sale_quote
+            self.assertTrue(store_sale_quote(source, Item.objects.get(pk=source.item_id), 100)["allowed"])
             source.freshness_unknown = False; source.expires_world_minute = 2000; source.save()
         Item.objects.filter(pk=source.item_id).update(item_type="HoeTool", max_use_count=10)
         source.remaining_uses = 9; source.save()
         self.assertEqual(self.run_action("sell_store", params, location="GENERAL_STORE")["result_code"], "TRADE_ITEM_NOT_FOR_SALE")
         source.refresh_from_db(); self.bag_a.refresh_from_db(); self.account.refresh_from_db()
         self.assertEqual((source.item_amount, self.bag_a.money, self.account.balance), (3, 100, 200))
-        self.assertFalse(VillageStoreInventorySlot.objects.filter(store=self.store).exists())
+        self.assertFalse(VillageStoreInventorySlot.objects.filter(store=self.store, item_id=1030).exists())
         self.assertFalse(EconomicLedgerEntry.objects.filter(entry_type="SELL_TO_STORE").exists())

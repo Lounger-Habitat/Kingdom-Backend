@@ -1,7 +1,7 @@
 """Shared, side-effect-free cooking and review arithmetic (RNG is explicit)."""
 import random
 
-QUALITY_COEFFICIENTS = {1: .3, 2: .7, 3: 1., 4: 1.5, 5: 2., 6: 3.}
+from items.quality import DISH_COEFFICIENTS as QUALITY_COEFFICIENTS, quality_price
 
 
 def cook_time_bonus(actual, standard):
@@ -30,7 +30,7 @@ def overall_score(scores, difficulty, rng=random):
 def default_value(item, quality):
     if quality not in QUALITY_COEFFICIENTS:
         raise ValueError("DISH_QUALITY_INVALID")
-    return max(1, round(round(item.item_price * item.sell_percentage) * QUALITY_COEFFICIENTS[quality]))
+    return quality_price(round(item.item_price * item.sell_percentage), quality, dish=True)
 
 
 def review_value(value, score):

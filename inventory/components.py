@@ -8,12 +8,14 @@ own one-to-one detail tables: no generic foreign keys or shared mutable instance
 from copy import deepcopy
 
 from django.core.exceptions import ObjectDoesNotExist
+from django.core.validators import MinValueValidator, MaxValueValidator
 from django.db import models, router, transaction
 
 
 # legacy name: (relation, typed field, legacy default)
 COMPONENT_FIELDS = {
     "remaining_uses": ("usage", "remaining", None),
+    "equipment_level": ("usage", "equipment_level", 1),
     "ingredient": ("dish", "ingredients", ""),
     "cook_time": ("dish", "cook_time", 0),
     "dish_metadata": ("dish", "metadata", {}),
@@ -42,6 +44,8 @@ class UsageFields(models.Model):
     # NULL = unknown/not recorded, -1 = unlimited; preserve invalid historical
     # values for the existing fail-closed durability validation, never repair here.
     remaining = models.IntegerField(null=True, blank=True)
+    equipment_level = models.PositiveSmallIntegerField("装备等级", default=1,
+        validators=[MinValueValidator(1), MaxValueValidator(5)])
 
     class Meta:
         abstract = True
@@ -117,6 +121,7 @@ class BatchComponents(models.Model):
         self.quality = value
 
     remaining_uses = component_property("remaining_uses")
+    equipment_level = component_property("equipment_level")
     ingredient = component_property("ingredient")
     cook_time = component_property("cook_time")
     dish_metadata = component_property("dish_metadata")

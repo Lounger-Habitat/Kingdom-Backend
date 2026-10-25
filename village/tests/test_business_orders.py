@@ -173,7 +173,8 @@ class BusinessOrderTests(PlayerFixture, TestCase):
         self.assertEqual(SkillRewardReceipt.objects.filter(player=self.a, skill_code="business").count(), 2)
         self.assertEqual(PlayerSkillProgress.objects.get(player=self.a, skill_code="business").total_xp, 40)
         self.bag_a.refresh_from_db()
-        self.assertEqual(self.bag_a.money, 172)
+        # Includes the existing 15-gold first-supply introductory goal reward.
+        self.assertEqual(self.bag_a.money, 187)
         self.level(self.b, 440)
         self.prepare(self.b, self.bag_b)
         meal = self.row("FRESH_MEALS")
@@ -186,7 +187,7 @@ class BusinessOrderTests(PlayerFixture, TestCase):
         self.assertEqual(business_orders_overview(self.a, 1440)["completed_today"], 0)
         self.accept(meal)
 
-    def test_final_payment_revalidates_every_held_batch_and_abandon_preserves_expired_original(self):
+    def test_final_payment_accepts_historical_expiry_and_preserves_audit(self):
         result = publish_commission(self.npc, dict(title="两种真实备货", reward_gold=10, valid_for_minutes=1000,
             default_location_code="RESTAURANT", stages=[dict(id="s", conditions=[
                 dict(id="corn", type="item", item_ids=[1030], target=2, min_quality=3,
@@ -202,21 +203,15 @@ class BusinessOrderTests(PlayerFixture, TestCase):
         self.clock.save()
         row.refresh_from_db()
         view = project_commission(row, actor_type="PLAYER", actor_id=self.a.pk)
-        self.assertTrue(view["held_stale"])
-        self.assertFalse(view["can_act"])
-        self.assertTrue(view["can_abandon"])
-        with self.assertRaises(CommissionError) as error:
-            contribute_commission(row.pk, "PLAYER", self.a.pk, "wood", 1, uuid.uuid4(), 210,
-                                  item_id=1002, instance_id=wood.instance_id, location="RESTAURANT")
-        self.assertEqual(error.exception.code, "HELD_BATCH_NO_LONGER_ELIGIBLE")
+        self.assertFalse(view["held_stale"])
+        self.assertTrue(view["can_act"])
+        contribute_commission(row.pk, "PLAYER", self.a.pk, "wood", 1, uuid.uuid4(), 210,
+                              item_id=1002, instance_id=wood.instance_id, location="RESTAURANT")
         row.refresh_from_db(); wood.refresh_from_db(); self.bag_a.refresh_from_db()
-        self.assertEqual((row.status, wood.item_amount, self.bag_a.money), ("ACTIVE", 1, 100))
-        self.assertEqual(row.progress["conditions"], {"corn": 2})
-        abandon_commission(row.pk, "PLAYER", self.a.pk, uuid.uuid4(), 210)
-        returned = self.bag_a.slots.get(item_id=1030, item_amount=2)
-        self.assertEqual(returned.expires_world_minute, 200)
-        self.assertEqual(returned.dish_metadata, {"original": True})
-        self.assertFalse(held_batch_issues(row, 210))
+        self.assertEqual((row.status, wood.item_amount, self.bag_a.money), ("COMPLETED", 0, 110))
+        delivered = self.lucy.slots.get(item_id=1030, item_amount=2)
+        self.assertEqual(delivered.expires_world_minute, 200)
+        self.assertEqual(delivered.dish_metadata, {"original": True})
 
     def test_final_payment_rejects_changed_held_quality_without_consuming_last_delivery(self):
         self.level(self.a, 80)

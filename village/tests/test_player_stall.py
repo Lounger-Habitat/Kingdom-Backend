@@ -43,7 +43,7 @@ class PlayerStallTests(PlayerFixture, TestCase):
             review_comment="正式样品评语", **kwargs)
 
     def act(self, action, params=None, **kwargs):
-        return self.run_action(action, params, location="RESTAURANT", **kwargs)
+        return self.run_action(action, params, location="PLAYER_STALL", **kwargs)
 
     def opened(self):
         response = self.act("open_player_stall")
@@ -82,7 +82,7 @@ class PlayerStallTests(PlayerFixture, TestCase):
         self.assertEqual(legacy.current_level, 4)
         source = self.food()
         original = {field: copy.deepcopy(getattr(source, field)) for field in BATCH_COPY_FIELDS}
-        payload = self.payload("list_stall_dish", dict(instance_id=str(source.instance_id), quantity=2), location="RESTAURANT")
+        payload = self.payload("list_stall_dish", dict(instance_id=str(source.instance_id), quantity=2), location="PLAYER_STALL")
         listed = execute_player_action(payload)
         self.assertTrue(listed["success"], listed)
         self.assertEqual(listed, execute_player_action(copy.deepcopy(payload)))
@@ -104,10 +104,7 @@ class PlayerStallTests(PlayerFixture, TestCase):
         base = dict(instance_id=str(source.instance_id), quantity=6)
         self.assertEqual(self.act("list_stall_dish", base)["result_code"], "MENU_CAPACITY_REACHED")
         base["quantity"] = 1
-        for fields, code in ((dict(freshness_unknown=True), "FRESHNESS_UNKNOWN"),
-            (dict(freshness_unknown=False, expires_world_minute=None), "FRESHNESS_REQUIRED"),
-            (dict(expires_world_minute=600), "ITEM_EXPIRED"),
-            (dict(expires_world_minute=2000, dish_metadata={"public_meal_claim": {"world_minute": 100}}), "PUBLIC_MEAL_NOT_RESALE")):
+        for fields, code in ((dict(expires_world_minute=2000, dish_metadata={"public_meal_claim": {"world_minute": 100}}), "PUBLIC_MEAL_NOT_RESALE"),):
             for name, value in fields.items():
                 setattr(source, name, value)
             source.save(update_fields=list(fields))
@@ -202,7 +199,7 @@ class PlayerStallTests(PlayerFixture, TestCase):
         self.assertFalse(PlayerRecipe.objects.filter(recipe_name=recipe.recipe_name).exists())
         wood.item_amount = 4; wood.save(update_fields=["item_amount"])
         quote = business_overview(self.a, self.bag_a, 600)["upgrade"]
-        payload = self.payload("upgrade_player_stall", dict(expected_quote=quote["quote_hash"]), location="RESTAURANT")
+        payload = self.payload("upgrade_player_stall", dict(expected_quote=quote["quote_hash"]), location="PLAYER_STALL")
         with patch.object(VillagePlayerActionReceipt.objects, "create", side_effect=RuntimeError("receipt unavailable")):
             with self.assertRaises(RuntimeError):
                 execute_player_action(payload)

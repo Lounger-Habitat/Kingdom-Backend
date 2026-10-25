@@ -171,12 +171,10 @@ def expire_supply(minute):
 def _eligibility(slot, order, minute):
     if slot.item_id not in order.accepted_item_ids:
         return "ITEM_NOT_ACCEPTED"
-    if slot.quality < 3:
+    if not 1 <= slot.quality <= 6:
         return "QUALITY_REQUIRED"
-    if slot.freshness_unknown or slot.expires_world_minute is None or slot.produced_world_minute is None or not slot.source_request_id:
+    if slot.produced_world_minute is not None and slot.produced_world_minute > minute:
         return "PROVENANCE_REQUIRED"
-    if slot.produced_world_minute > minute or slot.expires_world_minute <= minute or slot.expires_world_minute < minute + 60:
-        return "FRESHNESS_REQUIRED"
     if not Item.objects.filter(pk=slot.item_id, is_deleted=False).exists():
         return "ITEM_UNAVAILABLE"
     return ""
@@ -359,8 +357,6 @@ def spend_reserve(batch_id, beneficiary_bag, allocations, request_id, minute, pu
                                                                   instance_id=row["instance_id"]).first()
         if not source or source.item_amount < row["quantity"]:
             _fail("INSUFFICIENT_RESERVE", "公共储备的该批次物资不足。")
-        if source.freshness_unknown or source.expires_world_minute is None or source.expires_world_minute <= minute:
-            _fail("RESERVE_EXPIRED", "该储备批次已经过期或鲜期不明。")
         moved.append(_batch_line(_copy_quantity(source, target, row["quantity"]), row["quantity"]))
     if isinstance(target, NpcGlobalInventory):
         target.asset_version += 1

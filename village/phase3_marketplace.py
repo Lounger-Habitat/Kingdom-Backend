@@ -94,8 +94,6 @@ def _serialize_query_result(name: str, result: Any, npc: NpcDefinition | None = 
                 # including legacy NPC food whose provenance is unverified.
                 batch = marketplace_services._listing_batch(listing)
                 expiry = batch.get("expiresWorldMinute")
-                if batch.get("freshnessUnknown") or (expiry is not None and expiry <= world_minute):
-                    continue
             row = serialize_listing(listing, npc)
             if listing.status == "active" and listing.expires_at and listing.expires_at <= now:
                 # Reading must not return goods or bump asset versions. Report the

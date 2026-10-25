@@ -14,6 +14,8 @@ from django.utils import timezone
 
 from account.models import GameAccount
 from game_time.models import GlobalGameTimeState
+from items.quality import production_quality, player_skill_level, quality_rng
+from .phase3_asset_service import deterministic_rng
 from inventory.models import InventoryBag, InventorySlot
 from items.models import Item
 from marketplace.models import MarketListing, MarketListingStatus
@@ -27,7 +29,6 @@ from .lucy_catalog import MEALS
 
 LOCATIONS = {
     "claim_starter_hunting_kit": {"HUNTING_GATE"},
-    "repair_hunting_weapon": {"BUTCHER_YARD"},
     "start_safe_rest": {"VILLAGE_SQUARE"},
     "finish_safe_rest": {"VILLAGE_SQUARE"},
     "start_game_processing": {"BUTCHER_YARD"},
@@ -38,12 +39,11 @@ LOCATIONS = {
     "buy_store": {"GENERAL_STORE", "RESTAURANT"},
     "sell_store": {"GENERAL_STORE"},
     "supply_deliver": {"GENERAL_STORE"},
-    "repair_tool": {"GENERAL_STORE"},
-    "upgrade_tool": {"GENERAL_STORE"},
     "cook_dish": {"RESTAURANT"},
+    "prepare_business_orders": {"RESTAURANT"},
     "request_dish_review": {"RECORD_HALL"},
-    **{action: {"RESTAURANT"} for action in ("open_player_stall", "list_stall_dish",
-        "withdraw_stall_dish", "upgrade_player_stall", "prepare_business_orders")},
+    **{action: {"PLAYER_STALL"} for action in ("open_player_stall", "list_stall_dish",
+        "withdraw_stall_dish", "upgrade_player_stall")},
 }
 PARAMS = {
     "start_mastery": {"skill_code"},
@@ -54,11 +54,12 @@ PARAMS = {
     "repair_hunting_weapon": {"instance_id", "expected_quote"},
     "start_safe_rest": set(),
     "finish_safe_rest": set(),
-    "preview_game_processing": {"prey_instance_id"},
-    "start_game_processing": {"prey_instance_id", "expected_quote"},
+    "preview_game_processing": {"prey_instance_id", "quantity"},
+    "start_game_processing": {"prey_instance_id", "quantity", "expected_quote"},
     "cancel_game_processing": {"job_id"},
     "claim_game_processing": {"job_id"},
     "overview": set(),
+    "plant_state": set(),
     "contribute": {"affair_id", "condition_id", "kind", "item_id", "quantity", "instance_id"},
     "labor_start": {"affair_id", "condition_id"}, "labor_cancel": set(),
     "commission_accept": {"commission_id"},
@@ -68,13 +69,14 @@ PARAMS = {
     "buy_marketplace": {"listing_id", "quantity", "expected_unit_price"},
     "list_marketplace": {"instance_id", "quantity", "unit_price"},
     "delist_marketplace": {"listing_id"},
-    "buy_store": {"listing_id", "quantity", "expected_unit_price"},
+    "buy_store": {"listing_id", "quantity", "expected_unit_price", "expected_quality"},
     "sell_store": {"instance_id", "quantity", "expected_unit_price"},
-    "collect": {"collect_type", "category", "tool_instance_id"},
+    "collect": {"node_id", "attempt_id", "collect_type", "category", "tool_instance_id"},
     "supply_accept": {"order_id"},
     "supply_deliver": {"order_id", "instance_id", "quantity"},
     "supply_abandon": {"order_id"},
     "track_goal": {"goal_code"},
+    "claim_goal_rewards": set(),
     "repair_tool": {"instance_id", "expected_quote"},
     "upgrade_tool": {"instance_id", "expected_quote"},
     "claim_starter_axe": set(),
@@ -94,7 +96,13 @@ from .professional_catalog import PROFESSIONAL_COLLECT_TYPES
 COLLECTION_LOCATIONS.update({name: "DEEP_FOREST" for name in PROFESSIONAL_COLLECT_TYPES})
 LOCATIONS["prepare_professional_contracts"] = {"GENERAL_STORE"}
 from .player_farm import ACTIONS as FARM_ACTIONS
+from .plant_catalog import ACTIONS as PLANT_ACTIONS
+PARAMS.update(PLANT_ACTIONS)
 PARAMS.update(FARM_ACTIONS)
+from player.tutorials import CONTROL_PARAMS as TUTORIAL_PARAMS
+PARAMS.update(TUTORIAL_PARAMS)
+from player.arrival import CONTROL_PARAMS as ARRIVAL_PARAMS
+PARAMS.update(ARRIVAL_PARAMS)
 LOCATIONS.update({action: {"BILL_FARM"} for action in FARM_ACTIONS})
 
 
@@ -134,22 +142,18 @@ def response(request_id, code="OK", message="操作完成。", data=None):
 def _batch_data(slot, minute, names=None):
     return dict(instance_id=str(slot.instance_id), item_id=slot.item_id,
         item_name=(names or {}).get(slot.item_id, str(slot.item_id)), quantity=slot.item_amount,
-        quality=slot.quality, remaining_uses=slot.remaining_uses, expires_world_minute=slot.expires_world_minute,
+        quality=slot.quality, remaining_uses=slot.remaining_uses, expires_world_minute=None,
         produced_world_minute=slot.produced_world_minute, source_request_id=str(slot.source_request_id) if slot.source_request_id else None,
-        remaining_freshness_minutes=None if slot.expires_world_minute is None else max(0, slot.expires_world_minute-minute),
-        freshness_unknown=slot.freshness_unknown,
-        usable=not slot.freshness_unknown and (slot.expires_world_minute is None or slot.expires_world_minute > minute))
+        remaining_freshness_minutes=None, freshness_unknown=False,
+        usable=slot.item_amount > 0)
 
 
 def _consume(bag, item_id, quantity, minute, *, instance_id=None, min_quality=1, min_remaining=0, perishable=False):
     slots = InventorySlot.objects.select_for_update().filter(bag=bag, item_id=item_id, item_amount__gt=0)
     if instance_id:
         slots = slots.filter(instance_id=key(instance_id))
-    rows = list(slots.order_by(models.F("expires_world_minute").asc(nulls_last=True), "slot_index"))
-    usable = [s for s in rows if not s.freshness_unknown and s.quality >= min_quality
-              and (s.expires_world_minute is not None or not perishable)
-              and (s.expires_world_minute is None or
-                   (s.expires_world_minute > minute and s.expires_world_minute >= minute + min_remaining))]
+    rows = list(slots.order_by("quality", "slot_index"))
+    usable = [s for s in rows if s.quality >= min_quality]
     if sum(s.item_amount for s in usable) < quantity:
         fail("INSUFFICIENT_QUALIFIED_ITEMS", "背包中符合数量、品质和保鲜要求的物品不足。")
     result = []
@@ -238,6 +242,7 @@ def overview(player, bag, minute, *, read_only=False):
     from .player_farm import farm_overview
     from .affairs import project_affairs
     from .personal_commissions import list_commissions
+    from .cooperation import decorate_commission_rewards
     from .models import VillageAffairContribution
     from inventory.models import CollectionPoint
     from player.models import PlayerState
@@ -258,6 +263,8 @@ def overview(player, bag, minute, *, read_only=False):
     from .models import VillageStore
     general_store = VillageStore.objects.filter(pk="GENERAL_STORE").values("status", "account__balance").first()
     commissions = list_commissions(minute, actor_type="PLAYER", actor_id=str(player.pk))
+    cooperation = cooperation_overview(player, minute, read_only=read_only)
+    decorate_commission_rewards(commissions, player, cooperation)
     affairs = project_affairs(minute)
     from .task_progress import decorate_task_progress
     decorate_task_progress(affairs, commissions)
@@ -274,24 +281,29 @@ def overview(player, bag, minute, *, read_only=False):
     for listing in MarketListing.objects.filter(status=MarketListingStatus.ACTIVE, remaining_amount__gt=0).exclude(seller=player).order_by("price", "pk")[:100]:
         batch = _listing_batch(listing)
         expiry = batch.get("expiresWorldMinute")
-        if batch.get("freshnessUnknown") or (expiry is not None and expiry <= minute) or (listing.expires_at and listing.expires_at <= timezone.now()):
+        if listing.expires_at and listing.expires_at <= timezone.now():
             continue
         market.append(dict(listing_id=str(listing.pk), item_id=listing.item_id, item_name=listing.item_name_snapshot,
-            remaining_quantity=listing.remaining_amount, unit_price=listing.price, quality=listing.quality, expires_world_minute=expiry))
+            remaining_quantity=listing.remaining_amount, unit_price=listing.price, quality=listing.quality, expires_world_minute=None))
     if bag.pk:
         bag.refresh_from_db()
     starter = starter_overview(player, bag, minute, read_only=read_only)
     starter["gathering"] = gathering_overview(player, bag, minute)
-    return dict(world_minute=minute, player_id=str(player.pk), player_name=player.username, money=bag.money,
+    from .plant_gathering import overview as plant_overview
+    plants = plant_overview(player, bag, minute)
+    from .production_tools import tools_overview
+    tool_state = tools_overview(player, bag, minute, read_only=read_only)
+    projection = dict(world_minute=minute, player_id=str(player.pk), player_name=player.username, money=bag.money,
         action_points=state.action_points, action_points_max=state.action_points_max,
         growth=growth_snapshot(player, read_only=read_only),
         starter=starter,
+        plants=plants,
         mastery=mastery_overview(player, bag, minute, read_only=read_only),
-        cooperation=cooperation_overview(player, minute, read_only=read_only),
+        cooperation=cooperation,
         professional_contracts=professional_contracts_overview(player, minute, read_only=read_only),
-        production=production_overview(player, bag, minute, read_only=read_only),
-        collection_points=collection_points_projection(player, bag, minute),
-        cooking=cooking_overview(player, bag, minute, read_only=read_only),
+        production=production_overview(player, bag, minute, read_only=read_only, tool_state=tool_state),
+        collection_points=collection_points_projection(player, bag, minute, tool_state=tool_state),
+        cooking=cooking_overview(player, bag, minute, read_only=read_only, tool_state=tool_state),
         reviews=review_overview(player, bag, minute, read_only=read_only),
         hunting=hunting_overview(player, bag, minute, read_only=read_only),
         processing=processing_overview(player, bag, minute, read_only=read_only),
@@ -309,6 +321,11 @@ def overview(player, bag, minute, *, read_only=False):
             "item_type": items[s.item_id].item_type if s.item_id in items else "",
             "general_store_sale": store_sale_quote(s, items.get(s.item_id), minute)}
             for s in bag.slots.filter(item_amount__gt=0).select_related("usage", "dish", "review")] if bag.pk else [])
+    from player.tutorials import tutorial_overview
+    projection["tutorial"] = tutorial_overview(player, bag, minute, projection, read_only=read_only)
+    from player.arrival import arrival_overview
+    projection["arrival"] = arrival_overview(player)
+    return projection
 
 
 def _execute(player, bag, action, p, rid, location, clock, authority_session_id=None):
@@ -317,6 +334,18 @@ def _execute(player, bag, action, p, rid, location, clock, authority_session_id=
         fail("LOCATION_INVALID", "请前往对应地点再操作。")
     if action == "overview":
         return {}
+    if action in ARRIVAL_PARAMS:
+        from player.arrival import control, ArrivalError
+        try:
+            return control(player, action, p)
+        except ArrivalError as exc:
+            fail(exc.code, exc.message)
+    if action in TUTORIAL_PARAMS:
+        from player.tutorials import control, TutorialError
+        try:
+            return control(player, action, p, bag)
+        except TutorialError as exc:
+            fail(exc.code, exc.message)
     if action in {"start_mastery", "contribute_mastery", "claim_mastery"}:
         from player.mastery import MasteryError, execute_mastery_action
         if action == "contribute_mastery":
@@ -375,6 +404,9 @@ def _execute(player, bag, action, p, rid, location, clock, authority_session_id=
             return execute_tool_action(player, bag, action, p, rid, clock)
         except ToolError as exc:
             fail(exc.code, exc.message)
+    if action == "claim_goal_rewards":
+        # post_action_progress settles only this player's proven, unpaid goals.
+        return {}
     if action == "track_goal":
         from player.starter import StarterError, track_goal
         try:
@@ -411,6 +443,14 @@ def _execute(player, bag, action, p, rid, location, clock, authority_session_id=
                         if action == "commission_contribute" and result.get("status") == "COMPLETED" else 0)
         except CommissionError as exc:
             fail(exc.code, exc.message)
+    if action in PLANT_ACTIONS or action == "collect" and "node_id" in p:
+        from .plant_gathering import PlantError, execute as execute_plant
+        try:
+            return execute_plant(player, bag, action, p, rid, location, minute, authority_session_id)
+        except PlantError as exc:
+            fail(exc.code, exc.message)
+    # Compatibility for trusted service integrations. The current Env only authorizes
+    # player collection against a real node_id (including receipt-only retries).
     if action == "collect":
         from inventory.models import CollectionPoint
         from inventory.views import _build_collect_pool
@@ -466,6 +506,8 @@ def _execute(player, bag, action, p, rid, location, clock, authority_session_id=
         state.save(update_fields=["action_points", "action_points_recovered_at"])
         next_index = (bag.slots.aggregate(n=models.Max("slot_index"))["n"] or 0)+1
         collected = []
+        from player.equipment import stats_for
+        tool_stats = stats_for(tool) if tool else None
         remaining_resource = resource.remaining_quantity if resource else None
         for _ in range(min(point.collect_count, len(valid))):
             if remaining_resource is not None and remaining_resource <= 0:
@@ -478,11 +520,13 @@ def _execute(player, bag, action, p, rid, location, clock, authority_session_id=
             if remaining_resource is not None:
                 amount = min(amount, remaining_resource)
                 remaining_resource -= amount
-            # New production has explicit server provenance and freshness. Never
+            # New production has explicit server provenance and a frozen quality. Never
             # merge it into a historical/expired stack or refresh old shelf life.
+            quality = production_quality(player_skill_level(player, "gathering"),
+                quality_rng(rid, "COLLECT:" + str(next_index)), (tool_stats or {}).get("quality_bonus_chance", 0))
             slot = InventorySlot.objects.create(bag=bag, slot_index=next_index, item_id=item.pk,
-                item_amount=amount, quality=professional["quality"] if professional else 3, produced_world_minute=minute,
-                expires_world_minute=minute+(professional["freshness_minutes"] if professional else 2880), source_request_id=rid,
+                item_amount=amount, quality=quality, produced_world_minute=minute,
+                expires_world_minute=None, source_request_id=rid,
                 item_bag_name=f"{item.item_name}_{next_index}")
             next_index += 1
             collected.append(_batch_data(slot, minute, {item.pk: item.item_name}))
@@ -492,7 +536,8 @@ def _execute(player, bag, action, p, rid, location, clock, authority_session_id=
         elif resource:
             consume_resource(resource, sum(b["quantity"] for b in collected))
         from player.models import ItemGameplayDefinition
-        tool_tier = ItemGameplayDefinition.objects.filter(item_id=tool.item_id).values_list("tier", flat=True).first() if tool else None
+        from player.equipment import stats_for
+        tool_tier = stats_for(tool)["tier"] if tool else None
         return dict(collected_items=collected, action_points=state.action_points, action_cost=point.action_cost,
                     category=p.get("category"), tool_used=wear_tool(tool) if tool is not None else None,
                     growth_rewards=[settle_growth(player, source_type="professional_collect" if professional else "advanced_collect" if resource else "collect", source_id=rid,
@@ -592,7 +637,8 @@ def execute_player_action(payload):
         if type(player_id) not in (str, int) or not str(player_id).isascii() or not str(player_id).isdigit() or len(str(player_id)) > 18:
             fail("PLAYER_NOT_FOUND", "玩家身份无效。")
         # Same first lock as NPC economics/marketplace, before any private bags.
-        clock = GlobalGameTimeState.objects.select_for_update().filter(pk=1).first()
+        clocks = GlobalGameTimeState.objects if payload.get("action") == "plant_state" else GlobalGameTimeState.objects.select_for_update()
+        clock = clocks.filter(pk=1).first()
         if clock is None:
             fail("WORLD_NOT_READY", "村庄时间尚未初始化。")
         player = GameAccount.objects.filter(pk=int(player_id), is_active=True, is_ai=False).first()
@@ -620,11 +666,18 @@ def execute_player_action(payload):
                 current = answer["data"]["current_labor"]
                 if current and current["labor_id"] == saved.get("labor_id"):
                     answer["data"]["receipt_labor"] = current
-            if action in FARM_ACTIONS:
+            if action in FARM_ACTIONS or action in ARRIVAL_PARAMS:
                 answer["replayed"] = True
             return answer
         if "read_only" in payload and type(payload["read_only"]) is not bool:
             fail("INVALID_PARAMS", "观察上下文无效。")
+        if action == "plant_state":
+            if not VillageSimulationConfig.objects.filter(config_key="default", village_economy_enabled=True).exists():
+                return response(rid, "FEATURE_DISABLED", "Village economy is unavailable.")
+            from .plant_gathering import overview as plant_overview
+            bag = InventoryBag.objects.filter(player=player, character_id=player.username).first()
+            bag = bag or InventoryBag(player=player, character_id=player.username)
+            return response(rid, data=dict(plants=plant_overview(player, bag, clock.world_minute)))
         if action == "preview_game_processing":
             if not VillageSimulationConfig.objects.filter(config_key="default", village_economy_enabled=True).exists():
                 return response(rid, "FEATURE_DISABLED", "Village economy is unavailable.")
@@ -662,6 +715,22 @@ def execute_player_action(payload):
         cfg = VillageSimulationConfig.objects.filter(config_key="default", village_economy_enabled=True).first()
         if not cfg:
             fail("FEATURE_DISABLED", "村庄经济尚未开放。")
+        if action in {"plant_start", "plant_cancel"}:
+            # A lease neither moves inventory nor advances the world economy.
+            # Avoid rebuilding every gameplay panel just to begin/cancel a timer.
+            from .plant_gathering import overview as plant_overview
+            try:
+                with transaction.atomic():
+                    bag, _ = get_player_main_bag(player)
+                    bag = InventoryBag.objects.select_for_update().get(pk=bag.pk)
+                    result = _execute(player, bag, action, params, rid, payload.get("current_location_code", ""),
+                        clock, payload.get("authority_session_id"))
+                answer = response(rid, data=dict(result=result, plants=plant_overview(player, bag, clock.world_minute)))
+            except ActionError as exc:
+                answer = response(rid, exc.code, exc.message)
+            VillagePlayerActionReceipt.objects.create(player=player, request_id=rid, payload_hash=digest,
+                action=action, response=answer, world_minute=clock.world_minute)
+            return answer
         # Expiry is world maintenance: it survives a rejected player action.
         from .personal_commissions import expire_commissions
         expire_commissions(clock.world_minute)
@@ -674,11 +743,13 @@ def execute_player_action(payload):
                 bag, _ = get_player_main_bag(player)
                 bag = InventoryBag.objects.select_for_update().get(pk=bag.pk)
                 result = _execute(player, bag, action, params, rid, payload.get("current_location_code", ""), clock, payload.get("authority_session_id"))
-                if action != "overview":
+                if action != "overview" and action not in TUTORIAL_PARAMS and action not in ARRIVAL_PARAMS:
                     from player.starter import post_action_progress
                     progress = post_action_progress(player, bag, action, params, result, rid, clock.world_minute)
                     result.setdefault("growth_rewards", []).extend(progress.pop("growth_rewards", []))
                     result.update(progress)
+                    from player.tutorials import observe_action
+                    observe_action(player, bag, action, result, rid)
                     if action == "collect":
                         from .starter_supply import ensure_supply_batch
                         from .player_gathering import GatheringError, ensure_gathering_catalog

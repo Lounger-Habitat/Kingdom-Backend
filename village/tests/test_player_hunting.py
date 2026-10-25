@@ -20,6 +20,21 @@ from village.wildlife import execute as wildlife
 
 
 class PlayerHuntingTests(PlayerFixture, TestCase):
+    def test_new_sword_and_axe_last_use_kills_earn_real_hunting_experience(self):
+        for item_id, weapon in ((4130, 1), (4104, 3)):
+            with self.subTest(item_id=item_id):
+                tool = self.tool(item_id, 1)
+                attack = uuid.uuid4()
+                permit = self.call(weapon=weapon, rid=attack, instance_id=str(tool.instance_id))
+                self.assertTrue(permit["success"], permit)
+                prey = uuid.uuid4()
+                self.assertTrue(wildlife(dict(action="register", request_id=str(uuid.uuid4()), prey_id=str(prey),
+                    species="DEER", region_id="DEEP_FOREST", position=dict(x=-145, y=6.35, z=125)))["success"])
+                result = wildlife(dict(action="finish", request_id=str(uuid.uuid4()), prey_id=str(prey), attempt_id=str(uuid.uuid4()),
+                    actor_type="PLAYER", actor_id=str(self.a.pk), death_world_minute=100, attack_id=str(attack)))
+                self.assertTrue(result["success"], result)
+                self.assertTrue(result["data"]["growth_rewards"], result)
+
     def setUp(self):
         super().setUp()
         self.session = "test-env-session-a"
@@ -64,9 +79,11 @@ class PlayerHuntingTests(PlayerFixture, TestCase):
         self.assertFalse([q for q in queries if q["sql"].lstrip().upper().startswith(("INSERT", "UPDATE", "DELETE"))])
 
     def test_starter_kit_is_real_once_and_t1_repair_is_free_without_ap_or_xp(self):
-        first = self.action("claim_starter_hunting_kit")
-        self.assertEqual({row["item_id"] for row in first["items_added"]}, {4110, 4112, 4114})
-        self.assertEqual({s.remaining_uses for s in self.bag_a.slots.all()}, {60})
+        from inventory.services import ensure_initial_equipment
+        ensure_initial_equipment(self.a, self.bag_a)
+        ensure_initial_equipment(self.a, self.bag_a)
+        self.assertEqual(set(self.bag_a.slots.filter(item_amount__gt=0).values_list("item_id", flat=True)), {4104, 4114})
+        self.tool(4110)
         with self.assertRaises(HuntingError):
             self.action("claim_starter_hunting_kit")
         jack, _ = NpcDefinition.objects.get_or_create(agent_id="10012", defaults=dict(name="Jack"))
@@ -107,12 +124,13 @@ class PlayerHuntingTests(PlayerFixture, TestCase):
 
     def test_t2_requires_level_four_and_last_use_kill_retains_reward_after_weapon_leaves_bag(self):
         bow = self.tool(4113, 1)
+        bow.equipment_level = 3; bow.save(update_fields=["equipment_level"])
         self.assertEqual(self.call(weapon=2)["result_code"], "SKILL_LEVEL_REQUIRED")
         PlayerSkillProgress.objects.create(player=self.a, skill_code="hunting", total_xp=440)
         attack = uuid.uuid4()
         permit = self.call(weapon=2, rid=attack)
         self.assertTrue(permit["success"], permit)
-        self.assertEqual(permit["data"]["weapon"]["damage_multiplier"], 1.2)
+        self.assertEqual(permit["data"]["weapon"]["moves"]["bow_shot"]["multiplier"], 1.8)
         self.assertAlmostEqual(permit["data"]["weapon"]["draw_duration"], 1.14)
         self.assertEqual(permit["data"]["weapon"]["remaining_uses"], 0)
         bow.item_amount = 0; bow.save(update_fields=["item_amount"])
@@ -173,21 +191,21 @@ class PlayerHuntingTests(PlayerFixture, TestCase):
         account, _ = VillageStoreAccount.objects.get_or_create(store=store)
         before = account.balance
         bow = self.tool(4112)
-        for item_id, quantity in ((1002, 8), (29105, 2), (29104, 1)):
+        for item_id, quantity in ((1002, 1), (29105, 2), (29104, 1)):
             self.slot(quantity, item_id=item_id, expires_world_minute=None)
         def quote():
             return next(row["upgrade"] for row in tools_overview(self.a, self.bag_a, 100)["tools"] if row["item_id"] == 4112)
         missing = quote()
         self.assertEqual(missing["reason"], "INSUFFICIENT_MATERIALS")
-        self.assertEqual({r["item_id"]: r["quantity"] for r in missing["materials"]}, {1002: 8, 29105: 2, 29104: 2})
-        feathers = self.bag_a.slots.get(item_id=29104); feathers.item_amount = 2
+        self.assertEqual({r["item_id"]: r["quantity"] for r in missing["materials"]}, {1002: 2})
+        feathers = self.bag_a.slots.get(item_id=1002); feathers.item_amount = 2
         feathers.save(update_fields=["item_amount"])
         original = bow.instance_id
         execute_tool_action(self.a, self.bag_a, "upgrade_tool", dict(instance_id=str(original),
             expected_quote=quote()["quote_hash"]), uuid.uuid4(), self.clock)
         bow.refresh_from_db(); account.refresh_from_db(); self.bag_a.refresh_from_db()
-        self.assertEqual((bow.instance_id, bow.item_id, bow.remaining_uses, self.bag_a.money, account.balance-before), (original, 4113, 120, 400, 100))
-        self.assertEqual(sum(self.bag_a.slots.filter(item_id__in=[1002, 29104, 29105]).values_list("item_amount", flat=True)), 0)
+        self.assertEqual((bow.instance_id, bow.item_id, bow.remaining_uses, self.bag_a.money, account.balance-before), (original, 4112, 60, 480, 20))
+        self.assertEqual(sum(self.bag_a.slots.filter(item_id__in=[1002, 29104, 29105]).values_list("item_amount", flat=True)), 3)
 
     def test_combat_receipt_failure_rolls_back_wear_health_and_personal_revision(self):
         spear = self.tool()

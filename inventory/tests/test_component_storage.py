@@ -246,7 +246,7 @@ class ComponentStorageTests(TestCase):
         row = self.make_slot(rated=False, review_comment="", produced_world_minute=100, expires_world_minute=200)
         self.api(inventory_rate, {"instanceId": str(row.instance_id), "ratingPrice": 90, "overallScore": 99, "reviewComment": "new"})
         row.refresh_from_db()
-        rated = self.bag.slots.exclude(pk=row.pk).get()
+        rated = self.bag.slots.filter(item_id=row.item_id).exclude(pk=row.pk).get()
         self.assertEqual((row.item_amount, row.rated, rated.item_amount, rated.review_comment), (1, False, 1, "new"))
         self.assertEqual(rated.dish_metadata, row.dish_metadata)
         self.assertEqual(rated.expires_world_minute, 200)

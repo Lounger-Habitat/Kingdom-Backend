@@ -16,12 +16,9 @@ logger = logging.getLogger(__name__)
 
 
 def _get_quality_coeff(dish_quality):
-    """品质售价系数：1→0.3，2→0.7，3+→1.0"""
-    if dish_quality <= 1:
-        return 0.3
-    if dish_quality == 2:
-        return 0.7
-    return 1.0
+    """统一六档料理售价系数"""
+    from items.quality import DISH_COEFFICIENTS
+    return DISH_COEFFICIENTS.get(dish_quality, 0)
 
 
 class RestaurantService:
@@ -345,7 +342,8 @@ class RestaurantService:
                     defaults={"game_day": global_time.game_day},
                 )
                 level_bonus = sum(row.reward_price_bonus_pct for row in RestaurantLevelConfig.objects.filter(level__lte=state.current_level))
-                base_price = item.rating_price if item.rated and item.rating_price > 0 else int((Item.objects.filter(item_id=item.item_id).first().item_price if Item.objects.filter(item_id=item.item_id).first() else 100) * _get_quality_coeff(item.dish_quality))
+                from items.quality import quality_price
+                base_price = item.rating_price if item.rated and item.rating_price > 0 else quality_price(Item.objects.filter(item_id=item.item_id).first().item_price if Item.objects.filter(item_id=item.item_id).first() else 100, item.dish_quality, dish=True)
                 price = int(base_price * (100 + level_bonus) / 100)
                 dish_info = {
                     "item_name": item.item_name,

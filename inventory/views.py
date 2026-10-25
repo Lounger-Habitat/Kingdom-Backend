@@ -44,6 +44,8 @@ def get_or_create_bag(player, character_id):
             "characterId": "NPC 库存为全服共享数据，不能通过玩家背包接口访问"
         })
     bag, _ = InventoryBag.objects.get_or_create(player=player, character_id=player.username)
+    from .services import ensure_initial_equipment
+    ensure_initial_equipment(player, bag)
     return bag
 
 
@@ -79,6 +81,7 @@ def clear_slot_if_empty(slot):
         slot.dish_quality = 3
         slot.hide_in_shop = False
         slot.remaining_uses = None
+        slot.equipment_level = 1
         slot.review_comment = ""
         slot.dish_metadata = {}
         slot.produced_world_minute = None
@@ -1799,7 +1802,7 @@ def character_trade(request):
             stock = sum(
                 get_available_slot_amount(slot)
                 for slot in other["bag"].slots.filter(item_id=gift["item_id"], item_amount__gt=0)
-                if slot.expires_world_minute is None or slot.expires_world_minute > world_minute
+                if True
             )
             if not dialogue_gift and (gift["item_id"] not in SAFE_STOCKS or stock >= SAFE_STOCKS[gift["item_id"]]):
                 return Response(error_response("该正式 NPC 当前不符合救急缺货条件"), status=409)
@@ -1814,8 +1817,6 @@ def character_trade(request):
                 if not item["instance_id"]:
                     return None, f"{label}: 请选择明确的物品批次"
                 expiry = getattr(slot, "expires_world_minute", None)
-                if slot.freshness_unknown or (expiry is not None and expiry <= world_minute):
-                    return None, f"{label}: 物品已经过期"
             if slot.item_amount < item["amount"]:
                 return None, f"{label}: 物品数量不足"
             item_config = Item.objects.filter(item_id=item["item_id"]).first()

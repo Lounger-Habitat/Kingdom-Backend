@@ -213,7 +213,7 @@ _OUTCOME_REASONS = {
     "LUCY_ACTION_NOT_FINISHED": "尚未达到动作配置的完成时间",
     "HUNT_CODE_RETIRED": "旧计时狩猎已停用，请通过真实猎物狩猎",
     "PREY_UNAVAILABLE": "指定猎物不存在、已过期或正在被占用，请刷新库存",
-    "PREY_FRESHNESS_UNKNOWN": "猎物缺少可靠鲜期记录，不能加工",
+    "PREY_QUALITY_INVALID": "猎物品质无效，不能加工",
     "PRODUCTION_RESOURCE_UNAVAILABLE": "工作预留的猎物或工具已不可用，工作已停止",
     "PRODUCTION_NOT_FINISHED": "尚未达到数据库配置的完成时间",
     "PRODUCTION_COMMAND_REQUIRED": "必须通过正式狩猎或加工命令开工后才能结算",

@@ -84,6 +84,7 @@ def auth_login(request):
             status=status.HTTP_401_UNAUTHORIZED,
         )
 
+    init_player_bags(account)
     return Response(_jwt_response(account))
 
 

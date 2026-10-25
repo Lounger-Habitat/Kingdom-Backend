@@ -138,6 +138,9 @@ class Phase7PresentationTests(TestCase):
             self.assertEqual(env_client.get("/api/village/operations/snapshot").status_code, 404)
 
     def test_public_store_shows_shelf_history_and_sales_without_private_data(self):
+        # This scenario owns its shelf; later migrations may seed starter stock.
+        VillageStoreInventorySlot.objects.filter(store_id="GENERAL_STORE").delete()
+        VillageStoreListing.objects.filter(store_id="GENERAL_STORE").delete()
         Item.objects.create(item_id=45001, item_name="测试农具", max_use_count=20)
         store = VillageStore.objects.get(store_code="GENERAL_STORE")
         store.location_code = "GENERAL_STORE"
@@ -485,7 +488,7 @@ class Phase7PresentationTests(TestCase):
         self.assertEqual(data["economy"]["today_import_total"], 20)
         self.assertEqual(data["story"]["player_contribution"]["event_count"], 1)
         locations = {row["location_code"]: row["is_open"] for row in data["locations"]}
-        self.assertEqual(locations, {
+        self.assertEqual({code: locations.get(code) for code in ("ALWAYS_OPEN", "DAY_SHOP", "MARKET_STREET", "NIGHT_SHOP")}, {
             "ALWAYS_OPEN": True,
             "DAY_SHOP": True,
             "MARKET_STREET": False,
@@ -493,7 +496,7 @@ class Phase7PresentationTests(TestCase):
         })
         self.assertEqual(set(data["story"]), {
             "arc_code", "public_problem", "public_plan", "progress",
-            "player_contribution", "recent_transition_reason", "retired_plan", "affairs",
+            "player_contribution", "recent_transition_reason", "retired_plan", "affairs", "daily_events",
         })
         self.assertEqual(set(data["story"]["progress"]), {
             "bridge_condition", "repair_fund", "repair_wood", "repair_metal",

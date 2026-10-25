@@ -159,15 +159,11 @@ def _inventory_item_projection(
         if row.remaining_uses is not None:
             durability["remaining_uses"] = row.remaining_uses
         if item and item["max_use_count"] >= 0:
-            durability["max_uses"] = item["max_use_count"]
+            durability["max_uses"] = item.get("equipment_levels", {}).get(row.equipment_level, item["max_use_count"])
+        projected["equipment_level"] = row.equipment_level
         if durability:
             projected["durability"] = durability
 
-    if item_type in _PERISHABLE_ITEM_TYPES:
-        if row.expires_world_minute is not None:
-            projected["expires_world_minute"] = row.expires_world_minute
-        if row.freshness_unknown:
-            projected["freshness_unknown"] = True
 
     if item_type == ItemType.FOOD:
         projected["food_instance_id"] = str(row.instance_id)
@@ -341,11 +337,7 @@ def _store_listing_fields(npc, store_code, item, restaurant_items, *, slot=None,
                 reason = str(exc)
     batch_reason = None
     if slot is not None:
-        if slot.freshness_unknown:
-            batch_reason = "FRESHNESS_UNKNOWN"
-        elif slot.expires_world_minute is not None and slot.expires_world_minute <= minute:
-            batch_reason = "ITEM_EXPIRED"
-        elif not available:
+        if not available:
             batch_reason = "ITEM_RESERVED" if slot.item_amount > 0 else "TRADE_INSUFFICIENT_ITEM"
     reason = reason or batch_reason
     sell_reason = batch_reason
@@ -355,7 +347,7 @@ def _store_listing_fields(npc, store_code, item, restaurant_items, *, slot=None,
         sell_reason = "ITEM_VALUE_UNAVAILABLE"
     elif slot is not None:
         sell_reason = sell_reason or general_store_tool_sale_reason(
-            item["item_type"], item["max_use_count"], slot.remaining_uses,
+            item["item_type"], item.get("equipment_levels", {}).get(slot.equipment_level, item["max_use_count"]), slot.remaining_uses,
         )
     return {
         "own_store_code": store_code,
@@ -399,6 +391,10 @@ def _inventory(npc: NpcDefinition, query_params=None) -> dict:
             item_id__in={slot.item_id for slot in slots}, is_deleted=False
         ).values("item_id", "item_price", "item_type", "max_use_count")
     }
+    from player.equipment import equipment_catalog
+    for (item_id, level), stats in equipment_catalog().items():
+        if item_id in item_details:
+            item_details[item_id].setdefault("equipment_levels", {})[level] = stats["max_durability"]
     names = _item_names(row.item_id for row in slots)
     dish_item_ids = _restaurant_item_ids()
     available = {row.instance_id: get_available_slot_amount(row, minute) for row in slots}

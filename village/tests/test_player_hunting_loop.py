@@ -35,8 +35,8 @@ class PlayerHuntingLoopTests(PlayerFixture, TestCase):
         VillageActionDurationConfig.objects.update_or_create(action_name='PROCESS_GAME', defaults=dict(duration_minutes=5))
 
     def test_real_permit_deer_to_processing_tick_and_existing_meat_soup(self):
-        starter = self.run_action('claim_starter_hunting_kit', location='HUNTING_GATE')
-        self.assertTrue(starter['success'], starter)
+        from inventory.models import InventorySlot
+        InventorySlot.objects.create(bag=self.bag_a, slot_index=self.bag_a.slots.count(), item_id=4110, item_amount=1, remaining_uses=60)
         attack_id = str(uuid.uuid4())
         permit = execute_combat(dict(action='authorize_attack', player_id=str(self.a.pk),
             request_id=attack_id, authority_session_id='loop-env-session', weapon=0))
@@ -66,14 +66,14 @@ class PlayerHuntingLoopTests(PlayerFixture, TestCase):
         claimed = self.run_action('claim_game_processing', dict(job_id=job_id), location='BUTCHER_YARD')
         self.assertTrue(claimed['success'], claimed)
         meat = self.bag_a.slots.get(item_id=29107, item_amount=4)
-        self.assertEqual((meat.produced_world_minute, meat.expires_world_minute), (100, 2980))
+        self.assertEqual((meat.produced_world_minute, meat.expires_world_minute), (100, None))
         self.assertFalse(meat.dish_metadata)
         self.bag_a.refresh_from_db(); self.jack.refresh_from_db()
         self.assertEqual((self.bag_a.money, self.jack.money), (95, 245))
         PlayerState.objects.update_or_create(player_id=str(self.a.pk), defaults=dict(action_points=200))
         PlayerSkillProgress.objects.update_or_create(player=self.a, skill_code='cooking', defaults=dict(total_xp=440))
         tool = InventorySlot.objects.create(bag=self.bag_a, slot_index=self.bag_a.slots.count(),
-            item_id=4107, item_amount=1, remaining_uses=50)
+            item_id=4107, item_amount=1, remaining_uses=50, equipment_level=3)
         salt = self.slot(1, item_id=1049, quality=3, expires_world_minute=None)
         params = dict(recipe_id=29226, batches=1, tool_instance_id=str(tool.instance_id), selections=[
             dict(instance_id=str(meat.instance_id), quantity=2), dict(instance_id=str(salt.instance_id), quantity=1)])
@@ -84,7 +84,7 @@ class PlayerHuntingLoopTests(PlayerFixture, TestCase):
             expected_quote=cooking['data']['result']['preview']['quote_hash']), location='RESTAURANT')
         self.assertTrue(cooked['success'], cooked)
         dish = cooked['data']['result']['dish']
-        self.assertEqual((dish['item_id'], dish['quantity'], dish['expires_world_minute']), (29203, 3, 2980))
+        self.assertEqual((dish['item_id'], dish['quantity'], dish['expires_world_minute']), (29203, 3, None))
         self.assertEqual(PlayerSkillProgress.objects.get(player=self.a, skill_code='hunting').total_xp, 32)
 
     def test_ordinary_player_token_cannot_reach_trusted_combat_or_report_damage(self):

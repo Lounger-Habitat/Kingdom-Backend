@@ -10,6 +10,14 @@ from village.tests.test_phase3_direct_trade import DirectTradeTestBase, _payload
 
 
 class StoreToolBuybackTests(DirectTradeTestBase):
+    def test_inspection_reports_upgraded_tool_level_and_its_full_durability(self):
+        self.jack_inv.slots.all().delete()
+        self.tool(40, equipment_level=3)
+        row = _inventory(self.jack)["items"][0]
+        self.assertEqual(row["equipment_level"], 3)
+        self.assertEqual(row["durability"]["max_uses"], 40)
+        self.assertEqual(row["sale"]["target"], "GENERAL_STORE")
+
     def setUp(self):
         super().setUp()
         Item.objects.update_or_create(item_id=4002, defaults={
@@ -134,7 +142,9 @@ class StoreToolBuybackTests(DirectTradeTestBase):
         used.refresh_from_db();self.assertEqual(used.item_amount,0)
 
     def test_other_tool_types_use_item_configuration_and_non_tools_keep_price(self):
+        from player.models import EquipmentLevel
         Item.objects.update_or_create(item_id=4001,defaults={'item_type':ItemType.HOE_TOOL,'item_price':50,'max_use_count':10})
+        EquipmentLevel.objects.filter(equipment__item_id=4001, level=1).update(max_durability=10)
         self._give_item(self.jack_inv,4001,1)
         farm=self.jack_inv.slots.get(item_id=4001);farm.remaining_uses=9;farm.save()
         result=commit_economy_action(self.sale_payload(items=[{'item_id':4001,'amount':1}]))
@@ -146,9 +156,10 @@ class StoreToolBuybackTests(DirectTradeTestBase):
         self.assertEqual(result['data']['gold_amount'],58)
 
     def test_configured_unlimited_tool_requires_explicit_unlimited_batch(self):
-        Item.objects.filter(item_id=4002).update(max_use_count=-1)
+        Item.objects.create(item_id=40020, item_name="旧式无限工具", item_type=ItemType.COLLECT_TOOL, item_price=50, max_use_count=-1)
         infinite=self.tool(-1)
-        result=commit_economy_action(self.sale_payload())
+        infinite.item_id=40020; infinite.save(update_fields=['item_id'])
+        result=commit_economy_action(self.sale_payload(items=[{'item_id':40020,'amount':1}]))
         self.assertEqual(result['result_code'],'OK',result)
         stock=VillageStoreInventorySlot.objects.get(source_slot_instance_id=infinite.instance_id)
         self.assertEqual(stock.remaining_uses,-1)

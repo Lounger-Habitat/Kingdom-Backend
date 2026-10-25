@@ -46,8 +46,8 @@ def serialize_listing(listing, viewer=None, *, context=None):
         "cookTime": listing.cook_time,
         "remainingUses": listing.remaining_uses,
         "producedWorldMinute": batch.get("producedWorldMinute"),
-        "expiresWorldMinute": batch.get("expiresWorldMinute"),
-        "freshnessUnknown": bool(batch.get("freshnessUnknown")),
+        "expiresWorldMinute": None,
+        "freshnessUnknown": False,
         "reviewComment": listing.review_comment,
         "itemBagName": listing.item_bag_name,
         "createdAt": listing.created_at.isoformat() if listing.created_at else None,
@@ -64,7 +64,7 @@ def serialize_listing(listing, viewer=None, *, context=None):
 def _tooltip_context(listings):
     from items.models import Item
     from game_time.models import GlobalGameTimeState
-    items = {item.item_id: item for item in Item.objects.filter(
+    items = {item.item_id: item for item in Item.objects.select_related("equipment_definition").prefetch_related("equipment_definition__levels").filter(
         item_id__in={listing.item_id for listing in listings})}
     minute = GlobalGameTimeState.objects.filter(pk=1).values_list("world_minute", flat=True).first()
     return items, minute

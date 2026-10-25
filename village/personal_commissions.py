@@ -281,13 +281,8 @@ def _take_items(row, condition, bag, quantity, item_id, instance_id, world_minut
     if instance_id is not None:
         slots = slots.filter(instance_id=_uuid(instance_id))
     usable = []
-    for slot in slots.order_by(models.F("expires_world_minute").asc(nulls_last=True), "slot_index"):
-        if slot.freshness_unknown or slot.quality < condition["min_quality"]:
-            continue
-        expires = slot.expires_world_minute
-        if expires is None and (condition["requires_freshness"] or condition["min_remaining_minutes"] > 0):
-            continue
-        if expires is not None and (expires <= world_minute or expires < world_minute + condition["min_remaining_minutes"]):
+    for slot in slots.order_by("quality", "slot_index"):
+        if slot.quality < condition['min_quality']:
             continue
         available = get_available_slot_amount(slot, world_minute) if isinstance(bag, NpcGlobalInventory) else slot.item_amount
         if available:
@@ -321,17 +316,8 @@ def held_batch_issues(row, world_minute):
         if (not condition or condition["type"] != "item" or batch.item_id not in condition["item_ids"]
                 or batch.quantity <= 0 or not isinstance(snapshot, dict)):
             reason = "HELD_BATCH_INVALID"
-        elif snapshot.get("freshness_unknown"):
-            reason = "FRESHNESS_UNKNOWN"
         elif type(snapshot.get("quality")) is not int or snapshot["quality"] < condition["min_quality"]:
             reason = "QUALITY_REQUIRED"
-        else:
-            expiry = snapshot.get("expires_world_minute")
-            if expiry is None and (condition["requires_freshness"] or condition["min_remaining_minutes"] > 0):
-                reason = "FRESHNESS_REQUIRED"
-            elif expiry is not None and (type(expiry) is not int or expiry <= world_minute
-                    or expiry < world_minute + condition["min_remaining_minutes"]):
-                reason = "FRESHNESS_REQUIRED"
         if reason:
             issues.append(dict(condition_id=batch.condition_id, item_id=batch.item_id,
                 quantity=batch.quantity, reason=reason,

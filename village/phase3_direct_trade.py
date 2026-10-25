@@ -132,7 +132,7 @@ def _get_buyer_available_money(inventory: NpcGlobalInventory) -> int:
     return max(0, inventory.money - reserved)
 
 
-def general_store_tool_sale_reason(item_type, max_use_count, remaining_uses):
+def general_store_tool_sale_reason(item_type, max_use_count, remaining_uses, *, slot=None):
     """Fixed-price automatic buyback accepts only tools at configured full durability.
 
     Negotiated personal trades and operator listings retain their own pricing.
@@ -142,6 +142,11 @@ def general_store_tool_sale_reason(item_type, max_use_count, remaining_uses):
         ItemType.REAP_TOOL, ItemType.WATER_TOOL, ItemType.COLLECT_TOOL,
     }:
         return None
+    if slot is not None:
+        from player.equipment import stats_for
+        stats = stats_for(slot)
+        if stats:
+            max_use_count = stats["max_durability"]
     if remaining_uses is None:
         return "TOOL_DURABILITY_UNKNOWN"
     if max_use_count == -1 and remaining_uses == -1:
@@ -164,33 +169,31 @@ def _consume_personal_fefo_available(
 ) -> List[Tuple[NpcGlobalInventorySlot, int]]:
     """Consume *amount* available items from an NPC inventory (FEFO).
 
-    Skips expired batches and ACTIVE-delivery reservations.  Reduces
+    Skips ACTIVE-delivery reservations and consumes lower quality first.  Reduces
     ``item_amount`` in place.  Raises ``ValueError("INSUFFICIENT_ITEM")`` if
-    the unreserved/unexpired total is less than *amount*.
+    the unreserved total is less than *amount*.
     """
     slots = list(
         NpcGlobalInventorySlot.objects.select_for_update()
         .filter(bag=inventory, item_id=item_id, item_amount__gt=0)
         .order_by(
-            models.F("expires_world_minute").asc(nulls_last=True),
+            "quality",
             models.F("produced_world_minute").asc(nulls_last=True),
             "instance_id",
         )
     )
-    # Validate before any mutation: compute total unreserved/unexpired amount
+    # Validate before any mutation: compute total unreserved amount
     # and fail early so a failed settlement never partially deducts items.
     total_available = 0
     eligible_slots = []
     tool_rejection = None
     for slot in slots:
-        if slot.expires_world_minute is not None and slot.expires_world_minute <= world_minute:
-            continue
         available = get_available_slot_amount(slot, world_minute)
         if available <= 0:
             continue
         if store_purchase_item is not None:
             reason = general_store_tool_sale_reason(
-                store_purchase_item.item_type, store_purchase_item.max_use_count, slot.remaining_uses,
+                store_purchase_item.item_type, store_purchase_item.max_use_count, slot.remaining_uses, slot=slot,
             )
             if reason:
                 tool_rejection = tool_rejection or reason
@@ -205,8 +208,6 @@ def _consume_personal_fefo_available(
     for slot in eligible_slots:
         if remaining <= 0:
             break
-        if slot.expires_world_minute is not None and slot.expires_world_minute <= world_minute:
-            continue
         available = get_available_slot_amount(slot, world_minute)
         if available <= 0:
             continue
@@ -230,7 +231,7 @@ def _consume_store_fefo_available(
         VillageStoreInventorySlot.objects.select_for_update()
         .filter(store=store, listing=listing, item_amount__gt=0)
         .order_by(
-            models.F("expires_world_minute").asc(nulls_last=True),
+            "quality",
             models.F("produced_world_minute").asc(nulls_last=True),
             "instance_id",
         )
@@ -238,8 +239,6 @@ def _consume_store_fefo_available(
     # Validate before any mutation (mirror the personal-inventory helper).
     total_available = 0
     for slot in slots:
-        if slot.expires_world_minute is not None and slot.expires_world_minute <= world_minute:
-            continue
         total_available += store_available(slot, world_minute)
     if total_available < amount:
         raise ValueError("INSUFFICIENT_ITEM")
@@ -249,8 +248,6 @@ def _consume_store_fefo_available(
     for slot in slots:
         if remaining <= 0:
             break
-        if slot.expires_world_minute is not None and slot.expires_world_minute <= world_minute:
-            continue
         available = store_available(slot, world_minute)
         if available <= 0:
             continue
@@ -298,10 +295,6 @@ def store_inventory_status(store: VillageStore, world_minute: int) -> Tuple[str,
     if store.store_code == "RESTAURANT_STORE":
         slots = slots.filter(listing__status="ACTIVE")
     for slot in slots:
-        if (slot.item_attributes or {}).get("freshness_unknown"):
-            continue
-        if slot.expires_world_minute is not None and slot.expires_world_minute <= world_minute:
-            continue
         available = max(0, slot.item_amount - slot.reserved_amount)
         if available == 0:
             continue
@@ -395,6 +388,8 @@ def _do_sell_to_store(npc_id, params, world_minute, request_id):
                 or not _is_positive_int(row["amount"])):
             return _fail(ResultCode.P3_INVALID_PARAMS)
         quantities[row["item_id"]] = quantities.get(row["item_id"], 0) + row["amount"]
+    from items.quality import item_price
+    inventory = NpcGlobalInventory.objects.select_for_update().get(npc=seller)
     priced_items = []
     item_configs = {}
     for item_id, amount in sorted(quantities.items()):
@@ -403,9 +398,31 @@ def _do_sell_to_store(npc_id, params, world_minute, request_id):
             return _fail(ResultCode.P3_INVALID_PARAMS, data={
                 "failure_kind": "ITEM_VALUE_UNAVAILABLE", "unavailable_item_id": item_id,
             })
+        left, batches, tool_rejection = amount, [], None
+        for source in inventory.slots.filter(item_id=item_id, item_amount__gt=0).order_by(
+                "quality",
+                models.F("produced_world_minute").asc(nulls_last=True), "instance_id"):
+            tool_reason = general_store_tool_sale_reason(item.item_type, item.max_use_count, source.remaining_uses, slot=source)
+            if tool_reason:
+                tool_rejection = tool_rejection or tool_reason
+                continue
+            take = min(left, get_available_slot_amount(source, world_minute))
+            if take:
+                try:
+                    price = item_price(item, source.quality)
+                except ValueError:
+                    return _fail(ResultCode.P3_INVALID_PARAMS, data={"failure_kind": "ITEM_QUALITY_INVALID"})
+                batches.append({"quality": source.quality, "amount": take, "unit_price": price})
+                left -= take
+            if not left:
+                break
+        if left:
+            return _fail(ResultCode.TRADE_ITEM_NOT_FOR_SALE if tool_rejection else ResultCode.TRADE_INSUFFICIENT_ITEM,
+                         data={"failure_kind": tool_rejection} if tool_rejection else {})
+        prices = {batch["unit_price"] for batch in batches}
         priced_items.append({"item_id": item_id, "item_name": item.item_name,
-                             "amount": amount, "unit_price": item.item_price,
-                             "gold_amount": item.item_price * amount})
+            "amount": amount, "unit_price": next(iter(prices)) if len(prices) == 1 else None,
+            "gold_amount": sum(batch["unit_price"] * batch["amount"] for batch in batches), "quality_batches": batches})
         item_configs[item_id] = item
     # The canonical item value is authoritative, including when a legacy
     # caller supplies gold_amount. Retail markups, ratings and sell_percentage
@@ -744,7 +761,6 @@ def _do_respond_trade(
                 for slot in NpcGlobalInventorySlot.objects.select_for_update().filter(
                     bag=buyer_inv, item_id=item_id, item_amount__gt=0
                 )
-                if slot.expires_world_minute is None or slot.expires_world_minute > world_minute
             )
             emergency_supply = (
                 buyer_available < SAFE_STOCKS[item_id]
@@ -1007,9 +1023,10 @@ def _do_list_store_item(
 
         listing_price_mode = listing.price_mode
 
-        # Write store-owned batches preserving produced/expired/source batch.
+        placed = []
+        # Preserve source attributes while assigning a quality-specific shelf.
         for slot, taken in consumed:
-            VillageStoreInventorySlot.objects.create(
+            stored = VillageStoreInventorySlot.objects.create(
                 store=store,
                 listing=listing,
                 item_id=item_id,
@@ -1022,6 +1039,11 @@ def _do_list_store_item(
                 item_attributes=slot.item_attributes if stock_source == "STORE" else
                     {key: getattr(slot, key) for key in BATCH_ITEM_ATTRIBUTES},
             )
+            placed.append(stored)
+        listing = placed[0].listing
+        unit_price, listing_price_mode = listing.unit_price, listing.price_mode
+        shelves = [{"listing_id": str(row.listing_id), "quality": row.quality,
+                    "unit_price": row.listing.unit_price, "quantity": row.item_amount} for row in placed]
 
         if params.get("stock_source", "PERSONAL") == "PERSONAL":
             operator_inv.asset_version += 1
@@ -1034,7 +1056,7 @@ def _do_list_store_item(
         asset_versions={str(npc_id): operator_inv.asset_version},
         effects={
             "store_code": store_code,
-            "listing_id": str(listing.listing_id),
+            "listing_id": str(listing.listing_id), "listings": shelves,
             "item_id": item_id,
             "amount": amount,
             "unit_price": unit_price,
@@ -1044,7 +1066,7 @@ def _do_list_store_item(
         external_delta=0,
         data={
             "store_code": store_code,
-            "listing_id": str(listing.listing_id),
+            "listing_id": str(listing.listing_id), "listings": shelves,
             "item_id": item_id,
             "amount": amount,
             "unit_price": unit_price,
@@ -1115,6 +1137,10 @@ def _do_update_store_price(
         ):
             return _fail(ResultCode.TRADE_STORE_VERSION_CONFLICT)
 
+        if price_mode == PriceMode.ORIGINAL:
+            from items.quality import item_price
+            item = Item.objects.get(pk=listing.item_id)
+            unit_price = item_price(item, listing.quality, unit_price)
         listing.price_mode = price_mode
         listing.unit_price = unit_price
         listing.save(update_fields=["price_mode", "unit_price", "updated_at"])
@@ -1518,8 +1544,6 @@ def query_store_inventory(
         for slot in VillageStoreInventorySlot.objects.filter(
             store=store, listing=listing, item_amount__gt=0
         ):
-            if slot.expires_world_minute is not None and slot.expires_world_minute <= world_minute:
-                continue
             available += store_available(slot, world_minute)
             batches.append({**slot.item_attributes, "food_instance_id": str(slot.instance_id),
                             "available_amount": store_available(slot, world_minute),

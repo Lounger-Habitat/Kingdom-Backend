@@ -5,6 +5,7 @@ from account.models import GameAccount
 from django.core.management import call_command
 from django.core.management.base import CommandError
 from django.db import connection
+from django.db.migrations.executor import MigrationExecutor
 from django.db.migrations.recorder import MigrationRecorder
 from django.test import TestCase, override_settings
 from django.utils import timezone
@@ -15,7 +16,7 @@ from inventory.models import (BagTemplate, BagTemplateSlot, EnvActionReceipt, In
                               CollectionPoint)
 from cooking.models import PityCounter
 from leaderboard.models import LeaderboardEntry, PendingReward, ReportEvent
-from player.models import DefaultRecipe, PlayerRecipe, PlayerState, PlayerTitle
+from player.models import DefaultRecipe, PlayerRecipe, PlayerState, PlayerTitle, PlayerTutorialState, PlayerArrivalState
 from restaurant.models import (PlayerRestaurantState, MenuItem, DailyBusinessLog,
                                CustomerTransaction, RestaurantHourlySlot, RestaurantSaleEvent)
 from items.models import Item
@@ -459,6 +460,9 @@ class ResetVillageWorldTests(TestCase):
                                            current_season_id="old-season")
         PlayerRecipe.objects.create(player=state, recipe_name="old-recipe")
         PlayerTitle.objects.create(player=state, title_id="old-title", title_name="old")
+        PlayerTutorialState.objects.create(player=player, started=True, paused=True, route_code="gathering",
+            revision=9, evidence={"collect": ["old-collect"], "hint:movement": ["read"], "hint:camera": ["read"]},
+            completed={"basics_move": timezone.now().isoformat(), "basics_collect": timezone.now().isoformat()})
         bag = InventoryBag.objects.create(player=player, character_id=player.username)
         InventoryBag.objects.filter(pk=bag.pk).update(money=9999)
         InventorySlot.objects.create(bag=bag, slot_index=0, item_id=4001, item_amount=3, remaining_uses=1)
@@ -563,6 +567,91 @@ class ResetVillageWorldTests(TestCase):
                       CustomerTransaction, RestaurantHourlySlot, RestaurantSaleEvent, PendingReward, ReportEvent, LeaderboardEntry):
             self.assertFalse(model.objects.exists(), model.__name__)
 
+    def test_reset_restarts_tutorial_tasks_for_all_accounts_without_old_progress(self):
+        from player.models import PlayerMilestoneProgress, PlayerSkillProgress, SkillRewardReceipt
+        from player.progression import award_skill
+        from player.tutorials import control
+        from village.player_actions import overview
+
+        player = self._create_current_progress()
+        other = GameAccount.objects.create(username="tutorial-free-explore", password="keep-password")
+        PlayerTutorialState.objects.create(player=other, paused=True)
+        award_skill(player, source_type="collect", source_id="old-collect", skill_code="gathering", xp=10,
+            milestone=dict(code="first_gathering", title="首次采集", xp=20))
+        call_command("reset_village_world", "--confirm", "RESET_WUXI_VILLAGE", stdout=StringIO())
+        for model in (PlayerTutorialState, PlayerMilestoneProgress, PlayerSkillProgress, SkillRewardReceipt):
+            self.assertFalse(model.objects.exists(), model.__name__)
+
+        minute = GlobalGameTimeState.get_instance().world_minute
+        for account in (player, other):
+            with self.subTest(account=account.username):
+                bag = InventoryBag.objects.get(player=account, character_id=account.username)
+                tutorial = overview(account, bag, minute)["tutorial"]
+                self.assertTrue(tutorial["show_welcome"])
+                self.assertFalse(tutorial["started"])
+                self.assertFalse(tutorial["paused"])
+                self.assertEqual((tutorial["route_code"], tutorial["revision"]), ("basics", 0))
+                self.assertTrue(all(not task["completed"] for route in tutorial["routes"] for task in route["tasks"]))
+                control(account, "tutorial_start", {}, bag)
+                state = PlayerTutorialState.objects.get(player=account)
+                self.assertEqual((state.evidence, state.completed), ({}, {}))
+                self.assertEqual(overview(account, bag, minute)["tutorial"]["current_task"]["code"], "basics_move")
+                for hint in ("movement", "camera"):
+                    control(account, "tutorial_ack", {"hint_code": hint, "task_code": "basics_move"}, bag)
+                self.assertEqual(overview(account, bag, minute)["tutorial"]["current_task"]["code"], "basics_collect")
+
+    def test_full_reset_restarts_human_arrivals_and_preserves_dry_run_rollback(self):
+        # Exercise the actual reset only inside the explicitly isolated test DB.
+        self.assertIn("memory", connection.settings_dict["NAME"])
+        from player.arrival import arrival_overview, control
+
+        excluded = GameAccount.objects.create(username="arrival-legacy-excluded", password="keep-password",
+            appearance={"test": "keep-appearance"}, appearance_revision=4)
+        played = GameAccount.objects.create(username="arrival-already-played")
+        missing = GameAccount.objects.create(username="arrival-missing-state")
+        ai = GameAccount.objects.create(username="arrival-ai", is_ai=True)
+        PlayerArrivalState.objects.filter(player=excluded).update(eligible=False)
+        PlayerArrivalState.objects.filter(player=played).update(started_at=timezone.now(), finished_at=timezone.now(),
+            finish_reason="skipped", revision=2)
+        PlayerArrivalState.objects.filter(player=missing).delete()
+        # Reset must disable AI even if an earlier state was incorrectly enabled.
+        PlayerArrivalState.objects.filter(player=ai).update(eligible=True)
+        PlayerTutorialState.objects.create(player=played, started=True, paused=True)
+        InventoryBag.objects.create(player=excluded, character_id=excluded.username, money=987)
+        for action in ("arrival_begin", "arrival_finish"):
+            VillagePlayerActionReceipt.objects.create(player=played, request_id=uuid.uuid4(), payload_hash="a"*64,
+                action=action, response={"success": True}, world_minute=100)
+
+        def arrivals():
+            return list(PlayerArrivalState.objects.order_by("player_id").values())
+
+        before_arrivals = arrivals()
+        before_receipts = list(VillagePlayerActionReceipt.objects.order_by("pk").values())
+        call_command("reset_village_world", "--dry-run", stdout=StringIO())
+        self.assertEqual(arrivals(), before_arrivals)
+        self.assertFalse(PlayerArrivalState.objects.filter(player=missing).exists())
+        self.assertEqual(list(VillagePlayerActionReceipt.objects.order_by("pk").values()), before_receipts)
+        self.assertEqual(InventoryBag.objects.get(player=excluded).money, 987)
+        self.assertTrue(PlayerTutorialState.objects.get(player=played).paused)
+
+        for round_number in range(2):
+            with self.subTest(reset=round_number + 1):
+                call_command("reset_village_world", "--confirm", "RESET_WUXI_VILLAGE", stdout=StringIO())
+                self.assertEqual(PlayerArrivalState.objects.count(), GameAccount.objects.count())
+                self.assertFalse(VillagePlayerActionReceipt.objects.exists())
+                self.assertFalse(PlayerTutorialState.objects.exists())
+                for account in (excluded, played, missing, ai):
+                    state = PlayerArrivalState.objects.get(player=account)
+                    self.assertEqual((state.eligible, state.started_at, state.finished_at, state.finish_reason, state.revision),
+                        (not account.is_ai, None, None, "", 0))
+                    self.assertEqual(arrival_overview(account)["should_play"], not account.is_ai)
+                excluded.refresh_from_db()
+                self.assertEqual((excluded.password, excluded.appearance, excluded.appearance_revision),
+                    ("keep-password", {"test": "keep-appearance"}, 4))
+            if round_number == 0:
+                self.assertTrue(control(excluded, "arrival_begin", {})["arrival_started_now"])
+                self.assertTrue(control(excluded, "arrival_finish", {"reason": "completed"})["arrival_finished_now"])
+
     def test_full_reset_clears_g0_to_g5_protected_records_and_frozen_farm_rules(self):
         # This destructive command is exercised only against the explicitly
         # configured in-memory test database, never the saved village.
@@ -575,13 +664,18 @@ class ResetVillageWorldTests(TestCase):
         from village.player_dish_reviews import execute_review_action
         from village.starter_supply import ensure_supply_batch, execute_supply, spend_reserve
         from village.models import (NpcProfile, StarterSupplyBatch, StarterSupplyOrder, StarterSupplyDelivery,
-            StarterSupplyReceipt, StarterReserveTransfer, VillageGatheringResourceState,
+            StarterSupplyReceipt, StarterReserveTransfer, VillageGatheringResourceState, VillagePlantNode, VillagePlayerGathering,
             VillagePlayerDishReview, VillageBusinessOrderDay, VillageBusinessOrderLink,
             VillageTreeNode, VillageChopAttempt, VillageForestryReceipt)
 
         clock = GlobalGameTimeState.get_instance()
         minute = clock.world_minute
         player = GameAccount.objects.create(username="growth-reset-player", password="keep-password")
+        from village.plant_catalog import NODES
+        plant_id = next(iter(NODES))
+        VillagePlantNode.objects.create(node_id=plant_id, ready_world_minute=minute+1440)
+        VillagePlayerGathering.objects.create(player=player, equipped_instance_id=uuid.uuid4(),
+            attempt=dict(node_id=plant_id, attempt_id=str(uuid.uuid4())))
         PlayerState.objects.create(player_id=str(player.pk))
         bag = InventoryBag.objects.create(player=player, character_id=player.username, money=100)
         award_skill(player, source_type="collect", source_id=uuid.uuid4(), skill_code="gathering", xp=10,
@@ -691,7 +785,7 @@ class ResetVillageWorldTests(TestCase):
             VillageProfessionalContractLink, PlayerHuntingState, PlayerCombatReceipt, VillagePlayerProcessingJob,
             SkillRewardReceipt, PlayerMilestoneProgress, PlayerSkillProgress, PlayerGrowthState,
             StarterSupplyReceipt, StarterSupplyDelivery, StarterReserveTransfer, StarterSupplyOrder, StarterSupplyBatch,
-            VillageGatheringResourceState, VillagePlayerDishReview, VillageBusinessOrderLink, VillageBusinessOrderDay,
+            VillageGatheringResourceState, VillagePlantNode, VillagePlayerGathering, VillagePlayerDishReview, VillageBusinessOrderLink, VillageBusinessOrderDay,
             VillageForestryReceipt, VillageChopAttempt, VillageTreeNode)
         for model in tracked:
             self.assertTrue(model.objects.exists(), model.__name__)
@@ -747,12 +841,14 @@ class ResetVillageWorldTests(TestCase):
 
     def test_pending_migration_fails_before_mutating_progress(self):
         player = self._create_current_progress()
-        MigrationRecorder(connection).record_unapplied("village", "0074_villageactiontask")
+        # Unapply a current leaf so the reset's migration plan sees pending work.
+        migration = MigrationExecutor(connection).loader.graph.leaf_nodes("player")[0]
+        MigrationRecorder(connection).record_unapplied(*migration)
 
         for arguments in (("--confirm", "RESET_WUXI_VILLAGE"), ("--dry-run",)):
             with self.assertRaisesMessage(CommandError, "python manage.py migrate") as error:
                 call_command("reset_village_world", *arguments, stdout=StringIO())
-            self.assertIn("village.0074_villageactiontask", str(error.exception))
+            self.assertIn(".".join(migration), str(error.exception))
 
         self.assertEqual(InventoryBag.objects.get(player=player).money, 9999)
         self.assertTrue(VillageHuntAttempt.objects.exists())

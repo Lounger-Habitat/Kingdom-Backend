@@ -28,6 +28,24 @@ from village.tests.test_player_actions import PlayerFixture
 
 
 class PlayerCookingTests(PlayerFixture, TestCase):
+    def test_quality_bonus_is_rolled_per_standard_batch_and_each_output_has_proof(self):
+        from unittest.mock import Mock
+        from player.models import EquipmentLevel
+        self.level()
+        self.tool.equipment_level = 3
+        self.tool.save(update_fields=["equipment_level"])
+        EquipmentLevel.objects.filter(equipment__item_id=4106, level=3).update(quality_bonus_chance=.5)
+        raw = self.raw(8)
+        rng = Mock()
+        rng.randint.return_value = 0
+        rng.random.side_effect = [0, .1, 0, .9, 0, .1]
+        with patch("village.player_cooking.quality_rng", return_value=rng), patch("village.player_cooking.calculate_quality", return_value=3):
+            answer, _ = self.cook(self.params(raw, quantity=6, batches=3))
+        self.assertTrue(answer["success"], answer)
+        outputs = answer["data"]["result"]["items_added"]
+        self.assertEqual({row["quality"]: row["quantity"] for row in outputs}, {4: 4, 3: 2})
+        self.assertTrue(all(is_player_cooked(self.bag_a.slots.get(instance_id=row["instance_id"]), self.a) for row in outputs))
+
     def setUp(self):
         super().setUp()
         for item_id in (1049, 1056, 1009, 1034, 1057, 1077, 1025, 1042, 1023):
@@ -66,12 +84,39 @@ class PlayerCookingTests(PlayerFixture, TestCase):
         self.assertEqual((raw.item_amount, self.tool.remaining_uses, self.state.action_points), (amount, 20, 200))
         self.assertFalse(SkillRewardReceipt.objects.filter(player=self.a, source_type="player_cooking").exists())
 
+    def test_ingredient_overview_exposes_real_categories_for_backpack_filter(self):
+        Item.objects.filter(pk=1030).update(item_type=ItemType.VEGETABLE)
+        self.raw()
+        self.raw(item_id=1049, expires_world_minute=None)
+        ingredients = {row["item_id"]: row for row in cooking_overview(self.a, self.bag_a, 100)["ingredients"]}
+        self.assertEqual(ingredients[1030]["item_type"], ItemType.VEGETABLE)
+        self.assertEqual(ingredients[1049]["item_type"], ItemType.SEASONING)
+
+    def test_one_cook_after_preview_advances_both_preparation_and_cooking_lessons(self):
+        from player.models import PlayerTutorialState
+        from player.tutorial_catalog import VERSION
+        PlayerTutorialState.objects.create(player=self.a, version=VERSION, started=True, route_code="cooking",
+            completed={"cooking_recipe": "fixture"})
+        raw = self.raw(expires_world_minute=1000)
+        preview = self.run_action("preview_cooking", self.params(raw), location="RESTAURANT")
+        self.assertTrue(preview["success"], preview)
+        answer, payload = self.cook(self.params(raw))
+        self.assertTrue(answer["success"], answer)
+        tutorial = answer["data"]["overview"]["tutorial"]
+        self.assertEqual(tutorial["current_task"]["code"], "cooking_review")
+        state = PlayerTutorialState.objects.get(player=self.a)
+        self.assertIn("cooking_prepare", state.completed)
+        self.assertIn("cooking_first", state.completed)
+        self.assertNotIn("cooking_review", state.completed)
+        self.assertEqual(execute_player_action(copy.deepcopy(payload)), answer)
+        self.assertEqual(SkillRewardReceipt.objects.filter(player=self.a, source_type="player_cooking").count(), 1)
+
     def test_exact_batch_real_receipt_and_retry_do_not_duplicate_assets_or_xp(self):
         raw = self.raw(expires_world_minute=1000)
         cooked, payload = self.cook(self.params(raw))
         self.assertTrue(cooked["success"], cooked)
         dish = cooked["data"]["result"]["dish"]
-        self.assertEqual((dish["quantity"], dish["produced_world_minute"], dish["expires_world_minute"]), (2, 100, 1000))
+        self.assertEqual((dish["quantity"], dish["produced_world_minute"], dish["expires_world_minute"]), (2, 100, None))
         self.assertEqual(cooked["data"]["result"]["growth_rewards"][0]["xp_gained"], 40)
         self.assertEqual(cooked, execute_player_action(copy.deepcopy(payload)))
         raw.refresh_from_db(); self.tool.refresh_from_db(); self.state.refresh_from_db()
@@ -88,25 +133,25 @@ class PlayerCookingTests(PlayerFixture, TestCase):
         self.level()
         raw = self.raw(8)
         params = self.params(raw, quantity=6, batches=3)
-        self.assertEqual(preview_cooking(self.a, self.bag_a, params, 100)["reason"], "TOOL_TIER_REQUIRED")
+        self.assertEqual(preview_cooking(self.a, self.bag_a, params, 100)["reason"], "TOOL_LEVEL_REQUIRED")
         better = InventorySlot.objects.create(bag=self.bag_a, slot_index=2, item_id=4107,
-                                              item_amount=1, remaining_uses=50)
+                                              item_amount=1, remaining_uses=50, equipment_level=3)
         params["tool_instance_id"] = str(better.instance_id)
         cooked, _ = self.cook(params)
         self.assertTrue(cooked["success"], cooked)
         result = cooked["data"]["result"]
-        self.assertEqual((result["dish"]["quantity"], result["action_cost"], result["tool_used"]["uses"]), (6, 15, 3))
+        self.assertEqual((sum(row["quantity"] for row in result["items_added"]), result["action_cost"], result["tool_used"]["uses"]), (6, 15, 3))
         better.refresh_from_db(); self.state.refresh_from_db(); raw.refresh_from_db()
         self.assertEqual((better.remaining_uses, self.state.action_points, raw.item_amount), (47, 185, 2))
         self.assertEqual(result["growth_rewards"][0]["xp_gained"], 80)
         self.assertEqual(result["growth_rewards"][0]["facts"]["standard_batches"], 3)
 
-    def test_level_two_quality_floor_and_real_meat_variant_level_gate(self):
+    def test_level_two_keeps_low_quality_possible_and_real_meat_variant_level_gate(self):
         raw = self.raw()
         with patch("village.player_cooking.calculate_quality", return_value=2):
             self.level(100)
             cooked, _ = self.cook(self.params(raw))
-        self.assertEqual(cooked["data"]["result"]["dish"]["quality"], 3)
+        self.assertIn(cooked["data"]["result"]["dish"]["quality"], (2, 3))
         meat = self.raw(item_id=1009)
         salt = self.raw(item_id=1049, expires_world_minute=None)
         params = self.params(raw, quantity=1, recipe_id=29212)
@@ -114,13 +159,13 @@ class PlayerCookingTests(PlayerFixture, TestCase):
                                   dict(instance_id=str(salt.instance_id), quantity=1)]
         self.assertEqual(preview_cooking(self.a, self.bag_a, params, 100)["reason"], "SKILL_LEVEL_REQUIRED")
 
-    def test_expired_unknown_duplicate_and_foreign_batches_fail_without_charge(self):
+    def test_legacy_freshness_is_ignored_but_duplicate_and_foreign_batches_fail_without_charge(self):
         raw = self.raw(expires_world_minute=100)
         params = self.params(raw)
-        self.assertEqual(preview_cooking(self.a, self.bag_a, params, 100)["reason"], "INGREDIENT_EXPIRED")
+        self.assertTrue(preview_cooking(self.a, self.bag_a, params, 100)["available"])
         raw.expires_world_minute = 1000; raw.freshness_unknown = True
         raw.save(update_fields=["expires_world_minute", "freshness_unknown"])
-        self.assertEqual(preview_cooking(self.a, self.bag_a, params, 100)["reason"], "FRESHNESS_UNKNOWN")
+        self.assertTrue(preview_cooking(self.a, self.bag_a, params, 100)["available"])
         raw.freshness_unknown = False; raw.save(update_fields=["freshness_unknown"])
         params["selections"] *= 2
         self.assertEqual(preview_cooking(self.a, self.bag_a, params, 100)["reason"], "DUPLICATE_INGREDIENT_BATCH")
@@ -130,22 +175,22 @@ class PlayerCookingTests(PlayerFixture, TestCase):
         self.assertEqual(failed["result_code"], "INGREDIENT_NOT_OWNED")
         self.assert_uncharged(raw)
 
-    def test_legacy_perishables_only_explore_ordinary_and_do_not_become_fresh(self):
+    def test_legacy_perishables_cook_normally_with_provenance_and_experience(self):
         raw = self.raw(expires_world_minute=None)
-        self.assertEqual(preview_cooking(self.a, self.bag_a, self.params(raw), 100)["reason"], "LEGACY_FRESHNESS_UNKNOWN")
+        self.assertTrue(preview_cooking(self.a, self.bag_a, self.params(raw), 100)["available"])
         salt = self.raw(item_id=1049, expires_world_minute=None)
         params = self.params(raw, recipe_id=None)
         params["selections"].append(dict(instance_id=str(salt.instance_id), quantity=1))
         cooked, _ = self.cook(params)
         self.assertTrue(cooked["success"], cooked)
         dish = cooked["data"]["result"]["dish"]
-        self.assertTrue(dish["freshness_unknown"])
+        self.assertFalse(dish["freshness_unknown"])
         self.assertIsNone(dish["expires_world_minute"])
         self.assertEqual(dish["item_id"], 61001)
-        self.assertFalse(is_player_cooked(self.bag_a.slots.get(instance_id=dish["instance_id"]), self.a))
-        self.assertFalse(PlayerMilestoneProgress.objects.filter(player=self.a, code="first_player_cooking").exists())
+        self.assertTrue(is_player_cooked(self.bag_a.slots.get(instance_id=dish["instance_id"]), self.a))
+        self.assertTrue(PlayerMilestoneProgress.objects.filter(player=self.a, code="first_player_cooking").exists())
 
-    def test_old_hidden_knowledge_and_free_discovery_do_not_leak_recipe_quantities(self):
+    def test_hidden_knowledge_and_discovery_keep_preview_private_then_unlock_exact_cook(self):
         learned = PlayerRecipe.objects.create(player=self.state, recipe_name=self.ordinary.recipe_name,
                                                catalog_recipe=self.ordinary, show_ingredient_count=False)
         raw = self.raw()
@@ -165,7 +210,25 @@ class PlayerCookingTests(PlayerFixture, TestCase):
         self.assertEqual((preview["recipe_id"], preview["output_item_id"], preview["output_quantity"]), (None, None, None))
         cooked, _ = self.cook(params)
         self.assertTrue(cooked["success"], cooked)
-        self.assertFalse(PlayerRecipe.objects.get(player=self.state, recipe_name=self.ordinary.recipe_name).show_ingredient_count)
+        self.assertTrue(PlayerRecipe.objects.get(player=self.state, recipe_name=self.ordinary.recipe_name).show_ingredient_count)
+        self.assertTrue(cooked["data"]["result"]["recipe_quantities_unlocked"])
+
+    def test_correct_ratio_upgrades_existing_hidden_recipe_and_retry_is_idempotent(self):
+        learned = PlayerRecipe.objects.create(player=self.state, recipe_name=self.ordinary.recipe_name,
+                                               show_ingredient_count=False)
+        raw = self.raw(expires_world_minute=1000)
+        salt = self.raw(item_id=1049, expires_world_minute=None)
+        params = self.params(raw, recipe_id=self.ordinary.pk)
+        params["selections"].append(dict(instance_id=str(salt.instance_id), quantity=1))
+        cooked, payload = self.cook(params)
+        self.assertTrue(cooked["success"], cooked)
+        self.assertTrue(cooked["data"]["result"]["recipe_quantities_unlocked"])
+        learned.refresh_from_db()
+        self.assertEqual((learned.show_ingredient_count, learned.catalog_recipe_id), (True, self.ordinary.pk))
+        row = next(r for r in cooked["data"]["overview"]["cooking"]["recipes"] if r["id"] == self.ordinary.pk)
+        self.assertEqual([i["count"] for i in row["ingredients"]], [2, 1])
+        self.assertEqual(cooked, execute_player_action(copy.deepcopy(payload)))
+        self.assertEqual(PlayerRecipe.objects.filter(player=self.state, recipe_name=self.ordinary.recipe_name).count(), 1)
 
     def test_wrong_ordinary_ratios_and_failed_exploration_give_no_success_xp(self):
         raw = self.raw()
@@ -176,6 +239,8 @@ class PlayerCookingTests(PlayerFixture, TestCase):
         self.assertTrue(cooked["success"], cooked)
         dish = cooked["data"]["result"]["dish"]
         self.assertEqual((dish["item_id"], dish["quantity"]), (61001, 1))
+        self.assertFalse(cooked["data"]["result"]["recipe_quantities_unlocked"])
+        self.assertFalse(PlayerRecipe.objects.get(player=self.state, recipe_name=self.ordinary.recipe_name).show_ingredient_count)
         self.assertFalse(is_player_cooked(self.bag_a.slots.get(instance_id=dish["instance_id"]), self.a))
         failed, _ = self.cook(self.params(salt, quantity=1, recipe_id=None))
         self.assertEqual((failed["data"]["result"]["dish"]["item_id"], failed["data"]["result"]["dish"]["quality"]), (1078, 1))
@@ -211,7 +276,7 @@ class PlayerCookingTests(PlayerFixture, TestCase):
         self.assertEqual(overview["observed_world_minute"], 100)
         self.assertEqual(empty["reason"], "INGREDIENT_NOT_OWNED")
         self.assertEqual(preview["missing_items"], [dict(item_id=1030, item_name="玉米", quantity=1,
-            location_code="BILL_FARM", reason="FRESH_INGREDIENT_REQUIRED")])
+            location_code="BILL_FARM", reason="INGREDIENT_REQUIRED")])
 
     def test_production_proof_survives_sample_split_but_rejects_buyer_or_tampered_batch(self):
         raw = self.raw()
@@ -253,8 +318,8 @@ class PlayerCookingTests(PlayerFixture, TestCase):
         # Neither ordinary multi-batch nor village cooking can spend old pity.
         counter.count_6 = 89; counter.save(update_fields=["count_6"])
         self.level()
-        self.tool.item_id = 4107; self.tool.remaining_uses = 50
-        self.tool.save(update_fields=["item_id", "remaining_uses"])
+        self.tool.item_id = 4107; self.tool.remaining_uses = 50; self.tool.equipment_level = 3
+        self.tool.save(update_fields=["item_id", "remaining_uses", "equipment_level"])
         raw.item_amount = 8; raw.save(update_fields=["item_amount"])
         PlayerRecipe.objects.filter(player=self.state, catalog_recipe=self.ordinary).update(show_ingredient_count=True)
         multiple = self.params(raw, quantity=6, recipe_id=self.ordinary.pk, batches=3)
@@ -274,15 +339,15 @@ class PlayerCookingTests(PlayerFixture, TestCase):
         account, _ = VillageStoreAccount.objects.get_or_create(store=store, defaults=dict(balance=10))
         balance_before = account.balance
         migration = importlib.import_module("items.migrations.0010_player_cooking_tools")
-        migration.install(apps, SimpleNamespace(connection=connection))
+        ensure_production_catalog(100)
         listing = VillageStoreListing.objects.get(store=store, item_id=4106)
         self.assertEqual(listing.inventory_slots.count(), 20)
         self.assertEqual({(s.item_amount, s.remaining_uses) for s in listing.inventory_slots.all()}, {(1, 20)})
         ensure_production_catalog(100)
-        migration.install(apps, SimpleNamespace(connection=connection))
+        ensure_production_catalog(100)
         listing.delete()
         ensure_production_catalog(200)
-        migration.install(apps, SimpleNamespace(connection=connection))
+        ensure_production_catalog(100)
         self.assertFalse(VillageStoreListing.objects.filter(store=store, item_id=4106).exists())
         self.assertEqual(EconomicLedgerEntry.objects.filter(entry_type="G3_INITIAL_STOCK").count(), 1)
         self.level()
@@ -294,5 +359,5 @@ class PlayerCookingTests(PlayerFixture, TestCase):
         execute_tool_action(self.a, self.bag_a, "upgrade_tool", dict(instance_id=str(original),
             expected_quote=quote["quote_hash"]), uuid.uuid4(), self.clock)
         self.tool.refresh_from_db(); wood.refresh_from_db(); self.bag_a.refresh_from_db(); account.refresh_from_db()
-        self.assertEqual((self.tool.instance_id, self.tool.item_id, self.tool.remaining_uses), (original, 4107, 50))
-        self.assertEqual((wood.item_amount, self.bag_a.money, account.balance), (0, 100, balance_before + 100))
+        self.assertEqual((self.tool.instance_id, self.tool.item_id, self.tool.remaining_uses), (original, 4106, 20))
+        self.assertEqual((wood.item_amount, self.bag_a.money, account.balance), (6, 180, balance_before + 20))

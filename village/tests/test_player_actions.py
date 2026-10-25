@@ -1,5 +1,6 @@
 import copy
 import uuid
+from unittest.mock import patch
 
 from django.test import TestCase
 from rest_framework.test import APIClient
@@ -15,7 +16,7 @@ from marketplace.services import create_system_listing
 from player.models import PlayerState
 from village.models import (VillageSimulationConfig, VillagePersonalCommission, VillagePersonalCommissionReceipt,
     VillagePlayerActionReceipt, VillagePlayerContribution, VillageStoryArc, VillageStoryFact,
-    VillageStoryMeeting, VillagePublicDecision, VillageAccount, VillageLocationDefinition, NpcProfile)
+    VillageStoryMeeting, VillagePublicDecision, VillageAccount, VillageLocationDefinition, NpcProfile, EconomicLedgerEntry)
 from village.personal_commissions import publish_commission
 from village.player_actions import execute_player_action
 from village.phase3_catalog import REPAIR_WOOD_ITEM_ID, REPAIR_METAL_ITEM_ID
@@ -111,7 +112,10 @@ class PlayerActionTests(PlayerFixture, TestCase):
         second = self.run_action("commission_contribute", self.delivery_params(cb, 6), player=self.b)
         self.assertTrue(second["success"], second)
         self.bag_a.refresh_from_db(); self.bag_b.refresh_from_db(); self.lucy.refresh_from_db()
-        self.assertEqual(self.bag_a.money+self.bag_b.money+self.lucy.money, 1200)
+        onboarding = sum(EconomicLedgerEntry.objects.filter(entry_type="STARTER_GOAL_REWARD")
+            .values_list("external_delta", flat=True))
+        self.assertEqual(onboarding, 30)  # Two independently completed first-supply goals.
+        self.assertEqual(self.bag_a.money+self.bag_b.money+self.lucy.money, 1200 + onboarding)
         batches = list(self.lucy.slots.order_by("slot_index"))
         self.assertEqual(sum(s.item_amount for s in batches), 11)
         self.assertEqual(batches[0].quality, 4)
@@ -157,7 +161,7 @@ class PlayerActionTests(PlayerFixture, TestCase):
         self.slot(1, expires_world_minute=160)
         self.slot(1, expires_world_minute=None)
         self.assertTrue(self.run_action("commission_contribute", self.delivery_params(commission, 1))["success"])
-        self.assertEqual(self.run_action("commission_contribute", self.delivery_params(commission, 1))["result_code"], "INSUFFICIENT_QUALIFIED_ITEMS")
+        self.assertTrue(self.run_action("commission_contribute", self.delivery_params(commission, 1))["success"])
 
     def test_npc_cash_spend_cannot_spend_commission_reward_escrow(self):
         commission = self.commission(3)
@@ -168,7 +172,7 @@ class PlayerActionTests(PlayerFixture, TestCase):
         result = self.run_action("commission_contribute", self.delivery_params(commission, 3))
         self.assertTrue(result["success"], result)
         self.bag_a.refresh_from_db()
-        self.assertEqual(self.bag_a.money, 115)
+        self.assertEqual(self.bag_a.money, 130)  # 15 order gold + 15 first-supply goal gold.
 
     def test_overview_never_generates_procurement_and_has_no_old_contract_fields(self):
         for money in (0, 10, 1000):
@@ -189,7 +193,7 @@ class PlayerActionTests(PlayerFixture, TestCase):
         self.slot(2, expires_world_minute=100)
         self.slot(2, freshness_unknown=True)
         foreign = self.slot(4, bag=self.bag_b)
-        result = self.run_action("commission_contribute", self.delivery_params(commission, 4))
+        result = self.run_action("commission_contribute", self.delivery_params(commission, 7))
         self.assertFalse(result["success"])
         self.assertEqual(sum(s.item_amount for s in self.bag_a.slots.all()), 8)
         result = self.run_action("commission_contribute", self.delivery_params(commission, 1, instance_id=str(foreign.instance_id)))
@@ -274,16 +278,17 @@ class PlayerActionTests(PlayerFixture, TestCase):
         level.items.all().delete()
         CollectionPointLevelItem.objects.create(level=level, item_id=1030, collect_min_amount=2, collect_max_amount=2)
         payload = self.payload("collect", dict(collect_type="采集食材"))
-        first = execute_player_action(payload)
+        with patch("village.player_actions.production_quality", return_value=3):
+            first = execute_player_action(payload)
         self.assertTrue(first["success"], first)
         self.assertEqual(first, execute_player_action(payload))
         self.assertEqual(PlayerState.objects.get(player_id=str(self.a.pk)).action_points, 185)
         slot = self.bag_a.slots.get()
-        self.assertEqual((slot.item_amount, slot.produced_world_minute, slot.expires_world_minute), (2, 100, 2980))
+        self.assertEqual((slot.item_amount, slot.produced_world_minute, slot.expires_world_minute), (2, 100, None))
         self.assertEqual(str(slot.source_request_id), payload["request_id"])
         commission = self.commission()
         self.assertTrue(self.run_action("commission_contribute", self.delivery_params(commission, 2))["success"])
-        self.bag_a.refresh_from_db(); self.assertEqual(self.bag_a.money, 110)
+        self.bag_a.refresh_from_db(); self.assertEqual(self.bag_a.money, 135)  # Order 10 + gathering goal 10 + supply goal 15.
         PlayerState.objects.filter(player_id=str(self.a.pk)).update(action_points=0)
         self.assertEqual(self.run_action("collect", dict(collect_type="采集食材"))["result_code"], "INSUFFICIENT_ACTION_POINTS")
 

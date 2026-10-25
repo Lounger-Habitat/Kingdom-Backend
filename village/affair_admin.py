@@ -70,8 +70,6 @@ class AffairConditionForm(forms.Form):
         queryset=Item.objects.filter(is_deleted=False).order_by("item_id"), widget=forms.SelectMultiple(attrs={"size": 6}),
         help_text="多选表示其中任意一种均可计入同一目标；若每种物品都需要，请分别添加条件。")
     min_quality = forms.IntegerField(label="最低品质", min_value=0, max_value=6, required=False, initial=0)
-    requires_freshness = forms.BooleanField(label="要求有保鲜记录且未过期", required=False)
-    min_remaining_minutes = forms.IntegerField(label="最低剩余保鲜分钟", min_value=0, max_value=2147483647, required=False, initial=0)
     unit_minutes = forms.IntegerField(label="每份劳动的游戏分钟", min_value=1, max_value=1440, required=False, initial=60)
 
     def clean(self):
@@ -115,8 +113,7 @@ def configured_stages(stage_formset, condition_formset):
             condition["label"] = row["label"]
         if row["type"] == "item":
             condition.update(item_ids=[item.pk for item in row["item_ids"]], min_quality=row.get("min_quality") or 0,
-                requires_freshness=bool(row["requires_freshness"] or row.get("min_remaining_minutes")),
-                min_remaining_minutes=row.get("min_remaining_minutes") or 0)
+                requires_freshness=False, min_remaining_minutes=0)
         elif row["type"] == "labor":
             condition["unit_minutes"] = row["unit_minutes"]
         stages[row["stage_key"]]["conditions"].append(condition)

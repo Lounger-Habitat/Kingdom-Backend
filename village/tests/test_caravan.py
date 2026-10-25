@@ -131,11 +131,12 @@ class DailyCaravanTest(DirectTradeTestBase):
         self.assertEqual(self.public_fund.balance, 500)
         self.assertTrue(caravan.projection(660)["can_export"])
 
-    def test_expired_items_and_store_safety_stock(self):
+    def test_historical_expiry_counts_toward_village_safety_stock(self):
         self.arrive()
         self._give_item(self.nora_inv, 1030, 8)
         self._give_item(self.bill_inv, 1030, 20, expires=660)
-        self.assertEqual(self.act("EXPORT_GOODS", {"item_id": 1030, "amount": 8})["result_code"], "EXPORT_SAFETY_STOCK_REQUIRED")
+        self.assertEqual(self.act("EXPORT_GOODS", {"item_id": 1030, "amount": 8})["result_code"], "OK")
+        self._give_item(self.nora_inv, 1030, 8)
         VillageStoreInventorySlot.objects.create(store=self.store, item_id=1030, item_amount=10)
         self.assertEqual(self.act("EXPORT_GOODS", {"item_id": 1030, "amount": 8})["result_code"], "OK")
 

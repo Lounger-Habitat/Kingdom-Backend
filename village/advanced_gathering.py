@@ -117,7 +117,7 @@ def prepare_professional_collection(player, bag, params, minute):
         row.remaining_quantity, row.next_restore_world_minute = view["remaining_quantity"], view["next_restore_world_minute"]
         row.revision += 1
         row.save(update_fields=["remaining_quantity", "next_restore_world_minute", "revision"])
-    return dict(item_id=spec["item_id"], quantity=2, quality=4, freshness_minutes=2880, tool=tool, resource=row)
+    return dict(item_id=spec["item_id"], quantity=2, quality_min=1, quality_max=6, tool=tool, resource=row)
 
 
 def finish_professional_collection(resource, quantity=2):
@@ -126,11 +126,12 @@ def finish_professional_collection(resource, quantity=2):
     consume_resource(resource, quantity)
 
 
-def collection_points_projection(player, bag, minute):
+def collection_points_projection(player, bag, minute, *, tool_state=None):
     from inventory.models import CollectionPoint
     from .player_actions import COLLECTION_LOCATIONS
     from .player_gathering import CATEGORIES, _pool_item_ids
     from .production_tools import tools_overview
+    tool_state = tool_state if tool_state is not None else tools_overview(player, bag, minute)
     result = []
     for point in CollectionPoint.objects.filter(collect_type__in=COLLECTION_LOCATIONS):
         entry = dict(collect_type=point.collect_type, title=point.name,
@@ -141,12 +142,12 @@ def collection_points_projection(player, bag, minute):
             entry.update(tool_required=True, required_level=4, minimum_tool_tier=2,
                 categories=[dict(code=code, title=title, item_ids=sorted(ids.intersection(items)),
                                  available=bool(ids.intersection(items))) for code, title, items in CATEGORIES],
-                tools=[t for t in tools_overview(player, bag, minute)["tools"]
+                tools=[t for t in tool_state["tools"]
                        if t["capability"] == "targeted_gathering" and t["tier"] >= 2], **resource_overview(minute))
         elif is_professional_collection(point.collect_type):
             entry.update(tool_required=True, required_level=7, minimum_tool_tier=3, action_cost=20,
-                collect_count=1, output_quantity=2, quality=4, freshness_minutes=2880,
-                tools=[t for t in tools_overview(player, bag, minute)["tools"]
+                collect_count=1, output_quantity=2, quality_min=1, quality_max=6,
+                tools=[t for t in tool_state["tools"]
                        if t["capability"] == "targeted_gathering" and t["tier"] >= 3],
                 **professional_resource_overview(point.collect_type, minute))
         result.append(entry)

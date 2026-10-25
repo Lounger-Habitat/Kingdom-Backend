@@ -195,6 +195,7 @@ class StoreStatusConsistencyTest(TestCase):
     def test_day_close_and_direct_trade_share_one_status(self):
         from village.phase3_direct_trade import store_inventory_status as direct
 
+        VillageStoreInventorySlot.objects.filter(store=self.store).delete()
         # 空店 → 真正的 OUT_OF_STOCK。
         self.assertEqual(get_store_status(700), "OUT_OF_STOCK")
         self.assertEqual(get_store_availability(700), {})
@@ -235,7 +236,7 @@ class DayCloseSuccessTest(DayCloseTestBase):
         self.assertEqual(data["store_available_by_item"], get_store_availability(self.time.world_minute))
         event = VillageWorldEvent.objects.get(event_id=resp["event"]["event_id"])
         self.assertEqual(event.public_data["store_status"], data["store_status"])
-        self.assertEqual(event.public_data["store_available_by_item"], data["store_available_by_item"])
+        self.assertEqual(event.public_data["store_available_by_item"], {str(k): v for k, v in data["store_available_by_item"].items()})
 
     def test_day_close_expires_orders(self):
         """OPEN/MATCHED orders past day_end_minute should be expired."""
@@ -395,8 +396,8 @@ class DayCloseSequentialTest(DayCloseTestBase):
 
 
 class FoodSpoilageTest(DayCloseTestBase):
-    def test_expired_food_spoiled(self):
-        """Food with expires_world_minute <= day_end should be deleted."""
+    def test_historical_expiry_never_deletes_food(self):
+        """Old food is retained under quality-only rules."""
         # Day 0 end = 1439. Food expires at 1000 (within day 0).
         NpcGlobalInventorySlot.objects.create(
             bag=self.lucy_inv, slot_index=0, item_id=1056, item_amount=5,
@@ -409,8 +410,8 @@ class FoodSpoilageTest(DayCloseTestBase):
         slot = NpcGlobalInventorySlot.objects.filter(
             bag=self.lucy_inv, item_id=1056,
         ).first()
-        # Slot should be deleted (amount was 0 after spoilage)
-        self.assertIsNone(slot)
+        self.assertIsNotNone(slot)
+        self.assertEqual((slot.item_amount, slot.expires_world_minute), (5, 1000))
 
     def test_unexpired_food_preserved(self):
         """Food that expires after day_end should not be spoiled."""
@@ -462,8 +463,8 @@ class FoodSpoilageTest(DayCloseTestBase):
         self.assertEqual(resp["result_code"], ResultCode.OK)
 
         slot.refresh_from_db()
-        # 10 total - 7 spoiled = 3 reserved remain
-        self.assertEqual(slot.item_amount, 3)
+        # Reservations and unreserved stock both survive day close.
+        self.assertEqual(slot.item_amount, 10)
 
     def test_spoilage_recorded_in_data(self):
         """Spoilage details should be in result data."""
@@ -475,9 +476,8 @@ class FoodSpoilageTest(DayCloseTestBase):
         resp = self._close_day(0)
         self.assertEqual(resp["result_code"], ResultCode.OK)
         spoilage = resp["data"]["spoilage"]
-        self.assertEqual(spoilage["count"], 3)
-        self.assertEqual(len(spoilage["items_spoiled"]), 1)
-        self.assertEqual(spoilage["items_spoiled"][0]["item_id"], 1056)
+        self.assertEqual(spoilage["count"], 0)
+        self.assertEqual(spoilage["items_spoiled"], [])
 
 
 # ============================================================================
@@ -615,8 +615,8 @@ class TravelerSalesTest(DayCloseTestBase):
         self.assertEqual(resp["result_code"], ResultCode.OK)
         self.assertGreater(resp["external_delta"], 0)
 
-    def test_traveler_sales_skips_expired_dishes(self):
-        """Expired dishes should not be sold to travelers."""
+    def test_traveler_sales_accepts_historical_expiry(self):
+        """Both old and new dishes remain saleable."""
         # Expired dish
         NpcGlobalInventorySlot.objects.create(
             bag=self.lucy_inv, slot_index=0, item_id=1053, item_amount=1,
@@ -630,7 +630,7 @@ class TravelerSalesTest(DayCloseTestBase):
 
         resp = self._close_day(0)
         self.assertEqual(resp["result_code"], ResultCode.OK)
-        self.assertEqual(resp["data"]["traveler_sales"]["sold"], 1)
+        self.assertEqual(resp["data"]["traveler_sales"]["sold"], 2)
 
     def test_traveler_sales_skips_reserved_dishes(self):
         """Reserved dishes should not be sold to travelers."""

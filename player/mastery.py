@@ -69,7 +69,7 @@ def _rules(skill):
         "gathering": "亲采三种专业原料，各交一份给Nora。",
         "farming": "亲自收获专业南瓜和另一种作物，各交两份给Bill。",
         "forestry": "以对应工具亲伐不同节点的韧木和硬木，各交两份给Jack。",
-        "cooking": "正确制作三种专业料理，各交一份优秀且至少剩余60分钟鲜期的样品给Lucy。",
+        "cooking": "正确制作三种专业料理，各交一份品质至少4的样品给Lucy。",
         "hunting": "同一只真实野猪完成可信格挡或翻滚、本人最终击杀，并领取本人加工产物。",
         "business": "完成专业合同，并有至少三份采购成本可追溯的合格终端销售，收入覆盖这些采购成本。",
     }
@@ -98,16 +98,7 @@ def _sample_proof(slot, requirement, proofs, minute, skill):
     if not proof:
         return None
     receipt, facts, output = proof
-    if (slot.item_id not in requirement["item_ids"] or facts.get("tool_tier", 0) < requirement["minimum_tool_tier"]
-            or type(output.get("quantity")) is not int or slot.item_amount > output["quantity"]
-            or slot.quality < requirement["minimum_quality"] or slot.freshness_unknown
-            or output.get("item_id") != slot.item_id or output.get("quality") != slot.quality
-            or output.get("produced_world_minute") != slot.produced_world_minute
-            or output.get("expires_world_minute") != slot.expires_world_minute
-            or slot.produced_world_minute is None or slot.produced_world_minute > minute):
-        return None
-    if requirement.get("fresh") and (slot.expires_world_minute is None or slot.expires_world_minute <= minute
-            or slot.expires_world_minute-minute < requirement["minimum_remaining"]):
+    if (slot.item_id not in requirement['item_ids'] or facts.get('tool_tier', 0) < requirement['minimum_tool_tier'] or type(output.get('quantity')) is not int or (slot.item_amount > output['quantity']) or (slot.quality < requirement['minimum_quality']) or (output.get('item_id') != slot.item_id) or (output.get('quality') != slot.quality) or (output.get('produced_world_minute') != slot.produced_world_minute) or (output.get('expires_world_minute') != slot.expires_world_minute) or (slot.produced_world_minute is None) or (slot.produced_world_minute > minute)):
         return None
     if requirement.get("crop_code") and facts.get("crop_code") != requirement["crop_code"]:
         return None
@@ -168,7 +159,7 @@ def _business_evidence(player, since):
         batch = sale.batch_snapshot or {}
         expiry = batch.get("expires_world_minute")
         if (sale.pk in known_transactions and sale.dish_quality >= 3 and sale.amount_paid > 0
-                and not batch.get("freshness_unknown") and type(expiry) is int and expiry > sale.world_minute):
+                and 1 <= sale.dish_quality <= 6):
             sales.append(sale)
     revenue, cost = sum(s.amount_paid for s in sales), sum(s.unit_cost for s in sales)
     evidence = []

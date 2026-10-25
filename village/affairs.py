@@ -30,7 +30,7 @@ def legacy_definition(requirements, locations=None):
     if requirements.get("meals"):
         preparation.append(dict(id="legacy_meals", type="item", label="成品餐食", item_ids=list(MEALS),
             target=requirements["meals"], locations=locations,
-            min_quality=1, requires_freshness=True))
+            min_quality=1, requires_freshness=False))
     if requirements.get("gold"):
         preparation.append(dict(id="legacy_gold", type="gold", target=requirements["gold"], locations=locations))
     stages = []
@@ -122,7 +122,7 @@ def normalize_definition(requirements, locations=None, *, validate_references=Tr
                         or type(remaining) is not int or remaining < 0):
                     invalid("物品、品质或保鲜要求不合法。")
                 condition.update(item_ids=list(dict.fromkeys(ids)), min_quality=quality,
-                    requires_freshness=freshness, min_remaining_minutes=remaining)
+                    requires_freshness=False, min_remaining_minutes=0)
                 item_ids.update(ids)
             elif kind == "labor":
                 minutes = source.get("unit_minutes", 60)
@@ -432,7 +432,7 @@ def project_affair(row):
                  for c in all_conditions if c["type"] == "item" and c["id"] != "legacy_meals" and len(c["item_ids"]) == 1]
     meal_conditions = [c for c in all_conditions if c["id"] == "legacy_meals"]
     meals = portion("meal", "成品餐食", meal_conditions)
-    meals.update(item_ids=list(MEALS), min_quality=1, min_remaining_minutes=0, requires_freshness=True)
+    meals.update(item_ids=list(MEALS), min_quality=1, min_remaining_minutes=0, requires_freshness=False)
     labor_conditions = [c for c in all_conditions if c["type"] == "labor"]
     current_labor = next((c for c in current if c["type"] == "labor" and c["available"]), None)
     labor = portion("labor", "劳动", labor_conditions)

@@ -186,8 +186,8 @@ class ForestryTests(PlayerFixture, TestCase):
         self.assertEqual(self.call('preflight', node=node, actor_type='PLAYER', actor_id=str(self.a.pk))['result_code'], 'SKILL_LEVEL_REQUIRED')
         PlayerSkillProgress.objects.create(player=self.a, skill_code='forestry', total_xp=440)
         self.assertEqual(self.call('preflight', node=node, actor_type='PLAYER', actor_id=str(self.a.pk))['result_code'], 'TOOL_TIER_REQUIRED')
-        self.axe_a.item_id, self.axe_a.remaining_uses = 4105, 50
-        self.axe_a.save(update_fields=['item_id', 'remaining_uses'])
+        self.axe_a.item_id, self.axe_a.remaining_uses, self.axe_a.equipment_level = 4105, 50, 3
+        self.axe_a.save(update_fields=['item_id', 'remaining_uses', 'equipment_level'])
         ready = self.call('preflight', node=node, actor_type='PLAYER', actor_id=str(self.a.pk))
         self.assertTrue(ready['success'], ready)
         self.assertEqual(ready['data']['forestry']['cooldown_seconds'], 1)

@@ -104,8 +104,7 @@ def _observation(source_id, p, *, facts=None, until=None, location=None, affair_
 def _review_usable(review, minute):
     from items.models import Item
     slot = review.slot
-    return (slot.bag.npc_id == review.owner_id and slot.item_amount == 1 and not slot.freshness_unknown
-        and (slot.expires_world_minute is None or slot.expires_world_minute > minute)
+    return (slot.bag.npc_id == review.owner_id and slot.item_amount == 1
         and Item.objects.filter(pk=slot.item_id, is_deleted=False).exists())
 
 
@@ -146,9 +145,7 @@ def _observe(rule, p, minute):
     elif rule == "PERISHABLE_STOCK":
         from .phase3_asset_service import get_available_slot_amount
         rows, _ = _inventory(p["npc_id"], minute)
-        near = [r for r in rows if r.item_id in p["item_ids"] and r.expires_world_minute is not None
-                and minute < r.expires_world_minute <= minute + p.get("warning_minutes", 600)
-                and get_available_slot_amount(r, minute) > 0]
+        near = []  # Food no longer expires; no shelf-life invitation is generated.
         if near:
             found.append(_observation(p["npc_id"], p, facts={"batch_ids": [str(r.instance_id) for r in near]},
                                       until=min(r.expires_world_minute for r in near)))
@@ -156,8 +153,7 @@ def _observe(rule, p, minute):
         for r in VillageDishReview.objects.select_related("slot__bag").filter(target_npc_id=p["npc_id"], status="PENDING",
                 expires_world_minute__gt=minute).order_by("created_world_minute")[:20]:
             if _review_usable(r, minute):
-                found.append(_observation(r.pk, p, until=min(r.expires_world_minute, r.slot.expires_world_minute)
-                                          if r.slot.expires_world_minute is not None else r.expires_world_minute))
+                found.append(_observation(r.pk, p, until=r.expires_world_minute))
     elif rule in {"CARAVAN_VISIT", "NORMAL_CARAVAN_RETURN"}:
         from .caravan import ARRIVAL, DEPARTURE
         day, clock = divmod(minute, 1440)
@@ -218,8 +214,6 @@ def _end_fact(row, current, minute):
     if rule == "PERISHABLE_STOCK":
         rows = list(NpcGlobalInventorySlot.objects.filter(bag__npc__agent_id=row.npc_id,
             instance_id__in=row.facts.get("batch_ids", []), item_amount__gt=0))
-        if any(r.expires_world_minute is not None and r.expires_world_minute <= minute for r in rows):
-            return "EXPIRED", "本次关注的鲜货已到保鲜期限，邀请结束。"
         if not rows:
             return "RESOLVED", "本次关注的鲜货已从原库存处理或转出，去向以实际生产和交易记录为准。"
     elif rule == "DISH_REVIEW":

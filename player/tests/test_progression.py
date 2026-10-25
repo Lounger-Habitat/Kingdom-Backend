@@ -1,4 +1,6 @@
 import copy
+from datetime import timedelta
+from django.utils import timezone
 import importlib
 import uuid
 from unittest.mock import patch
@@ -157,6 +159,13 @@ class LegacyGrowthTests(TestCase):
 
 
 class GrowthCollectionIntegrationTests(PlayerFixture, TestCase):
+    def payload(self, action, params=None, **kwargs):
+        payload = super().payload(action, params, **kwargs)
+        payload["authority_session_id"] = "plant-growth-test-session"
+        if action == "plant_start":
+            payload["current_location_code"] = "FOREST_EDGE"
+        return payload
+
     def setUp(self):
         super().setUp()
         point = CollectionPoint.objects.get(collect_type="采集食材")
@@ -167,13 +176,20 @@ class GrowthCollectionIntegrationTests(PlayerFixture, TestCase):
         CollectionPointLevelItem.objects.create(level=level, item_id=1030, collect_min_amount=2, collect_max_amount=2)
 
     def test_real_collect_asset_ap_growth_receipt_replay_and_conflict(self):
-        payload = self.payload("collect", dict(collect_type="采集食材"))
-        first = execute_player_action(payload)
+        from village.plant_catalog import NODES
+        node = next(key for key, value in NODES.items() if value["species"] == "OYSTER")
+        Item.objects.get_or_create(item_id=1035, defaults=dict(item_name="蘑菇", item_price=4))
+        started = self.run_action("plant_start", dict(node_id=node))
+        self.assertTrue(started["success"], started)
+        attempt = started["data"]["result"]["attempt"]
+        payload = self.payload("collect", dict(node_id=node, attempt_id=attempt["attempt_id"]))
+        with patch("village.plant_gathering.timezone.now", return_value=timezone.now()+timedelta(seconds=10)):
+            first = execute_player_action(payload)
         self.assertTrue(first["success"], first)
         self.assertEqual(first["data"]["result"]["growth_rewards"][0]["xp_gained"], 30)
         self.assertEqual(first, execute_player_action(copy.deepcopy(payload)))
-        self.assertEqual(PlayerState.objects.get(player_id=str(self.a.pk)).action_points, 185)
-        self.assertEqual(self.bag_a.slots.get().item_amount, 2)
+        self.assertEqual(PlayerState.objects.get(player_id=str(self.a.pk)).action_points, 195)
+        self.assertEqual(self.bag_a.slots.get().item_amount, 3)
         self.assertEqual(SkillRewardReceipt.objects.filter(player=self.a).count(), 1)
         self.assertFalse(PlayerGrowthState.objects.filter(player=self.b).exists())
         conflict = copy.deepcopy(payload)
@@ -183,15 +199,18 @@ class GrowthCollectionIntegrationTests(PlayerFixture, TestCase):
         self.assertEqual(current, first["data"]["overview"]["growth"])
 
     def test_failed_collect_and_receipt_failure_never_leave_growth_or_assets(self):
+        from village.plant_catalog import NODES
+        node = next(key for key, value in NODES.items() if value["species"] == "OYSTER")
+        Item.objects.get_or_create(item_id=1035, defaults=dict(item_name="蘑菇", item_price=4))
         state = PlayerState.objects.create(player_id=str(self.a.pk), action_points=0)
-        failure = self.run_action("collect", dict(collect_type="采集食材"))
+        failure = self.run_action("plant_start", dict(node_id=node))
         self.assertEqual(failure["result_code"], "INSUFFICIENT_ACTION_POINTS")
         self.assertFalse(PlayerGrowthState.objects.filter(player=self.a).exists())
         state.action_points = 200
         state.save(update_fields=["action_points"])
         with patch("village.player_actions.VillagePlayerActionReceipt.objects.create", side_effect=RuntimeError("receipt failed")):
             with self.assertRaises(RuntimeError):
-                self.run_action("collect", dict(collect_type="采集食材"))
+                self.run_action("plant_start", dict(node_id=node))
         state.refresh_from_db()
         self.assertEqual(state.action_points, 200)
         self.assertFalse(self.bag_a.slots.exists())

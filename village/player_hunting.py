@@ -4,6 +4,7 @@ import hashlib
 import hmac
 import json
 import uuid
+import secrets
 
 from django.conf import settings
 from django.db import transaction
@@ -17,6 +18,8 @@ from player.progression import ensure_growth, growth_snapshot
 from .models import EconomicLedgerEntry, VillageHuntAttempt, VillageSimulationConfig, VillageWildlife
 from .phase3_catalog import HUNTING_WEAPONS, HUNTING_KILL_XP
 from .production_tools import ToolError, resolve_tool, wear_tool, _index, _single_in_place
+from player.models import EquipmentDefinition
+from player.equipment import stats_for, weapon_moves, WEAPONS
 
 KIT_MILESTONE = "starter_hunting_kit_claimed"
 SAFE_LOCATION, REST_MINUTES = "VILLAGE_SQUARE", 30
@@ -78,53 +81,64 @@ def _combat_ready(state):
 
 
 def _weapon_data(slot, weapon, level):
-    spec = HUNTING_WEAPONS.get(slot.item_id)
-    tier = spec["tier"] if spec else 3 if slot.item_id == 4122 else 2 if slot.item_id == 4105 else 1
+    stats = stats_for(slot)
     item = Item.objects.filter(pk=slot.item_id).first()
-    return dict(weapon=weapon, instance_id=str(slot.instance_id), item_id=slot.item_id, name=item.item_name if item else str(slot.item_id),
-        tier=tier, remaining_uses=slot.remaining_uses, max_uses=item.max_use_count if item else 0,
-        damage_multiplier=1.4 if tier == 3 and spec else 1.2 if tier == 2 and spec else 1.0,
-        draw_duration=1.2 * (.95 if level >= 2 else 1))
+    if not stats:
+        return dict(weapon=weapon, instance_id=str(slot.instance_id), item_id=slot.item_id,
+            name=item.item_name if item else str(slot.item_id), equipment_level=slot.equipment_level,
+            remaining_uses=slot.remaining_uses, max_uses=0, usable=False)
+    return dict(weapon=weapon, instance_id=str(slot.instance_id), item_id=slot.item_id,
+        name=stats["item_name"], category=stats["category"], equipment_level=stats["level"], tier=stats["tier"],
+        remaining_uses=slot.remaining_uses, max_uses=stats["max_durability"],
+        base_attack_min=stats["attack_min"], base_attack_max=stats["attack_max"],
+        moves=weapon_moves(stats["category"]), draw_duration=1.2 * (.95 if level >= 2 else 1))
 
 
 def resolve_player_weapon(player, bag, weapon, instance_id, minute):
     if type(weapon) is not int or weapon not in CAPABILITIES:
         reject("INVALID_WEAPON", "武器类型无效。")
     if not bag.pk:
-        reject("TOOL_MISSING", "请先领取并持有真实狩猎武器。")
+        reject("TOOL_MISSING", "请先持有真实武器。")
     try:
         slot = resolve_tool(player, bag, CAPABILITIES[weapon], instance_id=instance_id, minute=minute)
     except ToolError as exc:
         reject(exc.code, exc.message)
-    if (weapon != 3 and (slot.item_id not in HUNTING_WEAPONS or HUNTING_WEAPONS[slot.item_id]["weapon"] != weapon)
-            or weapon == 3 and slot.item_id not in (4104, 4105, 4122)):
-        reject("TOOL_UNAVAILABLE", "该物品不是当前开放的真实武器。")
+    stats = stats_for(slot)
+    if not stats or WEAPONS.get(stats["category"]) != weapon:
+        reject("TOOL_UNAVAILABLE", "该物品不是指定类型的武器。")
+    if stats["attack_min"] < 1 or stats["attack_max"] < stats["attack_min"]:
+        reject("WEAPON_CONFIGURATION_UNAVAILABLE", "武器基础攻击配置无效。")
+    moves = weapon_moves(stats["category"])
+    expected = {0: {"spear_thrust"}, 1: {"sword_light_0", "sword_light_1", "sword_light_2", "sword_heavy"},
+                2: {"bow_shot"}, 3: {"axe_chop"}}[weapon]
+    if not expected.issubset(moves):
+        reject("WEAPON_MOVE_UNAVAILABLE", "武器招式配置不完整。")
     return slot, _weapon_data(slot, weapon, _level(player))
 
 
 def weapon_repair_quote(player, bag, slot, minute):
-    spec = HUNTING_WEAPONS.get(slot.item_id)
+    stats = stats_for(slot)
     item = Item.objects.filter(pk=slot.item_id, is_deleted=False).first()
     reason = ("TOOL_NOT_OWNED" if not bag.pk or slot.bag_id != bag.pk or bag.player_id != player.pk or bag.character_id != player.username else
-        "FREE_REPAIR_T1_ONLY" if not spec or spec["tier"] != 1 else
+        "PAID_REPAIR_REQUIRED" if not stats or stats["repair_gold"] or stats["repair_materials"] else
         "TOOL_UNAVAILABLE" if not item else
-        "TOOL_DURABILITY_UNKNOWN" if type(slot.remaining_uses) is not int or not 0 <= slot.remaining_uses <= item.max_use_count else
-        "TOOL_EXPIRED" if slot.freshness_unknown or slot.expires_world_minute is not None and slot.expires_world_minute <= minute else
-        "TOOL_ALREADY_FULL" if slot.remaining_uses == item.max_use_count else
-        "WORKSHOP_UNAVAILABLE" if not NpcDefinition.objects.filter(agent_id="10012", is_test_only=False).exists() else "")
+        "TOOL_DURABILITY_UNKNOWN" if type(slot.remaining_uses) is not int or not 0 <= slot.remaining_uses <= stats["max_durability"] else
+        "TOOL_EXPIRED" if False else
+        "TOOL_ALREADY_FULL" if slot.remaining_uses == stats["max_durability"] else "")
     payload = dict(player_id=player.pk, instance_id=str(slot.instance_id), item_id=slot.item_id,
-        amount=slot.item_amount, remaining_uses=slot.remaining_uses, maximum=item.max_use_count if item else None)
+        amount=slot.item_amount, remaining_uses=slot.remaining_uses, maximum=stats["max_durability"] if stats else None, configuration=stats)
     return dict(available=not reason, reason=reason, quote_hash=hmac.new(settings.SECRET_KEY.encode(),
         json.dumps(payload, sort_keys=True).encode(), hashlib.sha256).hexdigest(), gold_cost=0, materials=[],
         material_item_id=None, material_quantity=0, target_item_id=slot.item_id, required_level=1,
-        location_code="BUTCHER_YARD", action="repair_hunting_weapon")
+        location_code=None, action="repair_hunting_weapon")
 
 
 def hunting_overview(player, bag, minute, read_only=False):
     state = PlayerHuntingState.objects.filter(player=player).first()
     level, weapons = _level(player), []
-    for slot in bag.slots.filter(item_amount__gt=0, item_id__in=[*HUNTING_WEAPONS, 4104, 4105, 4122]).order_by("slot_index") if bag.pk else []:
-        weapon = HUNTING_WEAPONS[slot.item_id]["weapon"] if slot.item_id in HUNTING_WEAPONS else 3
+    for slot in bag.slots.filter(item_amount__gt=0, item_id__in=[*HUNTING_WEAPONS, 4104, 4105, *EquipmentDefinition.objects.filter(category__in=WEAPONS).values_list("item_id", flat=True)]).order_by("slot_index") if bag.pk else []:
+        profile = EquipmentDefinition.objects.filter(item_id=slot.item_id).first()
+        weapon = WEAPONS[profile.category] if profile else HUNTING_WEAPONS.get(slot.item_id, {}).get("weapon", 3)
         data = _weapon_data(slot, weapon, level)
         try:
             _combat_ready(state)
@@ -132,27 +146,26 @@ def hunting_overview(player, bag, minute, read_only=False):
             reason = ""
         except HuntingError as exc:
             reason = exc.code
-        repair = weapon_repair_quote(player, bag, slot, minute)
+        from .production_tools import _quote
+        repair = _quote(player, bag, slot, "repair", minute)
         if read_only:
             repair.update(available=False, reason="MODE_READ_ONLY")
         data.update(usable=not reason, reason=reason, repair=repair)
         weapons.append(data)
-    claimed = PlayerMilestoneProgress.objects.filter(player=player, code=KIT_MILESTONE).exists()
-    kit_ready = Item.objects.filter(pk__in=[4110, 4112, 4114], is_deleted=False).count() == 3
-    claim_reason = "MODE_READ_ONLY" if read_only else "ALREADY_CLAIMED" if claimed else "WEAPON_CATALOG_UNAVAILABLE" if not kit_ready else ""
+    claim_reason = "MODE_READ_ONLY" if read_only else "STARTER_EQUIPMENT_AUTOMATIC"
     health = _health(state)
     ready = health["recovery_ready_world_minute"]
     reason = "MODE_READ_ONLY" if read_only else "ALREADY_HEALTHY" if health["current"] >= 100 else ""
     return dict(revision=PlayerGrowthState.objects.filter(player=player).values_list("revision", flat=True).first() or 0,
         observed_world_minute=minute, level=level, health=health, weapons=weapons,
-        can_claim_starter_kit=not claim_reason, claim_reason=claim_reason,
+        can_claim_starter_kit=False, claim_reason=claim_reason,
         rest=dict(can_start=not reason and ready is None, can_finish=not read_only and ready is not None and minute >= ready,
             reason=reason or "REST_IN_PROGRESS" if ready is not None and minute < ready else reason,
             ready_world_minute=ready, remaining_minutes=max(0, ready-minute) if ready is not None else 0,
             duration_minutes=REST_MINUTES, location_code=SAFE_LOCATION),
         rules=dict(kill_xp=deepcopy(HUNTING_KILL_XP), first_kill_bonus=20, attack_wear=1,
-            starter_kit_location="HUNTING_GATE", t1_repair_location="BUTCHER_YARD", t1_repair_gold=0,
-            t2_minimum_level=4, t2_damage_multiplier=1.2, t3_minimum_level=7, t3_damage_multiplier=1.4,
+            starter_kit_location=None, initial_equipment_item_ids=[4114, 4104], weapon_shop_location="GENERAL_STORE", t1_repair_location=None, t1_repair_gold=0,
+            equipment_max_level=5, damage_formula="base_attack * move_multiplier",
             boar_health=180, boar_hit_damage=30, boar_defense_outcomes=["BLOCKED", "DODGED"], health_maximum=100, safe_rest_minutes=REST_MINUTES),
         regions=deepcopy(REGIONS))
 
@@ -164,21 +177,7 @@ def execute_hunting_action(player, bag, action, params, rid, clock):
         reject("PLAYER_BAG_REQUIRED", "请使用本人主背包。")
     state, _ = PlayerHuntingState.objects.select_for_update().get_or_create(player=player)
     if action == "claim_starter_hunting_kit":
-        if params:
-            reject("INVALID_PARAMS", "领取基础狩猎装备不需要额外参数。")
-        if PlayerMilestoneProgress.objects.filter(player=player, code=KIT_MILESTONE).exists():
-            reject("ALREADY_CLAIMED", "每人只能领取一次基础狩猎装备，现有武器可免费整修。")
-        items = Item.objects.in_bulk([4110, 4112, 4114])
-        if len(items) != 3 or any(i.is_deleted for i in items.values()):
-            reject("WEAPON_CATALOG_UNAVAILABLE", "基础狩猎装备目录尚未就绪。")
-        added = []
-        for item in items.values():
-            slot = InventorySlot.objects.create(bag=bag, slot_index=_index(bag), item_id=item.pk,
-                item_amount=1, quality=3, remaining_uses=item.max_use_count, produced_world_minute=clock.world_minute, source_request_id=rid)
-            added.append(dict(_weapon_data(slot, HUNTING_WEAPONS[item.pk]["weapon"], _level(player)), quantity=1))
-        PlayerMilestoneProgress.objects.create(player=player, code=KIT_MILESTONE, title="领取基础狩猎装备",
-            source_type=action, source_id=str(rid))
-        result = dict(items_added=added)
+        reject("STARTER_EQUIPMENT_AUTOMATIC", "初始剑和斧头已随背包发放，其他武器请到商店购买。")
     elif action == "repair_hunting_weapon":
         if set(params) != {"instance_id", "expected_quote"}:
             reject("INVALID_PARAMS", "请确认本人武器整修报价。")
@@ -191,9 +190,9 @@ def execute_hunting_action(player, bag, action, params, rid, clock):
         if not quote["available"]:
             reject(quote["reason"], "当前不能整修这件武器。")
         _single_in_place(slot)
-        slot.remaining_uses = Item.objects.get(pk=slot.item_id).max_use_count
+        slot.remaining_uses = stats_for(slot)["max_durability"]
         slot.save(update_fields=["remaining_uses"])
-        result = dict(weapon=_weapon_data(slot, HUNTING_WEAPONS[slot.item_id]["weapon"], _level(player)), spent_gold=0)
+        result = dict(weapon=_weapon_data(slot, WEAPONS[stats_for(slot)["category"]], _level(player)), spent_gold=0)
     elif action in {"start_safe_rest", "finish_safe_rest"}:
         if params:
             reject("INVALID_PARAMS", "安全点休整不接受额外参数。")
@@ -269,14 +268,14 @@ def execute_combat(payload):
                 return answer
             if action == "authorize_attack":
                 _combat_ready(state)
-                if payload.get("weapon") == 3:
-                    reject("WRONG_WEAPON", "斧子继续使用真实伐木作业规则。")
                 bag = InventoryBag.objects.select_for_update().filter(player=player, character_id=player.username).first()
                 if not bag:
                     reject("TOOL_MISSING", "本人主背包中没有武器。")
                 slot, weapon = resolve_player_weapon(player, bag, payload.get("weapon"), payload.get("instance_id"), clock.world_minute)
                 used = wear_tool(slot)
-                weapon.update(instance_id=used["instance_id"], remaining_uses=used["remaining_uses"])
+                weapon.update(instance_id=used["instance_id"], remaining_uses=used["remaining_uses"],
+                    attack_base=secrets.randbelow(weapon["base_attack_max"] - weapon["base_attack_min"] + 1) + weapon["base_attack_min"],
+                    critical=secrets.randbelow(100) < 10, critical_chance=0.1, critical_multiplier=1.5)
                 result = dict(weapon=weapon)
             else:
                 damage = payload.get("damage")
@@ -305,6 +304,9 @@ def execute_combat(payload):
             if action == "authorize_attack" or not state.authority_session_id:
                 state.authority_session_id = session
             _bump(player, state)
+            if action == "authorize_attack":
+                from player.tutorials import observe_weapon
+                observe_weapon(player, weapon["category"], rid)
             result["health"] = _health(state)
             answer = dict(success=True, result_code="OK", data=result)
             PlayerCombatReceipt.objects.create(player=player, request_id=rid, authority_session_id=session,

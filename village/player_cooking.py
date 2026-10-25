@@ -8,6 +8,7 @@ import uuid
 from django.db import transaction
 from django.conf import settings
 from django.utils import timezone
+from items.quality import cooking_quality, ingredient_average, valid_quality, quality_rng
 from cooking.dish_rules import calculate_quality
 from inventory.models import InventorySlot
 from items.models import Item, ItemType
@@ -18,9 +19,10 @@ from player.services import recover_action_points, ACTION_POINT_RECOVERY_SECONDS
 from recipes.models import Recipe, RecipeIngredient
 from .models import EconomicLedgerEntry, VillagePlayerActionReceipt
 from .phase3_asset_service import deterministic_rng
+from player.equipment import stats_for
 from .production_tools import resolve_tool, wear_tool, tools_overview, ToolError, _index
-from .player_cooking_rules import (VILLAGE_RECIPES, NONPERISHABLE_IDS, RULE_VERSION,
-    XP_PER_BATCH, FIRST_COOK_BONUS, AP_PER_BATCH, SHELF_LIFE)
+from .player_cooking_rules import (VILLAGE_RECIPES, RULE_VERSION,
+    XP_PER_BATCH, FIRST_COOK_BONUS, AP_PER_BATCH)
 
 from .professional_catalog import PROFESSIONAL_RECIPES, batch_evidence
 
@@ -30,7 +32,7 @@ class CookingError(Exception):
         super().__init__(message)
 
 
-PITY_POLICY = "普通正确且鲜期合格的单批料理沿用旧保底；村庄配方和批量制作不消耗旧保底计数。"
+PITY_POLICY = "正确配比的普通单批料理沿用旧保底；食材品质、技能和炊具共同影响成品，品质1～6均可正常制作和售卖。"
 
 
 def reject(code, message):
@@ -74,23 +76,14 @@ def _is_ingredient(slot, item, ids):
         and not slot.dish_metadata and not slot.ingredient and slot.remaining_uses is None)
 
 
-def _perishable(item):
-    return item.pk not in NONPERISHABLE_IDS and item.item_type != ItemType.SEASONING
-
-
 def _ingredient_view(slot, item, minute):
-    reason = ("FRESHNESS_UNKNOWN" if slot.freshness_unknown else "INGREDIENT_EXPIRED"
-              if slot.expires_world_minute is not None and slot.expires_world_minute <= minute else
-              "PROVENANCE_INVALID" if slot.produced_world_minute is not None and slot.produced_world_minute > minute else
-              "PROVENANCE_REQUIRED" if _perishable(item) and slot.expires_world_minute is not None
-                  and (slot.produced_world_minute is None or not slot.source_request_id) else "")
-    legacy = _perishable(item) and slot.expires_world_minute is None
-    return dict(instance_id=str(slot.instance_id), item_id=slot.item_id, item_name=item.item_name,
+    reason = "INGREDIENT_QUALITY_INVALID" if not valid_quality(slot.quality) else "PROVENANCE_INVALID" if slot.produced_world_minute is not None and slot.produced_world_minute > minute else ""
+    return dict(instance_id=str(slot.instance_id), item_id=slot.item_id, item_name=item.item_name, item_type=item.item_type,
         quantity=slot.item_amount, available_quantity=0 if reason else slot.item_amount,
         quality=slot.quality, produced_world_minute=slot.produced_world_minute,
-        expires_world_minute=slot.expires_world_minute, freshness_unknown=slot.freshness_unknown,
+        expires_world_minute=None, freshness_unknown=False,
         source_request_id=str(slot.source_request_id) if slot.source_request_id else None,
-        legacy_perishable=legacy, reason=reason)
+        legacy_perishable=False, reason=reason)
 
 
 def _available_ap(player):
@@ -103,10 +96,11 @@ def _available_ap(player):
     return min(NATURAL_ACTION_POINT_CAP, state.action_points + elapsed // ACTION_POINT_RECOVERY_SECONDS)
 
 
-def cooking_overview(player, bag, minute, read_only=False):
+def cooking_overview(player, bag, minute, read_only=False, *, tool_state=None):
     level = _level(player)
     knowledge = _knowledge(player)
-    tools = [row for row in tools_overview(player, bag, minute, read_only=read_only)["tools"] if row["capability"] == "cooking"]
+    tool_state = tool_state if tool_state is not None else tools_overview(player, bag, minute, read_only=read_only)
+    tools = [row for row in tool_state["tools"] if row["capability"] == "cooking"]
     recipes = []
     for recipe in Recipe.objects.prefetch_related("ingredients").order_by("pk"):
         known, visible = _visibility(recipe, knowledge)
@@ -130,7 +124,7 @@ def cooking_overview(player, bag, minute, read_only=False):
         ("first_player_cooking", "亲自制作合格料理", "RESTAURANT"),
         ("first_formal_dish_review", "完成本人料理的正式点评", "RECORD_HALL"))]
     return dict(revision=PlayerGrowthState.objects.filter(player=player).values_list("revision", flat=True).first() or 0,
-        observed_world_minute=minute, level=level, max_batches=5 if level >= 7 and any(t["usable"] and t["tier"] >= 3 for t in tools) else 3 if level >= 4 and any(t["usable"] and t["tier"] >= 2 for t in tools) else 1,
+        observed_world_minute=minute, level=level, max_batches=max((t["cooking_batches"] for t in tools if t["usable"]), default=1),
         recipes=recipes, ingredients=ingredients, tools=tools, goals=goals, pity_policy=PITY_POLICY)
 
 
@@ -161,7 +155,7 @@ def _prepare(player, bag, params, minute, *, execute=False):
             reject("INGREDIENT_NOT_OWNED", "食材不属于本人，或该物品不可作为原料。")
         view = _ingredient_view(slot, item, minute)
         if view["reason"]:
-            reject(view["reason"], "所选原料已经过期、来源异常或鲜期不明。")
+            reject(view["reason"], "所选原料品质无效或来源记录异常。")
         if view["available_quantity"] < entry["quantity"]:
             reject("INSUFFICIENT_INGREDIENTS", "所选食材批次的实际数量不足。")
         rows.append((slot, entry["quantity"]))
@@ -188,16 +182,17 @@ def _prepare(player, bag, params, minute, *, execute=False):
     level = _level(player)
     if level < required:
         reject("SKILL_LEVEL_REQUIRED", "烹饪等级未达到配方要求。")
-    if batches > 3 and level < 7:
-        reject("SKILL_LEVEL_REQUIRED", "5批专业制作需要烹饪7级及T3炊具。")
-    if batches > 1 and (level < 4 or not visible):
-        reject("BATCH_RECIPE_KNOWLEDGE_REQUIRED", "多批制作需要烹饪4级及已明确数量的标准配方。")
+    if batches > 1 and not visible:
+        reject("BATCH_RECIPE_KNOWLEDGE_REQUIRED", "多批制作需要已明确数量的标准配方。")
     if not params.get("tool_instance_id"):
         reject("TOOL_MISSING", "请选择本人实际持有的炊具。")
     try:
-        tool = resolve_tool(player, bag, "cooking", params["tool_instance_id"], max(tier, 3 if batches > 3 else 2 if batches > 1 else 1), minute=minute)
+        tool = resolve_tool(player, bag, "cooking", params["tool_instance_id"], tier, minute=minute)
     except ToolError as exc:
         reject(exc.code, exc.message)
+    tool_stats = stats_for(tool)
+    if not tool_stats or batches > tool_stats["cooking_batches"]:
+        reject("TOOL_LEVEL_REQUIRED", "所选炊具的单次批数上限不足。")
     if tool.remaining_uses < batches:
         reject("TOOL_BROKEN", "所选炊具耐久不足以完成全部批次。")
     if _available_ap(player) < AP_PER_BATCH * batches:
@@ -210,24 +205,20 @@ def _prepare(player, bag, params, minute, *, execute=False):
         expected[ingredient.item_id] = expected.get(ingredient.item_id, 0) + ingredient.count * batches
     exact = recipe is not None and amounts == expected
     village = recipe is not None and recipe.pk in VILLAGE_RECIPES
-    legacy = any(v["legacy_perishable"] for v in views)
-    if village and legacy:
-        reject("LEGACY_FRESHNESS_UNKNOWN", "历史无期限易腐原料不能制作可信村庄鲜餐。")
+    legacy = False
     if village and not exact and (visible or execute) or batches > 1 and not exact:
         reject("INGREDIENTS_MISMATCH", "所选原料不满足标准配方，请核对已知配比。")
     matched = recipe is not None and set(expected) == set(amounts)
     output = Item.objects.filter(pk=recipe.item_id, is_deleted=False).first() if recipe and matched else None
     if recipe and matched and (output is None or recipe.output_quantity < 1):
         reject("RECIPE_CATALOG_UNAVAILABLE", "菜品物品或标准产量尚未配置。")
-    expiries = [v["expires_world_minute"] for v in views if v["expires_world_minute"] is not None
-                and _perishable(Item.objects.get(pk=v["item_id"]))]
-    expires = None if legacy else min([minute + SHELF_LIFE, *expiries])
+    expires = None
     quantity = recipe.output_quantity * batches if exact else 1
     mask = recipe_id is None and not known
     payload = dict(recipe_id=recipe.pk if recipe else None, recipe_version=recipe.version if recipe else None,
         recipe_ingredients=expected, recipe_output=(recipe.item_id, recipe.output_quantity) if recipe else None,
         batches=batches, level=level, tool_instance_id=str(tool.instance_id), tool_item_id=tool.item_id,
-        tool_uses=tool.remaining_uses, tool_amount=tool.item_amount,
+        tool_uses=tool.remaining_uses, tool_amount=tool.item_amount, tool_configuration=tool_stats,
         inputs=sorted(views, key=lambda v: v["instance_id"]), rule_version=RULE_VERSION)
     preview = dict(available=True, reason="", quote_hash=hmac.new(settings.SECRET_KEY.encode(),
         json.dumps(payload, sort_keys=True).encode(), hashlib.sha256).hexdigest(),
@@ -236,9 +227,8 @@ def _prepare(player, bag, params, minute, *, execute=False):
         output_item_id=None if mask else output.pk if output else None,
         output_quantity=None if mask or not visible else quantity, batches=batches,
         action_cost=AP_PER_BATCH * batches, tool_uses=batches, expires_world_minute=expires,
-        freshness_unknown=legacy, selected_batches=views, missing_items=[],
-        warnings=(["历史无期限易腐原料的成品仍为鲜期不明，不能用于鲜餐交付。"] if legacy else [])
-            + (["数量未显示，成品与配比结果在实际制作后揭晓。"] if not visible else []) + [PITY_POLICY])
+        freshness_unknown=legacy, ingredient_average_quality=ingredient_average(views), selected_batches=views, missing_items=[],
+        warnings=(["数量未显示，成品与配比结果在实际制作后揭晓。"] if not visible else []) + [PITY_POLICY])
     return dict(recipe=recipe if matched else None, exact=exact, output=output, quantity=quantity,
         rows=rows, amounts=amounts, tool=tool, batches=batches, level=level, legacy=legacy,
         expires=expires, preview=preview)
@@ -269,13 +259,13 @@ def _visible_missing(player, bag, params, minute):
         if item:
             for slot in bag.slots.filter(item_id=item.pk, item_amount__gt=0):
                 view = _ingredient_view(slot, item, minute)
-                if not view["reason"] and not (recipe.pk in VILLAGE_RECIPES and view["legacy_perishable"]):
+                if not view["reason"]:
                     available += slot.item_amount
         shortage = max(0, ingredient.count * batches - available)
         if shortage:
             result.append(dict(item_id=ingredient.item_id, item_name=ingredient.item_name, quantity=shortage,
                 location_code="BILL_FARM" if ingredient.item_id in {1030, 1005, 1025, 1042, 1038, 1043} else "GENERAL_STORE",
-                reason="FRESH_INGREDIENT_REQUIRED" if recipe.pk in VILLAGE_RECIPES else "INGREDIENT_REQUIRED"))
+                reason="INGREDIENT_REQUIRED"))
     return result
 
 
@@ -311,14 +301,14 @@ def execute_player_cooking(player, bag, params, rid, clock):
     state.action_points_recovered_at = timezone.now()
     state.save(update_fields=["action_points", "action_points_recovered_at"])
     recipe = plan["recipe"]
-    rng = deterministic_rng(rid, "PLAYER_COOK_V1", clock.world_minute // 1440)
+    rng = quality_rng(rid, "PLAYER_COOK")
     from cooking.views import FAILED_DISH_ITEM_ID, _apply_pity
     item_id = recipe.item_id if recipe else FAILED_DISH_ITEM_ID
     seconds = max(0, recipe.default_cook_time + rng.randint(-40 if plan["exact"] else -50, 40 if plan["exact"] else 50)) if recipe else 0
     amounts = {key: value / plan["batches"] for key, value in plan["amounts"].items()}
     quality = calculate_quality(recipe, amounts, plan["exact"], seconds, rng) if recipe else 1
-    if recipe and plan["exact"] and plan["level"] >= 2 and not plan["legacy"]:
-        quality = max(4 if recipe.pk in PROFESSIONAL_RECIPES else 3, quality)
+    average = ingredient_average(consumed)
+    quality = cooking_quality(quality, average, plan["level"], stats_for(tool)["quality_bonus_chance"], rng) if recipe and plan["batches"] == 1 else quality
     pity_counts, pity_changed = None, False
     if recipe and not recipe.village_only and plan["exact"] and not plan["legacy"] and plan["batches"] == 1:
         # Keep the original player's counters/config and the original tier rules.
@@ -334,52 +324,80 @@ def execute_player_cooking(player, bag, params, rid, clock):
         recipe={k: getattr(recipe, k) for k in ("version", "difficulty", "cuisine", "dish_category", "serving_style", "taste_profile", "default_cook_time")} if recipe else {},
         ingredients=deepcopy(consumed), ingredients_exact=plan["exact"], standard_batches=plan["batches"],
         output_quantity=plan["quantity"], quality=quality,
+        ingredient_average_quality=average, quality_rule="quality-v2",
         cook_time_source="LEGACY_PITY_SECONDS" if pity_changed else "RECIPE_RANDOM_SECONDS" if recipe else "FAILED_RECIPE",
-        freshness_policy="LEGACY_UNKNOWN" if plan["legacy"] else "EARLIEST_PERISHABLE_INPUT")
+        freshness_policy="QUALITY_ONLY")
     if pity_counts is not None:
         metadata["pity_counts"] = pity_counts
-    slot = InventorySlot.objects.create(bag=bag, slot_index=_index(bag), item_id=item_id,
-        item_amount=plan["quantity"], quality=quality, produced_world_minute=clock.world_minute,
-        expires_world_minute=plan["expires"], freshness_unknown=plan["legacy"], source_request_id=rid,
-        ingredient="、".join(f"{v['item_name']}×{v['quantity']}" for v in consumed), cook_time=seconds,
-        dish_metadata=metadata, rated=False, rating_price=-1)
+    quality_groups = {}
+    for _ in range(plan["batches"] if plan["exact"] else 1):
+        improved = quality
+        if recipe and plan["exact"] and plan["batches"] > 1:
+            improved = cooking_quality(calculate_quality(recipe, amounts, True, seconds, rng), average, plan["level"], stats_for(tool)["quality_bonus_chance"], rng)
+        quality_groups[improved] = quality_groups.get(improved, 0) + 1
+    output_slots = []
+    for group_quality, group_count in quality_groups.items():
+        group_metadata = deepcopy(metadata)
+        group_metadata.update(quality=group_quality, standard_batches=group_count,
+            output_quantity=recipe.output_quantity * group_count if plan["exact"] else plan["quantity"],
+            production_batch_id=str(uuid.uuid5(uuid.UUID(batch_id), str(group_quality))))
+        output_slots.append(InventorySlot.objects.create(bag=bag, slot_index=_index(bag), item_id=item_id,
+            item_amount=group_metadata["output_quantity"], quality=group_quality, produced_world_minute=clock.world_minute,
+            expires_world_minute=plan["expires"], freshness_unknown=plan["legacy"], source_request_id=rid,
+            ingredient="、".join(f"{v['item_name']}×{v['quantity']}" for v in consumed), cook_time=seconds,
+            dish_metadata=group_metadata, rated=False, rating_price=-1))
+    slot = output_slots[0]
+    metadata, quality = slot.dish_metadata, slot.quality
     learned = False
+    mastered = False
     if recipe:
-        _, learned = PlayerRecipe.objects.get_or_create(player=state, recipe_name=recipe.recipe_name,
-            defaults=dict(catalog_recipe=recipe, show_ingredient_count=recipe.pk in VILLAGE_RECIPES))
-    dish = dict(instance_id=str(slot.instance_id), item_id=item_id, quantity=slot.item_amount, quality=quality,
-        cook_time_seconds=seconds, dish_metadata=deepcopy(metadata), produced_world_minute=clock.world_minute,
-        expires_world_minute=slot.expires_world_minute, freshness_unknown=slot.freshness_unknown)
+        knowledge, learned = PlayerRecipe.objects.get_or_create(player=state, recipe_name=recipe.recipe_name,
+            defaults=dict(catalog_recipe=recipe, show_ingredient_count=plan["exact"]))
+        # A correct real cook proves the quantities even for ordinary recipes and
+        # existing name-only knowledge. All valid qualities can trade and request review.
+        mastered = plan["exact"] and (learned or not knowledge.show_ingredient_count)
+        if plan["exact"] and (not knowledge.show_ingredient_count or knowledge.catalog_recipe_id != recipe.pk):
+            knowledge.catalog_recipe = recipe
+            knowledge.show_ingredient_count = True
+            knowledge.save(update_fields=["catalog_recipe", "show_ingredient_count"])
+    dishes = [dict(instance_id=str(output.instance_id), item_id=item_id, quantity=output.item_amount, quality=output.quality,
+        cook_time_seconds=seconds, dish_metadata=deepcopy(output.dish_metadata), produced_world_minute=clock.world_minute,
+        expires_world_minute=output.expires_world_minute, freshness_unknown=output.freshness_unknown) for output in output_slots]
+    dish = dishes[0]
     rewards = []
     if recipe and plan["exact"] and not plan["legacy"]:
         rewards = [award_skill(player, source_type="player_cooking", source_id=rid, skill_code="cooking",
             xp=XP_PER_BATCH * plan["batches"], milestone=dict(code="first_player_cooking", title="亲自制作合格料理", xp=FIRST_COOK_BONUS),
             facts=dict(recipe_id=recipe.pk, recipe_version=recipe.version, production_batch_id=batch_id,
-                output_item_id=item_id, output_instance_id=str(slot.instance_id), quantity=slot.item_amount,
+                output_item_id=item_id, output_instance_id=str(slot.instance_id), quantity=sum(output.item_amount for output in output_slots),
                 quality=quality, standard_batches=plan["batches"], freshness_unknown=slot.freshness_unknown,
                 source_request_id=str(rid), produced_world_minute=clock.world_minute,
-                tool_tier=3 if tool.item_id == 4123 else 2 if tool.item_id == 4107 else 1, outputs=[batch_evidence(slot)]))]
+                tool_tier=stats_for(tool)["tier"], tool_equipment_level=tool.equipment_level, outputs=[batch_evidence(output) for output in output_slots]))]
     EconomicLedgerEntry.objects.create(request_id=uuid.uuid5(uuid.NAMESPACE_URL, f"player-cooking-ledger:{player.pk}:{rid}"),
         entry_type="PLAYER_COOK", world_minute=clock.world_minute,
-        changes={"player_id": str(player.pk), "inputs": consumed, "output": dish, "tool_used": used})
-    return dict(dish=dish, items_consumed=consumed, items_added=[dish], tool_used=used,
-        action_cost=cost, action_points=state.action_points, growth_rewards=rewards, is_newly_learned=learned)
+        changes={"player_id": str(player.pk), "inputs": consumed, "output": dish, "outputs": dishes, "tool_used": used})
+    return dict(dish=dish, dishes=dishes, items_consumed=consumed, items_added=dishes, tool_used=used,
+        action_cost=cost, action_points=state.action_points, growth_rewards=rewards, is_newly_learned=learned,
+        recipe_quantities_unlocked=mastered)
 
 
 def is_player_cooked(slot, player):
     """Verify the immutable production fact, including after trade/sample splitting."""
     metadata = slot.dish_metadata or {}
-    if metadata.get("maker_player_id") != str(player.pk) or metadata.get("rule_version") != RULE_VERSION:
+    if metadata.get("maker_player_id") != str(player.pk) or metadata.get("rule_version") not in ("player-cooking-v1", RULE_VERSION):
         return False
     try:
         rid = uuid.UUID(metadata.get("production_request_id", ""))
     except (ValueError, TypeError, AttributeError):
         return False
     receipt = VillagePlayerActionReceipt.objects.filter(player=player, request_id=rid, action="cook_dish").first()
-    dish = (receipt.response.get("data", {}).get("result", {}).get("dish", {}) if receipt and receipt.response.get("success") else {})
+    result = receipt.response.get("data", {}).get("result", {}) if receipt and receipt.response.get("success") else {}
+    candidates = result.get("dishes") or [result.get("dish", {})]
+    dish = next((candidate for candidate in candidates if candidate.get("quality") == slot.quality
+        and (candidate.get("dish_metadata") or {}).get("production_batch_id") == metadata.get("production_batch_id")), {})
     original = dish.get("dish_metadata") or {}
     return (dish.get("item_id") == slot.item_id and metadata.get("recipe_id") is not None
-        and original.get("ingredients_exact") is True and dish.get("freshness_unknown") is False
+        and original.get("ingredients_exact") is True
         and str(slot.source_request_id) == str(rid)
         and dish.get("produced_world_minute") == slot.produced_world_minute
         and dish.get("expires_world_minute") == slot.expires_world_minute

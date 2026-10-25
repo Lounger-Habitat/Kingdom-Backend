@@ -9,17 +9,15 @@ from game_time.models import GlobalGameTimeState
 from inventory.components import copy_batch_attributes
 from inventory.models import InventorySlot
 from items.models import Item
-from player.models import ItemGameplayDefinition, PlayerMilestoneProgress
+from player.models import EquipmentDefinition, WeaponMove
+from player.equipment import stats_for, definition_for, equipment_attributes, CAPABILITIES, equipment_catalog
 from player.progression import ensure_growth, growth_snapshot
 from .models import (EconomicLedgerEntry, VillageStore, VillageStoreAccount,
                      VillageStoreInventorySlot, VillageStoreListing)
-from .phase3_catalog import HUNTING_WEAPONS, FEATHER, ROUGH_LEATHER
-from .professional_catalog import T3_UPGRADES, PROFESSIONAL_WOOD, PUMPKIN_SEED
+from .professional_catalog import PUMPKIN_SEED
 
-UPGRADES = {4101: (4102, 6), 4001: (4103, 8), 4104: (4105, 10), 4106: (4107, 8),
-            4110: (4111, 8), 4112: (4113, 8), **T3_UPGRADES}
 AXE_MILESTONE = "starter_axe_claimed"
-STOCK_ITEMS = (1051, 29301, 29302, 29303, 29304, 29305, 4001, 4106, PUMPKIN_SEED)
+STOCK_ITEMS = (1051, 29301, 29302, 29303, 29304, 29305, 4001, 4106, 4110, 4112, PUMPKIN_SEED)
 
 
 class ToolError(Exception):
@@ -44,19 +42,19 @@ def _level(player, code):
 
 
 def _fresh(slot, minute):
-    return not slot.freshness_unknown and (slot.expires_world_minute is None or slot.expires_world_minute > minute)
+    return True
 
 
 def _definition(slot):
-    return ItemGameplayDefinition.objects.select_related("item").filter(item_id=slot.item_id, item__is_deleted=False).first()
+    return definition_for(slot)
 
 
 def resolve_tool(player, bag, capability, instance_id=None, minimum_tier=1, *, minute):
     """Pure validation. The caller may already hold world/bag locks; no setup writes."""
     if bag.player_id != player.pk or bag.character_id != player.username:
         reject("TOOL_NOT_OWNED", "只能使用本人主背包中的工具。")
-    definitions = {d.item_id: d for d in ItemGameplayDefinition.objects.select_related("item").filter(
-        capability_code=capability, item__is_deleted=False)}
+    definitions = {d.item_id: d for d in EquipmentDefinition.objects.filter(enabled=True, item__is_deleted=False)
+                   if CAPABILITIES[d.category] == capability}
     rows = InventorySlot.objects.filter(bag=bag, item_id__in=definitions, item_amount__gt=0).order_by("slot_index")
     if connection_in_transaction():
         rows = rows.select_for_update()
@@ -65,15 +63,16 @@ def resolve_tool(player, bag, capability, instance_id=None, minimum_tier=1, *, m
     rows = list(rows)
     if not rows:
         reject("TOOL_MISSING", "背包中没有指定用途的工具。")
-    qualified = [s for s in rows if definitions[s.item_id].tier >= minimum_tier]
+    definitions = {s.pk: _definition(s) for s in rows}
+    qualified = [s for s in rows if definitions[s.pk] and definitions[s.pk].tier >= minimum_tier]
     if not qualified:
         reject("TOOL_TIER_REQUIRED", "该资源需要更高阶工具。")
-    permitted = [s for s in qualified if not definitions[s.item_id].required_skill or
-                 _level(player, definitions[s.item_id].required_skill) >= definitions[s.item_id].required_level]
+    permitted = [s for s in qualified if not definitions[s.pk].required_skill or
+                 _level(player, definitions[s.pk].required_skill) >= definitions[s.pk].required_level]
     if not permitted:
         reject("SKILL_LEVEL_REQUIRED", "技能等级未达到工具使用要求。")
     usable = [s for s in permitted if _fresh(s, minute) and type(s.remaining_uses) is int
-              and 0 < s.remaining_uses <= definitions[s.item_id].item.max_use_count]
+              and 0 < s.remaining_uses <= definitions[s.pk].item.max_use_count]
     if not usable:
         reject("TOOL_DURABILITY_UNKNOWN" if any(s.remaining_uses is None for s in permitted) else "TOOL_BROKEN",
                "工具已损坏、过期或耐久信息无效。")
@@ -105,7 +104,8 @@ def wear_tool(slot):
         slot = used
     slot.remaining_uses -= 1
     slot.save(update_fields=["remaining_uses"])
-    return dict(item_id=slot.item_id, instance_id=str(slot.instance_id), uses=1, remaining_uses=slot.remaining_uses)
+    return dict(item_id=slot.item_id, instance_id=str(slot.instance_id), equipment_level=slot.equipment_level,
+        equipment_stats=stats_for(slot), uses=1, remaining_uses=slot.remaining_uses)
 
 
 def _single_in_place(slot):
@@ -128,78 +128,93 @@ def _store():
                                         status__in=_TRADABLE_STORE_STATUSES).first()
 
 
-def _quote(player, bag, slot, operation, minute):
-    definition = _definition(slot)
-    if operation == "repair" and slot.item_id in HUNTING_WEAPONS and HUNTING_WEAPONS[slot.item_id]["tier"] == 1:
+def tool_attributes(definition):
+    return equipment_attributes(getattr(definition, "equipment_stats", None))
+
+
+def _quote(player, bag, slot, operation, minute, *, context=None):
+    catalog = context["catalog"] if context is not None else None
+    current = catalog.get((slot.item_id, slot.equipment_level)) if catalog is not None else stats_for(slot)
+    if operation == "repair" and current and current["category"] in {"sword", "spear", "bow"} and not current["repair_gold"] and not current["repair_materials"]:
         from .player_hunting import weapon_repair_quote
         return weapon_repair_quote(player, bag, slot, minute)
-    target_id, material_quantity = UPGRADES.get(slot.item_id, (None, 0))
-    tier = definition.tier if definition else 0
-    professional_upgrade = operation == "upgrade" and tier == 2
-    gold = (200 if professional_upgrade else 100) if operation == "upgrade" else 25 if tier == 3 else 5 if tier == 1 else 15
-    material = 29306 if professional_upgrade else PROFESSIONAL_WOOD if tier == 3 else 1002 if operation == "upgrade" or tier == 1 else 29306
-    material_quantity = material_quantity if operation == "upgrade" else 1
-    target = Item.objects.filter(pk=target_id, is_deleted=False).first() if target_id else None
-    required = (7 if professional_upgrade else 4) if operation == "upgrade" else definition.required_level if definition else 1
-    skill = definition.required_skill if definition else ""
-    level = _level(player, skill) if skill else 1
-    available_material = sum(s.item_amount for s in _material_slots(bag, material, minute))
-    requirements = [(material, material_quantity)]
-    if professional_upgrade:
-        requirements += [(ROUGH_LEATHER, 2)] + ([(FEATHER, 4)] if slot.item_id == 4113 else [])
-    if operation == "upgrade" and slot.item_id in (4110, 4112):
-        requirements += [(ROUGH_LEATHER, 2)] + ([(FEATHER, 2)] if slot.item_id == 4112 else [])
-    materials = [dict(item_id=key, item_name=Item.objects.filter(pk=key).values_list("item_name", flat=True).first() or str(key),
-        quantity=quantity, available_quantity=sum(s.item_amount for s in _material_slots(bag, key, minute)))
-        for key, quantity in requirements]
-    store = _store()
-    account = VillageStoreAccount.objects.filter(store=store).first() if store else None
-    reason = ("TOOL_UNAVAILABLE" if not definition or definition.capability_code not in {"farming", "forestry", "targeted_gathering", "cooking", "hunting_spear", "hunting_bow", "hunting_sword"}
-        or definition.tier not in (1, 2, 3) else "NO_UPGRADE" if operation == "upgrade" and not target else
-        "TOOL_DURABILITY_UNKNOWN" if type(slot.remaining_uses) is not int or not 0 <= slot.remaining_uses <= definition.item.max_use_count else
-        "TOOL_EXPIRED" if not _fresh(slot, minute) else "TOOL_ALREADY_FULL" if operation == "repair" and slot.remaining_uses == definition.item.max_use_count else
-        "SKILL_LEVEL_REQUIRED" if level < required else "STORE_UNAVAILABLE" if not account else
+    target_level = slot.equipment_level + (operation == "upgrade")
+    target = (catalog.get((slot.item_id, target_level)) if catalog is not None else stats_for(slot, level=target_level)) if target_level <= 5 else None
+    rule = target if operation == "upgrade" else current
+    requirements = rule["upgrade_materials" if operation == "upgrade" else "repair_materials"] if rule else []
+    gold = rule["upgrade_gold" if operation == "upgrade" else "repair_gold"] if rule else 0
+    materials = []
+    for row in requirements:
+        item = context["items"].get(row["item_id"]) if context is not None else Item.objects.filter(pk=row["item_id"], is_deleted=False).first()
+        materials.append(dict(item_id=row["item_id"], item_name=item.item_name if item else str(row["item_id"]),
+            quantity=row["quantity"], available_quantity=context["materials"].get(row["item_id"], 0) if context is not None else sum(s.item_amount for s in _material_slots(bag, row["item_id"], minute)), configured=bool(item)))
+    skill_level = ((context["levels"].get(current["required_skill"], 1) if context is not None else _level(player, current["required_skill"])) if current and current["required_skill"] else 1)
+    account = context["account"] if context is not None else VillageStoreAccount.objects.filter(store_id="GENERAL_STORE").first()
+    reason = ("TOOL_UNAVAILABLE" if not current else "NO_UPGRADE" if operation == "upgrade" and not target else
+        "TOOL_DURABILITY_UNKNOWN" if type(slot.remaining_uses) is not int or not 0 <= slot.remaining_uses <= current["max_durability"] else
+        "TOOL_EXPIRED" if not _fresh(slot, minute) else
+        "TOOL_ALREADY_FULL" if operation == "repair" and slot.remaining_uses == current["max_durability"] else
+        "SKILL_LEVEL_REQUIRED" if skill_level < rule["required_skill_level"] else
+        "STORE_UNAVAILABLE" if not account else "MATERIAL_UNAVAILABLE" if any(not m["configured"] for m in materials) else
         "INSUFFICIENT_MONEY" if bag.money < gold else "INSUFFICIENT_MATERIALS" if any(m["available_quantity"] < m["quantity"] for m in materials) else "")
-    payload = dict(operation=operation, instance_id=str(slot.instance_id), item_id=slot.item_id,
-        amount=slot.item_amount, remaining=slot.remaining_uses, money=bag.money, material_available=available_material,
-        gold=gold, material=material, material_quantity=material_quantity, target_id=target_id,
-        level=level, account_id=account.pk if account else None, definition_version=definition.rules_version if definition else 0,
-        maximum_uses=definition.item.max_use_count if definition else None,
-        target_maximum_uses=target.max_use_count if target else None, materials=materials)
-    return dict(available=not reason, reason=reason, quote_hash=hashlib.sha256(json.dumps(payload, sort_keys=True).encode()).hexdigest(),
-        gold_cost=gold, material_item_id=material, material_quantity=material_quantity,
-        target_item_id=target_id if operation == "upgrade" else slot.item_id, required_level=required,
-        materials=materials, location_code="GENERAL_STORE", action="upgrade_tool" if operation == "upgrade" else "repair_tool")
+    payload = dict(operation=operation, instance_id=str(slot.instance_id), item_id=slot.item_id, amount=slot.item_amount,
+        remaining=slot.remaining_uses, money=bag.money, current=current, target=target, materials=materials,
+        skill_level=skill_level, account_id=account.pk if account else None)
+    return dict(available=not reason, reason=reason,
+        quote_hash=hashlib.sha256(json.dumps(payload, sort_keys=True).encode()).hexdigest(),
+        gold_cost=gold, materials=materials, material_item_id=materials[0]["item_id"] if materials else None,
+        material_quantity=materials[0]["quantity"] if materials else 0, target_item_id=slot.item_id,
+        current_equipment_level=slot.equipment_level, target_equipment_level=target_level if target else slot.equipment_level,
+        required_level=rule["required_skill_level"] if rule else 1,
+        target_item_name=current["item_name"] if current else None,
+        target_maximum_uses=target["max_durability"] if target else current["max_durability"] if current else None,
+        current_attributes=equipment_attributes(current), target_attributes=equipment_attributes(target if operation == "upgrade" else current),
+        location_code=None, action="upgrade_tool" if operation == "upgrade" else "repair_tool")
 
 
 def tools_overview(player, bag, minute, read_only=False):
-    definitions = {d.item_id: d for d in ItemGameplayDefinition.objects.select_related("item").filter(
-        capability_code__in=["farming", "forestry", "targeted_gathering", "cooking", "hunting_spear", "hunting_bow", "hunting_sword"], item__is_deleted=False)}
+    levels = {s["code"]: s["level"] for s in growth_snapshot(player, read_only=True)["skills"]}
+    slots = list(bag.slots.filter(item_amount__gt=0).order_by("slot_index")) if bag.pk else []
+    materials = {}
+    for source in slots:
+        if _fresh(source, minute):
+            materials[source.item_id] = materials.get(source.item_id, 0) + source.item_amount
+    catalog = equipment_catalog()
+    context = dict(catalog=catalog, levels=levels, materials=materials, items=Item.objects.filter(is_deleted=False).in_bulk(),
+        account=VillageStoreAccount.objects.filter(store_id="GENERAL_STORE").first())
     tools = []
-    for slot in bag.slots.filter(item_id__in=definitions, item_amount__gt=0).order_by("slot_index") if bag.pk else []:
-        definition = definitions[slot.item_id]
-        repair, upgrade = _quote(player, bag, slot, "repair", minute), _quote(player, bag, slot, "upgrade", minute)
+    moves = list(WeaponMove.objects.all())
+    for slot in slots:
+        stats = catalog.get((slot.item_id, slot.equipment_level))
+        if not stats:
+            continue
+        repair, upgrade = _quote(player, bag, slot, "repair", minute, context=context), _quote(player, bag, slot, "upgrade", minute, context=context)
         if read_only:
             for quote in (repair, upgrade):
                 quote.update(available=False, reason="MODE_READ_ONLY")
-        tools.append(dict(instance_id=str(slot.instance_id), item_id=slot.item_id, item_name=definition.item.item_name,
-            capability=definition.capability_code, tier=definition.tier, remaining_uses=slot.remaining_uses,
-            maximum_uses=definition.item.max_use_count, required_level=definition.required_level,
-            usable=_fresh(slot, minute) and type(slot.remaining_uses) is int
-                and 0 < slot.remaining_uses <= definition.item.max_use_count
-                and (not definition.required_skill or _level(player, definition.required_skill) >= definition.required_level),
+        attributes = equipment_attributes(stats)
+        for move in moves:
+            if move.category == stats["category"]:
+                value = f"×{move.multiplier:g}" if move.category != "bow" else f"×{move.minimum_multiplier:g}～{move.multiplier:g}"
+                attributes.append(dict(code="move:" + move.code, label=move.name, value=value))
+        tools.append(dict(instance_id=str(slot.instance_id), item_id=slot.item_id, item_name=stats["item_name"],
+            equipment_level=stats["level"], level=stats["level"], category=stats["category"], advanced=stats["advanced"],
+            gathering_time_reduction=stats["gathering_time_reduction"], gathering_quality_bonus=stats["quality_bonus_chance"],
+            cooking_batches=stats["cooking_batches"], attributes=attributes,
+            capability=stats["capability"], tier=stats["tier"], remaining_uses=slot.remaining_uses,
+            maximum_uses=stats["max_durability"], required_level=stats["required_skill_level"],
+            usable=_fresh(slot, minute) and type(slot.remaining_uses) is int and 0 < slot.remaining_uses <= stats["max_durability"]
+                and (not stats["required_skill"] or levels.get(stats["required_skill"], 1) >= stats["required_skill_level"]),
             repair=repair, upgrade=upgrade))
-    claimed = PlayerMilestoneProgress.objects.filter(player=player, code=AXE_MILESTONE).exists()
-    axe = Item.objects.filter(pk=4104, is_deleted=False).exists()
-    return dict(tools=tools, can_claim_starter_axe=axe and not claimed and not read_only,
-        claim_reason="MODE_READ_ONLY" if read_only else "ALREADY_CLAIMED" if claimed else "AXE_UNAVAILABLE" if not axe else "",
+    return dict(tools=tools, can_claim_starter_axe=False,
+        claim_reason="MODE_READ_ONLY" if read_only else "STARTER_EQUIPMENT_AUTOMATIC",
         shop=[dict(item_id=l.item_id, item_name=l.item_name, listing_id=str(l.pk), unit_price=l.unit_price, stock=l.stock)
               for l in _shop_rows(minute)])
 
 
 def _shop_rows(minute):
     from .lucy_restaurant import store_available
-    for listing in VillageStoreListing.objects.filter(store_id="GENERAL_STORE", item_id__in=STOCK_ITEMS, status="ACTIVE"):
+    for listing in VillageStoreListing.objects.filter(store_id="GENERAL_STORE", item_id__in=[*STOCK_ITEMS, *EquipmentDefinition.objects.filter(enabled=True).values_list("item_id", flat=True)], status="ACTIVE"):
         item = Item.objects.filter(pk=listing.item_id, is_deleted=False).first()
         if not item:
             continue
@@ -214,30 +229,13 @@ def execute_tool_action(player, bag, action, params, rid, clock):
     if bag.player_id != player.pk or bag.character_id != player.username:
         reject("TOOL_NOT_OWNED", "只能整备本人主背包中的工具。")
     if action == "claim_starter_axe":
-        if params:
-            reject("INVALID_PARAMS", "领取基础斧不需要参数。")
-        state = ensure_growth(player)
-        if PlayerMilestoneProgress.objects.filter(player=player, code=AXE_MILESTONE).exists():
-            reject("ALREADY_CLAIMED", "每人只能免费领取一次基础斧，可维修已有工具。")
-        item = Item.objects.filter(pk=4104, is_deleted=False).first()
-        if not item:
-            reject("AXE_UNAVAILABLE", "基础斧目录尚未就绪。")
-        slot = InventorySlot.objects.create(bag=bag, slot_index=_index(bag), item_id=4104, item_amount=1,
-            remaining_uses=item.max_use_count, quality=3, produced_world_minute=clock.world_minute, source_request_id=rid)
-        PlayerMilestoneProgress.objects.create(player=player, code=AXE_MILESTONE, title="领取基础斧",
-            source_type="claim_starter_axe", source_id=str(rid))
-        state.revision += 1
-        state.save(update_fields=["revision"])
-        result = dict(item_id=4104, instance_id=str(slot.instance_id), quantity=1, remaining_uses=slot.remaining_uses)
-        changes = {f"PLAYER:{player.pk}": {"4104": 1}, "source": "G2_ONCE_PER_PLAYER"}
+        reject("STARTER_EQUIPMENT_AUTOMATIC", "初始斧头已随背包发放，无需领取。")
     else:
         if action not in ("repair_tool", "upgrade_tool") or set(params) != {"instance_id", "expected_quote"}:
             reject("INVALID_PARAMS", "工具操作参数无效。")
         slot = InventorySlot.objects.select_for_update().filter(bag=bag, instance_id=_uuid(params["instance_id"]), item_amount__gt=0).first()
         if not slot:
             reject("TOOL_MISSING", "本人背包中没有该工具实例。")
-        if action == "repair_tool" and slot.item_id in HUNTING_WEAPONS and HUNTING_WEAPONS[slot.item_id]["tier"] == 1:
-            reject("FREE_REPAIR_AT_JACK", "基础狩猎武器请到Jack屠宰棚免费整修。")
         quote = _quote(player, bag, slot, "repair" if action == "repair_tool" else "upgrade", clock.world_minute)
         if not isinstance(params["expected_quote"], str) or params["expected_quote"] != quote["quote_hash"]:
             reject("QUOTE_CHANGED", "工具或材料、资金条件已变化，请刷新报价。")
@@ -257,9 +255,12 @@ def execute_tool_action(player, bag, action, params, rid, clock):
                 reject("INSUFFICIENT_MATERIALS", "维修材料已变化。")
         original_item = slot.item_id
         _single_in_place(slot)
-        slot.item_id = quote["target_item_id"]
-        slot.remaining_uses = Item.objects.get(pk=slot.item_id).max_use_count
-        slot.save(update_fields=["item_id", "remaining_uses"])
+        if action == "upgrade_tool":
+            slot.equipment_level = quote["target_equipment_level"]
+            slot.save(update_fields=["equipment_level"])
+        else:
+            slot.remaining_uses = stats_for(slot)["max_durability"]
+            slot.save(update_fields=["remaining_uses"])
         bag.money -= quote["gold_cost"]
         bag._money_change_source = action
         bag.save(update_fields=["money"])
@@ -267,7 +268,7 @@ def execute_tool_action(player, bag, action, params, rid, clock):
         account.account_version += 1
         account.save(update_fields=["balance", "account_version", "updated_at"])
         result = dict(instance_id=str(slot.instance_id), item_id=slot.item_id, previous_item_id=original_item,
-            remaining_uses=slot.remaining_uses, spent_gold=quote["gold_cost"],
+            equipment_level=slot.equipment_level, remaining_uses=slot.remaining_uses, spent_gold=quote["gold_cost"],
             materials_consumed=[dict(item_id=m["item_id"], quantity=m["quantity"]) for m in quote["materials"]])
         changes = {f"PLAYER:{player.pk}": {"money": -quote["gold_cost"], **{str(m["item_id"]): -m["quantity"] for m in quote["materials"]}},
             "STORE:GENERAL_STORE": {"money": quote["gold_cost"]}, "tool": result}
@@ -284,7 +285,7 @@ def ensure_production_catalog(minute):
     if not store or not VillageStoreAccount.objects.filter(store=store).exists():
         return []
     installed = []
-    for item_id in STOCK_ITEMS:
+    for item_id in dict.fromkeys([*STOCK_ITEMS, *EquipmentDefinition.objects.filter(enabled=True).values_list("item_id", flat=True)]):
         marker = uuid.uuid5(uuid.NAMESPACE_URL, "kingdom:g3:cooking-stock:4106:v1" if item_id == 4106
                             else "kingdom:g6:pumpkin-stock:29307:v1" if item_id == PUMPKIN_SEED
                             else f"kingdom:g2:production-stock:{item_id}:v1")
@@ -296,7 +297,7 @@ def ensure_production_catalog(minute):
         listing = VillageStoreListing.objects.create(listing_id=uuid.uuid5(marker, "listing"), store=store,
             item_id=item_id, unit_price=max(1, item.item_price), price_mode="ORIGINAL", status="ACTIVE",
             listed_by_npc=store.operator_npc, created_request_id=marker, listed_world_minute=minute)
-        is_tool = item_id in (4001, 4106)
+        is_tool = EquipmentDefinition.objects.filter(item_id=item_id, enabled=True).exists()
         count = 20 if is_tool else 30
         for index in range(count if is_tool else 1):
             VillageStoreInventorySlot.objects.create(instance_id=uuid.uuid5(marker, str(index)), store=store,

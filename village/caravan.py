@@ -216,12 +216,12 @@ def store_finances(npc_id, store_code=None):
     minute = GlobalGameTimeState.objects.get(pk=1).world_minute
     stock = []
     for slot in VillageStoreInventorySlot.objects.filter(store=account.store, listing__isnull=True, item_amount__gt=0):
-        expired = slot.expires_world_minute is not None and slot.expires_world_minute <= minute
+        expired = False
         stock.append({"instance_id": str(slot.instance_id), "item_id": slot.item_id,
             "item_amount": slot.item_amount, "reserved_amount": slot.reserved_amount,
             "withdrawable_amount": 0 if expired else max(0, slot.item_amount - slot.reserved_amount),
             "expired": expired, "remaining_uses": slot.remaining_uses,
-            "expires_world_minute": slot.expires_world_minute, "item_attributes": slot.item_attributes})
+            "expires_world_minute": None, "item_attributes": slot.item_attributes})
     return {
         "store_code": account.store_id, "balance": account.balance,
         "minimum_operating_balance": account.minimum_operating_balance,
@@ -340,8 +340,7 @@ def handle_withdraw_item(npc_id, params, minute, request_id):
     inventory.asset_version += 1
     inventory.save(update_fields=["asset_version", "updated_at"])
     available = sum(row["withdrawable_amount"] for row in store_finances(npc_id)["unlisted_stock"] if row["item_id"] == item)
-    personal_available = sum(get_available_slot_amount(slot) for slot in inventory.slots.filter(item_id=item)
-        if slot.expires_world_minute is None or slot.expires_world_minute > minute)
+    personal_available = sum(get_available_slot_amount(slot) for slot in inventory.slots.filter(item_id=item))
     return _ok(asset_versions={str(npc_id): inventory.asset_version}, external_delta=0,
         effects={str(npc_id): {str(item): amount}, "STORE:" + store.pk: {str(item): -amount}},
         data={"store_code": store.pk, "item_id": item, "amount": amount, "batches": batches,
@@ -402,10 +401,9 @@ def handle_limits(npc_id, params, minute, request_id):
 
 def available_village_stock(item_id, minute):
     from .phase3_asset_service import get_available_slot_amount
-    live = Q(expires_world_minute__isnull=True) | Q(expires_world_minute__gt=minute)
-    personal = NpcGlobalInventorySlot.objects.filter(live, item_id=item_id, item_amount__gt=0,
+    personal = NpcGlobalInventorySlot.objects.filter( item_id=item_id, item_amount__gt=0,
         bag__npc__is_test_only=False, bag__npc__agent_id__in=[10011, 10012, 10013, 10014, 10015])
-    stored = VillageStoreInventorySlot.objects.filter(live, item_id=item_id, item_amount__gt=0)
+    stored = VillageStoreInventorySlot.objects.filter( item_id=item_id, item_amount__gt=0)
     return sum(get_available_slot_amount(s) for s in personal) + sum(max(0, s.item_amount - s.reserved_amount) for s in stored)
 
 
@@ -482,11 +480,13 @@ def handle_export(npc_id, params, minute, request_id):
     if amount > surplus:
         return _fail("EXPORT_SAFETY_STOCK_REQUIRED", data={"maximum_amount": surplus})
     try:
-        _consume_personal_fefo_available(inventory, item, amount, minute)
+        consumed = _consume_personal_fefo_available(inventory, item, amount, minute)
     except ValueError:
         return _fail("P3_INSUFFICIENT_ITEM")
     price = visit.export_prices[str(item)]
-    income = price * amount
+    from items.quality import item_price
+    catalog_item = Item.objects.get(pk=item)
+    income = sum(item_price(catalog_item, slot.quality, price) * count for slot, count in consumed)
     inventory.money += income
     inventory.asset_version += 1
     inventory.save()
@@ -498,10 +498,8 @@ def handle_export(npc_id, params, minute, request_id):
 
 def consume_unlisted(store, item_id, amount, minute):
     rows = list(VillageStoreInventorySlot.objects.select_for_update().filter(
-        Q(expires_world_minute__isnull=True) | Q(expires_world_minute__gt=minute),
         store=store, listing__isnull=True, item_id=item_id, item_amount__gt=0,
-    ).order_by("expires_world_minute", "produced_world_minute", "instance_id"))
-    rows.sort(key=lambda s: (s.expires_world_minute is None, s.expires_world_minute or 0))
+    ).order_by("quality", "produced_world_minute", "instance_id"))
     if sum(max(0, s.item_amount - s.reserved_amount) for s in rows) < amount:
         raise ValueError("insufficient unlisted store stock")
     consumed = []

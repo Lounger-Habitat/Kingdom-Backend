@@ -101,7 +101,7 @@ class JackProductionTests(ProductionTestBase):
         self.assertEqual(result['result_code'],'OK',result)
         self.assertTrue(commit_economy_action(self.payload(hunt))['replayed'])
         prey=self.jack_inv.slots.get(item_id__in=PREY_ITEM_IDS,item_amount__gt=0)
-        self.assertEqual((prey.item_amount,prey.produced_world_minute,prey.expires_world_minute),(1,705,3585))
+        self.assertEqual((prey.item_amount,prey.produced_world_minute,prey.expires_world_minute),(1,705,None))
         cmd=self.start('PROCESS_GAME',{'prey_instance_id':str(prey.instance_id)})
         self.assertEqual(get_available_slot_amount(prey,705),0)
         result=self.finish(cmd)
@@ -111,7 +111,8 @@ class JackProductionTests(ProductionTestBase):
         for item_id,amount in PREY_RECIPES[prey.item_id]['outputs'].items():
             slot=self.jack_inv.slots.get(item_id=item_id,item_amount__gt=0)
             self.assertEqual(slot.item_amount,amount)
-            self.assertEqual(slot.expires_world_minute,None if item_id in BYPRODUCT_ITEM_IDS else 3585)
+            self.assertIsNone(slot.expires_world_minute)
+            self.assertEqual(slot.quality, prey.quality)
         self.jack_hunt_tool.refresh_from_db();self.assertEqual(self.jack_hunt_tool.remaining_uses,18)
 
     def test_all_animals_processing_and_no_freshness_reset(self):
@@ -197,14 +198,14 @@ class JackProductionTests(ProductionTestBase):
         self.assertEqual(get_available_slot_amount(prey,702),1)
         self.assertEqual(get_available_slot_amount(self.jack_hunt_tool,702),1)
 
-    def test_expiry_mid_process_and_invalid_prey_cannot_produce_byproduct(self):
+    def test_historical_expiry_does_not_cancel_processing(self):
         prey=self.prey(expires=703)
         cmd=self.start('PROCESS_GAME',{'prey_instance_id':str(prey.instance_id)})
         result=self.finish(cmd)
-        self.assertNotEqual(result['result_code'],'OK')
-        prey.refresh_from_db();self.assertEqual(prey.item_amount,1)
-        self.assertFalse(self.jack_inv.slots.filter(item_id__in=BYPRODUCT_ITEM_IDS).exists())
-        self.jack_hunt_tool.refresh_from_db();self.assertEqual(self.jack_hunt_tool.remaining_uses,20)
+        self.assertEqual(result['result_code'],'OK')
+        prey.refresh_from_db();self.assertEqual(prey.item_amount,0)
+        self.assertTrue(self.jack_inv.slots.filter(item_id__in=BYPRODUCT_ITEM_IDS).exists())
+        self.jack_hunt_tool.refresh_from_db();self.assertEqual(self.jack_hunt_tool.remaining_uses,19)
 
     def test_atomic_failure_after_first_output_rolls_back_every_asset(self):
         prey=self.prey();cmd=self.start('PROCESS_GAME',{'prey_instance_id':str(prey.instance_id)})
@@ -266,8 +267,8 @@ class JackProductionTests(ProductionTestBase):
     def test_processing_information_explains_unknown_and_reserved_prey(self):
         p=self.prey();p.produced_world_minute=None;p.save()
         data=production_info(self.jack,700)
-        self.assertFalse(data['prey'][0]['can_process'])
-        self.assertIn('PREY_FRESHNESS_UNKNOWN',data['prey'][0]['blocked_reasons'])
+        self.assertTrue(data['prey'][0]['can_process'])
+        self.assertEqual(data['prey'][0]['blocked_reasons'], [])
 
     def test_invalid_processing_params_and_wrong_role_are_rejected_at_accept(self):
         for params in ({'prey_instance_id':'29101'},{'prey_instance_id':str(uuid.uuid4()),'amount':99}):

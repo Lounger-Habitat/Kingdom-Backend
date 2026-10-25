@@ -16,6 +16,23 @@ def cooperation_score(player, npc_id):
     return VillagePlayerNpcRelationship.objects.filter(player=player, npc__agent_id=str(npc_id)).values_list("score", flat=True).first() or 0
 
 
+def decorate_commission_rewards(commissions, player, summary):
+    """Pure reward preview; completed orders show their actual cooperation gain."""
+    from player.progression_rules import BUSINESS_ORDER_XP
+    from .models import VillagePlayerNpcRelationshipChange
+    relationships = {row["npc_id"]: row for row in summary["npcs"]}
+    earned = {str(key): value for key, value in VillagePlayerNpcRelationshipChange.objects.filter(
+        relationship__player=player, commission_id__in=[row["commission_id"] for row in commissions])
+        .values_list("commission_id", "applied_delta")}
+    for row in commissions:
+        row["reward_business_xp"] = BUSINESS_ORDER_XP
+        relation = relationships.get(str(row["publisher_npc_id"]))
+        gain = min(COMPLETION_GAIN, relation["daily_gain_remaining"], 100 - relation["score"]) if relation else 0
+        row["reward_cooperation"] = earned.get(row["commission_id"], 0) if row["status"] == "COMPLETED" else (
+            gain if row["status"] in {"OPEN", "ACTIVE"} else 0)
+        row["reward_cooperation_capped"] = bool(relation and not gain and row["status"] in {"OPEN", "ACTIVE"})
+
+
 def record_commission_completion(row, minute):
     """Called inside the existing successful commission transaction, never on reads."""
     if (row.status != "COMPLETED" or row.actor_type != "PLAYER"

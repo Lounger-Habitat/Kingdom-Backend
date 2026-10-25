@@ -39,7 +39,7 @@ class InventorySlotInline(admin.TabularInline):
     model = InventorySlot
     form = BatchComponentForm
     extra = 0
-    fields = ["slot_index", "item_id", "item_amount", "quality", "rated", "rating_price", "overall_score", "ingredient", "item_bag_name", "cook_time", "hide_in_shop", "remaining_uses"]
+    fields = ["slot_index", "item_id", "item_amount", "quality", "rated", "rating_price", "overall_score", "ingredient", "item_bag_name", "cook_time", "hide_in_shop", "remaining_uses", "equipment_level"]
     ordering = ["slot_index"]
 
 
@@ -196,7 +196,7 @@ class NpcGlobalInventorySlotInline(admin.TabularInline):
     model = NpcGlobalInventorySlot
     form = BatchComponentForm
     extra = 0
-    fields = ["slot_index", "item_id", "item_amount", "quality", "rated", "rating_price", "overall_score", "ingredient", "item_bag_name", "cook_time", "hide_in_shop", "remaining_uses"]
+    fields = ["slot_index", "item_id", "item_amount", "quality", "rated", "rating_price", "overall_score", "ingredient", "item_bag_name", "cook_time", "hide_in_shop", "remaining_uses", "equipment_level"]
     ordering = ["slot_index"]
 
     @staticmethod

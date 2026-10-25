@@ -436,47 +436,9 @@ def _expire_orders_and_deliveries(day_end_minute: int) -> Dict[str, Any]:
 
 
 def _spoil_food(day_end_minute: int) -> Tuple[Dict[str, Any], int]:
-    """Delete/spoil food items where expires_world_minute <= day_end_minute
-    and not reserved by an ACTIVE delivery.
+    """Quality-only inventory does not spoil; retain the day-close receipt shape."""
+    return {"items_spoiled": [], "count": 0}, 0
 
-    Returns (result_dict, external_delta) where external_delta is always 0.
-    """
-    from .phase3_asset_service import get_available_slot_amount
-
-    # Find all food slots that expire within the day
-    food_slots = NpcGlobalInventorySlot.objects.select_for_update().filter(
-        expires_world_minute__isnull=False,
-        expires_world_minute__lte=day_end_minute,
-        item_amount__gt=0,
-    )
-
-    items_spoiled: List[Dict[str, Any]] = []
-    total_spoiled = 0
-
-    for slot in food_slots:
-        # Check if reserved by ACTIVE delivery
-        reserved = (
-            NpcTradeDelivery.objects.filter(
-                seller_slot_instance_id=slot.instance_id,
-                status=DeliveryStatus.ACTIVE,
-            ).aggregate(total=models.Sum("reserved_amount"))["total"]
-            or 0
-        )
-        spoilable = max(0, slot.item_amount - reserved)
-        if spoilable > 0:
-            items_spoiled.append({
-                "item_id": slot.item_id,
-                "amount": spoilable,
-                "instance_id": str(slot.instance_id),
-            })
-            slot.item_amount = reserved  # keep only reserved portion
-            if slot.item_amount <= 0:
-                slot.delete()
-            else:
-                slot.save(update_fields=["item_amount"])
-            total_spoiled += spoilable
-
-    return {"items_spoiled": items_spoiled, "count": total_spoiled}, 0
 
 
 def _get_available_dish_count_with_expiry(day_end_minute: int) -> int:

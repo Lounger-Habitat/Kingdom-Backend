@@ -9,13 +9,14 @@ from django.test.utils import CaptureQueriesContext
 from django.utils import timezone
 from inventory.models import InventorySlot, NpcDefinition, NpcGlobalInventory, NpcGlobalInventorySlot
 from items.models import Item
+from items.quality import quality_price
 from player.mastery import mastery_overview
 from player.models import (PlayerMasteryChallenge, PlayerSkillProgress, PlayerState, PlayerTitle,
     SkillRewardReceipt, PlayerCombatReceipt, PlayerHuntingState)
 from village.advanced_gathering import professional_resource_overview
 from village.forestry import execute as forestry
 from village.models import (VillageFarmPlot, VillageGatheringResourceState, VillageTreeNode,
-    VillageWildlife, VillageStore, VillageStoreAccount, NpcRuntimeState, VillageActionDurationConfig)
+    VillageWildlife, VillageStore, VillageStoreAccount, NpcRuntimeState, VillageActionDurationConfig, EconomicLedgerEntry)
 from village.player_cooking import preview_cooking, cooking_overview
 from village.player_hunting import execute_combat
 from village.player_processing import execute_processing_action, settle_processing_jobs
@@ -44,7 +45,9 @@ class ProfessionalGrowthTests(PlayerFixture, TestCase):
 
     def tool(self, item_id, uses=100, bag=None):
         bag = bag or self.bag_a
-        return InventorySlot.objects.create(bag=bag, slot_index=bag.slots.count(), item_id=item_id, item_amount=1, remaining_uses=uses)
+        aliases = {4120: 4102, 4121: 4103, 4122: 4105, 4123: 4107, 4124: 4111, 4125: 4113}
+        return InventorySlot.objects.create(bag=bag, slot_index=bag.slots.count(), item_id=aliases.get(item_id, item_id),
+            item_amount=1, remaining_uses=uses, equipment_level=5 if item_id in aliases else 1)
 
     def mastery(self, skill="gathering"):
         return next(c for c in mastery_overview(self.a, self.bag_a, self.clock.world_minute)["challenges"] if c["skill_code"] == skill)
@@ -54,8 +57,9 @@ class ProfessionalGrowthTests(PlayerFixture, TestCase):
         self.assertTrue(result["success"], result)
 
     def collect(self, collect_type, tool, rid=None):
-        return self.run_action("collect", dict(collect_type=collect_type, tool_instance_id=str(tool.instance_id)),
-                               location="DEEP_FOREST", rid=rid)
+        with patch("village.player_actions.production_quality", return_value=4):
+            return self.run_action("collect", dict(collect_type=collect_type, tool_instance_id=str(tool.instance_id)),
+                                   location="DEEP_FOREST", rid=rid)
 
     def test_professional_overview_and_virtual_resource_restore_never_write(self):
         self.level("gathering")
@@ -73,27 +77,28 @@ class ProfessionalGrowthTests(PlayerFixture, TestCase):
         self.level("hunting")
         self.bag_a.money = 500; self.bag_a.save(update_fields=["money"])
         bow = self.tool(4113, 8)
-        for key, count in [(29306, 4), (29105, 2), (29104, 4), (29311, 1)]:
+        bow.equipment_level = 4; bow.save(update_fields=["equipment_level"])
+        for key, count in [(1002, 13), (29306, 4), (29105, 2), (29104, 4), (29311, 1)]:
             self.slot(count, item_id=key, quality=4, expires_world_minute=None)
         def quote(kind):
             return next(t for t in tools_overview(self.a, self.bag_a, 100)["tools"] if t["instance_id"] == str(bow.instance_id))[kind]
         upgrade = quote("upgrade")
         self.assertTrue(upgrade["available"], upgrade)
-        self.assertEqual([(m["item_id"], m["quantity"]) for m in upgrade["materials"]], [(29306, 4), (29105, 2), (29104, 4)])
+        self.assertEqual([(m["item_id"], m["quantity"]) for m in upgrade["materials"]], [(1002, 12), (29306, 4)])
         original = bow.instance_id
         execute_tool_action(self.a, self.bag_a, "upgrade_tool", dict(instance_id=str(original), expected_quote=upgrade["quote_hash"]), uuid.uuid4(), self.clock)
         bow.refresh_from_db(); self.bag_a.refresh_from_db(); self.store_account.refresh_from_db()
-        self.assertEqual((bow.instance_id, bow.item_id, bow.remaining_uses, self.bag_a.money, self.store_account.balance), (original, 4125, 180, 300, 700))
+        self.assertEqual((bow.instance_id, bow.item_id, bow.remaining_uses, self.bag_a.money, self.store_account.balance), (original, 4113, 8, 225, 775))
         bow.remaining_uses = 1; bow.save(update_fields=["remaining_uses"])
         repair = quote("repair")
-        self.assertEqual((repair["gold_cost"], repair["materials"][0]["item_id"]), (25, 29311))
+        self.assertEqual((repair["gold_cost"], repair["materials"][0]["item_id"]), (15, 1002))
         with self.assertRaises(RuntimeError), transaction.atomic():
             execute_tool_action(self.a, self.bag_a, "repair_tool", dict(instance_id=str(original), expected_quote=repair["quote_hash"]), uuid.uuid4(), self.clock)
             raise RuntimeError("rollback")
         self.bag_a.refresh_from_db(); bow.refresh_from_db()
-        self.assertEqual((self.bag_a.money, bow.remaining_uses, self.bag_a.slots.get(item_id=29311).item_amount), (300, 1, 1))
+        self.assertEqual((self.bag_a.money, bow.remaining_uses, self.bag_a.slots.get(item_id=29311).item_amount), (225, 1, 1))
         execute_tool_action(self.a, self.bag_a, "repair_tool", dict(instance_id=str(original), expected_quote=repair["quote_hash"]), uuid.uuid4(), self.clock)
-        self.bag_a.refresh_from_db(); self.assertEqual(self.bag_a.money, 275)
+        self.bag_a.refresh_from_db(); self.assertEqual(self.bag_a.money, 210)
         ensure_production_catalog(100); ensure_production_catalog(100)
         self.assertEqual(sum(s.item_amount for s in VillageStore.objects.get(pk="GENERAL_STORE").inventory_slots.filter(item_id=29307)), 30)
 
@@ -120,7 +125,8 @@ class ProfessionalGrowthTests(PlayerFixture, TestCase):
             self.assertTrue(self.collect(collect_type, tool)["success"])
         self.assertEqual(VillageGatheringResourceState.objects.count(), 3)
 
-    def test_pumpkin_frozen_batch_and_real_harvest_proof(self):
+    @patch("village.player_farm.production_quality", return_value=4)
+    def test_pumpkin_frozen_batch_and_real_harvest_proof(self, quality_roll):
         self.level("farming")
         self.start("farming")
         tool = self.tool(4121)
@@ -137,8 +143,8 @@ class ProfessionalGrowthTests(PlayerFixture, TestCase):
             expected_batch_id=str(plot.batch_id), tool_instance_id=str(tool.instance_id)), location="BILL_FARM")
         self.assertTrue(result["success"], result)
         output = self.bag_a.slots.get(item_id=1001)
-        self.assertTrue(6 <= output.item_amount <= 8)
-        self.assertEqual(output.expires_world_minute, self.clock.world_minute+5760)
+        self.assertTrue(6 <= output.item_amount <= 9)
+        self.assertIsNone(output.expires_world_minute)
         proof = SkillRewardReceipt.objects.get(player=self.a, source_type="farm_harvest").result["facts"]
         self.assertEqual((proof["tool_tier"], proof["outputs"][0]["instance_id"]), (3, str(output.instance_id)))
         requirements = self.mastery("farming")["requirements"]
@@ -168,7 +174,8 @@ class ProfessionalGrowthTests(PlayerFixture, TestCase):
         self.assertTrue(second["success"], second)
         self.assertTrue(self.mastery("forestry")["can_contribute"])
 
-    def test_five_professional_cooking_batches_need_t3_and_leave_trusted_exact_output(self):
+    @patch("village.player_cooking.cooking_quality", return_value=4)
+    def test_five_professional_cooking_batches_need_t3_and_leave_trusted_exact_output(self, quality_roll):
         self.level("cooking")
         self.start("cooking")
         tool = self.tool(4123)
@@ -185,8 +192,9 @@ class ProfessionalGrowthTests(PlayerFixture, TestCase):
         params["expected_quote"] = preview["quote_hash"]
         result = self.run_action("cook_dish", params, location="RESTAURANT")
         self.assertTrue(result["success"], result)
-        dish = self.bag_a.slots.get(item_id=29206)
-        self.assertEqual((dish.item_amount, dish.expires_world_minute), (15, 2000))
+        dishes = self.bag_a.slots.filter(item_id=29206)
+        dish = dishes.first()
+        self.assertEqual((sum(row.item_amount for row in dishes), dish.expires_world_minute), (15, None))
         self.assertGreaterEqual(dish.quality, 4)
         tool.refresh_from_db(); self.assertEqual(tool.remaining_uses, 95)
         facts = SkillRewardReceipt.objects.get(player=self.a, source_type="player_cooking").result["facts"]
@@ -247,7 +255,7 @@ class ProfessionalGrowthTests(PlayerFixture, TestCase):
         self.assertTrue(result["success"], result)
         for item_id in [29308, 29309, 29310]:
             sample = nora.slots.get(item_id=item_id)
-            self.assertEqual((sample.item_amount, sample.expires_world_minute), (1, 2980))
+            self.assertEqual((sample.item_amount, sample.expires_world_minute), (1, None))
             self.assertEqual(self.bag_a.slots.get(item_id=item_id).item_amount, 1)
         self.assertTrue(self.mastery()["can_claim"])
         claimed = self.run_action("claim_mastery", dict(skill_code="gathering"))
@@ -258,7 +266,9 @@ class ProfessionalGrowthTests(PlayerFixture, TestCase):
                                timezone.now().timestamp(), delta=5)
         self.assertEqual(PlayerMasteryChallenge.objects.get(player=self.a).claimed_world_minute, self.clock.world_minute)
         self.assertEqual(self.run_action("claim_mastery", dict(skill_code="gathering"))["result_code"], "ALREADY_CLAIMED")
-        self.bag_a.refresh_from_db(); self.assertEqual(self.bag_a.money, money)
+        self.bag_a.refresh_from_db()
+        introductory_gold = sum(EconomicLedgerEntry.objects.filter(entry_type="STARTER_GOAL_REWARD", changes__player_id=str(self.a.pk)).values_list("external_delta", flat=True))
+        self.assertEqual(self.bag_a.money, money + introductory_gold)
 
     def test_mastery_rejects_purchased_or_old_missing_proofs(self):
         self.level("gathering", 5780)
@@ -301,7 +311,7 @@ class ProfessionalGrowthTests(PlayerFixture, TestCase):
         self.clock.world_minute = 105; self.clock.save()
         settle_processing_jobs(105)
         claimed = execute_processing_action(self.a, self.bag_a, "claim_game_processing", dict(job_id=job["job_id"]), uuid.uuid4(), self.clock)
-        self.assertEqual(self.bag_a.slots.get(item_id=1057, item_amount=4).expires_world_minute, 2980)
+        self.assertIsNone(self.bag_a.slots.get(item_id=1057, item_amount=4).expires_world_minute)
         view = self.mastery("hunting")
         self.assertEqual(view["requirements"][0]["current_quantity"], 1)
         self.assertFalse(view["can_claim"])
@@ -326,8 +336,9 @@ class ProfessionalGrowthTests(PlayerFixture, TestCase):
         purchased = self.run_action("buy_marketplace", dict(listing_id=str(listing.pk), quantity=3, expected_unit_price=7), location="MARKET_STREET")
         self.assertTrue(purchased["success"], purchased.get("result_code"))
         received = purchased["data"]["result"]["purchased_batches"][0]["instance_id"]
-        self.assertTrue(self.run_action("open_player_stall", location="RESTAURANT")["success"])
-        self.assertTrue(self.run_action("list_stall_dish", dict(instance_id=received, quantity=3), location="RESTAURANT")["success"])
+        opened = self.run_action("open_player_stall", location="PLAYER_STALL")
+        self.assertTrue(opened["success"], opened.get("result_code"))
+        self.assertTrue(self.run_action("list_stall_dish", dict(instance_id=received, quantity=3), location="PLAYER_STALL")["success"])
         hourly = RestaurantHourlySlot.objects.create(player=self.a, game_year=1, game_month=1, game_day=1, game_hour=10, quota=3)
         RestaurantSaleEvent.objects.bulk_create([RestaurantSaleEvent(slot=hourly, scheduled_minute=m) for m in (5,6,7)])
         self.clock.apply_world_minute(607); self.clock.save()
@@ -374,7 +385,7 @@ class ProfessionalGrowthTests(PlayerFixture, TestCase):
             sold = caravan.handle_export("10015", dict(item_id=29311, amount=2), 2100, uuid.uuid4())
         self.assertEqual(sold["result_code"], "OK", sold)
         stock.refresh_from_db(); nora.refresh_from_db(); visit.refresh_from_db()
-        self.assertEqual((stock.item_amount, visit.exported_amount, nora.money-before), (0, 2, 2*visit.export_prices["29311"]))
+        self.assertEqual((stock.item_amount, visit.exported_amount, nora.money-before), (0, 2, 2*quality_price(visit.export_prices["29311"], 4)))
         config.caravan_item_ids, config.caravan_export_item_ids = [], []
         config.save()
         migration.install(apps, SimpleNamespace(connection=connection))

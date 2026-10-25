@@ -1,7 +1,7 @@
 import copy
 import uuid
 
-from django.db import connection
+from django.db import connection, transaction
 from django.test import TestCase
 from django.test.utils import CaptureQueriesContext
 
@@ -9,7 +9,7 @@ from inventory.components import same_batch_attributes
 from inventory.models import CollectionPoint, CollectionPointLevel, CollectionPointLevelItem, InventorySlot
 from player.models import PlayerGrowthState, PlayerMilestoneProgress, PlayerSkillProgress, SkillRewardReceipt
 from player.starter import (post_action_progress, record_order_completion, starter_overview,
-                            track_goal, StarterError)
+                            track_goal, StarterError, GOAL_GOLD, _award_goal_rewards)
 from village.models import (EconomicLedgerEntry, StarterReserveTransfer, StarterSupplyBatch,
                             StarterSupplyOrder, VillageAccount)
 from village.starter_supply import (BATCH_CODE, SupplyError, ensure_supply_batch, execute_supply,
@@ -42,6 +42,57 @@ class StarterSupplyTests(PlayerFixture, TestCase):
         with self.assertRaises(SupplyError) as caught:
             fn()
         self.assertEqual(caught.exception.code, code)
+
+    def test_legacy_goal_rewards_are_visible_read_only_and_paid_once_per_player(self):
+        for code in GOAL_GOLD:
+            PlayerMilestoneProgress.objects.create(player=self.a, code=code, title=code,
+                source_type="historical_action", source_id=str(uuid.uuid4()))
+        before = starter_overview(self.a, self.bag_a, 100)
+        self.assertEqual({row["code"]: row["reward_gold"] for row in before["goals"]}, GOAL_GOLD)
+        self.assertTrue(all(row["reward_claimable"] for row in before["goals"]))
+        read_only = starter_overview(self.a, self.bag_a, 100, read_only=True)
+        self.assertFalse(any(row["reward_claimable"] for row in read_only["goals"]))
+        self.bag_a.refresh_from_db(); self.assertEqual(self.bag_a.money, 100)
+        payload = self.payload("claim_goal_rewards")
+        from village.player_actions import execute_player_action
+        first = execute_player_action(payload)
+        self.assertTrue(first["success"], first)
+        self.assertEqual(sum(row["earned_gold"] for row in first["data"]["result"]["starter_rewards"]), 70)
+        self.assertEqual(first, execute_player_action(copy.deepcopy(payload)))
+        self.assertEqual(self.run_action("claim_goal_rewards")["data"]["result"]["starter_rewards"], [])
+        self.bag_a.refresh_from_db(); self.assertEqual(self.bag_a.money, 170)
+        self.assertTrue(all(row["reward_claimed"] for row in starter_overview(self.a, self.bag_a, 100)["goals"]))
+        entries = EconomicLedgerEntry.objects.filter(entry_type="STARTER_GOAL_REWARD")
+        self.assertEqual(entries.count(), 5)
+        self.assertEqual(sum(entries.values_list("external_delta", flat=True)), 70)
+        self.fund.refresh_from_db(); self.assertEqual(self.fund.balance, 1000)
+        self.assertEqual(self.run_action("claim_goal_rewards", player=self.b)["data"]["result"]["starter_rewards"], [])
+        self.assertEqual(self.run_action("claim_goal_rewards", {"gold": 999})["result_code"], "INVALID_PARAMS")
+        denied = self.payload("claim_goal_rewards"); denied["read_only"] = True
+        self.assertEqual(execute_player_action(denied)["result_code"], "MODE_READ_ONLY")
+
+    def test_reward_gold_and_ledger_roll_back_with_the_enclosing_action(self):
+        PlayerMilestoneProgress.objects.create(player=self.a, code="first_gathering", title="第一次采集",
+            source_type="collect", source_id=str(uuid.uuid4()))
+        with self.assertRaises(RuntimeError):
+            with transaction.atomic():
+                self.assertEqual(_award_goal_rewards(self.a, ["first_gathering"], 100)[0]["earned_gold"], 10)
+                raise RuntimeError("later settlement failed")
+        self.bag_a.refresh_from_db(); self.assertEqual(self.bag_a.money, 100)
+        self.assertFalse(EconomicLedgerEntry.objects.filter(entry_type="STARTER_GOAL_REWARD").exists())
+
+    def test_commission_reward_preview_uses_actual_cooperation_and_daily_cap(self):
+        for _ in range(2):
+            commission = self.commission(quantity=1)
+            self.fresh_slot(quantity=1)
+            result = self.run_action("commission_contribute", self.delivery_params(commission, 1))
+            self.assertTrue(result["success"], result)
+            completed = next(row for row in result["data"]["overview"]["my_commissions"] if row["commission_id"] == commission)
+            self.assertEqual((completed["reward_business_xp"], completed["reward_cooperation"]), (20, 2))
+        available_id = self.commission(quantity=1, accept=False)
+        available = next(row for row in self.run_action("overview")["data"]["overview"]["commissions"] if row["commission_id"] == available_id)
+        self.assertEqual(available["reward_cooperation"], 0)
+        self.assertTrue(available["reward_cooperation_capped"])
 
     def test_views_never_create_campaign_money_or_growth(self):
         with CaptureQueriesContext(connection) as queries:

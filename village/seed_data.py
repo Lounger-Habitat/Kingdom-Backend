@@ -109,6 +109,7 @@ NPC_SEEDS = [
 LOCATION_SEEDS = [
     ("VILLAGE_SQUARE", "村庄广场", (0, 0, 0), "public", 20),
     ("MARKET_STREET", "市场街", (12, 0, -4), "market", 16),
+    ("PLAYER_STALL", "集市摊位", (29, 0, -3.8), "market", 3),
     ("RESTAURANT", "Lucy 饭店", (-3, 0, 19), "home_work", 12),
     ("RECORD_HALL", "Mark 品鉴处与议事厅", (-22, 0, 11), "home_work", 12),
     ("GENERAL_STORE", "Nora 杂货铺", (21, 0, 11), "home_work", 8),

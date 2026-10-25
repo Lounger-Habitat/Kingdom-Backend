@@ -1,7 +1,7 @@
 import uuid
 
 from django.core.exceptions import ValidationError
-from django.db import models
+from django.db import models, transaction
 from inventory.components import BatchComponents, UsageFields, DishFields, ReviewFields
 
 from .phase3_contract import (
@@ -1486,7 +1486,11 @@ class VillageStoreInventorySlot(BatchComponents):
             if name != "remaining_uses":
                 setattr(self, name, value.get(name, default))
 
+    @transaction.atomic
     def save(self, *args, **kwargs):
+        if self._state.adding and self.listing_id and self.item_amount > 0:
+            from .store_quality import assign_listing
+            assign_listing(self)
         if kwargs.get("update_fields") is not None and "item_attributes" in kwargs["update_fields"]:
             from inventory.components import COMPONENT_FIELDS
             kwargs["update_fields"] = (set(kwargs["update_fields"]) - {"item_attributes"}) | {"common_attributes", "quality"} | (COMPONENT_FIELDS.keys() - {"remaining_uses"})
@@ -1511,6 +1515,7 @@ class VillageStoreInventorySlot(BatchComponents):
 
 
 class VillageStoreListing(models.Model):
+    quality = models.IntegerField(default=3)
     public_meal_code = models.CharField(max_length=2, blank=True, default="")
     subsidy_decision = models.ForeignKey("VillagePublicDecision", null=True, blank=True, on_delete=models.PROTECT)
     """A store's authoritative price listing for one item/price tier."""
@@ -2462,6 +2467,21 @@ class StarterReserveTransfer(models.Model):
         verbose_name_plural = "公共储备支用记录"
 
 
+class VillagePlantNode(models.Model):
+    """One shared plant; a projection never creates or restores this row."""
+    node_id = models.UUIDField(primary_key=True)
+    ready_world_minute = models.PositiveBigIntegerField(default=0)
+    revision = models.PositiveBigIntegerField(default=0)
+
+
+class VillagePlayerGathering(models.Model):
+    player = models.OneToOneField("account.GameAccount", on_delete=models.CASCADE)
+    equipped_instance_id = models.UUIDField(null=True, blank=True)
+    # Frozen server quote, including owner session, tool, deadline and node revision.
+    attempt = models.JSONField(default=dict)
+    revision = models.PositiveBigIntegerField(default=0)
+
+
 class VillageGatheringResourceState(models.Model):
     code = models.CharField(max_length=40, primary_key=True)
     remaining_quantity = models.PositiveIntegerField(default=120)
@@ -2478,13 +2498,14 @@ class VillagePlayerProcessingJob(models.Model):
     job_id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
     player = models.ForeignKey("account.GameAccount", on_delete=models.PROTECT)
     request_id = models.UUIDField(unique=True)
+    submitted_at = models.DateTimeField(auto_now_add=True)
     escrow_bag = models.OneToOneField("inventory.InventoryBag", on_delete=models.PROTECT)
     input_slot = models.ForeignKey("inventory.InventorySlot", on_delete=models.PROTECT)
     source_instance_id = models.UUIDField()
     input_snapshot = models.JSONField(default=dict)
     output_spec = models.JSONField(default=dict)
     output_snapshot = models.JSONField(default=list)
-    tool_instance_id = models.UUIDField()
+    tool_instance_id = models.UUIDField(null=True, blank=True)
     fee_gold = models.PositiveIntegerField()
     duration_minutes = models.PositiveIntegerField()
     status = models.CharField(max_length=16, default="RUNNING")
@@ -2497,7 +2518,6 @@ class VillagePlayerProcessingJob(models.Model):
 
     class Meta:
         constraints = [
-            models.UniqueConstraint(fields=["player"], condition=models.Q(status__in=["RUNNING", "READY", "FAILED"]), name="processing_one_unfinished_player"),
             models.UniqueConstraint(fields=["status"], condition=models.Q(status="RUNNING"), name="processing_one_jack_job"),
         ]
 

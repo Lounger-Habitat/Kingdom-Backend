@@ -46,14 +46,14 @@ class StarterLoopTests(TestCase):
         self.assertEqual(accepted["data"]["result"]["earned_gold"], 54)
         self.assertEqual(accepted["data"]["result"]["growth_rewards"][0]["xp_gained"], 20)
         self.bag.refresh_from_db()
-        self.assertEqual(self.bag.money, 254)
+        self.assertEqual(self.bag.money, 279)  # Initial funds + order + first gathering/supply goals.
         shop = accepted["data"]["overview"]["starter"]["gathering"]["tool_shop"]
         bought, purchase = self.act("buy_store", dict(listing_id=shop["listing_id"],
             quantity=1, expected_unit_price=shop["unit_price"]), "GENERAL_STORE")
         self.assertEqual(bought, execute_player_action(copy.deepcopy(purchase)))
         tool_id = bought["data"]["result"]["purchased_batches"][0]["instance_id"]
         self.bag.refresh_from_db()
-        self.assertEqual(self.bag.money, 204)
+        self.assertEqual(self.bag.money, 239)  # Tool costs 50; its one-time goal returns 10.
         for _ in range(5):
             latest, _ = self.act("collect", {"collect_type": "采集食材"}, "FOREST_EDGE")
         self.assertEqual(latest["data"]["overview"]["growth"]["skills"][0]["level"], 2)
@@ -66,6 +66,10 @@ class StarterLoopTests(TestCase):
         self.assertEqual(PlayerState.objects.get(player_id=str(self.player.pk)).action_points, 95)
         goals = {row["code"]: row["completed"] for row in targeted["data"]["overview"]["starter"]["goals"]}
         self.assertTrue(all(goals.values()), goals)
+        self.bag.refresh_from_db()
+        self.assertEqual(self.bag.money, 274)  # 200 + 54 - 50 + all five goals (70).
+        self.assertEqual(EconomicLedgerEntry.objects.filter(entry_type="STARTER_GOAL_REWARD").count(), 5)
+        self.assertTrue(all(row["reward_claimed"] for row in targeted["data"]["overview"]["starter"]["goals"]))
         self.assertTrue(targeted["data"]["overview"]["starter"]["supply"]["completed_personal"])
 
     def test_expired_order_maintenance_runs_from_world_time_without_a_player_click(self):

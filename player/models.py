@@ -114,6 +114,36 @@ class PlayerGrowthState(models.Model):
         verbose_name_plural = "玩家成长档案"
 
 
+class PlayerTutorialState(models.Model):
+    """Account-owned teaching progress; never a source of money or skill XP."""
+    player = models.OneToOneField(GameAccount, on_delete=models.CASCADE, related_name="tutorial_state")
+    version = models.PositiveIntegerField(default=1)
+    revision = models.PositiveBigIntegerField(default=0)
+    started = models.BooleanField(default=False)
+    paused = models.BooleanField(default=False)
+    route_code = models.CharField(max_length=20, default="basics")
+    evidence = models.JSONField(default=dict, blank=True)
+    completed = models.JSONField(default=dict, blank=True)
+
+    class Meta:
+        verbose_name = "玩家教学进度"
+        verbose_name_plural = "玩家教学进度"
+
+
+class PlayerArrivalState(models.Model):
+    """One-off personal arrival, independent of teaching and shared bed leases."""
+    player = models.OneToOneField(GameAccount, on_delete=models.CASCADE, related_name="arrival_state")
+    eligible = models.BooleanField(default=False)
+    revision = models.PositiveBigIntegerField(default=0)
+    started_at = models.DateTimeField(null=True, blank=True)
+    finished_at = models.DateTimeField(null=True, blank=True)
+    finish_reason = models.CharField(max_length=20, default="", blank=True)
+
+    class Meta:
+        verbose_name = "玩家入村开场"
+        verbose_name_plural = "玩家入村开场"
+
+
 class PlayerSkillProgress(models.Model):
     from .progression_rules import SKILLS
 
@@ -221,3 +251,6 @@ class PlayerMasteryChallenge(models.Model):
 
     class Meta:
         constraints = [models.UniqueConstraint(fields=["player", "skill_code"], name="player_mastery_skill_unique")]
+
+
+from .equipment_models import EquipmentDefinition, EquipmentLevel, WeaponMove  # noqa: E402,F401

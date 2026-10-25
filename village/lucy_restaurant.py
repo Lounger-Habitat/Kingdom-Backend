@@ -100,8 +100,6 @@ def public_meal_availability(npc, minute, recipes, inventory):
 
 
 def store_available(slot, minute):
-    if (slot.item_attributes or {}).get("freshness_unknown") or (slot.expires_world_minute is not None and slot.expires_world_minute <= minute):
-        return 0
     return max(0, slot.item_amount - slot.reserved_amount)
 
 

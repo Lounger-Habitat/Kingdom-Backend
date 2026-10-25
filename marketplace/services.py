@@ -35,7 +35,7 @@ def _listing_batch(listing):
                  "rated": listing.rated, "ratingPrice": listing.rating_price,
                  "overallScore": listing.overall_score, "ingredient": listing.ingredient,
                  "cookTime": listing.cook_time, "dishQuality": listing.dish_quality,
-                 "remainingUses": listing.remaining_uses, "reviewComment": listing.review_comment,
+                 "equipmentLevel": listing.equipment_level, "remainingUses": listing.remaining_uses, "reviewComment": listing.review_comment,
                  "dishMetadata": listing.dish_metadata, "itemBagName": listing.item_bag_name})
     if listing.source_type == MarketListingSource.NPC and "batchMetadataVersion" not in snap:
         from village.phase3_catalog import CORN_OUTPUT_ITEM_ID, HUNT_MEAT_ITEM_IDS, PREY_ITEM_IDS, RECIPE_WHITELIST
@@ -167,6 +167,7 @@ def clear_slot_if_empty(slot):
         slot.dish_quality = 3
         slot.hide_in_shop = False
         slot.remaining_uses = None
+        slot.equipment_level = 1
         slot.review_comment = ""
         _apply_batch(slot, {})
         update_fields = [
@@ -181,7 +182,7 @@ def clear_slot_if_empty(slot):
             "cook_time",
             "dish_quality",
             "hide_in_shop",
-            "remaining_uses",
+            "remaining_uses", "equipment_level",
             "review_comment", "produced_world_minute", "expires_world_minute", "freshness_unknown", "dish_metadata",
         ]
         update_fields.append("source_request_id")
@@ -202,7 +203,7 @@ def snapshot_slot(slot):
         "cookTime": slot.cook_time,
         "dishQuality": slot.dish_quality,
         "hideInShop": slot.hide_in_shop,
-        "remainingUses": slot.remaining_uses,
+        "equipmentLevel": slot.equipment_level, "remainingUses": slot.remaining_uses,
         "reviewComment": slot.review_comment,
         "batchMetadataVersion": 1,
         "producedWorldMinute": slot.produced_world_minute,
@@ -341,6 +342,7 @@ def _return_items_to_bag(bag, listing, amount):
     slot.cook_time = listing.cook_time
     slot.dish_quality = listing.dish_quality
     slot.remaining_uses = listing.remaining_uses
+    slot.equipment_level = listing.equipment_level
     slot.review_comment = listing.review_comment
     _apply_batch(slot, snap)
     slot.save()
@@ -372,6 +374,7 @@ def _add_snapshot_item_to_bag(bag, snap, amount):
     slot.cook_time = snap.get("cookTime", 0)
     slot.dish_quality = snap.get("dishQuality", 3)
     slot.hide_in_shop = False
+    slot.equipment_level = snap.get("equipmentLevel", 1)
     slot.remaining_uses = snap.get("remainingUses")
     slot.review_comment = snap.get("reviewComment", "")
     _apply_batch(slot, snap)
@@ -468,10 +471,6 @@ def _create_listing_for_owner(owner, instance_id, amount, price, *, expected_ass
         return None, "价格必须大于0"
     if slot.item_amount < amount:
         return None, "物品数量不足"
-    if slot.freshness_unknown:
-        return None, "物品保质期来源未核实，暂不能出售"
-    if slot.expires_world_minute is not None and slot.expires_world_minute <= world_minute:
-        return None, "物品已过期"
     if owner["kind"] == "npc":
         from village.phase3_asset_service import get_available_slot_amount
         if get_available_slot_amount(slot, world_minute) < amount:
@@ -591,11 +590,7 @@ def _buy_listing_for_owner(buyer_owner, listing_id, amount, *, expected_asset_ve
     batch = _listing_batch(listing)
     if not Item.objects.filter(pk=listing.item_id, is_deleted=False).exists():
         return None, "物品不存在或已停用"
-    if batch.get("freshnessUnknown"):
-        return None, "挂单物品保质期来源未核实，暂不能成交"
     expiry = batch.get("expiresWorldMinute")
-    if expiry is not None and expiry <= world_minute:
-        return None, "挂单物品已过期"
     if listing.expires_at and listing.expires_at <= timezone.now():
         _expire_single_listing(listing)
         return None, "挂单已过期"
@@ -725,7 +720,7 @@ def create_system_listing(item_id, amount, price, expires_at=None, snapshot_over
         item_bag_name=snap.get("itemBagName", ""),
         cook_time=snap.get("cookTime", 0),
         dish_quality=snap.get("dishQuality", 3),
-        remaining_uses=snap.get("remainingUses"),
+        equipment_level=snap.get("equipmentLevel", 1), remaining_uses=snap.get("remainingUses"),
         review_comment=snap.get("reviewComment", ""),
         expires_at=expires_at,
     )

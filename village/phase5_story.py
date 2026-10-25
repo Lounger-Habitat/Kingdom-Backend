@@ -504,21 +504,13 @@ def _consume(npc_id, item_id, amount, player_id=None, *, qualified_meal=False, i
     def available(row):
         if instance_id is not None and str(row.instance_id) != str(instance_id):
             return 0
-        if qualified_meal and (row.quality < 1 or row.freshness_unknown or row.expires_world_minute is None or row.expires_world_minute <= minute):
+        if qualified_meal and not 1 <= row.quality <= 6:
             return 0
         if condition:
             if row.quality < condition.get("min_quality", 0):
                 return 0
-            minimum = condition.get("min_remaining_minutes", 0)
-            if (condition.get("requires_freshness") or minimum > 0) and (
-                row.freshness_unknown or row.expires_world_minute is None or row.expires_world_minute <= minute
-                or row.expires_world_minute - minute < minimum
-            ):
-                return 0
         if not player_id:
             return get_available_slot_amount(row, minute)
-        if row.freshness_unknown or (row.expires_world_minute is not None and row.expires_world_minute <= minute):
-            return 0
         return row.item_amount
     if sum(available(row) for row in slots) < amount:
         return False

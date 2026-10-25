@@ -32,9 +32,9 @@ class PlayerBusinessTickTests(PlayerFixture, TestCase):
         self.assertEqual(len(batches), 1)
         received = self.bag_a.slots.get(instance_id=batches[0]['instance_id'])
         self.assertEqual((received.item_amount, received.expires_world_minute), (3, 2000))
-        self.assertTrue(self.run_action('open_player_stall', location='RESTAURANT')['success'])
+        self.assertTrue(self.run_action('open_player_stall', location='PLAYER_STALL')['success'])
         listed = self.run_action('list_stall_dish', dict(instance_id=str(received.instance_id),
-            quantity=3), location='RESTAURANT')
+            quantity=3), location='PLAYER_STALL')
         self.assertTrue(listed['success'], listed)
         hourly = RestaurantHourlySlot.objects.create(player=self.a, game_year=1,
             game_month=1, game_day=1, game_hour=10, quota=3)

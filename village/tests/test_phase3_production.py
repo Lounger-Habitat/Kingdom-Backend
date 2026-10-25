@@ -555,7 +555,7 @@ class CookSuccessTest(ProductionTestBase):
         self.assertIn(dish.dish_quality, range(2, 7))
         self.assertEqual(dish.dish_metadata["base_quality"], 3)
         self.assertFalse(dish.rated)
-        self.assertEqual(dish.expires_world_minute, 700 + 2880)
+        self.assertIsNone(dish.expires_world_minute)
 
 
 class CookFailureTest(ProductionTestBase):

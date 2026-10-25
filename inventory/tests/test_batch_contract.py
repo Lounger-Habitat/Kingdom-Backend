@@ -18,7 +18,7 @@ def slot(**changes):
                   dish_quality=3, remaining_uses=None, rated=False, rating_price=-1,
                   overall_score=0, ingredient="", cook_time=0, review_comment="",
                   dish_metadata={}, produced_world_minute=600,
-                  expires_world_minute=None, freshness_unknown=False, source_request_id=uuid.uuid4())
+                  expires_world_minute=None, freshness_unknown=False, source_request_id=uuid.uuid4(), equipment_level=0)
     return SimpleNamespace(**(values | changes))
 
 
@@ -33,8 +33,9 @@ class BatchContractTests(SimpleTestCase):
         self.assertEqual(result["id"], str(source.instance_id))
         self.assertEqual(result["quantity"], 5)
         self.assertTrue(result["stacking"]["stackable"])
-        for key in ("dish", "usage", "quality", "freshness"):
+        for key in ("dish", "usage", "freshness"):
             self.assertIsNone(result[key])
+        self.assertEqual(result["quality"], 3)
         self.assertEqual(source.__dict__, before)
 
     def test_quality_is_explicitly_enabled_and_limit_is_configuration(self):
@@ -71,7 +72,7 @@ class BatchContractTests(SimpleTestCase):
                                                 (600, 700, False, "EXPIRED"), (900, 700, True, "UNKNOWN"),
                                                 (900, None, False, "UNKNOWN")):
             result = project_batch(slot(expires_world_minute=expiry, freshness_unknown=unknown), self.item(), minute)
-            self.assertEqual(result["freshness"]["state"], expected)
+            self.assertIsNone(result["freshness"])
 
     def test_missing_catalog_and_disabled_stacking_fail_closed(self):
         for item in (None, self.item(stackable=False)):
@@ -107,7 +108,7 @@ class BatchSerializationTests(TestCase):
             self.assertEqual(row["slotIndex"], i)
             self.assertEqual(row["instanceID"], row["batch"]["id"])
             self.assertIn("dishQuality", row)
-            self.assertIsNone(row["batch"]["quality"])
+            self.assertEqual(row["batch"]["quality"], 3)
             self.assertIsNone(row["batch"]["usage"])
 
     def test_single_serializer_and_unknown_tool_preserve_null_in_new_contract(self):

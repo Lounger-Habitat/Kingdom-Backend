@@ -29,7 +29,7 @@ class AdvancedGatheringIntegrationTests(TestCase):
             bag = InventoryBag.objects.create(player=player, character_id=name, money=200)
             PlayerState.objects.create(player_id=str(player.pk), action_points=200)
             PlayerSkillProgress.objects.create(player=player, skill_code="gathering", total_xp=440)
-            tool = InventorySlot.objects.create(bag=bag, slot_index=0, item_id=4102, item_amount=1, remaining_uses=50)
+            tool = InventorySlot.objects.create(bag=bag, slot_index=0, item_id=4102, item_amount=1, remaining_uses=50, equipment_level=3)
             self.players.append(player); self.bags.append(bag); self.tools.append(tool)
         self.point, _ = CollectionPoint.objects.update_or_create(collect_type=COLLECT_TYPE,
             defaults=dict(name="林下食材点", item_type="食材", action_cost=20, collect_count=2, default_level=1))

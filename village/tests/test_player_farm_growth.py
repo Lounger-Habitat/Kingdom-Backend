@@ -16,6 +16,31 @@ from village.player_farm import farm_overview
 
 
 class PlayerFarmGrowthTests(TestCase):
+    def test_admin_configured_extra_harvest_is_frozen_at_planting(self):
+        from unittest.mock import Mock
+        from player.models import EquipmentLevel
+        self.level(80)
+        self.tool.equipment_level = 2
+        self.tool.save(update_fields=["equipment_level"])
+        rule = EquipmentLevel.objects.get(equipment__item_id=4001, level=2)
+        rule.harvest_bonus_chance = 1
+        rule.save()
+        rng = Mock()
+        rng.randint.return_value = 4
+        rng.random.return_value = 0
+        with patch("village.player_farm.deterministic_rng", return_value=rng):
+            answer = self.act("plant_farm_plot", crop_code="CORN")
+        self.assertTrue(answer["success"], answer)
+        self.plot.refresh_from_db()
+        self.assertEqual(self.plot.production_rules_snapshot["tool_harvest_bonus_chance"], 1)
+        self.assertEqual(self.plot.production_rules_snapshot["yield_amount"], 5)
+        rule.harvest_bonus_chance = 0
+        rule.save()
+        self.mature()
+        answer = self.act("harvest_farm_plot", expected_batch_id=str(self.plot.batch_id))
+        self.assertTrue(answer["success"], answer)
+        self.assertEqual(self.bag.slots.get(item_id=1030).item_amount, 5)
+
     def setUp(self):
         VillageSimulationConfig.objects.update_or_create(config_key="default", defaults=dict(village_economy_enabled=True))
         self.clock = GlobalGameTimeState.get_instance(); self.clock.world_minute = 100; self.clock.save()
@@ -54,7 +79,8 @@ class PlayerFarmGrowthTests(TestCase):
         self.assertTrue(first["success"], first)
         self.plot.refresh_from_db()
         frozen, batch = copy.deepcopy(self.plot.production_rules_snapshot), str(self.plot.batch_id)
-        self.assertEqual((frozen["quality"], frozen["bonus_seed_chance"], frozen["effective_growth_minutes"]), (3, .30, 1440))
+        self.assertIn(frozen["quality"], range(1, 7))
+        self.assertEqual((frozen["bonus_seed_chance"], frozen["effective_growth_minutes"]), (.30, 1440))
         self.level(780)
         self.mature()
         altered = dict(FARM_CROP_RULES["CORN"], output_item_id=1043, seed_item_id=29305,
@@ -64,11 +90,12 @@ class PlayerFarmGrowthTests(TestCase):
         self.assertTrue(result["success"], result)
         output = self.bag.slots.get(item_id=1030)
         self.assertEqual((output.item_amount, output.quality, output.expires_world_minute),
-                         (frozen["yield_amount"], 3, self.clock.world_minute + 2880))
+                         (frozen["yield_amount"], frozen["quality"], None))
         receipt = SkillRewardReceipt.objects.get(player=self.player, skill_code="farming")
         self.assertEqual((receipt.source_id, receipt.result["xp_gained"]), (batch, 40))
-        self.assertEqual(receipt.result["facts"], dict(crop_code="CORN", batch_id=batch, output_item_id=1030,
-                                                     amount=frozen["yield_amount"], quality=3))
+        expected = dict(crop_code="CORN", batch_id=batch, output_item_id=1030, amount=frozen["yield_amount"], quality=frozen["quality"])
+        self.assertEqual({key: receipt.result["facts"][key] for key in expected}, expected)
+        self.assertEqual(receipt.result["facts"]["tool_equipment_level"], 1)
         self.assertFalse(self.bag.slots.filter(item_id=1043).exists())
         self.assertIsNone(self.bag.slots.filter(item_id=1051).order_by("-slot_index").first().expires_world_minute)
 
@@ -95,13 +122,16 @@ class PlayerFarmGrowthTests(TestCase):
         no_tool = self.act("plant_farm_plot", crop_code="ONION")
         self.assertEqual(no_tool["result_code"], "TOOL_TIER_REQUIRED")
         better = self.slot(4103, 1, 50)
+        better.equipment_level = 3; better.save(update_fields=["equipment_level"])
         planted = self.act("plant_farm_plot", crop_code="ONION", tool_instance_id=str(better.instance_id))
         self.assertTrue(planted["success"], planted)
         self.plot.refresh_from_db()
-        self.assertEqual((self.plot.production_rules_snapshot["quality"], self.plot.production_rules_snapshot["growth_minutes"]), (4, 720))
+        frozen_quality = self.plot.production_rules_snapshot["quality"]
+        self.assertIn(frozen_quality, range(1, 7))
+        self.assertEqual(self.plot.production_rules_snapshot["growth_minutes"], 720)
         self.mature()
         harvested = self.act("harvest_farm_plot", expected_batch_id=str(self.plot.batch_id), tool_instance_id=str(better.instance_id))
         self.assertTrue(harvested["success"], harvested)
-        self.assertEqual(self.bag.slots.get(item_id=1038).quality, 4)
+        self.assertEqual(self.bag.slots.get(item_id=1038).quality, frozen_quality)
         catalog = farm_overview(self.player, self.bag, self.clock.world_minute)["crops"]
         self.assertEqual((catalog["ONION"]["growth_minutes"], catalog["GREEN_RADISH"]["growth_minutes"]), (720, 2160))

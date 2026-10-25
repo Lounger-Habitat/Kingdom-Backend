@@ -3,17 +3,48 @@ from django.db import transaction
 from .models import InventoryBag, InventorySlot, BagTemplate, BagTemplateSlot
 
 
+@transaction.atomic
+def ensure_initial_equipment(player, bag):
+    """One grant per player; login also upgrades older saves without duplicating gear."""
+    from items.models import Item
+    from player.models import PlayerMilestoneProgress
+    from game_time.models import GlobalGameTimeState
+    InventoryBag.objects.select_for_update().get(pk=bag.pk)
+    minute = GlobalGameTimeState.objects.values_list("world_minute", flat=True).first() or 0
+    for item_id, family, marker, legacy in (
+        (4114, (4114,), "initial_sword_granted", "starter_hunting_kit_claimed"),
+        (4104, (4104, 4105, 4122), "initial_axe_granted", "starter_axe_claimed"),
+    ):
+        if PlayerMilestoneProgress.objects.filter(player=player, code=marker).exists():
+            continue
+        item = Item.objects.filter(pk=item_id, is_deleted=False).first()
+        if item is None:
+            continue
+        owned = bag.slots.filter(item_id__in=family, item_amount__gt=0).exists()
+        claimed = PlayerMilestoneProgress.objects.filter(player=player, code=legacy).exists()
+        if not owned and not claimed:
+            index = max(bag.slots.values_list("slot_index", flat=True), default=-1) + 1
+            InventorySlot.objects.create(bag=bag, slot_index=index, item_id=item_id, item_bag_name=item.item_name,
+                item_amount=1, quality=3, remaining_uses=item.max_use_count, produced_world_minute=minute)
+        PlayerMilestoneProgress.objects.create(player=player, code=marker, title="初始装备",
+            source_type="initial_equipment", source_id=str(player.pk))
+
+
 def init_player_bags(player):
     """从 ``player`` 模板初始化玩家自己的背包。
 
     NPC 库存属于 ``NpcGlobalInventory``，绝不能在这里为每个玩家复制一份。
     """
-    if InventoryBag.objects.filter(player=player, character_id=player.username).exists():
+    existing = InventoryBag.objects.filter(player=player, character_id=player.username).first()
+    if existing:
+        ensure_initial_equipment(player, existing)
         return 0
 
     template = BagTemplate.objects.prefetch_related("slots__item").filter(character_id="player").first()
     if template is None:
-        return 0
+        bag, _ = InventoryBag.objects.get_or_create(player=player, character_id=player.username)
+        ensure_initial_equipment(player, bag)
+        return 1
 
     with transaction.atomic():
         bag = InventoryBag.objects.create(
@@ -41,6 +72,7 @@ def init_player_bags(player):
                 hide_in_shop=slot.hide_in_shop,
                 remaining_uses=remaining_uses,
             )
+        ensure_initial_equipment(player, bag)
 
     # 设置富豪榜日榜第一天基准金币和总榜快照
     if template.money > 0:

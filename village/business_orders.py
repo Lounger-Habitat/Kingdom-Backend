@@ -115,8 +115,7 @@ def _context(player, minute):
                 continue
             slots = inventory.slots.filter(item_id=item_id, item_amount__gt=0) if inventory else []
             stocks[key] = sum(get_available_slot_amount(slot, minute) for slot in slots
-                if not slot.freshness_unknown and slot.quality >= 3
-                and (not fresh or slot.expires_world_minute is not None and slot.expires_world_minute >= minute + 60))
+                if slot.quality >= 3)
     published = set(VillageBusinessOrderLink.objects.filter(day_id=day).values_list("template_code", flat=True))
     catalog = Item.objects.in_bulk({item_id for template in TEMPLATES for item_id, _, _ in template["items"]})
     level = _level(player)
@@ -137,7 +136,7 @@ def _context(player, minute):
             item = catalog.get(item_id)
             stock, promised = stocks[(item_id, fresh)], incoming.get(item_id, 0)
             requirements.append(dict(item_id=item_id, item_name=item.item_name if item else str(item_id),
-                quantity=quantity, min_quality=3, requires_freshness=fresh, min_remaining_minutes=60 if fresh else 0,
+                quantity=quantity, min_quality=3, requires_freshness=False, min_remaining_minutes=0,
                 available_stock=stock, incoming_quantity=promised, target_stock=quantity,
                 shortage=max(0, quantity - stock - promised)))
         catalog_present = all(catalog.get(r["item_id"]) and not catalog[r["item_id"]].is_deleted for r in requirements)

@@ -8,6 +8,7 @@ from inventory.components import COMPONENT_FIELDS
 from inventory.models import InventorySlot
 from inventory.serializers import serialize_bag
 from items.models import Item
+from items.quality import item_price, has_quality, valid_quality
 from .models import (EconomicLedgerEntry, VillageAccount, VillageStore,
                      VillageStoreAccount, VillageStoreInventorySlot, VillageStoreListing,
                      VillageWorldEvent)
@@ -22,16 +23,15 @@ def store_sale_quote(slot, item, minute):
         reason = "该物品暂无有效收购价格"
     elif slot.item_amount <= 0:
         reason = "该批次已用完"
-    elif slot.freshness_unknown:
-        reason = "保鲜状态待核实，暂不能出售"
-    elif slot.expires_world_minute is not None and slot.expires_world_minute <= minute:
-        reason = "该批次已过期"
-    else:
-        tool_reason = general_store_tool_sale_reason(item.item_type, item.max_use_count, slot.remaining_uses)
-        if tool_reason:
-            reason = "仅收购满耐久工具" if tool_reason == "TOOL_NOT_FULL_DURABILITY" else "工具耐久无效或未核实，暂不能收购"
+    if reason is None:
+        if has_quality(item) and not valid_quality(slot.quality):
+            reason = "物品品质记录无效"
+        else:
+            tool_reason = general_store_tool_sale_reason(item.item_type, item.max_use_count, slot.remaining_uses, slot=slot)
+            if tool_reason:
+                reason = "仅收购满耐久工具" if tool_reason == "TOOL_NOT_FULL_DURABILITY" else "工具耐久无效或未核实，暂不能收购"
     return dict(allowed=reason is None, reason=reason,
-                unit_price=item.item_price if item is not None and not item.is_deleted and item.item_price > 0 else None,
+                unit_price=item_price(item, slot.quality) if reason is None else None,
                 available_quantity=slot.item_amount if reason is None else 0)
 
 
@@ -110,6 +110,10 @@ def buy_from_store(player, bag, params, request_id, location, clock):
         fail("TRADE_LISTING_NOT_ACTIVE", "商品已售罄或下架。")
     if store.status not in _TRADABLE_STORE_STATUSES:
         fail("TRADE_STORE_CLOSED", "商店当前未营业。")
+    if "expected_quality" in params and params["expected_quality"] != listing.quality:
+        fail("QUALITY_CHANGED", "商品品质已变化，请重新选择。")
+    if listing.inventory_slots.filter(item_amount__gt=0).exclude(quality=listing.quality).exists() and not listing.public_meal_code:
+        fail("QUALITY_CHANGED", "货架品质不一致，请等待更新。")
     public_meal = bool(listing.public_meal_code)
     if public_meal and quantity != 1:
         fail("PUBLIC_MEAL_ONE_PORTION_ONLY", "公共餐每人每日只能领取一份。")
@@ -177,7 +181,7 @@ def buy_from_store(player, bag, params, request_id, location, clock):
         target.save()
         next_index += 1
         purchased.append(dict(instance_id=str(target.instance_id), item_id=target.item_id,
-            quantity=amount, quality=target.quality, expires_world_minute=target.expires_world_minute))
+            quantity=amount, quality=target.quality, expires_world_minute=None))
     bag.money -= total
     bag._money_change_source = "village_store_buy"
     bag.save(update_fields=["money"])

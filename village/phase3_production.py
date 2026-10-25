@@ -15,6 +15,7 @@ from typing import Any, Dict
 from django.db import transaction
 
 from game_time.models import GlobalGameTimeState
+from items.quality import production_quality, quality_rng
 from inventory.models import NpcGlobalInventory, NpcGlobalInventorySlot
 from recipes.models import Recipe, RecipeIngredient
 
@@ -173,7 +174,7 @@ def _do_plant(
         plot.batch_id = batch_id
         # NPC production retains its existing rules and never inherits a
         # previous player's skill snapshot on a returned plot.
-        plot.production_rules_snapshot = {}
+        plot.production_rules_snapshot = {"quality_rule": "quality-v2", "quality": production_quality(4, quality_rng(request_id, "NPC_FARM"))}
         plot.crop_code = crop_code
         plot.planted_world_minute = world_minute
         from .farm_irrigation import effective_growth_minutes
@@ -343,7 +344,7 @@ def _do_harvest(
         added_items = []
         add_batch(
             inventory, output_item_id, output_amount,
-            world_minute, None, request_id,
+            world_minute, None, request_id, item_attributes={"quality": (plot.production_rules_snapshot or {}).get("quality", 3)},
         )
         added_items.append({"item_id": output_item_id, "amount": output_amount})
 

@@ -5,7 +5,7 @@ from .advanced_gathering import LOCATION, resource_overview
 from .phase3_catalog import FARM_CROP_RULES
 
 
-def production_overview(player, bag, minute, *, read_only=False):
+def production_overview(player, bag, minute, *, read_only=False, tool_state=None):
     from .production_tools import tools_overview
     growth = growth_snapshot(player, read_only=True)
     levels = {s["code"]: s["level"] for s in growth["skills"]}
@@ -44,7 +44,7 @@ def production_overview(player, bag, minute, *, read_only=False):
     from .advanced_gathering import professional_resource_overview
     for collect_type, spec in PROFESSIONAL_COLLECT_TYPES.items():
         resources.append(dict(code=spec["code"], title=spec["title"], location_code="DEEP_FOREST",
-            description="\u6df1\u6797\u4e13\u4e1a\u5171\u4eab\u8d44\u6e90\uff0c\u6bcf\u6b21\u4e24\u4efd\u54c1\u8d284\u3002",
+            description="深林专业共享资源，每次两份，品质由技能与工具共同决定。",
             requirements=["\u91c7\u96c67\u7ea7\u3001T3\u91c7\u96c6\u5305\u300120AP\u30011\u8010\u4e45\u3002"],
             uses=["\u4e13\u4e1a\u6599\u7406\u3001\u5b9e\u9645\u5408\u540c\u3001\u672c\u4eba\u7cbe\u901a\u8003\u6838\u3002"], available=levels["gathering"] >= 7,
             **professional_resource_overview(collect_type, minute)))
@@ -66,4 +66,4 @@ def production_overview(player, bag, minute, *, read_only=False):
     point = CollectionPoint.objects.filter(collect_type="采集林下食材").first()
     if point is None:
         resources[1].update(available=False, description="林下采集点目录尚未就绪。", remaining_quantity=None)
-    return dict(revision=growth["revision"], tools=tools_overview(player, bag, minute, read_only=read_only), resources=resources)
+    return dict(revision=growth["revision"], tools=tool_state if tool_state is not None else tools_overview(player, bag, minute, read_only=read_only), resources=resources)

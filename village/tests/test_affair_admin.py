@@ -155,12 +155,12 @@ class VillageAffairAdminTests(TestCase):
                 self.assertEqual([c["type"] for c in public["conditions"]], [c["type"] for c in conditions])
                 self.assertTrue(all(c["available"] for c in public["conditions"]))
 
-    def test_optional_item_quality_and_freshness_are_stored(self):
+    def test_item_quality_is_stored_and_old_freshness_limits_are_ignored(self):
         data = self.payload([{"conditions": [{"type": "item", "target": 5, "item_ids": [91001],
                                              "min_quality": 3, "min_remaining_minutes": 120}]}])
         self.assertEqual(self.client.post(self.add_url, data).status_code, 302)
         need = VillageAffair.objects.get().requirements["stages"][0]["conditions"][0]
-        self.assertEqual((need["min_quality"], need["min_remaining_minutes"], need["requires_freshness"]), (3, 120, True))
+        self.assertEqual((need["min_quality"], need["min_remaining_minutes"], need["requires_freshness"]), (3, 0, False))
 
     def test_repeat_submission_preserves_progress_and_does_not_duplicate(self):
         data = self.payload()
@@ -195,11 +195,10 @@ class VillageAffairAdminTests(TestCase):
             name = "stage_formset" if prefix == "stages" else "condition_formset"
             self.assertTrue(response.context[name].non_form_errors())
 
-    def test_invalid_type_target_item_quality_freshness_or_duration_is_rejected(self):
+    def test_invalid_type_target_item_quality_or_duration_is_rejected(self):
         for overrides in ({"conditions-0-type": "meeting"}, {"conditions-0-target": "0"},
                           {"conditions-0-target": "-1"}, {"conditions-0-target": "1.5"},
                           {"conditions-0-item_ids": []}, {"conditions-0-min_quality": "7"},
-                          {"conditions-0-min_remaining_minutes": "-1"},
                           {"conditions-0-type": "labor", "conditions-0-unit_minutes": "0"},
                           {"conditions-0-type": "labor", "conditions-0-unit_minutes": ""}):
             with self.subTest(overrides=overrides):

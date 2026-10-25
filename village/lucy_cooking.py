@@ -8,12 +8,13 @@ from django.db import transaction
 from inventory.models import NpcGlobalInventory, NpcGlobalInventorySlot
 from items.models import Item
 from recipes.models import Recipe
+from items.quality import ingredient_average, cooking_quality, quality_rng
 from cooking.dish_rules import calculate_quality, default_value, overall_score, review_value
 from .lucy_catalog import RELIEF_PACK
 from .models import NpcCookingCounter, VillageDishReview, VillageAccount
 from .phase3_asset_service import (_ok, _fail, add_batch, consume_fefo, get_available_slot_amount,
                                   deterministic_rng, BATCH_ITEM_ATTRIBUTES)
-from .phase3_catalog import RECIPE_WHITELIST, DISH_SPOILAGE_MINUTES
+from .phase3_catalog import RECIPE_WHITELIST
 from .public_finance import mark_unavailable
 
 
@@ -93,7 +94,7 @@ def cook(npc_id, params, minute, request_id):
         item = Item.objects.filter(item_id=recipe.item_id, is_deleted=False).first()
         if item is None:
             return _fail("P3_RECIPE_NOT_ALLOWED")
-        # Recheck at settlement: ingredients may have expired or been used since start.
+        # Recheck at settlement: ingredients may have been used or reserved since start.
         failure = _missing_ingredients(inventory, recipe, minute)
         if failure:
             return failure
@@ -105,22 +106,21 @@ def cook(npc_id, params, minute, request_id):
                 transaction.set_rollback(True)
                 return _fail("P3_INSUFFICIENT_ITEM")
             inputs.append(dict(item_id=ingredient.item_id, name=ingredient.item_name, amount=ingredient.count,
-                batches=[dict(instance_id=str(s.instance_id), amount=n, produced_world_minute=s.produced_world_minute,
+                batches=[dict(instance_id=str(s.instance_id), amount=n, quality=s.quality, produced_world_minute=s.produced_world_minute,
                               expires_world_minute=s.expires_world_minute) for s, n in consumed]))
-        rng = deterministic_rng(request_id, "LUCY_COOK_V1", minute // 1440)
+        rng = quality_rng(request_id, "LUCY_COOK")
         cold = recipe.item_id == RELIEF_PACK
         seconds = 0 if cold else max(0, recipe.default_cook_time + rng.randint(-40, 40))
         quality = 3 if cold else calculate_quality(recipe, {i.item_id: i.count for i in ingredients}, True, seconds, rng)
         if not cold:
+            quality = cooking_quality(quality, ingredient_average([dict(batch, item_id=i["item_id"]) for i in inputs for batch in i["batches"]]), 7, 0, rng)
             quality, seconds = _pity(inventory.npc, quality, seconds, recipe.default_cook_time, rng)
         recipe_info = {key: getattr(recipe, key) for key in ("cuisine", "dish_category", "serving_style",
                        "taste_profile", "difficulty", "default_cook_time", "version")}
         metadata = dict(rule_version="lucy-dish-v1", maker_npc_id=str(npc_id), recipe_id=recipe.pk,
             recipe_name=recipe.recipe_name, recipe=recipe_info, ingredients=inputs, base_quality=3,
             cook_time_source="NO_HEAT" if cold else "RECIPE_RANDOM_SECONDS", production_request_id=str(request_id))
-        input_expiries = [batch["expires_world_minute"] for ingredient in inputs for batch in ingredient["batches"]
-                          if batch["expires_world_minute"] is not None]
-        expires = min([minute + DISH_SPOILAGE_MINUTES, *input_expiries])
+        expires = None
         slot = add_batch(inventory, recipe.item_id, recipe.output_quantity, minute,
             expires, request_id, item_attributes=dict(dish_metadata=metadata,
             dish_quality=quality, cook_time=seconds, ingredient="、".join(f"{i.item_name}×{i.count}" for i in ingredients),
@@ -188,7 +188,7 @@ def request_review(npc_id, params, minute, request_id):
         name=Item.objects.get(item_id=slot.item_id).item_name, quality=slot.dish_quality,
         cook_time_seconds=slot.cook_time, ingredient=slot.ingredient, metadata=copy.deepcopy(slot.dish_metadata),
         historical_information_incomplete=not bool(slot.dish_metadata.get("recipe")))
-    expiry = min(minute + 180, slot.expires_world_minute) if slot.expires_world_minute is not None else minute + 180
+    expiry = minute + 180
     row = VillageDishReview.objects.create(owner=inventory.npc, slot=slot, request_id=request_id,
         snapshot=snapshot, created_world_minute=minute, expires_world_minute=expiry)
     inventory.asset_version += 1
@@ -251,7 +251,7 @@ def rate_dish(npc_id, params, minute, request_id):
         return _fail("DISH_REVIEW_EXPIRED", data={"review_id": str(row.pk), "expires_world_minute": row.expires_world_minute})
     inventory = NpcGlobalInventory.objects.select_for_update().get(npc=row.owner)
     slot = NpcGlobalInventorySlot.objects.select_for_update().get(pk=row.slot_id)
-    if slot.bag_id != inventory.pk or slot.item_amount != 1 or slot.freshness_unknown or (slot.expires_world_minute is not None and slot.expires_world_minute <= minute):
+    if slot.bag_id != inventory.pk or slot.item_amount != 1:
         return _fail("DISH_REVIEW_SAMPLE_UNAVAILABLE")
     difficulty = ((row.snapshot.get("metadata") or {}).get("recipe") or {}).get("difficulty", 1)
     score = overall_score(scores, difficulty, deterministic_rng(row.request_id, "DISH_REVIEW_V1", row.created_world_minute // 1440))

@@ -145,9 +145,8 @@ class PlayerGatheringTests(TestCase):
             with self.subTest(uses=uses), self.assertRaises(GatheringError) as error:
                 self.prepare(dict(category="leafy", tool_instance_id=str(broken.instance_id)))
             self.assertEqual(error.exception.code, "GATHERING_TOOL_UNUSABLE")
-        expired = self.tool(expires_world_minute=100)
-        with self.assertRaises(GatheringError):
-            self.prepare(dict(category="leafy", tool_instance_id=str(expired.instance_id)))
+        old = self.tool(expires_world_minute=100)
+        self.assertEqual(self.prepare(dict(category="leafy", tool_instance_id=str(old.instance_id)))[2].pk, old.pk)
 
     def test_wear_splits_only_one_physical_tool_and_rolls_back_with_business(self):
         self.enable()

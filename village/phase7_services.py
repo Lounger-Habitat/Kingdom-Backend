@@ -6,7 +6,7 @@ import uuid
 from datetime import date
 
 from django.db import connection
-from django.db.models import Count, Max, Min, Q, Sum
+from django.db.models import Count, Exists, Max, Min, OuterRef, Q, Sum
 from django.utils import timezone
 
 from game_time.models import GlobalGameTimeState
@@ -889,7 +889,7 @@ def public_store(store_code: str) -> dict | None:
             attributes = slot.item_attributes if isinstance(slot.item_attributes, dict) else {}
             batch = {
                 "available_amount": available,
-                "expires_world_minute": slot.expires_world_minute,
+                "expires_world_minute": None,
                 "batch": project_public_batch(
                     slot, items.get(slot.item_id), world_minute, available,
                     expires_world_minute=slot.expires_world_minute,
@@ -912,6 +912,7 @@ def public_store(store_code: str) -> dict | None:
             "listing_id": str(listing.listing_id),
             "item_id": listing.item_id,
             "item_name": item_names.get(listing.item_id, f"物品#{listing.item_id}"),
+            "quality": listing.quality,
             "available_amount": available_amount,
             "unit_price": listing.unit_price,
             "price_mode": listing.price_mode,
@@ -927,14 +928,14 @@ def public_store(store_code: str) -> dict | None:
     # Immediate buybacks have no listing: the goods enter the warehouse.
     # Read existing receipts so sales made before this projection also appear.
     buyback_receipts = VillageActionReceipt.objects.filter(
+        request_id=OuterRef("request_id"),
         success=True,
         response_data__data__sale_mode="IMMEDIATE_STORE",
         response_data__data__store_code=store_code,
     )
     buyback_entries = EconomicLedgerEntry.objects.filter(
         entry_type="PROPOSE_TRADE",
-        request_id__in=buyback_receipts.values("request_id"),
-    ).select_related("actor_npc").order_by("-world_minute", "-id")
+    ).filter(Exists(buyback_receipts)).select_related("actor_npc").order_by("-world_minute", "-id")
     entries = [
         *matching_entries.filter(entry_type__in=STORE_HISTORY_TYPES)[:30],
         *matching_entries.filter(entry_type="BUY_FROM_STORE")[:30],
@@ -1002,6 +1003,7 @@ def public_store(store_code: str) -> dict | None:
                 "buyer_display_name": actor_name,
                 "item_id": listing.item_id,
                 "item_name": item_names.get(listing.item_id, f"物品#{listing.item_id}"),
+            "quality": listing.quality,
                 "amount": data.get("amount", changes.get("amount", 0)),
                 "gross_amount": data.get("gross_amount", changes.get("gross_amount", 0)),
                 "fee_amount": data.get("fee_amount", changes.get("fee_amount", 0)),
@@ -1019,6 +1021,7 @@ def public_store(store_code: str) -> dict | None:
                 "actor_display_name": actor_name,
                 "item_id": listing.item_id,
                 "item_name": item_names.get(listing.item_id, f"物品#{listing.item_id}"),
+            "quality": listing.quality,
                 "amount": data.get("amount", changes.get("amount")),
                 "unit_price": data.get("unit_price", changes.get("unit_price")),
                 "price_mode": data.get("price_mode", changes.get("price_mode")),

@@ -5,6 +5,7 @@ usage/dish/freshness objects, not dish fields to infer generic item behavior.
 This adapter also accepts store/market attributes via a slot-shaped object.
 """
 from items.models import ItemType
+from items.quality import has_quality
 from types import SimpleNamespace
 
 
@@ -22,7 +23,7 @@ def item_rules(item):
     return {
         "stackable": item.stackable and not dish and (not usage or single_use),
         "maxPerSlot": item.max_stack_size,
-        "hasQuality": dish or item.quality_enabled,
+        "hasQuality": has_quality(item),
         "hasUsage": usage,
         "isDish": dish,
     }
@@ -43,13 +44,22 @@ def project_batch(slot, item, world_minute):
         mode = "UNKNOWN" if remaining is None else "UNLIMITED" if remaining == -1 else "FINITE" if remaining >= 0 else "INVALID"
         usage = {"mode": mode, "remaining": remaining,
                  "maximum": item.max_use_count if item else None}
+    equipment = None
+    if item is not None and has_usage:
+        from player.equipment import stats_for, _stats
+        level = getattr(slot, "equipment_level", 1)
+        cache = getattr(getattr(item, "_state", None), "fields_cache", {})
+        if "equipment_definition" in cache:
+            profile = cache["equipment_definition"]
+            row = next((r for r in profile.levels.all() if r.level == level), None) if profile and profile.enabled and not item.is_deleted else None
+            stats = _stats(row) if row else None
+        else:
+            stats = stats_for(SimpleNamespace(item_id=slot.item_id, equipment_level=level))
+        if stats:
+            equipment = {"level": level, "attackMin": stats["attack_min"], "attackMax": stats["attack_max"]}
+            usage["maximum"] = stats["max_durability"]
     produced = getattr(slot, "produced_world_minute", None)
-    expires = getattr(slot, "expires_world_minute", None)
-    unknown = getattr(slot, "freshness_unknown", False)
     freshness = None
-    if expires is not None or unknown:
-        state = "UNKNOWN" if unknown or world_minute is None else "EXPIRED" if expires is not None and expires <= world_minute else "FRESH"
-        freshness = {"expiresWorldMinute": expires, "state": state}
     dish = None
     if is_dish:
         dish = {"cookTime": slot.cook_time, "ingredients": slot.ingredient,
@@ -62,7 +72,7 @@ def project_batch(slot, item, world_minute):
         "quality": slot.dish_quality if rules["hasQuality"] or is_dish else None,
         "stacking": {"stackable": rules["stackable"] and not is_dish and (not has_usage or single_use),
                      "maxPerSlot": rules["maxPerSlot"], **({"singleUse": True} if single_use else {})},
-        "usage": usage, "dish": dish, "freshness": freshness,
+        "usage": usage, "equipment": equipment, "dish": dish, "freshness": freshness,
         "origin": {"producedWorldMinute": produced,
                    "requestId": str(slot.source_request_id) if getattr(slot, "source_request_id", None) else None},
         "snapshotWorldMinute": world_minute,
@@ -75,7 +85,7 @@ def project_public_batch(slot, item, world_minute, quantity, *, expires_world_mi
     view = SimpleNamespace(
         instance_id="", item_id=slot.item_id, item_amount=quantity,
         **{name: getattr(slot, name) for name in (
-            "dish_quality", "remaining_uses", "ingredient", "cook_time", "dish_metadata",
+            "dish_quality", "remaining_uses", "equipment_level", "ingredient", "cook_time", "dish_metadata",
             "rated", "rating_price", "overall_score", "review_comment")},
         expires_world_minute=expires_world_minute, freshness_unknown=freshness_unknown,
     )

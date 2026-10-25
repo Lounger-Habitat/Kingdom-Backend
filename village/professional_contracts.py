@@ -125,14 +125,12 @@ def _context(player, minute):
         requirements = []
         for item_id, target in spec["items"]:
             stock = sum(get_available_slot_amount(slot, minute) for slot in inventory.slots.filter(item_id=item_id, item_amount__gt=0)
-                if not slot.freshness_unknown and slot.quality >= spec["quality"]
-                and (not spec["remaining"] or slot.expires_world_minute is not None
-                     and slot.expires_world_minute >= minute + spec["remaining"])) if inventory else 0
+                if slot.quality >= spec['quality']) if inventory else 0
             gap = max(0, target - stock - incoming.get(item_id, 0))
             requirements.append(dict(item_id=item_id, item_name=catalog[item_id].item_name if item_id in catalog else str(item_id),
                 target_stock=target, quantity=gap, shortage=gap, available_stock=stock,
                 incoming_quantity=incoming.get(item_id, 0), min_quality=spec["quality"],
-                requires_freshness=bool(spec["remaining"]), min_remaining_minutes=spec["remaining"]))
+                requires_freshness=False, min_remaining_minutes=0))
         catalog_valid = all(i in catalog and not catalog[i].is_deleted and catalog[i].item_price > 0
                             for i, _ in spec["items"])
         full_value = sum(catalog[i].item_price * target for i, target in spec["items"]) if catalog_valid else 0

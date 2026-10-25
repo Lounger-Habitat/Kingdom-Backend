@@ -109,7 +109,7 @@ class MarketListing(BatchComponents):
         # system tools. Explicit instance attributes take precedence over JSON.
         if self._state.adding:
             snapshot = self.item_snapshot or {}
-            for name, key in (("dish_metadata", "dishMetadata"), ("remaining_uses", "remainingUses"),
+            for name, key in (("dish_metadata", "dishMetadata"), ("remaining_uses", "remainingUses"), ("equipment_level", "equipmentLevel"),
                               ("ingredient", "ingredient"), ("cook_time", "cookTime"),
                               ("rated", "rated"), ("rating_price", "ratingPrice"),
                               ("overall_score", "overallScore"), ("review_comment", "reviewComment")):

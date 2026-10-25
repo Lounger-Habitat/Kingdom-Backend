@@ -1,3 +1,4 @@
+from player.equipment import stats_for
 """Durable tree ownership and exactly-once wood rewards. Hits are Env-owned."""
 import copy
 import hashlib
@@ -87,7 +88,8 @@ def player_capability(actor_id, node, minute, tool_instance_id=None):
     except ToolError as exc:
         reject(exc.code)
     return player, bag, tool, dict(level=level, node_id=str(node.pk), tool_instance_id=str(tool.instance_id),
-        tier=3 if tool.item_id == 4122 else 2 if tool.item_id == 4105 else 1,
+        tier=stats_for(tool)["tier"],
+        equipment_level=tool.equipment_level, chop_power=stats_for(tool)["chop_power"],
         cooldown_seconds=.95 if level >= 2 and node.species not in {"HARDWOOD", "DURABLE_OAK"} else 1.0)
 
 
@@ -303,7 +305,7 @@ def _execute(action, p, clock):
                        output_item_id=attempt.output_item_id, output_quantity=attempt.wood_amount,
                        tool_instance_id=tool_used["instance_id"], source_request_id=str(p["request_id"]),
                        produced_world_minute=minute, quality=slot.quality,
-                       tool_tier=3 if tool.item_id == 4122 else 2 if tool.item_id == 4105 else 1, outputs=added))
+                       tool_tier=stats_for(tool)["tier"], tool_equipment_level=tool.equipment_level, outputs=added))
         VillageWorldEvent.objects.create(dedupe_key=f"forestry:{node.pk}:{generation}", event_type="PLAYER_CHOP_TREE",
             world_minute=minute, time_revision=clock.time_revision, player_ids=[attempt.actor_id],
             request_id=identifier(p["request_id"]), location_code=REGION,

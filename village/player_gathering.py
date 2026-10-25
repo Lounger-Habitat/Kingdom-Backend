@@ -53,8 +53,8 @@ def ensure_gathering_catalog(minute):
     item, _ = Item.objects.get_or_create(item_id=TOOL_ITEM_ID, defaults=dict(
         item_name=TOOL_NAME, item_type=ItemType.COLLECT_TOOL, item_price=TOOL_PRICE,
         max_use_count=TOOL_MAX_USES, stackable=False, collectable=False,
-        item_description="T1采集工具包。采集2级后按食材类别寻找资源，每次成功消耗1耐久；基础采集不需要工具。"))
-    if item.item_name != TOOL_NAME or item.item_type != ItemType.COLLECT_TOOL:
+        item_description="T1采集工具包。采集2级后可装备，植物采摘时间缩短15%，每次成功采摘消耗1耐久。"))
+    if item.item_type != ItemType.COLLECT_TOOL:
         reject("GATHERING_CATALOG_CONFLICT", "采集工具目录编号冲突，请联系管理员。")
     ItemGameplayDefinition.objects.get_or_create(item=item, defaults=dict(
         capability_code="targeted_gathering", tier=1, required_skill="gathering", required_level=REQUIRED_LEVEL,
@@ -133,10 +133,10 @@ def _pool_item_ids(player, collect_type="采集食材"):
 
 
 def _usable(slot, minute):
-    maximum = {4102: 50, 4120: 100}.get(slot.item_id, TOOL_MAX_USES)
-    return (slot.item_amount > 0 and not slot.freshness_unknown
-            and (slot.expires_world_minute is None or slot.expires_world_minute > minute)
-            and type(slot.remaining_uses) is int and 0 < slot.remaining_uses <= maximum)
+    from player.equipment import stats_for
+    stats = stats_for(slot)
+    maximum = stats["max_durability"] if stats else 0
+    return (slot.item_amount > 0 and type(slot.remaining_uses) is int and (0 < slot.remaining_uses <= maximum))
 
 
 def _tool_shop(minute):
@@ -175,9 +175,8 @@ def gathering_overview(player, bag, minute):
                        available=bool(ids.intersection(items))) for code, title, items in CATEGORIES]
     items = {i.pk: i for i in Item.objects.filter(pk__in=[TOOL_ITEM_ID, 4102, 4120], is_deleted=False)}
     slots = list(bag.slots.filter(item_id__in=items, item_amount__gt=0).order_by("slot_index")) if bag.pk else []
-    tools = [dict(instance_id=str(s.instance_id), item_id=s.item_id, item_name=items[s.item_id].item_name,
-                  remaining_uses=s.remaining_uses, maximum_uses=items[s.item_id].max_use_count,
-                  usable=_usable(s, minute) and level >= {4102: 4, 4120: 7}.get(s.item_id, REQUIRED_LEVEL)) for s in slots]
+    from .production_tools import tools_overview
+    tools = [row for row in tools_overview(player, bag, minute)["tools"] if row["capability"] == "targeted_gathering"]
     usable = any(tool["usable"] for tool in tools)
     reason = ("SKILL_LEVEL_REQUIRED" if level < REQUIRED_LEVEL else "GATHERING_TOOL_REQUIRED" if not usable
               else "COLLECTION_CATEGORY_EMPTY" if not any(c["available"] for c in categories) else None)
@@ -205,14 +204,16 @@ def prepare_targeted_collection(player, bag, params, pool, weights, *, minute=No
         reject("GATHERING_TOOL_REQUIRED", "请选择本人背包中的采集工具包。")
     if not Item.objects.filter(pk=TOOL_ITEM_ID, is_deleted=False).exists():
         reject("GATHERING_TOOL_UNAVAILABLE", "采集工具包尚未开放。")
+    from player.models import EquipmentDefinition
+    from player.equipment import stats_for
+    tool_ids = EquipmentDefinition.objects.filter(category="gathering", enabled=True).values_list("item_id", flat=True)
     tool = InventorySlot.objects.select_for_update().filter(
-        bag=bag, item_id__in=[TOOL_ITEM_ID, 4102, 4120], instance_id=instance_id, item_amount__gt=0).first()
+        bag=bag, item_id__in=tool_ids, instance_id=instance_id, item_amount__gt=0).first()
     if tool is None:
         reject("GATHERING_TOOL_REQUIRED", "本人背包中没有这件采集工具包。")
-    if tool.item_id == 4120 and _level(player) < 7:
-        reject("SKILL_LEVEL_REQUIRED", "T3 gathering requires level 7.")
-    if tool.item_id == 4102 and _level(player) < 4:
-        reject("SKILL_LEVEL_REQUIRED", "采集达到4级后可使用T2采集工具包。")
+    stats = stats_for(tool)
+    if not stats or _level(player) < stats["required_skill_level"]:
+        reject("SKILL_LEVEL_REQUIRED", "采集技能未达到该工具等级的使用要求。")
     if minute is None:
         minute = GlobalGameTimeState.objects.filter(pk=1).values_list("world_minute", flat=True).first()
         if minute is None:

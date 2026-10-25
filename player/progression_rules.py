@@ -22,16 +22,16 @@ REWARD_RULES = {"professional_collect": {"skill_code": "gathering", "xp": 20,
     "milestone_code": FIRST_GATHERING, "milestone_title": "第一次采集", "milestone_xp": FIRST_GATHERING_XP}}
 
 _UNLOCKS = {
-    "gathering": ((2, "targeted_gathering", "类别采集资格（需采集工具包）"), (4, "advanced_gathering", "进阶资源与改良工具包"),
-                  (7, "professional_gathering", "深林原料与专业工具包"), (10, "gathering_mastery", "采集精通挑战")),
-    "farming": ((2, "seed_return", "返种概率改善"), (4, "advanced_crops", "新作物与改良农具"),
+    "gathering": ((2, "targeted_gathering", "类别采集与新植物"), (4, "advanced_gathering", "林下植物与 Lv.3 采集包"),
+                  (7, "professional_gathering", "深林原料与 Lv.5 采集包"), (10, "gathering_mastery", "采集精通挑战")),
+    "farming": ((2, "seed_return", "返种概率改善"), (4, "advanced_crops", "进阶作物与 Lv.3 农具"),
                 (5, "crop_quality", "新播种批次品质改善"),
-                (7, "professional_crops", "专业作物与农具"), (10, "farming_mastery", "种植精通挑战")),
-    "forestry": ((2, "felling_efficiency", "普通树作业改善"), (4, "hardwood", "硬木与改良斧"),
-                 (7, "professional_wood", "专业木材与斧"), (10, "forestry_mastery", "伐木精通挑战")),
-    "hunting": ((2, "bow_preparation", "满弦准备改善"), (4, "deer_challenge", "改良武器与鹿的挑战"),
-                (7, "north_hunting", "专业武器与北坡挑战"), (10, "hunting_mastery", "狩猎精通挑战")),
-    "cooking": ((2, "basic_quality", "合格基础菜品质保障"), (4, "advanced_cooking", "复杂料理与批次制作"),
+                (7, "professional_crops", "专业作物与 Lv.5 农具"), (10, "farming_mastery", "种植精通挑战")),
+    "forestry": ((2, "felling_efficiency", "普通树作业改善"), (4, "hardwood", "硬木与 Lv.3 斧"),
+                 (7, "professional_wood", "专业木材与 Lv.5 斧"), (10, "forestry_mastery", "伐木精通挑战")),
+    "hunting": ((2, "bow_preparation", "满弦准备改善"), (4, "deer_challenge", "Lv.3 武器与鹿的挑战"),
+                (7, "north_hunting", "Lv.5 武器与北坡挑战"), (10, "hunting_mastery", "狩猎精通挑战")),
+    "cooking": ((2, "basic_quality", "料理品质概率改善与双批制作"), (4, "advanced_cooking", "复杂料理与批次制作"),
                 (7, "professional_cooking", "专业炊具与料理"), (10, "cooking_mastery", "烹饪精通挑战")),
     "business": ((2, "combined_orders", "组合备货订单"), (4, "player_stall", "玩家摊位"),
                  (7, "professional_contracts", "专业供应合同"), (10, "business_mastery", "专业经营目标")),
@@ -47,15 +47,15 @@ def skill_data(code, name, total_xp):
     level = level_for_xp(total_xp)
     effects = []
     if code == "gathering" and level >= 2:
-        effects.append(dict(code="targeted_gathering", title="可使用有耐久的采集工具包选择食材类别"))
+        effects.append(dict(code="targeted_gathering", title="解锁更多植物，可装备采集工具缩短采摘时间"))
     if code == "gathering" and level >= 4:
-        effects.append(dict(code="advanced_gathering", title="可用T2工具包采集林下食材，共享储量按世界时间恢复"))
+        effects.append(dict(code="advanced_gathering", title="可采摘林下植物，改良工具缩短30%采摘时间"))
     if code == "farming" and level >= 2:
         effects.append(dict(code="seed_return", title="后续新播种的额外返种概率为30%"))
     if code == "farming" and level >= 4:
         effects.append(dict(code="advanced_crops", title="配合T2农具可种植洋葱与青萝卜"))
     if code == "farming" and level >= 5:
-        effects.append(dict(code="crop_quality", title="后续新播种批次的产物品质为4，已播批次保持原规则"))
+        effects.append(dict(code="crop_quality", title="技能提高优秀、极品和绝品产出概率，已播批次保持原规则"))
     if code == "forestry" and level >= 2:
         effects.append(dict(code="felling_efficiency", title="普通砍伐作业间隔缩短5%"))
     if code == "forestry" and level >= 4:

@@ -6,6 +6,18 @@ from account.models import GameAccount
 from .models import PlayerState, PlayerRecipe, PlayerTitle, DefaultRecipe, PlayerResetProxy, ActionPointCostConfig
 from .models import (PlayerGrowthState, PlayerSkillProgress, SkillRewardReceipt,
                      PlayerMilestoneProgress, ItemGameplayDefinition)
+from .models import PlayerTutorialState
+
+
+@admin.register(PlayerTutorialState)
+class PlayerTutorialStateAdmin(admin.ModelAdmin):
+    list_display = ["player", "started", "paused", "route_code", "revision", "version"]
+    list_filter = ["started", "paused", "route_code"]
+    search_fields = ["player__username"]
+    readonly_fields = ["player", "version", "revision", "started", "paused", "route_code", "evidence", "completed"]
+
+    def has_add_permission(self, request):
+        return False
 
 
 class PlayerRecipeInline(admin.TabularInline):
@@ -218,3 +230,78 @@ class ItemGameplayDefinitionAdmin(admin.ModelAdmin):
     list_display = ["item", "capability_code", "tier", "required_skill", "required_level", "rules_version"]
     list_filter = ["capability_code", "tier", "required_skill"]
     search_fields = ["item__item_name", "capability_code"]
+
+    def get_readonly_fields(self, request, obj=None):
+        if obj and hasattr(obj.item, "equipment_definition"):
+            return ["capability_code", "tier", "required_skill", "required_level", "effects", "rules_version"]
+        return []
+
+
+from django.forms.models import BaseInlineFormSet
+from django.core.exceptions import ValidationError
+from .models import EquipmentDefinition, EquipmentLevel, WeaponMove
+
+
+class EquipmentLevelsFormSet(BaseInlineFormSet):
+    def clean(self):
+        super().clean()
+        if any(self.errors):
+            return
+        levels = [form.cleaned_data.get("level") for form in self.forms
+                  if form.cleaned_data and not form.cleaned_data.get("DELETE")]
+        if sorted(levels) != [1, 2, 3, 4, 5]:
+            raise ValidationError("每个品种必须完整配置 Lv.1～Lv.5，各等级只出现一次。")
+        if self.instance.category in {"sword", "spear", "bow", "axe"} and any(
+                form.cleaned_data.get("attack_min", 0) < 1 for form in self.forms if form.cleaned_data):
+            raise ValidationError("武器每一级的基础攻击下限都必须大于0。")
+
+
+class EquipmentLevelInline(admin.StackedInline):
+    model = EquipmentLevel
+    formset = EquipmentLevelsFormSet
+    extra = 5
+    min_num = 5
+    max_num = 5
+    can_delete = False
+    fieldsets = [(None, {"fields": [("level", "required_skill_level", "max_durability"), ("attack_min", "attack_max")]}),
+        ("生产属性（比例以0～1填写）", {"fields": [("gathering_time_reduction", "quality_bonus_chance"),
+            ("harvest_bonus_chance", "chop_power"), ("cooking_batches", "processing_time_reduction")]}),
+        ("升级与维修", {"fields": [("upgrade_gold", "repair_gold"), "upgrade_materials", "repair_materials"]})]
+
+
+@admin.register(EquipmentDefinition)
+class EquipmentDefinitionAdmin(admin.ModelAdmin):
+    list_display = ["item", "category", "advanced", "required_skill", "enabled"]
+    list_filter = ["category", "advanced", "enabled"]
+    search_fields = ["item__item_name", "item__item_id"]
+    autocomplete_fields = ["item"]
+    inlines = [EquipmentLevelInline]
+
+
+@admin.register(EquipmentLevel)
+class EquipmentLevelAdmin(admin.ModelAdmin):
+    list_display = ["equipment", "level", "required_skill_level", "attack_min", "attack_max", "max_durability"]
+    list_filter = ["equipment__category", "equipment__advanced", "level"]
+    search_fields = ["equipment__item__item_name"]
+
+    def has_add_permission(self, request):
+        return False
+
+    def has_delete_permission(self, request, obj=None):
+        return False
+
+
+@admin.register(WeaponMove)
+class WeaponMoveAdmin(admin.ModelAdmin):
+    list_display = ["name", "category", "code", "multiplier", "minimum_multiplier"]
+    list_editable = ["multiplier", "minimum_multiplier"]
+    list_filter = ["category"]
+
+    def has_add_permission(self, request):
+        return False
+
+    def get_readonly_fields(self, request, obj=None):
+        return ["code", "category"] if obj else []
+
+    def has_delete_permission(self, request, obj=None):
+        return False

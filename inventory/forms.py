@@ -6,6 +6,7 @@ from .components import COMPONENT_FIELDS
 
 class BatchComponentForm(forms.ModelForm):
     remaining_uses = forms.IntegerField(required=False, label="剩余使用次数")
+    equipment_level = forms.IntegerField(required=False, initial=1, min_value=1, max_value=5, label="装备等级")
     ingredient = forms.CharField(required=False, max_length=200, label="菜品原料")
     cook_time = forms.IntegerField(required=False, initial=0, label="烹饪时长")
     dish_metadata = forms.JSONField(required=False, label="菜品元数据")

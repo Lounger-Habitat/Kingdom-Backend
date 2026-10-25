@@ -2,6 +2,8 @@
 import uuid
 
 from inventory.models import NpcGlobalInventory, NpcGlobalInventorySlot
+from items.quality import production_quality, quality_rng
+from .phase3_asset_service import deterministic_rng
 from items.models import Item
 from .models import NpcCommandState, VillageActionDurationConfig, VillageSimulationConfig
 from .phase3_catalog import (
@@ -77,10 +79,9 @@ def work_unavailable(runtime, command, minute, *, resources=True):
         if key == "tool_instance_id" and (slot.remaining_uses is None or slot.remaining_uses <= 0):
             return "P3_TOOL_BROKEN"
         if key == "prey_instance_id" and (
-            slot.item_id not in PREY_ITEM_IDS or slot.produced_world_minute is None
-            or slot.expires_world_minute is None
+            slot.item_id not in PREY_ITEM_IDS or not 1 <= slot.quality <= 6
         ):
-            return "PREY_FRESHNESS_UNKNOWN"
+            return "PREY_QUALITY_INVALID"
     return None
 
 
@@ -110,8 +111,11 @@ def start_work(runtime, command, minute):
         ).first()
         if prey is None or get_available_slot_amount(prey, minute) < 1:
             return "PREY_UNAVAILABLE"
-        if prey.produced_world_minute is None or prey.expires_world_minute is None:
-            return "PREY_FRESHNESS_UNKNOWN"
+        from player.equipment import stats_for
+        import math
+        tool_stats = stats_for(tool)
+        if tool_stats:
+            command.duration_minutes = max(1, math.ceil(command.duration_minutes * (1-tool_stats["processing_time_reduction"])))
         state["prey_instance_id"] = str(prey.instance_id)
         state["outputs"] = {str(i): n for i, n in PREY_RECIPES[prey.item_id]["outputs"].items()}
     else:
@@ -190,12 +194,14 @@ def finish_work(npc_id, params, minute, request_id):
         from .wildlife import SPECIES
         outputs = {SPECIES[kill.species]: 1}
         produced = kill.death_world_minute
-        expires = produced + HUNT_MEAT_SPOILAGE_MINUTES
+        expires = None
+        quality = production_quality(7, quality_rng(request_id, "NPC_HUNT"))
         consumed = []
     else:
         prey = NpcGlobalInventorySlot.objects.select_for_update().get(instance_id=state["prey_instance_id"])
         outputs = {int(i): n for i, n in state["outputs"].items()}
-        produced, expires = prey.produced_world_minute, prey.expires_world_minute
+        produced, expires = prey.produced_world_minute, None
+        quality = prey.quality
         prey.item_amount -= 1
         prey.save(update_fields=["item_amount"])
         consumed = [{"item_id": prey.item_id, "amount": 1, "instance_id": str(prey.instance_id)}]
@@ -208,9 +214,9 @@ def finish_work(npc_id, params, minute, request_id):
     item_names = dict(Item.objects.filter(item_id__in=[*outputs, HUNT_TOOL_ITEM_ID]).values_list("item_id", "item_name"))
     for item_id, amount in outputs.items():
         expiry = None if item_id in BYPRODUCT_ITEM_IDS else expires
-        slot = add_batch(inventory, item_id, amount, produced, expiry, request_id)
+        slot = add_batch(inventory, item_id, amount, produced, expiry, request_id, item_attributes={"quality": quality})
         added.append({"item_id": item_id, "item_name": item_names.get(item_id, str(item_id)),
-                      "amount": amount, "instance_id": str(slot.instance_id),
+                      "amount": amount, "instance_id": str(slot.instance_id), "quality": slot.quality,
                       "produced_world_minute": produced, "expires_world_minute": expiry})
     inventory.asset_version += 1
     inventory.save(update_fields=["asset_version", "updated_at"])
@@ -247,14 +253,12 @@ def production_info(npc, minute):
     prey_rows = []
     for slot in slots:
         blocked = list(reasons)
-        if slot.freshness_unknown or slot.produced_world_minute is None or slot.expires_world_minute is None:
-            blocked.append("PREY_FRESHNESS_UNKNOWN")
-        if slot.expires_world_minute is not None and slot.expires_world_minute <= minute:
-            blocked.append("PREY_EXPIRED")
+        if not 1 <= slot.quality <= 6:
+            blocked.append("PREY_QUALITY_INVALID")
         if get_available_slot_amount(slot, minute) < 1:
             blocked.append("PREY_UNAVAILABLE_OR_RESERVED")
         prey_rows.append({"instance_id": str(slot.instance_id), "item_id": slot.item_id,
-            "available_quantity": get_available_slot_amount(slot, minute), "expires_world_minute": slot.expires_world_minute,
+            "available_quantity": get_available_slot_amount(slot, minute), "quality": slot.quality, "expires_world_minute": None,
             "can_process": not blocked, "blocked_reasons": blocked})
     return {
         "hunt_code": HUNT_ANIMALS_CODE, "hunts_started_today": count,
