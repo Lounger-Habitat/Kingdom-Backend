@@ -266,3 +266,15 @@ LOGGING = {
         },
     },
 }
+
+# Cached player-specific NPC quick phrases. Empty credentials/model disable inference.
+DEEPSEEK_API_URL = os.environ.get("DEEPSEEK_API_URL", "").strip()
+DEEPSEEK_API_KEY = os.environ.get("DEEPSEEK_API_KEY", "").strip()
+DEEPSEEK_MODEL = os.environ.get("DEEPSEEK_MODEL", "").strip()
+NPC_QUICK_INPUT_ENABLED = os.environ.get("NPC_QUICK_INPUT_ENABLED", "true").lower() in {"1", "true", "yes", "on"}
+NPC_QUICK_INPUT_INTERVAL_SECONDS = int(os.environ.get("NPC_QUICK_INPUT_INTERVAL_SECONDS", "60"))
+NPC_QUICK_INPUT_MIN_NEW_MESSAGES = int(os.environ.get("NPC_QUICK_INPUT_MIN_NEW_MESSAGES", "5"))
+NPC_QUICK_INPUT_QUIET_SECONDS = int(os.environ.get("NPC_QUICK_INPUT_QUIET_SECONDS", "30"))
+NPC_QUICK_INPUT_COOLDOWN_SECONDS = int(os.environ.get("NPC_QUICK_INPUT_COOLDOWN_SECONDS", "300"))
+NPC_QUICK_INPUT_TIMEOUT_SECONDS = int(os.environ.get("NPC_QUICK_INPUT_TIMEOUT_SECONDS", "30"))
+NPC_QUICK_INPUT_BATCH_SIZE = int(os.environ.get("NPC_QUICK_INPUT_BATCH_SIZE", "2"))

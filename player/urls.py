@@ -1,8 +1,10 @@
 from django.urls import path
 from . import views
 from .speech import transcribe
+from .quick_input_views import npc_quick_inputs
 
 urlpatterns = [
+    path("api/player/npc-quick-inputs", npc_quick_inputs, name="player-npc-quick-inputs"),
     path("api/player/speech/transcribe", transcribe, name="player-speech-transcribe"),
     path("player/state", views.player_state, name="player-state"),
     path("player/cost_action", views.player_cost_action, name="player-cost-action"),

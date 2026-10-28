@@ -8,3 +8,5 @@ class PlayerConfig(AppConfig):
 
     def ready(self):
         from . import signals  # noqa: F401
+        from .quick_input_scheduler import start_scheduler
+        start_scheduler()

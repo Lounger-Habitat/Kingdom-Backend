@@ -152,6 +152,28 @@ class PlayerArrivalState(models.Model):
         verbose_name_plural = "玩家入村开场"
 
 
+class PlayerNpcQuickInputState(models.Model):
+    """Cached suggestions only; authoritative speech receipts remain the history source."""
+    player = models.ForeignKey(GameAccount, on_delete=models.CASCADE, related_name="npc_quick_input_states")
+    npc = models.ForeignKey("inventory.NpcDefinition", on_delete=models.CASCADE, related_name="player_quick_input_states")
+    phrases = models.JSONField(default=list, blank=True)
+    version = models.PositiveIntegerField(default=1)
+    history_revision = models.PositiveBigIntegerField(default=0)
+    generated_revision = models.PositiveBigIntegerField(default=0)
+    history_initialized = models.BooleanField(default=False)
+    latest_activity_at = models.DateTimeField(null=True, blank=True)
+    generated_at = models.DateTimeField(null=True, blank=True)
+    generation_started_at = models.DateTimeField(null=True, blank=True)
+    generation_token = models.UUIDField(null=True, blank=True)
+    next_attempt_at = models.DateTimeField(null=True, blank=True)
+    last_error = models.CharField(max_length=64, blank=True, default="")
+
+    class Meta:
+        constraints = [models.UniqueConstraint(fields=["player", "npc"], name="player_npc_quick_input_unique")]
+        verbose_name = "玩家NPC常用话术"
+        verbose_name_plural = "玩家NPC常用话术"
+
+
 class PlayerSkillProgress(models.Model):
     from .progression_rules import SKILLS
 

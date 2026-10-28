@@ -1,5 +1,6 @@
 import uuid
 
+from django.db import transaction
 from django.db.models import Q
 
 from rest_framework.decorators import api_view, authentication_classes, permission_classes
@@ -566,6 +567,9 @@ def instruction_outcome_record(request):
     )
     if receipt.npc_id != profile.npc_id or receipt.action_kind != action:
         return Response({"success": False, "resultCode": "REQUEST_CONFLICT"}, status=409)
+    if created and action == "SPEECH" and success:
+        from player.quick_inputs import observe_speech_receipt
+        transaction.on_commit(lambda: observe_speech_receipt(receipt), robust=True)
     return Response({"success": True, "resultCode": "RECORDED" if created else "REPLAYED"})
 
 
