@@ -100,6 +100,9 @@ def accept_action(envelope):
     if task:
         if CommandService.compute_payload_sha256(task.envelope["payload"]["content"]) != CommandService.compute_payload_sha256(content):
             return False, ResultCode.REQUEST_ID_CONFLICT, None, False
+        from .capability_gaps import RECORD_KEY, export_task
+        if RECORD_KEY in task.result:
+            transaction.on_commit(lambda: export_task(task), robust=True)
         return (task.result.get("success", True),
                 ResultCode.COMMAND_REPLAYED if task.command_id else task.result.get("result_code", ResultCode.COMMAND_ACCEPTED),
                 task, True)
@@ -117,6 +120,9 @@ def accept_action(envelope):
         return finish(False, ResultCode.CLOCK_SKEW)
     if original["timestamp"] + getattr(settings, "VILLAGE_ACTION_MAX_AGE_MS", 86_400_000) < now_ms:
         return finish(False, ResultCode.MESSAGE_EXPIRED)
+    if action in CommandService.DIAGNOSTIC_ACTIONS:
+        from .capability_gaps import record_capability_gap
+        return record_capability_gap(task, clock.world_minute)
     parameters, error = resolve_parameters(content["params"], task, clock.world_minute, action)
     if error:
         return finish(False, error)

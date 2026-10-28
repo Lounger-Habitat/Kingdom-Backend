@@ -7,6 +7,10 @@ from dotenv import load_dotenv
 BASE_DIR = Path(__file__).resolve().parent.parent
 load_dotenv(BASE_DIR / ".env")
 
+AGENT_CAPABILITY_GAP_LOG_PATH = os.environ.get(
+    "AGENT_CAPABILITY_GAP_LOG_PATH", str(BASE_DIR / "logs" / "agent_capability_gaps.jsonl"),
+)
+
 # NPC voice drafts: server-side MiMo ASR credentials only.
 MIMO_API_KEY = os.environ.get("MIMO_API_KEY", "")
 

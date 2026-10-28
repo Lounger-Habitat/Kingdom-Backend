@@ -372,7 +372,7 @@ class AgentQueryTests(TestCase):
         self.assertIn("BILL_HOME=Bill农舍", text)
         self.assertIn("MARKET_STREET=市场街", text)
         self.assertNotIn("SECRET", text)
-        self.assertEqual({tool["name"] for tool in data["tools"]}, {"GET_RULE", "OBSERVE", "PLANT"})
+        self.assertEqual({tool["name"] for tool in data["tools"]}, {"GET_RULE", "OBSERVE", "PLANT", "REPORT_CAPABILITY_GAP"})
 
         NpcRuntimeState.objects.filter(npc=self.bill).update(
             action_status="RUNNING", hunger_fp=990, current_location_code="MARKET_STREET"
@@ -388,7 +388,7 @@ class AgentQueryTests(TestCase):
         self.assertIn("HUNT", text)
         self.assertNotIn("玉米", text)
         self.assertNotIn("PLANT", text)
-        self.assertEqual({tool["name"] for tool in data["tools"]}, {"GET_RULE", "OBSERVE", "HUNT"})
+        self.assertEqual({tool["name"] for tool in data["tools"]}, {"GET_RULE", "OBSERVE", "HUNT", "REPORT_CAPABILITY_GAP"})
 
         with patch.dict(CommandService.NEED_GATE_LIMITS, {"hunger": 800}):
             data = npc_available_actions(request, "10011").data["data"]

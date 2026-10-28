@@ -989,6 +989,7 @@ class CommandService:
     """命令生命周期服务。"""
 
     ALLOWED_ACTIONS = frozenset(COMMAND_CATALOG)
+    DIAGNOSTIC_ACTIONS = frozenset({"REPORT_CAPABILITY_GAP"})
     READ_QUERY_ACTIONS = frozenset({
         "INSPECT_SCHEDULE", "INSPECT_DIARIES",
         "GET_RULE", "INSPECT_LIVING_OPTIONS", "OBSERVE", "INSPECT_NEARBY", "INSPECT_INVENTORY",
@@ -1053,6 +1054,7 @@ class CommandService:
         if str(npc.agent_id) in FORMAL_NPC_IDS and not npc.is_test_only:
             # Rules remain discoverable even if an old/admin-edited profile omits them.
             actions.add("GET_RULE")
+            actions.update(CommandService.DIAGNOSTIC_ACTIONS)
         return actions
 
     @staticmethod
@@ -1259,7 +1261,7 @@ class CommandService:
             return False, ResultCode.UNKNOWN_ACTION, None
         if action_name not in CommandService.allowed_actions_for(npc):
             return False, ResultCode.ACTION_NOT_ALLOWED, None
-        if action_name in CommandService.READ_QUERY_ACTIONS or action_name in {"WRITE_SCHEDULE", "UPDATE_SCHEDULE", "WRITE_DIARY", "UPDATE_DIARY"}:
+        if action_name in CommandService.READ_QUERY_ACTIONS or action_name in CommandService.DIAGNOSTIC_ACTIONS or action_name in {"WRITE_SCHEDULE", "UPDATE_SCHEDULE", "WRITE_DIARY", "UPDATE_DIARY"}:
             return False, ResultCode.ACTION_NOT_ALLOWED, None
         if action_name in COMMISSION_ACTIONS:
             from .personal_commission_commands import validate_intent

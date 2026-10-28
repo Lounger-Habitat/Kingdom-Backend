@@ -6,10 +6,15 @@
 
 Mark 是外聘品鉴师，专属职责仅为查询待评菜品和评价菜品；从聘用生效日开始按后台配置每日发薪（初始为 100 金币），系统日结从公共资金自动转入个人钱包。评分不触发发薪；新制欠薪可在后续日结补发，旧制欠薪不补发。发布价格指数、审计公款、查询公共经济状态和领取公共工资四个指令已停用，已有财务历史保留。
 
-共 54 种指令（包含动态提供的 WAKE_UP）。
+共 55 种指令（包含动态提供的 WAKE_UP）。
+
+Lucy 入村教学沿用 `PUBLISH_PERSONAL_COMMISSION`：收到环境下发的 `tutorial_context_id` 且玩家愿意帮忙后，可仅提交该标识，后端使用受控食材模板并将委托留给对应玩家。`INSPECT_PERSONAL_COMMISSIONS` 可由 Lucy 选填 `tutorial_player_id` 查询该旅人的引导状态；其余 NPC 无权读取该上下文。引导委托的并发额度由 `LUCY_TUTORIAL_MAX_OPEN` 配置（默认 20，0 暂停新接待），与普通个人委托的 10 份上限分别计数。两类委托均从 NPC 真实钱包预扣报酬；额度不会补发金币。
+
+`REPORT_CAPABILITY_GAP` 的需求由后端保存，并输出到 `Backend/logs/agent_capability_gaps.jsonl`，每行一条 JSON。可用环境变量 `AGENT_CAPABILITY_GAP_LOG_PATH` 指定文件路径。所有正式 NPC 自动获得此工具；记录不会提供所请求的信息、执行原动作或打断当前活动。同一 action.id 在当前运行批次内只保存一份，变更内容需使用新编号。文件输出失败时仍保留数据库记录，并在回执中说明尚未写入；可在 Backend 目录运行 `python manage.py export_agent_capability_gaps`，从已保存请求重建文件（覆盖现有日志，包含历史运行批次）。
 
 | 指令 | 中文名称 | 可用 NPC | 详情 |
 |---|---|---|---|
+| `REPORT_CAPABILITY_GAP` | 记录环境能力需求 | 全部 | 当目标所需的信息或动作无法通过现有工具完成时，提交type（information/action）、request、purpose及可选blocker。即时保存需求，不消耗世界时间；回执不代表原请求已执行或能力已开放，无需等待处理。 |
 | `BROWSE_MARKETPLACE` | 浏览全服市场 | 全部 | 查看全服 Marketplace 在售挂单，可按物品筛选并限制返回数量。 |
 | `BUY_FROM_MARKETPLACE` | 购买全服商品 | 全部 | 在市场街（地点代码 MARKET_STREET）购买全服 Marketplace 挂单；耗时由系统决定（单位：世界分钟），无需传参；执行结果在 duration_minutes 字段返回实际消耗。 |
 | `BUY_FROM_STORE` | 商店购买 | 全部 | 其他 NPC 按上架记录价格购买商品；耗时由系统决定（单位：世界分钟），无需传参；执行结果在 duration_minutes 字段返回实际消耗。 |

@@ -1536,7 +1536,7 @@ def runtime_summary(npc_id: str) -> Dict[str, Any]:
     unavailable_reasons = {}
     available = []
     for action in sorted(actions):
-        if action in CommandService.READ_QUERY_ACTIONS or action in {"WRITE_SCHEDULE", "UPDATE_SCHEDULE", "WRITE_DIARY", "UPDATE_DIARY"}:
+        if action in CommandService.READ_QUERY_ACTIONS or action in CommandService.DIAGNOSTIC_ACTIONS or action in {"WRITE_SCHEDULE", "UPDATE_SCHEDULE", "WRITE_DIARY", "UPDATE_DIARY"}:
             available.append(action)
             continue
         if active_dialogue:

@@ -1,6 +1,48 @@
 {
   "actions": [
     {
+      "name": "REPORT_CAPABILITY_GAP",
+      "phase": "诊断",
+      "label": "记录环境能力需求",
+      "description": "当前目标需要的信息或动作无法通过已发现的工具完成时，记录具体需求及用途，供开发者查看。type=information表示想获取信息，type=action表示想执行动作，blocker可说明现有工具为何无法满足或已尝试什么。普通缺料、地点不符、已有动作仍在执行不应直接认定为能力缺失。同一需求没有新增情况时不要重复报告。该工具即时完成，不消耗世界时间、不打断当前活动；只记录需求，不提供所请求的信息或执行原动作，不代表能力已开放，无需等待处理。",
+      "parameters": {
+        "type": "object",
+        "properties": {
+          "type": {
+            "type": "string",
+            "enum": [
+              "information",
+              "action"
+            ],
+            "description": "information表示信息需求，action表示动作需求。"
+          },
+          "request": {
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 2000,
+            "description": "具体想获取什么信息，或想执行什么动作。"
+          },
+          "purpose": {
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 1000,
+            "description": "为了完成什么目标，需要上述信息或动作。"
+          },
+          "blocker": {
+            "type": "string",
+            "maxLength": 2000,
+            "description": "现有工具为什么无法满足、已尝试什么；只说明已知情况。"
+          }
+        },
+        "required": [
+          "type",
+          "request",
+          "purpose"
+        ],
+        "additionalProperties": false
+      }
+    },
+    {
       "name": "WRITE_SCHEDULE",
       "phase": "阶段一",
       "label": "写每日日程",

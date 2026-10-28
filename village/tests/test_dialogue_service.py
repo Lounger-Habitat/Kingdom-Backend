@@ -64,7 +64,7 @@ class DialogueServiceTests(TestCase):
         )
         self.assertEqual((replay["conversation_id"], replay["reused"]), (conversation_id, True))
         self.assertEqual(runtime_summary("10012")["action_status"], "DIALOGUING")
-        self.assertEqual(runtime_summary("10011")["available_actions"], ["GET_RULE"])
+        self.assertEqual(runtime_summary("10011")["available_actions"], ["GET_RULE", "REPORT_CAPABILITY_GAP"])
 
         self.assertEqual(DialogueService.speak(conversation_id, "10011", "one")["result_code"], ResultCode.DIALOGUE_SPOKEN)
         self.assertEqual(DialogueService.speak(conversation_id, "10011", "two")["result_code"], ResultCode.DIALOGUE_SPOKEN)
