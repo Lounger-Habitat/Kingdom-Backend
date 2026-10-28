@@ -105,7 +105,8 @@ class PlayerCommissionTests(PlayerFixture, TestCase):
         self.assertEqual(PlayerSkillProgress.objects.get(player=self.a, skill_code="business").total_xp, 20)
         self.assertEqual(SkillRewardReceipt.objects.filter(player=self.a, source_type="personal_commission").count(), 1)
         self.bag_a.refresh_from_db(); self.lucy.refresh_from_db()
-        self.assertEqual((self.bag_a.money, self.lucy.money), (180, 920))
+        # First real supply also receives the existing once-only 15 gold milestone.
+        self.assertEqual((self.bag_a.money, self.lucy.money), (195, 920))
         self.assertEqual(self.lucy.slots.get(item_id=1002).item_amount, 2)
         self.assertEqual(VillagePersonalCommission.objects.get().status, "COMPLETED")
 

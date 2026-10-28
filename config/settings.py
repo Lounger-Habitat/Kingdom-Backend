@@ -16,6 +16,9 @@ SECRET_KEY = os.environ.get(
 
 DEBUG = os.environ.get("DJANGO_DEBUG", "True") == "True"
 
+# Lucy onboarding uses its own finite intake quota; rewards still use her real wallet.
+LUCY_TUTORIAL_MAX_OPEN = int(os.environ.get("LUCY_TUTORIAL_MAX_OPEN", "20"))
+
 ALLOWED_HOSTS = os.environ.get("DJANGO_ALLOWED_HOSTS", "*").split(",")
 
 INSTALLED_APPS = [

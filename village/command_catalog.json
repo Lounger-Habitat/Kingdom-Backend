@@ -1418,7 +1418,7 @@
       "name": "PUBLISH_PERSONAL_COMMISSION",
       "phase": "个人委托",
       "label": "发布个人委托",
-      "description": "根据自己的实际需求向玩家发布委托，预留全部金币报酬。阶段按序完成，每阶段条件全部满足才开放下一阶段；发布后不可改价或改条件。NPC不承接个人委托。",
+      "description": "根据自己的实际需求向玩家发布委托，预留全部金币报酬。阶段按序完成，每阶段条件全部满足才开放下一阶段；发布后不可改价或改条件。NPC不承接个人委托。 Lucy收到环境提供的入村引导标识且玩家愿意帮助后，可仅提交tutorial_context_id；后端套用新手食材模板、绑定该玩家，重复调用复用同一有效委托。",
       "parameters": {
         "type": "object",
         "properties": {
@@ -1527,15 +1527,29 @@
               ],
               "additionalProperties": false
             }
+          },
+          "tutorial_context_id": {
+            "type": "string",
+            "description": "环境提供给Lucy的玩家入村引导标识；提供时使用受控新手模板，无需填写其他字段。"
           }
         },
-        "required": [
-          "title",
-          "reward_gold",
-          "valid_for_minutes",
-          "stages"
-        ],
-        "additionalProperties": false
+        "required": [],
+        "additionalProperties": false,
+        "anyOf": [
+          {
+            "required": [
+              "tutorial_context_id"
+            ]
+          },
+          {
+            "required": [
+              "title",
+              "reward_gold",
+              "valid_for_minutes",
+              "stages"
+            ]
+          }
+        ]
       }
     },
     {
@@ -1553,6 +1567,10 @@
               "all"
             ],
             "default": "published"
+          },
+          "tutorial_player_id": {
+            "type": "string",
+            "description": "仅Lucy可选填当前交谈旅人的真实玩家编号，查询该玩家入村引导进度及发布标识。"
           }
         },
         "required": [],

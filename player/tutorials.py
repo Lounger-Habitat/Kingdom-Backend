@@ -11,6 +11,7 @@ from django.utils import timezone
 from .models import (PlayerTutorialState, PlayerSkillProgress, PlayerMilestoneProgress,
                      SkillRewardReceipt, EquipmentDefinition)
 from .tutorial_catalog import VERSION, ROUTES, ROUTE_NAMES, TASKS, HINTS, SKILL_NAMES, SKILL_ACTIONS
+from .lucy_tutorial import life_routes_unlocked
 
 CONTROL_PARAMS = {"tutorial_start": set(), "tutorial_pause": set(),
     "tutorial_track": {"route_code"}, "tutorial_ack": {"hint_code", "task_code"}}
@@ -40,24 +41,42 @@ def _normalize(state):
         return
     # V1 global evidence has no task ownership. V2 already records each task;
     # preserve its partial work while retiring removed teaching goals.
-    evidence = {} if state.version < 2 else {code: rows for code, rows in state.evidence.items() if code in TASKS}
+    old_basics_done = state.version < 6 and "basics_route" in state.completed
+    old_lucy = state.version < 6
+    retired_basics = {"basics_move", "basics_collect", "basics_bag", "basics_income"}
+    evidence = {} if state.version < 2 else {code: rows for code, rows in state.evidence.items() if code in TASKS or code in retired_basics}
+    previous = dict(state.completed)
+    if old_basics_done:
+        stamp = state.completed["basics_route"]
+        for row in ROUTES["basics"]:
+            previous.setdefault(row["code"], stamp)
     completed = {}
     for rows in ROUTES.values():
         for row in rows:
             code, rule = row["code"], row["condition"]
-            stamp = state.completed.get(code)
+            stamp = previous.get(code)
             if stamp is None and rule[0] == "hints" and all(evidence.get(code, {}).get("hint:" + hint) for hint in rule[1:]):
                 stamp = timezone.now().isoformat()
             if stamp is None:
                 break
             completed[code] = stamp
+    # Earlier independent routes retain their own progress. New Lucy prerequisites
+    # must not discard old growth/route evidence for an in-progress basics player.
+    if old_lucy:
+        for code in retired_basics | {"basics_growth", "basics_route"}:
+            if code in previous:
+                completed[code] = previous[code]
     state.completed, state.evidence, state.version = completed, evidence, VERSION
+
+
+def _effective_route(state):
+    return state.route_code if life_routes_unlocked(state) else "basics"
 
 
 def _current_task(state):
     if not state.started:
         return None
-    return next((TASKS[row["code"]] for row in ROUTES[state.route_code]
+    return next((TASKS[row["code"]] for row in ROUTES[_effective_route(state)]
                  if row["code"] not in state.completed), None)
 
 
@@ -135,7 +154,7 @@ def _complete(state, context):
     if not state.started:
         return
     stamp = timezone.now().isoformat()
-    for definition in ROUTES[state.route_code]:
+    for definition in ROUTES[_effective_route(state)]:
         row = TASKS[definition["code"]]
         if not _met(row, state, context):
             break
@@ -202,6 +221,10 @@ def control(player, action, params, bag):
     state, _ = PlayerTutorialState.objects.select_for_update().get_or_create(player=player, defaults={"version": VERSION})
     before = _before(state)
     _normalize(state)
+    if not life_routes_unlocked(state):
+        if action == "tutorial_track" and params["route_code"] != "basics":
+            raise TutorialError("TUTORIAL_LUCY_REQUIRED", "先完成 Lucy 的入村引导，听她表达感谢后即可选择生活路线。")
+        state.route_code = "basics"
     acknowledged = False
     if action == "tutorial_pause":
         state.paused = True
@@ -287,6 +310,9 @@ def _progress_text(row, state, context, done):
     if done:
         return "已完成"
     rule = row["condition"]
+    if rule[0] == "lucy":
+        return {"meet": "靠近 Lucy，开始交谈", "accept": "与 Lucy 聊清需求后接取她发布的委托",
+            "complete": "以这份委托的真实交付结果为准", "thanks": "回去和 Lucy 聊聊"}[rule[1]]
     evidence = state.evidence.get(row["code"], {})
     if rule[0] == "event":
         count = min(rule[2], len(evidence.get(rule[1], [])))
@@ -317,12 +343,18 @@ def tutorial_overview(player, bag, minute, overview, read_only=False):
     saved = PlayerTutorialState.objects.filter(player=player).first()
     state = deepcopy(saved) if saved else PlayerTutorialState(player=player, version=VERSION)
     _normalize(state)
+    unlocked = life_routes_unlocked(state)
+    state.route_code = _effective_route(state)
+    from .lucy_tutorial import context as lucy_context
+    lucy = lucy_context(player, state)
     context = _context(player, bag)
     completed = set(state.completed)
     starter_goals = {g["code"]: g for g in (overview.get("starter") or {}).get("goals", [])}
     routes = []
     current = None
     for route, rows in ROUTES.items():
+        if route != "basics" and not unlocked:
+            continue
         projected, pending = [], False
         for definition in rows:
             row = TASKS[definition["code"]]
@@ -334,6 +366,8 @@ def tutorial_overview(player, bag, minute, overview, read_only=False):
                 learning_hint=row["condition"][1] if row["condition"][0] == "hints" and len(row["condition"]) == 2 else "",
                 learning_hints=sorted(event[5:] for event in _events(row) if event.startswith("hint:")
                     and not state.evidence.get(row["code"], {}).get(event)))
+            if row["condition"][0] == "lucy":
+                detail.update(npc_id="10014", commission_id=lucy["commission_id"], panel="lucy")
             detail["progress_text"] = _progress_text(row, state, context, done)
             legacy = starter_goals.get(row["legacy_goal_code"])
             if legacy:
@@ -348,6 +382,6 @@ def tutorial_overview(player, bag, minute, overview, read_only=False):
     return dict(schema_version=VERSION, revision=state.revision, observed_world_minute=minute,
         started=state.started, paused=state.paused, route_code=state.route_code,
         show_welcome=saved is None and not has_history and not read_only,
-        can_write=not read_only, current_task=current, routes=routes,
+        can_write=not read_only, current_task=current, routes=routes, lucy=lucy, life_routes_unlocked=unlocked,
         route_completed=current is None and state.started,
         reward_policy="原有五项入门金币奖励只结算一次；教学阅读不增加金币或技能经验。")

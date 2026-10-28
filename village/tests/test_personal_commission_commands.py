@@ -148,7 +148,8 @@ class PersonalCommissionCommandTests(TestCase):
         self.assertTrue(first["success"], first)
         self.assertEqual(first, execute_player_action(copy.deepcopy(payload)))
         row.refresh_from_db(); self.bag.refresh_from_db()
-        self.assertEqual((row.status, self.bag.money), ("COMPLETED", 180))
+        # Existing first_supply reward is separate from the 80 gold commission.
+        self.assertEqual((row.status, self.bag.money), ("COMPLETED", 195))
         self.assertEqual(NpcGlobalInventory.objects.get(npc=self.lucy).slots.get(item_id=1002).item_amount, 2)
 
     def test_authority_time_expires_and_refunds_open_commission(self):

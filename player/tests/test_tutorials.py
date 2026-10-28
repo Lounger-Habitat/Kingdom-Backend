@@ -10,12 +10,25 @@ from player.models import PlayerTutorialState, PlayerMilestoneProgress, PlayerSk
 from player.progression import award_skill
 from player.tutorials import control, observe_action, observe_skill, observe_weapon, tutorial_overview, TutorialError
 from player.tutorial_catalog import VERSION, ROUTES, TASKS
+from player.lucy_tutorial import LUCY_STEPS
 from village.tests.test_player_actions import PlayerFixture
 from village.models import EconomicLedgerEntry
 
 
 class TutorialTests(PlayerFixture, TestCase):
+    @staticmethod
+    def unlocked_progress():
+        # These tests exercise later route mechanics after Lucy's chapter.
+        return {code: "lucy-completed-fixture" for code in LUCY_STEPS}
+
+    def unlock_life_routes(self):
+        state, _ = PlayerTutorialState.objects.get_or_create(player=self.a, defaults=dict(version=VERSION))
+        state.completed.update(self.unlocked_progress())
+        state.save()
+
     def start(self, route="basics"):
+        if route != "basics":
+            self.unlock_life_routes()
         result = self.run_action("tutorial_track", {"route_code": route})
         self.assertTrue(result["success"], result)
         return result["data"]["overview"]["tutorial"]
@@ -36,6 +49,8 @@ class TutorialTests(PlayerFixture, TestCase):
         state, _ = PlayerTutorialState.objects.get_or_create(player=self.a,
             defaults=dict(version=VERSION, started=True))
         state.version, state.started, state.route_code = VERSION, True, row["route_code"]
+        if row["route_code"] != "basics":
+            state.completed.update(self.unlocked_progress())
         for earlier in ROUTES[row["route_code"]][:row["index"] - 1]:
             state.completed.setdefault(earlier["code"], "fixture")
         state.save()
@@ -62,19 +77,18 @@ class TutorialTests(PlayerFixture, TestCase):
         self.assertEqual(execute_player_action(denied)["result_code"], "MODE_READ_ONLY")
 
     def test_routes_switch_preserves_progress_and_pause_survives_reconnect(self):
+        self.unlock_life_routes()
         self.start()
-        for hint in ("movement", "camera"):
-            self.assertTrue(self.ack(hint)["success"])
         self.start("cooking")
         state = PlayerTutorialState.objects.get(player=self.a)
-        self.assertIn("basics_move", state.completed)
+        self.assertIn("basics_lucy_meet", state.completed)
         self.assertEqual(state.route_code, "cooking")
         self.run_action("tutorial_pause")
         self.assertTrue(self.project()["paused"])
         self.assertFalse(self.project(self.b)["started"])
         self.start("basics")
         self.assertFalse(self.project()["paused"])
-        self.assertEqual(self.project()["current_task"]["code"], "basics_collect")
+        self.assertEqual(self.project()["current_task"]["code"], "basics_growth")
 
     def test_client_cannot_acknowledge_gameplay_or_forge_experience(self):
         self.start("cooking")
@@ -161,12 +175,13 @@ class TutorialTests(PlayerFixture, TestCase):
         self.assertFalse(PlayerTutorialState.objects.exists())
         self.start("cooking")
         state = PlayerTutorialState.objects.get(player=self.a)
-        self.assertEqual((state.evidence, state.completed), ({}, {}))
+        self.assertEqual((state.evidence, state.completed), ({}, self.unlocked_progress()))
         self.ack("recipe"); self.ack("cooking_preview")
         self.assertEqual(self.project()["current_task"]["code"], "cooking_first")
         self.assertEqual(PlayerSkillProgress.objects.get(player=self.a, skill_code="cooking").total_xp, 20)
 
     def test_replayed_control_returns_saved_receipt_and_cannot_reset_route(self):
+        self.unlock_life_routes()
         payload = self.payload("tutorial_track", {"route_code": "cooking"})
         from village.player_actions import execute_player_action
         first = execute_player_action(payload)
@@ -269,13 +284,13 @@ class TutorialTests(PlayerFixture, TestCase):
         self.assertEqual(state.evidence["gathering_use"]["cook"], ["player_cooking:second"])
 
     def test_partial_learning_is_preserved_per_task_across_route_switches(self):
-        self.start(); self.ack("movement")
+        self.start("hunting"); self.activate("hunting_defense"); self.ack("training_block")
         self.start("cooking"); self.ack("recipe")
         self.assertEqual(self.project()["current_task"]["code"], "cooking_prepare")
-        self.start("basics"); self.ack("camera")
-        self.assertEqual(self.project()["current_task"]["code"], "basics_collect")
+        self.start("hunting"); self.ack("training_dodge")
+        self.assertEqual(self.project()["current_task"]["code"], "hunting_first")
         state = PlayerTutorialState.objects.get(player=self.a)
-        self.assertEqual(state.evidence["basics_move"], {"hint:movement": ["read"], "hint:camera": ["read"]})
+        self.assertEqual(state.evidence["hunting_defense"], {"hint:training_block": ["read"], "hint:training_dodge": ["read"]})
         self.assertEqual(state.evidence["cooking_recipe"], {"hint:recipe": ["read"]})
 
     def test_stale_hint_cannot_acknowledge_another_task_with_the_same_hint(self):
@@ -297,7 +312,7 @@ class TutorialTests(PlayerFixture, TestCase):
 
     def test_legacy_progress_discards_completions_after_a_gap_without_browsing_writes(self):
         old = PlayerTutorialState.objects.create(player=self.a, version=1, started=True, route_code="gathering",
-            completed={"basics_move": "old", "gathering_first": "old", "gathering_use": "old"},
+            completed={"basics_move": "old", "gathering_first": "old", "gathering_use": "old"} | self.unlocked_progress(),
             evidence={"collect": ["old-collect"], "income": ["old-sale"]})
         with CaptureQueriesContext(connection) as queries:
             view = self.project()
@@ -310,7 +325,7 @@ class TutorialTests(PlayerFixture, TestCase):
         old.refresh_from_db()
         self.assertEqual(old.version, VERSION)
         self.assertEqual(old.evidence, {})
-        self.assertEqual(old.completed, {"basics_move": "old", "gathering_first": "old"})
+        self.assertEqual(old.completed, {"basics_move": "old", "gathering_first": "old"} | self.unlocked_progress())
         self.assertEqual(old.revision, 1)
 
     def test_levels_wait_for_prerequisites_without_requiring_reearned_xp(self):
@@ -344,6 +359,7 @@ class TutorialTests(PlayerFixture, TestCase):
 
     def test_v2_upgrade_preserves_partial_work_and_retires_long_term_steps_without_read_writes(self):
         completed = {row["code"]: "old" for row in ROUTES["gathering"][:4]}
+        completed.update(self.unlocked_progress())
         completed["gathering_advanced"] = "old"
         old = PlayerTutorialState.objects.create(player=self.a, version=2, started=True, route_code="gathering",
             completed=completed, evidence={"gathering_recipe": {"hint:recipe": ["read"]},
@@ -363,7 +379,7 @@ class TutorialTests(PlayerFixture, TestCase):
 
     def test_v2_account_waiting_at_removed_forestry_step_has_finished_that_route(self):
         PlayerTutorialState.objects.create(player=self.a, version=2, started=True, route_code="forestry",
-            completed={row["code"]: "old" for row in ROUTES["forestry"]} | {"forestry_more": "old"},
+            completed={row["code"]: "old" for row in ROUTES["forestry"]} | {"forestry_more": "old"} | self.unlocked_progress(),
             evidence={"forestry_growth": {"wood": ["old"]}})
         view = self.project()
         self.assertTrue(view["route_completed"])
@@ -392,6 +408,7 @@ class TutorialTests(PlayerFixture, TestCase):
         for uses_done, maintenance_done in ((False, False), (True, False), (True, True)):
             with self.subTest(uses_done=uses_done, maintenance_done=maintenance_done):
                 completed = dict(forestry_equipment="old", forestry_first="old")
+                completed.update(self.unlocked_progress())
                 if uses_done:
                     completed["forestry_uses"] = "old"
                 if maintenance_done:
@@ -450,6 +467,7 @@ class TutorialTests(PlayerFixture, TestCase):
         for finished in (False, True):
             with self.subTest(finished=finished):
                 completed = dict(hunting_equipment="old", hunting_training="old")
+                completed.update(self.unlocked_progress())
                 if finished:
                     completed["hunting_defense"] = "old"
                 PlayerTutorialState.objects.update_or_create(player=self.a, defaults=dict(

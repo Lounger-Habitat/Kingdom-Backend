@@ -61,6 +61,8 @@ def build_agent_context(actions, profile=None):
         f"世界时间每经过30分钟，基础变化为{_effects(needs['base_effects_per_30_minutes'])}。动作另按实际持续时间结算行为变化；以下活动总效果已包含基础变化，不要重复叠加。",
         "需求数值由环境计算，不能通过行动参数直接修改。普通行动受忙碌状态限制，只读查询不会占用行动队列或结算资产。",
     ]
+    if "REPORT_CAPABILITY_GAP" in actions:
+        common.append("目标所需的信息或动作无法通过已发现的工具完成时，可用REPORT_CAPABILITY_GAP记录具体需求、用途和阻碍，供开发者查看。它不消耗世界时间、不打断当前活动，也不会执行原请求或立即开放能力；无需等待处理。同一需求没有新增情况时不要重复报告，普通缺料、地点不符或任务仍在执行不应直接认定为能力缺失。")
     if "INSPECT_NEARBY" in actions:
         common.append("INSPECT_NEARBY按场景中实际距离观察周围10米，包含人物、树木/树桩、动物、已登记设施和农田，带position、target_ref、状态和活动。categories筛选people/trees/animals/facilities，limit默认30、最多100；truncated表示未列完，sources中false表示该类信息未知，不代表没有。玩家仅包含在线、已初始化且参与村庄的角色；activity是公开状态，movement_state区分行走和奔跑，is_in_dialogue表示是否正在对话。普通变化经延迟合并以perception.updated通知，经过者可能已离开；是否回应由你决定，通知不会取消正在进行的动作。同一action.id只重放原观察，刷新使用新id；不必连续轮询。")
     if "MOVE" in actions:

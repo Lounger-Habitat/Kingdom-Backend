@@ -1,3 +1,5 @@
+import uuid
+
 from django.db import models
 from django.utils import timezone
 from account.models import GameAccount
@@ -124,6 +126,12 @@ class PlayerTutorialState(models.Model):
     route_code = models.CharField(max_length=20, default="basics")
     evidence = models.JSONField(default=dict, blank=True)
     completed = models.JSONField(default=dict, blank=True)
+    lucy_context_id = models.UUIDField(default=uuid.uuid4, editable=False, unique=True)
+    lucy_commission = models.OneToOneField("village.VillagePersonalCommission", null=True, blank=True,
+        on_delete=models.SET_NULL, related_name="lucy_tutorial")
+    lucy_conversation_id = models.CharField(max_length=256, blank=True, default="")
+    lucy_thanks_conversation_id = models.CharField(max_length=256, blank=True, default="")
+    lucy_thanks_speech_id = models.CharField(max_length=256, blank=True, default="")
 
     class Meta:
         verbose_name = "玩家教学进度"

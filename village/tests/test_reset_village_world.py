@@ -595,10 +595,65 @@ class ResetVillageWorldTests(TestCase):
                 control(account, "tutorial_start", {}, bag)
                 state = PlayerTutorialState.objects.get(player=account)
                 self.assertEqual((state.evidence, state.completed), ({}, {}))
-                self.assertEqual(overview(account, bag, minute)["tutorial"]["current_task"]["code"], "basics_move")
-                for hint in ("movement", "camera"):
-                    control(account, "tutorial_ack", {"hint_code": hint, "task_code": "basics_move"}, bag)
-                self.assertEqual(overview(account, bag, minute)["tutorial"]["current_task"]["code"], "basics_collect")
+                self.assertEqual(overview(account, bag, minute)["tutorial"]["current_task"]["code"], "basics_lucy_meet")
+                from player.lucy_tutorial import context, handle
+                handle(dict(operation="meet", player_id=str(account.pk), npc_id="10014", conversation_id="after-reset"))
+                self.assertEqual(overview(account, bag, minute)["tutorial"]["current_task"]["code"], "basics_lucy_meet")
+                handle(dict(operation="exchange", player_id=str(account.pk), npc_id="10014", conversation_id="after-reset",
+                            tutorial_context_id=context(account)["context_id"], player_speech_id="new-player-hello", speech_id="new-lucy-hello"))
+                self.assertEqual(overview(account, bag, minute)["tutorial"]["current_task"]["code"], "basics_lucy_commission")
+
+    def test_reset_invalidates_lucy_context_and_old_thanks_then_allows_new_chapter(self):
+        from player.lucy_tutorial import context, handle, LUCY_STEPS
+        from player.tutorials import control, TutorialError
+        from village.personal_commissions import (publish_commission, accept_commission,
+                                                  contribute_commission, CommissionError)
+        player = GameAccount.objects.create(username="lucy-reset-player", password="keep")
+        lucy = NpcDefinition.objects.get(agent_id="10014")
+        old_commission = VillagePersonalCommission.objects.create(publisher=lucy, title="old Lucy tutorial",
+            status="COMPLETED", actor_type="PLAYER", actor_id=str(player.pk), reward_gold=5, reserved_reward_gold=0,
+            opened_world_minute=0, expires_world_minute=1440, completed_world_minute=10, created_request_id=uuid.uuid4())
+        old = PlayerTutorialState.objects.create(player=player, started=True,
+            completed={code: "old" for code in LUCY_STEPS}, lucy_commission=old_commission,
+            lucy_conversation_id="old-conversation", lucy_thanks_conversation_id="old-conversation",
+            lucy_thanks_speech_id="old-thanks")
+        old_token = str(old.lucy_context_id)
+        call_command("reset_village_world", "--confirm", "RESET_WUXI_VILLAGE", stdout=StringIO())
+        self.assertFalse(PlayerTutorialState.objects.filter(player=player).exists())
+        self.assertFalse(VillagePersonalCommission.objects.filter(pk=old_commission.pk).exists())
+        bag = InventoryBag.objects.get(player=player, character_id=player.username)
+        control(player, "tutorial_start", {}, bag)
+        state = PlayerTutorialState.objects.get(player=player)
+        self.assertNotEqual(str(state.lucy_context_id), old_token)
+        self.assertIsNone(state.lucy_commission_id)
+        self.assertEqual((state.lucy_conversation_id, state.lucy_thanks_conversation_id, state.lucy_thanks_speech_id), ("", "", ""))
+        minute = GlobalGameTimeState.objects.get(pk=1).world_minute
+        with self.assertRaises(CommissionError) as stale:
+            publish_commission(lucy, dict(tutorial_context_id=old_token), uuid.uuid4(), minute)
+        self.assertEqual(stale.exception.code, "TUTORIAL_CONTEXT_INVALID")
+        with self.assertRaises(TutorialError):
+            handle(dict(operation="thanks", npc_id="10014", player_id=str(player.pk),
+                        conversation_id="old-conversation", speech_id="old-thanks", commission_id=str(old_commission.pk)))
+        handle(dict(operation="meet", npc_id="10014", player_id=str(player.pk), conversation_id="new-meeting"))
+        with self.assertRaises(TutorialError) as stale_exchange:
+            handle(dict(operation="exchange", npc_id="10014", player_id=str(player.pk), conversation_id="new-meeting",
+                        tutorial_context_id=old_token, player_speech_id="old-player-hello", speech_id="old-lucy-hello"))
+        self.assertEqual(stale_exchange.exception.code, "TUTORIAL_CONTEXT_INVALID")
+        handle(dict(operation="exchange", npc_id="10014", player_id=str(player.pk), conversation_id="new-meeting",
+                    tutorial_context_id=context(player)["context_id"], player_speech_id="new-player-hello", speech_id="new-lucy-hello"))
+        # This reset fixture only installs NPC seed inventory; supply the existing
+        # level-one gathering catalog too before exercising the new chapter.
+        for item_id in (1025, 1035, 1042):
+            Item.objects.get_or_create(pk=item_id, defaults=dict(item_name=f"ingredient-{item_id}", item_type="蔬菜", item_price=2))
+        row = publish_commission(lucy, dict(tutorial_context_id=context(player)["context_id"]), uuid.uuid4(), minute)
+        accept_commission(row["commission_id"], "PLAYER", str(player.pk), uuid.uuid4(), minute)
+        InventorySlot.objects.create(bag=bag, slot_index=1, item_id=1025, item_amount=2)
+        contribute_commission(row["commission_id"], "PLAYER", str(player.pk), "ingredients", 2, uuid.uuid4(), minute,
+                             item_id=1025, location="RESTAURANT")
+        handle(dict(operation="meet", npc_id="10014", player_id=str(player.pk), conversation_id="new-return"))
+        result = handle(dict(operation="thanks", npc_id="10014", player_id=str(player.pk),
+                             conversation_id="new-return", speech_id="new-thanks", commission_id=row["commission_id"]))
+        self.assertEqual(result["stage"], "completed")
 
     def test_full_reset_restarts_human_arrivals_and_preserves_dry_run_rollback(self):
         # Exercise the actual reset only inside the explicitly isolated test DB.

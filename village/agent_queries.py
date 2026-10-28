@@ -751,7 +751,7 @@ def _personal_commissions(npc, query_params=None):
     from .personal_commissions import list_commissions
     params = query_params or {}
     scope = params.get("scope", "published")
-    if set(params) - {"scope"} or not isinstance(scope, str) or scope not in {"published", "all"}:
+    if set(params) - {"scope", "tutorial_player_id"} or not isinstance(scope, str) or scope not in {"published", "all"}:
         raise ValueError("Invalid commission scope")
     rows = list_commissions(_world_minute(), actor_type="NPC", actor_id=str(npc.pk))
     if scope == "published":
@@ -759,9 +759,24 @@ def _personal_commissions(npc, query_params=None):
     bag = NpcGlobalInventory.objects.filter(npc=npc).first()
     from .phase3_asset_service import get_available_money
     from .personal_commissions import MAX_OPEN_PER_NPC
-    return {"scope": scope, "commissions": rows, "available_gold": get_available_money(bag) if bag else 0,
+    result = {"scope": scope, "commissions": rows, "available_gold": get_available_money(bag) if bag else 0,
         "max_open_per_npc": MAX_OPEN_PER_NPC,
         "world_minute": _world_minute()}
+    if str(npc.agent_id) == "10014":
+        from player.lucy_tutorial import publication_limit
+        result["max_open_tutorials"] = publication_limit()
+    if "tutorial_player_id" in params:
+        if str(npc.agent_id) != "10014" or not isinstance(params["tutorial_player_id"], str):
+            raise AgentQueryError("TUTORIAL_NPC_INVALID", {})
+        from account.models import GameAccount
+        from player.lucy_tutorial import context
+        if not params["tutorial_player_id"].isdecimal():
+            raise AgentQueryError("PLAYER_NOT_FOUND", {})
+        player = GameAccount.objects.filter(pk=params["tutorial_player_id"], is_active=True, is_ai=False).first()
+        if player is None:
+            raise AgentQueryError("PLAYER_NOT_FOUND", {})
+        result["lucy_tutorial"] = context(player)
+    return result
 
 
 def _affairs(npc, query_params=None):

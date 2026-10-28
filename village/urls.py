@@ -11,9 +11,11 @@ from . import wildlife_views
 from . import forestry_views
 from . import daily_record_views
 from . import action_lifecycle
+from . import lucy_tutorial_views
 
 
 urlpatterns = [
+    path("api/village/runtime/tutorial/lucy", lucy_tutorial_views.tutorial_lucy, name="village-lucy-tutorial"),
     path("api/village/player/combat/", player_combat_views.player_combat, name="village-player-combat"),
     path("api/village/npcs/<str:npc_id>/operation", action_lifecycle.runtime_operation),
     path("api/village/npcs/<str:npc_id>/resources", action_lifecycle.runtime_resources),

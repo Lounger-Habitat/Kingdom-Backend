@@ -110,7 +110,7 @@ def _save_bag(bag):
 
 
 def _row(commission_id):
-    row = VillagePersonalCommission.objects.select_for_update().select_related("publisher").filter(pk=_uuid(commission_id)).first()
+    row = VillagePersonalCommission.objects.select_for_update(of=("self",)).select_related("publisher", "lucy_tutorial").filter(pk=_uuid(commission_id)).first()
     if not row:
         _fail("COMMISSION_NOT_FOUND", "个人委托不存在。")
     return row
@@ -144,14 +144,16 @@ def _event(row, action, request_id, world_minute):
               "WITHDRAWN": "撤回了个人委托", "ABANDONED": "个人委托已放弃", "EXPIRED": "个人委托已到期"}
     clock = GlobalGameTimeState.objects.get(pk=1)
     data = project_commission(row)
+    tutorial = getattr(row, "lucy_tutorial", None)
     event, created = VillageWorldEvent.objects.get_or_create(dedupe_key=f"commission:{row.pk}:{action}", defaults=dict(
         request_id=request_id, event_type="PERSONAL_COMMISSION_" + action, world_minute=world_minute,
         time_revision=clock.time_revision, participant_npc_ids=data["affected_npc_ids"],
-        player_ids=[row.actor_id] if row.actor_type == "PLAYER" else [],
-        location_code=(row.locations or [""])[0], visibility="PUBLIC",
+        player_ids=[str(tutorial.player_id)] if tutorial else [row.actor_id] if row.actor_type == "PLAYER" else [],
+        location_code=(row.locations or [""])[0], visibility="PARTICIPANTS" if tutorial else "PUBLIC",
         player_summary=f"{row.publisher.name}：{labels[action]}「{row.title}」", hub_summary=f"{labels[action]}：{row.title}",
         public_data={"commission_id": str(row.pk), "publisher_npc_id": row.publisher.agent_id,
-                     "title": row.title, "status": row.status, "reward_gold": row.reward_gold}))
+                     "title": row.title, "status": row.status, "reward_gold": row.reward_gold,
+                     **({"tutorial_player_id": str(tutorial.player_id)} if tutorial else {})}))
     if created:
         from .phase4_visibility import enqueue_event_deliveries
         enqueue_event_deliveries(event)
@@ -202,15 +204,44 @@ def publish_commission(npc, params, request_id, world_minute):
     replay, fingerprint = _replay("NPC", npc.pk, request_id, "PUBLISH", {"params": params})
     if replay is not None:
         return replay
+    tutorial = None
+    if isinstance(params, dict) and "tutorial_context_id" in params:
+        from player.lucy_tutorial import state_for_publication, template
+        tutorial = state_for_publication(npc, params["tutorial_context_id"])
+        if tutorial.lucy_commission_id:
+            existing = tutorial.lucy_commission
+            if existing.status in OPEN_STATUSES and existing.expires_world_minute > world_minute:
+                return _record(existing, "NPC", npc.pk, request_id, "PUBLISH", fingerprint, world_minute)
+            if existing.status == "COMPLETED":
+                _fail("TUTORIAL_ALREADY_COMPLETED", "这位旅人已经完成入村委托。")
+            if existing.status in OPEN_STATUSES:
+                _refund(existing, "EXPIRED", uuid.uuid5(uuid.NAMESPACE_URL, f"personal-commission:{existing.pk}:expired"), world_minute)
+                tutorial.refresh_from_db()
+        params = template()
     title, description, reward, duration, locations, requirements = _definition(params, npc)
-    if VillagePersonalCommission.objects.filter(publisher=npc, status__in=OPEN_STATUSES).count() >= MAX_OPEN_PER_NPC:
-        _fail("COMMISSION_LIMIT", "同时开放的个人委托已达上限。")
+    open_rows = VillagePersonalCommission.objects.filter(publisher=npc, status__in=OPEN_STATUSES)
+    if tutorial:
+        # A newcomer need not wait for a separate world-maintenance tick before
+        # expired onboarding reservations release their finite slot and reward.
+        for expired in open_rows.filter(lucy_tutorial__isnull=False,
+                expires_world_minute__lte=world_minute).select_for_update(of=("self",)):
+            _refund(expired, "EXPIRED", uuid.uuid5(uuid.NAMESPACE_URL,
+                f"personal-commission:{expired.pk}:expired"), world_minute)
+        from player.lucy_tutorial import publication_limit
+        if open_rows.filter(lucy_tutorial__isnull=False).count() >= publication_limit():
+            _fail("COMMISSION_LIMIT", "Lucy 同时接待的入村委托已达上限，稍后可用同一引导标识重试。")
+    elif open_rows.filter(lucy_tutorial__isnull=True).count() >= MAX_OPEN_PER_NPC:
+        _fail("COMMISSION_LIMIT", "同时开放的普通个人委托已达上限。")
     bag = _bag("NPC", npc.pk)
     _cash(bag, -reward)
     row = VillagePersonalCommission.objects.create(publisher=npc, title=title, description=description,
         requirements=requirements, locations=locations, progress={"conditions": {}}, reward_gold=reward,
         reserved_reward_gold=reward, opened_world_minute=world_minute, expires_world_minute=world_minute + duration,
         created_request_id=_uuid(request_id))
+    if tutorial:
+        tutorial.lucy_commission = row
+        tutorial.revision += 1
+        tutorial.save()
     _event(row, "PUBLISH", request_id, world_minute)
     return _record(row, "NPC", npc.pk, request_id, "PUBLISH", fingerprint, world_minute)
 
@@ -228,6 +259,9 @@ def accept_commission(commission_id, actor_type, actor_id, request_id, world_min
     if replay is not None:
         return replay
     row = _row(commission_id)
+    tutorial = getattr(row, "lucy_tutorial", None)
+    if tutorial and (actor_type != "PLAYER" or str(tutorial.player_id) != str(actor_id)):
+        _fail("COMMISSION_RESERVED", "这是 Lucy 交给另一位旅人的入村委托。")
     _assert_live(row, world_minute)
     if row.status != "OPEN":
         _fail("COMMISSION_ALREADY_ACCEPTED", "该委托已被其他人认领。")
@@ -247,6 +281,8 @@ def accept_commission(commission_id, actor_type, actor_id, request_id, world_min
     row.actor_type, row.actor_id, row.status = actor_type, str(actor_id), "ACTIVE"
     row.version += 1
     row.save(update_fields=["actor_type", "actor_id", "status", "version"])
+    from player.lucy_tutorial import commission_changed
+    commission_changed(row)
     _event(row, "ACCEPT", request_id, world_minute)
     return _record(row, actor_type, actor_id, request_id, "ACCEPT", fingerprint, world_minute)
 
@@ -387,6 +423,8 @@ def _advance(row, condition, quantity, request_id, world_minute):
     if row.status == "COMPLETED":
         from .cooperation import record_commission_completion
         record_commission_completion(row, world_minute)
+        from player.lucy_tutorial import commission_changed
+        commission_changed(row)
         _event(row, "COMPLETED", request_id, world_minute)
     return earned
 
@@ -449,6 +487,8 @@ def _refund(row, status, request_id, world_minute):
     row.version += 1
     row.save(update_fields=["status", "reserved_reward_gold", "escrow_gold", "completed_world_minute", "version"])
     _stop_labor(row, status)
+    from player.lucy_tutorial import commission_changed
+    commission_changed(row)
     _event(row, status, request_id, world_minute)
 
 
@@ -501,6 +541,7 @@ def project_commission(row, *, actor_type=None, actor_id=None):
         version=row.version, opened_world_minute=row.opened_world_minute, completed_world_minute=row.completed_world_minute)
     data = project_affair(proxy)
     mine = actor_type == row.actor_type and str(actor_id) == row.actor_id
+    tutorial = getattr(row, "lucy_tutorial", None)
     publisher = actor_type == "NPC" and str(actor_id) == str(row.publisher_id)
     affected = [row.publisher.agent_id]
     actor_name = ""
@@ -527,6 +568,9 @@ def project_commission(row, *, actor_type=None, actor_id=None):
         can_act=actor_type == "PLAYER" and row.status == "ACTIVE" and mine,
         can_withdraw=row.status == "OPEN" and publisher, can_abandon=actor_type == "PLAYER" and row.status == "ACTIVE" and mine,
         available=row.status in OPEN_STATUSES, labor_available=row.status == "ACTIVE" and data["labor_available"])
+    if tutorial:
+        data["tutorial_player_id"] = str(tutorial.player_id)
+        data["can_accept"] = data["can_accept"] and str(actor_id) == str(tutorial.player_id)
     if mine or publisher:
         data.update(reserved_reward_gold=row.reserved_reward_gold, escrow_gold=row.escrow_gold)
         clock = GlobalGameTimeState.objects.filter(pk=1).first()
@@ -546,7 +590,13 @@ def project_commission(row, *, actor_type=None, actor_id=None):
 
 
 def list_commissions(world_minute, actor_type=None, actor_id=None):
-    base = VillagePersonalCommission.objects.select_related("publisher")
+    base = VillagePersonalCommission.objects.select_related("publisher", "lucy_tutorial")
+    if actor_type == "PLAYER":
+        base = base.filter(models.Q(lucy_tutorial__isnull=True) | models.Q(lucy_tutorial__player_id=actor_id))
+    elif actor_type == "NPC":
+        base = base.filter(models.Q(lucy_tutorial__isnull=True) | models.Q(publisher_id=actor_id))
+    else:
+        base = base.filter(lucy_tutorial__isnull=True)
     rows = list(base.filter(status="OPEN", expires_world_minute__gt=world_minute)
                 .order_by("-opened_world_minute", "-commission_id")[:100])
     if actor_type in ("PLAYER", "NPC") and actor_id is not None:

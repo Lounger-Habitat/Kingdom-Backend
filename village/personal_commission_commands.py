@@ -12,8 +12,8 @@ QUERY = "INSPECT_PERSONAL_COMMISSIONS"
 def validate_intent(action, params):
     """NPCs may publish their own commissions or withdraw unaccepted ones."""
     if action == "PUBLISH_PERSONAL_COMMISSION":
-        allowed = {"title", "description", "reward_gold", "valid_for_minutes", "default_location_code", "stages"}
-        required = {"title", "reward_gold", "valid_for_minutes", "stages"}
+        allowed = {"title", "description", "reward_gold", "valid_for_minutes", "default_location_code", "stages", "tutorial_context_id"}
+        required = {"tutorial_context_id"} if isinstance(params, dict) and "tutorial_context_id" in params else {"title", "reward_gold", "valid_for_minutes", "stages"}
     elif action == "WITHDRAW_PERSONAL_COMMISSION":
         allowed = required = {"commission_id"}
     else:
@@ -21,6 +21,8 @@ def validate_intent(action, params):
     if not isinstance(params, dict) or set(params) - allowed or not required.issubset(params):
         return "INVALID_COMMAND_SCHEMA"
     if action == "WITHDRAW_PERSONAL_COMMISSION" and not isinstance(params.get("commission_id"), str):
+        return "INVALID_COMMAND_SCHEMA"
+    if "tutorial_context_id" in params and not isinstance(params["tutorial_context_id"], str):
         return "INVALID_COMMAND_SCHEMA"
     return None
 
