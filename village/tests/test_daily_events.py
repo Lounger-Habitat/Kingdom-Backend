@@ -48,6 +48,23 @@ class DailyEventTests(TestCase):
     def event(self):
         return VillageDailyEvent.objects.get()
 
+    def test_inventory_batches_reservations_and_honors_review_deadlines(self):
+        from django.db import connection
+        from django.test.utils import CaptureQueriesContext
+        from village.daily_events import _inventory
+
+        slots = [self.slot(amount=3) for _ in range(20)]
+        self.slot("10012", amount=100)
+        for slot, expires, status in [(slots[0], 101, "PENDING"),
+                                     (slots[1], 100, "PENDING"), (slots[2], 101, "COMPLETED")]:
+            VillageDishReview.objects.create(owner=self.npcs["10014"], slot=slot,
+                request_id=uuid.uuid4(), created_world_minute=99, expires_world_minute=expires, status=status)
+        with CaptureQueriesContext(connection) as queries:
+            _, amounts = _inventory("10014", 100)
+        self.assertEqual(amounts[1030], 59)
+        self.assertLessEqual(len(queries), 5)
+        self.assertEqual(_inventory("10014", None)[1][1030], 58)
+
     def test_zero_players_opens_once_and_clock_expiry_does_not_create_assets(self):
         self.template()
         evaluate_daily_events()

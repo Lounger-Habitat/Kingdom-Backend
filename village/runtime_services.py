@@ -549,9 +549,29 @@ class TimeService:
             expire_supply(state.world_minute)
             from .player_farm import maintain_leases
             maintain_leases(state.world_minute, state.time_revision)
+            _maintain_village_development(state.world_minute)
             from .daily_events import evaluate_daily_events
             evaluate_daily_events(state.world_minute, expire_only=True)
         return True, ResultCode.COMMAND_ACCEPTED, state
+
+
+def _maintain_village_development(world_minute, *, bootstrap=False):
+    """World-authority maintenance; read queries never install or advance work."""
+    config = VillageSimulationConfig.objects.filter(config_key="default").first()
+    if config and config.farm_expansion_enabled:
+        from .farm_expansion import ensure_expansion_sites
+        from .models import VillageFarmExpansionSite
+        # Contributions already reduce progress atomically. Reinstall only at
+        # startup or first enable, rather than rebuilding 20 affairs every tick.
+        if bootstrap or VillageFarmExpansionSite.objects.filter(site_code__in=["E", "F"]).count() < 2:
+            ensure_expansion_sites(world_minute)
+    if config and config.career_development_enabled:
+        from .career_development import ensure_career_development
+        ensure_career_development(world_minute, bootstrap=bootstrap)
+    from .caravan_orders import ensure_orders, expire_orders
+    expire_orders(world_minute)
+    if config and config.caravan_orders_enabled:
+        ensure_orders(world_minute)
 
 
 # ============================================================================
@@ -742,6 +762,7 @@ class BootstrapService:
             })
 
         from .daily_events import evaluate_daily_events, project_daily_events
+        _maintain_village_development(time_state.world_minute, bootstrap=True)
         evaluate_daily_events(time_state.world_minute)
         return {
             "world_minute": time_state.world_minute,
@@ -767,6 +788,9 @@ class BootstrapService:
                 "village_hub_command_adapter_enabled": config.village_hub_command_adapter_enabled if config else False,
                 "village_needs_enabled": config.village_needs_enabled if config else False,
                 "village_economy_enabled": config.village_economy_enabled if config else False,
+                "farm_expansion_enabled": config.farm_expansion_enabled if config else False,
+                "caravan_orders_enabled": config.caravan_orders_enabled if config else False,
+                "career_development_enabled": config.career_development_enabled if config else False,
                 "village_social_enabled": config.village_social_enabled if config else False,
                 "village_story_enabled": config.village_story_enabled if config else False,
                 "village_presentation_enabled": config.village_presentation_enabled if config else False,
@@ -994,7 +1018,7 @@ class CommandService:
         "INSPECT_SCHEDULE", "INSPECT_DIARIES",
         "GET_RULE", "INSPECT_LIVING_OPTIONS", "OBSERVE", "INSPECT_NEARBY", "INSPECT_INVENTORY",
         "INSPECT_TRADE_OFFERS", "INSPECT_AFFAIRS",
-        "INSPECT_MARKET_STATE", "INSPECT_CARAVAN_REQUESTS", "INSPECT_FARM_STATE",
+        "INSPECT_MARKET_STATE", "INSPECT_CARAVAN_REQUESTS", "INSPECT_CARAVAN_ORDERS", "INSPECT_FARM_STATE",
         "INSPECT_RESTAURANT_STATE", "INSPECT_RATEABLE_DISHES",
         "BROWSE_MARKETPLACE", "CHECK_MY_MARKETPLACE_LISTINGS",
         "CHECK_MARKETPLACE_HISTORY",
@@ -1055,6 +1079,10 @@ class CommandService:
             # Rules remain discoverable even if an old/admin-edited profile omits them.
             actions.add("GET_RULE")
             actions.update(CommandService.DIAGNOSTIC_ACTIONS)
+        if not VillageSimulationConfig.objects.filter(config_key="default", caravan_orders_enabled=True).exists():
+            from .models import VillageCaravanOrder
+            if not VillageCaravanOrder.objects.filter(active_key="COMMUNAL").exists():
+                actions.difference_update({"INSPECT_CARAVAN_ORDERS", "DELIVER_CARAVAN_ORDER"})
         return actions
 
     @staticmethod
@@ -1954,6 +1982,9 @@ class ActionService:
                 success, result_code = False, error
         elif jack_work:
             settle_work_needs(rt, command, time_state.world_minute)
+            if not success:
+                from .career_development import release_trial_production
+                release_trial_production(command.request_id)
             if command.kind == "HUNT":
                 from .wildlife import release_command_attempts
                 release_command_attempts(command)

@@ -48,6 +48,11 @@ FARM_EVENT_TYPES = {
 }
 AFFAIR_EVENT_TYPES = {"VILLAGE_AFFAIR_PROGRESS", "VILLAGE_AFFAIR_READY", "VILLAGE_AFFAIR_COMPLETED"}
 DAILY_STORY_EVENT_TYPES = {"STORY_DAILY_OPENED", "STORY_DAILY_RESOLVED", "STORY_DAILY_EXPIRED"}
+EXPANSION_EVENT_TYPES = {"FARM_EXPANSION_AVAILABLE", "FARM_EXPANSION_PREPARED",
+                         "FARM_EXPANSION_COMPLETED", "FARM_PLOT_RECLAIMED"}
+ORDER_EVENT_TYPES = {"CARAVAN_ORDER_PUBLISHED", "CARAVAN_ORDER_EXPIRED", "CARAVAN_ORDER_COMPLETED",
+                     "CARAVAN_ORDER_LINE_FILLED", "CARAVAN_ORDER_REWARD_APPLIED"}
+CAREER_EVENT_TYPES = {"CAREER_AVAILABLE", "CAREER_TRIAL_OPENED", "CAREER_COMPLETED", "CAREER_REVIEW_COMPLETED"}
 PUBLIC_AFFAIR_FIELDS = ("affair_id", "stage_id", "current_stage_title", "open_needs", "completion_effect", "version")
 PUBLIC_AFFAIR_NEED_FIELDS = ("condition_id", "label", "kind", "item_id", "remaining", "unit_minutes", "locations")
 PUBLIC_STORY_EVENT_FIELDS = (
@@ -75,6 +80,19 @@ def public_story_event_fields(event: VillageWorldEvent) -> dict[str, Any]:
         return {}
     data = getattr(event, "public_data", {}) or {}
     fields = {}
+    if event.event_type in EXPANSION_EVENT_TYPES:
+        fields.update({key: deepcopy(data[key]) for key in (
+            "site_code", "status", "plot_code", "reclamation_status", "expansion_site_code",
+            "reclamation_affair_id", "reclaimed_world_minute", "can_use", "blocked_reason") if key in data})
+    if event.event_type in ORDER_EVENT_TYPES:
+        fields.update({key: deepcopy(data[key]) for key in (
+            "order_id", "deadline_world_minute", "budget_spent", "item_id", "rewards", "day_index",
+            "reward_ids", "buy_capacity", "buy_item_ids", "import_capacity", "extra_kinds", "message",
+            "theme", "theme_label", "trial_item_ids") if key in data})
+    if event.event_type in CAREER_EVENT_TYPES:
+        fields.update({key: deepcopy(data[key]) for key in (
+            "track_code", "code", "owner_npc_id", "owner_name", "title", "status", "phase",
+            "affair_id", "location_code", "unlocks", "item_ids", "completion_effect", "version", "message") if key in data})
     if event.event_type in AFFAIR_EVENT_TYPES:
         fields.update({key: deepcopy(data[key]) for key in PUBLIC_AFFAIR_FIELDS if key != "open_needs" and key in data})
         if isinstance(data.get("open_needs"), list):

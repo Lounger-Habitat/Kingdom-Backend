@@ -66,13 +66,15 @@ def ensure_gathering_catalog(minute):
     if (store is None or nora is None or store.operator_npc_id != nora.pk or
             not VillageStoreAccount.objects.filter(store=store).exists()):
         return None
+    from .production_tools import _initial_tool_listing
+    existing = _initial_tool_listing(store, TOOL_ITEM_ID, TOOL_PRICE, TOOL_MAX_USES)
     listing = VillageStoreListing.objects.filter(pk=TOOL_LISTING_ID).first()
     if listing is not None:
         return listing
     if EconomicLedgerEntry.objects.filter(request_id=STOCK_REQUEST_ID).exists():
         # Administrative removal of the listing is not a new stock entitlement.
         return None
-    listing = VillageStoreListing.objects.create(listing_id=TOOL_LISTING_ID, store=store,
+    listing = existing or VillageStoreListing.objects.create(listing_id=TOOL_LISTING_ID, store=store,
         item_id=TOOL_ITEM_ID, unit_price=TOOL_PRICE, price_mode="ORIGINAL", status="ACTIVE",
         listed_by_npc=nora, created_request_id=STOCK_REQUEST_ID, listed_world_minute=minute)
     for index in range(INITIAL_STOCK):
@@ -173,10 +175,8 @@ def gathering_overview(player, bag, minute):
     ids = _pool_item_ids(player)
     categories = [dict(code=code, title=title, item_ids=sorted(ids.intersection(items)),
                        available=bool(ids.intersection(items))) for code, title, items in CATEGORIES]
-    items = {i.pk: i for i in Item.objects.filter(pk__in=[TOOL_ITEM_ID, 4102, 4120], is_deleted=False)}
-    slots = list(bag.slots.filter(item_id__in=items, item_amount__gt=0).order_by("slot_index")) if bag.pk else []
     from .production_tools import tools_overview
-    tools = [row for row in tools_overview(player, bag, minute)["tools"] if row["capability"] == "targeted_gathering"]
+    tools = tools_overview(player, bag, minute, capability="targeted_gathering")["tools"]
     usable = any(tool["usable"] for tool in tools)
     reason = ("SKILL_LEVEL_REQUIRED" if level < REQUIRED_LEVEL else "GATHERING_TOOL_REQUIRED" if not usable
               else "COLLECTION_CATEGORY_EMPTY" if not any(c["available"] for c in categories) else None)

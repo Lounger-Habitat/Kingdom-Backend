@@ -76,6 +76,9 @@ def agent_tool(action):
         "parameters": deepcopy(command["parameters"]),
         "tags": tags,
     }
+    if action == "PLANT":
+        from .phase3_catalog import FARM_CROP_RULES
+        result["parameters"]["properties"]["crop_code"]["enum"] = list(FARM_CROP_RULES)
     policy = command.get("evidence_policy", policy_for(action))
     if policy is not None:
         result["evidence_policy"] = deepcopy(policy)

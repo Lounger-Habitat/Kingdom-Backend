@@ -52,21 +52,23 @@ def _milestone_data(row):
                 completed_at=row.completed_at.isoformat(), rules_version=row.rules_version)
 
 
-def growth_snapshot(player, *, read_only=False):
+def growth_snapshot(player, *, read_only=False, compact=False):
     state = PlayerGrowthState.objects.filter(player=player).first() if read_only else ensure_growth(player)
     points = _legacy_points(player) if state is None or state.legacy_migration_version < 1 else None
     totals = dict(PlayerSkillProgress.objects.filter(player=player).values_list("skill_code", "total_xp"))
     if points is not None:
         totals["gathering"] = max(totals.get("gathering", 0), _legacy_floor(points))
-    return dict(schema_version=1, revision=state.revision if state else 0, rules_version=RULES_VERSION,
+    result = dict(schema_version=1, revision=state.revision if state else 0, rules_version=RULES_VERSION,
         skills=[skill_data(code, name, totals.get(code, 0)) for code, name in SKILLS],
         milestones=[_milestone_data(row) for row in PlayerMilestoneProgress.objects.filter(player=player).order_by("pk")],
-        legacy_entitlements=deepcopy(state.legacy_entitlements) if points is None else legacy_entitlements(points),
-        equipment_definitions=[dict(item_id=d.item_id, item_name=d.item.item_name, capability_code=d.capability_code,
+        legacy_entitlements=deepcopy(state.legacy_entitlements) if points is None else legacy_entitlements(points))
+    if not compact:
+        result["equipment_definitions"] = [dict(item_id=d.item_id, item_name=d.item.item_name, capability_code=d.capability_code,
             tier=d.tier, required_skill=d.required_skill, required_level=d.required_level, effects=deepcopy(d.effects),
             maximum_uses=d.item.max_use_count, rules_version=d.rules_version,
             runtime_enforced=d.capability_code in {"targeted_gathering", "farming", "forestry", "cooking"})
-            for d in ItemGameplayDefinition.objects.select_related("item").filter(item__is_deleted=False).order_by("item_id")])
+            for d in ItemGameplayDefinition.objects.select_related("item").filter(item__is_deleted=False).order_by("item_id")]
+    return result
 
 
 @transaction.atomic

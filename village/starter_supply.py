@@ -168,34 +168,36 @@ def expire_supply(minute):
     return refund
 
 
-def _eligibility(slot, order, minute):
+def _eligibility(slot, order, minute, *, items=None):
     if slot.item_id not in order.accepted_item_ids:
         return "ITEM_NOT_ACCEPTED"
     if not 1 <= slot.quality <= 6:
         return "QUALITY_REQUIRED"
     if slot.produced_world_minute is not None and slot.produced_world_minute > minute:
         return "PROVENANCE_REQUIRED"
-    if not Item.objects.filter(pk=slot.item_id, is_deleted=False).exists():
+    available = (Item.objects.filter(pk=slot.item_id, is_deleted=False).exists() if items is None
+                 else slot.item_id in items and not items[slot.item_id].is_deleted)
+    if not available:
         return "ITEM_UNAVAILABLE"
     return ""
 
 
-def _order_data(order, player=None, bag=None, minute=0, *, read_only=False, completed_personal=False):
+def _order_data(order, player, slots, items, minute, *, read_only=False, completed_personal=False):
     expired = order.batch.expires_world_minute <= minute and order.status != "COMPLETED"
     status = "EXPIRED" if expired else order.status
     mine = player is not None and order.actor_player_id == player.pk
     reason = ("MODE_READ_ONLY" if read_only else "ORDER_EXPIRED" if expired else "PERSONAL_ORDER_COMPLETED"
               if completed_personal and status != "COMPLETED" else "ORDER_NOT_OWNED" if status == "ACTIVE" and not mine else "")
     rows = []
-    if bag and bag.pk:
-        names = dict(Item.objects.filter(pk__in=order.accepted_item_ids).values_list("pk", "item_name"))
-        for slot in bag.slots.filter(item_amount__gt=0, item_id__in=order.accepted_item_ids).order_by("slot_index"):
-            unsuitable = _eligibility(slot, order, minute)
-            rows.append(dict(instance_id=str(slot.instance_id), item_id=slot.item_id,
-                item_name=names.get(slot.item_id, str(slot.item_id)), quantity=slot.item_amount,
-                eligible_quantity=min(slot.item_amount, order.required_quantity - order.delivered_quantity)
-                    if not unsuitable and status == "ACTIVE" and mine and not read_only else 0,
-                reason=unsuitable or reason))
+    for slot in slots:
+        if slot.item_id not in order.accepted_item_ids:
+            continue
+        unsuitable = _eligibility(slot, order, minute, items=items)
+        rows.append(dict(instance_id=str(slot.instance_id), item_id=slot.item_id,
+            item_name=items[slot.item_id].item_name if slot.item_id in items else str(slot.item_id), quantity=slot.item_amount,
+            eligible_quantity=min(slot.item_amount, order.required_quantity - order.delivered_quantity)
+                if not unsuitable and status == "ACTIVE" and mine and not read_only else 0,
+            reason=unsuitable or reason))
     return dict(order_id=str(order.pk), title="公共储备入门供货", status=status,
         actor_player_id=str(order.actor_player_id) if order.actor_player_id else None,
         required_quantity=order.required_quantity, delivered_quantity=order.delivered_quantity,
@@ -211,10 +213,16 @@ def supply_overview(player, bag, minute, *, read_only=False):
     batch = StarterSupplyBatch.objects.filter(pk=BATCH_CODE).first()
     if batch is None:
         return dict(available=False, reason="FIRST_COLLECTION_REQUIRED", orders=[], completed_personal=False, version=0)
-    completed = batch.orders.filter(actor_player=player, status="COMPLETED").exists()
-    active = batch.orders.filter(actor_player=player, status="ACTIVE", batch__expires_world_minute__gt=minute).exists()
-    orders = [_order_data(order, player, bag, minute, read_only=read_only, completed_personal=completed)
-              for order in batch.orders.select_related("batch").order_by("order_id")]
+    order_rows = list(batch.orders.select_related("batch").order_by("order_id"))
+    player_id = player.pk if player is not None else None
+    completed = any(order.actor_player_id == player_id and order.status == "COMPLETED" for order in order_rows)
+    active = batch.expires_world_minute > minute and any(
+        order.actor_player_id == player_id and order.status == "ACTIVE" for order in order_rows)
+    accepted_ids = {item_id for order in order_rows for item_id in order.accepted_item_ids}
+    items = Item.objects.filter(pk__in=accepted_ids).only("item_name", "is_deleted").in_bulk() if bag and bag.pk else {}
+    slots = list(bag.slots.filter(item_amount__gt=0, item_id__in=accepted_ids).order_by("slot_index")) if bag and bag.pk else []
+    orders = [_order_data(order, player, slots, items, minute, read_only=read_only, completed_personal=completed)
+              for order in order_rows]
     for order in orders:
         if active:
             order["can_accept"] = False

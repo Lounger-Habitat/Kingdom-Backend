@@ -130,6 +130,23 @@ def accept_action(envelope):
     if action in QUERY_NAMES:
         ok, code, data = execute_agent_query(sender, action, parameters)
         return finish(ok, code, data)
+    if action == "DELIVER_CARAVAN_ORDER":
+        if action not in CommandService.allowed_actions_for(NpcDefinition.objects.get(agent_id=sender)):
+            return finish(False, ResultCode.ACTION_NOT_ALLOWED)
+        from .command_catalog import COMMAND_CATALOG
+        allowed = COMMAND_CATALOG[action]["parameters"]
+        if (set(parameters) - set(allowed["properties"]) or
+                not set(allowed["required"]) <= set(parameters)):
+            return finish(False, ResultCode.INVALID_COMMAND_SCHEMA)
+        from .caravan_orders import deliver_order
+        from .models import NpcRuntimeState
+        runtime = NpcRuntimeState.objects.filter(npc__agent_id=sender).first()
+        if runtime is None:
+            return finish(False, "NPC_NOT_READY")
+        result = deliver_order("NPC", sender, parameters, clock.world_minute, task.pk,
+                               runtime.current_location_code)
+        ok = str(result.get("result_code")) in {"OK", "ResultCode.OK"}
+        return finish(ok, result.get("result_code", "CARAVAN_ORDER_FAILED"), result.get("data", {}))
     from .daily_records import WRITE_ACTIONS, write_daily_record
     business = {"envelope_id": original["id"], "sender": sender, "recipient": environment,
                 "timestamp": original["timestamp"], "content": {"id": content["id"], "name": action, "params": parameters}}

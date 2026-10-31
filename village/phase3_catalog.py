@@ -10,6 +10,10 @@ Do NOT add database-backed configuration admin for these values.
 # use the same first-pass timing/yield/seed-return rules so balancing stays in
 # this one small catalog instead of leaking into the transaction handler.
 from .professional_catalog import PUMPKIN, PUMPKIN_SEED, PREY_BOAR, T3_TOOLS, PROFESSIONAL_EXPORT_PRICES
+from .career_catalog import (CROP_RULES as CAREER_CROPS, ITEMS as CAREER_ITEMS,
+    RECIPES as CAREER_RECIPES, EXPORT_PRICES as CAREER_EXPORT_PRICES,
+    IMPORT_ITEM_IDS as CAREER_IMPORT_IDS, EXPORT_ITEM_IDS as CAREER_EXPORT_IDS,
+    BYPRODUCT_ITEM_IDS as CAREER_BYPRODUCT_IDS, content_access as career_content_access)
 
 CORN_SEED_ITEM_ID = 1051
 CORN_OUTPUT_ITEM_ID = 1030
@@ -26,6 +30,7 @@ ONION_SEED_ITEM_ID = 29304
 GREEN_RADISH_SEED_ITEM_ID = 29305
 
 FARM_CROP_RULES = {
+    **CAREER_CROPS,
     "PUMPKIN": dict(display_name="南瓜", seed_item_id=PUMPKIN_SEED, output_item_id=PUMPKIN,
         growth_minutes=2880, yield_min=6, yield_max=8, guaranteed_seed_return=1,
         bonus_seed_chance=.30, required_level=7, minimum_tool_tier=3, quality=4,
@@ -79,6 +84,9 @@ FARM_CROP_RULES = {
 }
 
 FARM_SEED_ITEM_DEFINITIONS = {
+    **{spec["seed_item_id"]: (CAREER_ITEMS[spec["seed_item_id"]]["name"],
+         CAREER_ITEMS[spec["seed_item_id"]]["price"], CAREER_ITEMS[spec["seed_item_id"]]["description"])
+       for spec in CAREER_CROPS.values()},
     PUMPKIN_SEED: ("南瓜种子", 8, "专业南瓜种子；种植7级及T3农具。"),
     WHEAT_SEED_ITEM_ID: ("小麦种子", 5, "Bill农田种植小麦所需的种子，可由Nora通过商队进货。"),
     CARROT_SEED_ITEM_ID: ("胡萝卜种子", 5, "Bill农田种植胡萝卜所需的种子，可由Nora通过商队进货。"),
@@ -98,6 +106,7 @@ def farm_crop_catalog(irrigation=None):
             "crop_code": crop_code,
             **rule,
             "growth_minutes": effective_growth_minutes(rule["growth_minutes"], irrigation),
+            "development": career_content_access(rule["output_item_id"]),
         }
         for crop_code, rule in FARM_CROP_RULES.items()
     }
@@ -122,7 +131,7 @@ PREY_RECIPES = {
     PREY_DEER: {"name": "鹿（待处理猎物）", "weight": 0, "outputs": {VENISON: 4, ROUGH_LEATHER: 1}},
 }
 PREY_ITEM_IDS = frozenset(PREY_RECIPES)
-BYPRODUCT_ITEM_IDS = frozenset({FEATHER, ROUGH_LEATHER})
+BYPRODUCT_ITEM_IDS = frozenset({FEATHER, ROUGH_LEATHER}) | CAREER_BYPRODUCT_IDS
 JACK_ITEM_DEFINITIONS = {
     PREY_BOAR: ("野猪（待处理猎物）", 70, "北坡真实野猪；Jack加工为五花肉、排骨和粗皮革。"),
     PREY_CHICKEN: ("鸡（待处理猎物）", 12, "猎获的鸡。由Jack在屠宰棚处理为鸡肉和羽毛；不可直接食用。"),
@@ -162,7 +171,7 @@ REPAIR_METAL_ITEM_ID = 4003
 
 # ── Recipe whitelist ───────────────────────────────────────────────
 from .lucy_catalog import RECIPE_DEFINITIONS, MEALS, RELIEF_PACK
-RECIPE_WHITELIST = frozenset({2, 3, 6, 12, 16, 27}) | frozenset(RECIPE_DEFINITIONS)
+RECIPE_WHITELIST = frozenset({2, 3, 6, 12, 16, 27}) | frozenset(RECIPE_DEFINITIONS) | frozenset(CAREER_RECIPES)
 
 # ── Dish spoilage ──────────────────────────────────────────────────
 DISH_SPOILAGE_MINUTES = 2880
@@ -199,6 +208,8 @@ SAFE_STOCKS = {
 
 # ── Base prices (item_id → base_price) ─────────────────────────────
 BASE_PRICES = {
+    **CAREER_EXPORT_PRICES,
+    **{item_id: CAREER_ITEMS[item_id]["price"] for item_id in CAREER_IMPORT_IDS},
     **PROFESSIONAL_EXPORT_PRICES, PUMPKIN_SEED: 8,
     1005: 6,    # 小麦（与现有 Item 目录价格一致）
     1009: 12,   # 里脊肉
@@ -240,7 +251,7 @@ BASE_PRICES = {
 }
 
 # ── Import whitelist (item_id) ─────────────────────────────────────
-IMPORT_WHITELIST = frozenset({
+IMPORT_WHITELIST = CAREER_IMPORT_IDS | frozenset({
     PUMPKIN_SEED,
     1003, 1022, 1051, WHEAT_SEED_ITEM_ID, CARROT_SEED_ITEM_ID, POTATO_SEED_ITEM_ID,
     ONION_SEED_ITEM_ID, GREEN_RADISH_SEED_ITEM_ID,  # 种子
@@ -251,7 +262,7 @@ IMPORT_WHITELIST = frozenset({
 # 种子和调味料来自当前 ItemDataList；工具为阶段三农具和阶段三猎具。
 
 # ── Export whitelist (item_id) ─────────────────────────────────────
-EXPORT_WHITELIST = frozenset({1005, 1009, 1025, 1030, 1034, 1038, 1042, 1043, 1056, 1057, 1077, 1053, 1067, FEATHER, ROUGH_LEATHER, 29306}) | frozenset(PROFESSIONAL_EXPORT_PRICES)
+EXPORT_WHITELIST = frozenset({1005, 1009, 1025, 1030, 1034, 1038, 1042, 1043, 1056, 1057, 1077, 1053, 1067, FEATHER, ROUGH_LEATHER, 29306}) | frozenset(PROFESSIONAL_EXPORT_PRICES) | CAREER_EXPORT_IDS
 # 肉类、玉米及阶段三配方成品均可对外出货。
 
 # ── NPC starting money (from seed_data) ────────────────────────────

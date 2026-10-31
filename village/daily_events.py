@@ -87,11 +87,13 @@ def validate_template(template, *, check_references=False):
 
 
 def _inventory(npc_id, minute):
-    from .phase3_asset_service import get_available_slot_amount
-    rows = list(NpcGlobalInventorySlot.objects.filter(bag__npc__agent_id=npc_id, item_amount__gt=0))
+    from .phase3_asset_service import get_available_slot_amounts
+    rows = list(NpcGlobalInventorySlot.objects.select_related("bag__npc").filter(
+        bag__npc__agent_id=npc_id, item_amount__gt=0))
+    available = get_available_slot_amounts(rows, minute)
     amounts = {}
     for row in rows:
-        amounts[row.item_id] = amounts.get(row.item_id, 0) + get_available_slot_amount(row, minute)
+        amounts[row.item_id] = amounts.get(row.item_id, 0) + available[row.pk]
     return rows, amounts
 
 
@@ -132,7 +134,8 @@ def _observe(rule, p, minute):
         from .phase3_catalog import FARM_CROP_RULES, FARM_TOOL_ITEM_ID
         from .phase3_contract import PLOT_CODES
         from inventory.models import NpcGlobalInventory
-        plots = VillageFarmPlot.objects.filter(plot_code__in=PLOT_CODES, status="EMPTY", lessee_player__isnull=True, lease_enabled=False)
+        plots = VillageFarmPlot.objects.filter(plot_code__in=PLOT_CODES, reclamation_status="READY",
+                                              status="EMPTY", lessee_player__isnull=True, lease_enabled=False)
         bag = NpcGlobalInventory.objects.filter(npc__agent_id=p["npc_id"]).first()
         _, amounts = _inventory(p["npc_id"], minute)
         seeds = p.get("seed_item_ids", [r["seed_item_id"] for r in FARM_CROP_RULES.values()])
@@ -264,7 +267,7 @@ def _end_fact(row, current, minute):
         if rule == "FARM_PREPARATION":
             from .models import VillageFarmPlot
             plots = list(VillageFarmPlot.objects.filter(plot_code__in=row.facts.get("plot_codes", [])))
-            if not plots or all(r.lessee_player_id is not None or r.lease_enabled for r in plots):
+            if not plots or all(r.reclamation_status != "READY" or r.lessee_player_id is not None or r.lease_enabled for r in plots):
                 return "EXPIRED", "原空田已转为其他安排，本次农活邀请结束。"
         return "RESOLVED", row.rule_snapshot["resolved_summary"]
     return None

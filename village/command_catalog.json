@@ -415,13 +415,7 @@
           },
           "crop_code": {
             "type": "string",
-            "description": "作物代码",
-            "enum": [
-              "CORN",
-              "WHEAT",
-              "CARROT",
-              "POTATO"
-            ]
+            "description": "当前种植目录中的作物代码；开放条件以农田及对应事务查询为准"
           }
         },
         "required": [
@@ -473,7 +467,7 @@
       "name": "PROCESS_GAME",
       "phase": "阶段三",
       "label": "处理猎物",
-      "description": "在BUTCHER_YARD处理库存查询中的指定猎物实例，每次1件，消耗1次猎具，产出肉和羽毛或粗皮革；肉继承猎物到期时间。时长仅由数据库决定。",
+      "description": "在BUTCHER_YARD处理库存查询中的指定猎物实例，每次消耗1件猎物与1次猎具耐久。完整分割产出和时长以当前production目录为准，加工棚改进后可开放新肉类部位及副产品，新分割增加工时；开工时冻结产出，同一猎物只结算一次。物品不会因历史到期时间失效。",
       "parameters": {
         "type": "object",
         "properties": {
@@ -554,7 +548,7 @@
       "name": "EXPORT_GOODS",
       "phase": "阶段三",
       "label": "外部出货",
-      "description": "向在场商队出售个人可用物品。允许品种和报价取自本趟配置快照，所有品种共用本趟出口收购总量；先用INSPECT_MARKET_STATE查看export_remaining_amount和export_unit_price。出口扣个人背包、收入归个人，并保留村庄安全库存。超过剩余额度整笔失败，不部分成交。",
+      "description": "向在场商队出售本人或自己杂货铺的可用物品。stock_source=PERSONAL（默认）扣个人背包、收入归个人；STORE扣本人杂货铺未上架且未占用的库存、收入回杂货铺账户。先查询当趟报价、共享剩余额度和店内未上架库存；保留村庄安全库存，超过剩余额度整笔失败。",
       "parameters": {
         "type": "object",
         "properties": {
@@ -567,6 +561,11 @@
             "type": "integer",
             "description": "数量",
             "minimum": 1
+          },
+          "stock_source": {
+            "type": "string",
+            "enum": ["PERSONAL", "STORE"],
+            "description": "库存及货款账户：PERSONAL个人；STORE本人杂货铺未上架库存，货款回店"
           }
         },
         "required": [
@@ -1729,6 +1728,61 @@
         },
         "required": [
           "route_attempt_id"
+        ],
+        "additionalProperties": false
+      }
+    },
+    {
+      "name": "INSPECT_CARAVAN_ORDERS",
+      "phase": "阶段三",
+      "label": "查看商队限时订单",
+      "description": "查看当前商队限时收购订单的主题、新品试销条目、本地产出来源要求、交货窗口、截止时间、剩余需求和冻结品质报价，以及本人真实可交货批次、预计货款和阻碍。也返回近期结果与下趟公共奖励。只读，不生成订单或商队，不扣钱货；商队不在场可查看，现场交货时复核。",
+      "parameters": {
+        "type": "object",
+        "properties": {},
+        "required": [],
+        "additionalProperties": false
+      }
+    },
+    {
+      "name": "DELIVER_CARAVAN_ORDER",
+      "phase": "阶段三",
+      "label": "向商队订单交货",
+      "description": "在实际正常商队交货地点，出售本人背包内未占用且符合当前订单的一个物品批次。先用INSPECT_CARAVAN_ORDERS取得order_id、item_id、instance_id及该品质单价；quantity不能超过本人可用量或订单余量。每次成功交货立即收到货款，全部条目在截止前完成才结算已公布的整单奖励。数量超限、报价变化、商队离场、身体限制或条件不符时整笔拒绝，不丢货或付款。此能力只用于限时订单，不授予普通商队进出口或他人资产权限。相同请求仅重放原结果，未知结果先核验原动作，不能换编号重复交货。",
+      "parameters": {
+        "type": "object",
+        "properties": {
+          "order_id": {
+            "type": "string",
+            "format": "uuid",
+            "description": "当前有效订单编号"
+          },
+          "item_id": {
+            "type": "integer",
+            "minimum": 1,
+            "description": "订单需求中的商品编号"
+          },
+          "instance_id": {
+            "type": "string",
+            "format": "uuid",
+            "description": "本人可交货物品批次编号"
+          },
+          "quantity": {
+            "type": "integer",
+            "minimum": 1,
+            "description": "本次出售数量"
+          },
+          "expected_unit_price": {
+            "type": "integer",
+            "minimum": 1,
+            "description": "查询中该物品批次的冻结品质单价，可选；不符时拒绝成交"
+          }
+        },
+        "required": [
+          "order_id",
+          "item_id",
+          "instance_id",
+          "quantity"
         ],
         "additionalProperties": false
       }

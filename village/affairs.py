@@ -5,6 +5,7 @@ fields for the existing bridge story and older clients.
 """
 from copy import deepcopy
 import re
+from django.db import transaction
 
 from .lucy_catalog import MEALS
 from .models import VillageAffair, VillageAffairContribution, VillageStoryFact, VillageStoryMeeting
@@ -226,6 +227,14 @@ def resolve_condition(row, condition_id=None, kind=None, item_id=None):
     """Resolve only an open, unmet condition. Missing IDs are legacy shorthand."""
     if row.status == "COMPLETED":
         raise AffairError("AFFAIR_COMPLETED", "事务已经完成。")
+    if isinstance(row, VillageAffair):
+        from .farm_expansion import affair_blocked_reason
+        blocked, message = affair_blocked_reason(row)
+        if not blocked:
+            from .career_development import affair_blocked_reason as career_blocked_reason
+            blocked, message = career_blocked_reason(row)
+        if blocked:
+            raise AffairError(blocked, message)
     canonical_kind = {"material": "item", "meal": "item", "fund": "gold"}.get(kind, kind)
     stages = definition(row)["stages"]
     stage = active_stage(row)
@@ -360,6 +369,7 @@ def sync_bridge_fact(row, fact=None):
     fact.save(update_fields=["repair_wood", "community_meals", "repair_fund", "repair_labor_hours", "bridge_condition", "updated_at"])
 
 
+@transaction.atomic
 def contribute(row, kind, quantity, *, item_id=None, condition_id=None, world_minute, request_id, actor_npc=None, player_id=None):
     kind = "gold" if kind == "fund" else kind
     actor_type, actor_id = ("PLAYER", str(player_id)) if player_id is not None else ("NPC", str(actor_npc.agent_id))
@@ -387,6 +397,10 @@ def contribute(row, kind, quantity, *, item_id=None, condition_id=None, world_mi
     VillageAffairContribution.objects.create(affair=row, request_id=request_id, condition_id=condition["id"], actor_type=actor_type,
         actor_id=actor_id, kind=kind, item_id=item_id or 0, quantity=quantity, world_minute=world_minute)
     sync_bridge_fact(row)
+    from .farm_expansion import sync_expansion_effects
+    sync_expansion_effects(row, world_minute)
+    from .career_development import sync_career_development
+    sync_career_development(row, world_minute)
     _event(row, world_minute, request_id, actor_npc, player_id,
            progress_only=(old_stage or {}).get("id") == (next_stage or {}).get("id"))
     return project_affair(row)
@@ -401,6 +415,13 @@ def project_affair(row):
     from items.models import Item
     from .farm_irrigation import IRRIGATION_AFFAIR_CODE, COMPLETION_EFFECT
     req, progress = definition(row), condition_progress(row)
+    from .farm_expansion import affair_blocked_reason, affair_metadata
+    blocked, blocked_message = affair_blocked_reason(row)
+    expansion = affair_metadata(row)
+    from .career_development import affair_blocked_reason as career_blocked_reason, affair_metadata as career_metadata
+    if not blocked:
+        blocked, blocked_message = career_blocked_reason(row)
+    expansion.update(career_metadata(row))
     active = active_stage(row)
     ids = {item for s in req["stages"] for c in s["conditions"] for item in c.get("item_ids", [])}
     names = dict(Item.objects.filter(pk__in=ids).values_list("item_id", "item_name"))
@@ -424,6 +445,12 @@ def project_affair(row):
             after_active = True
     current = next((s["conditions"] for s in stages if s["status"] == "ACTIVE"), [])
     all_conditions = [c for s in stages for c in s["conditions"]]
+    if blocked:
+        for stage in stages:
+            if stage["status"] == "ACTIVE":
+                stage["status"] = "LOCKED"
+            for condition in stage["conditions"]:
+                condition["available"] = False
     def portion(kind, label, conditions):
         target = sum(c["target"] for c in conditions)
         submitted = sum(c["submitted"] for c in conditions)
@@ -439,11 +466,13 @@ def project_affair(row):
     labor.update(completed=labor["submitted"], duration_minutes=(current_labor or {}).get("unit_minutes", 60),
         unit_minutes=(current_labor or {}).get("unit_minutes", 60), locations=(current_labor or {}).get("locations", []))
     return dict(affair_id=row.code, code=row.code, kind=row.kind, title=row.title,
-        completion_effect=COMPLETION_EFFECT if row.code == IRRIGATION_AFFAIR_CODE else "恢复旧桥通行和正常商路" if row.code == BRIDGE_AFFAIR_CODE else "完成此事务并记录完成事件",
+        completion_effect=expansion.get("completion_effect") or (COMPLETION_EFFECT if row.code == IRRIGATION_AFFAIR_CODE else "恢复旧桥通行和正常商路" if row.code == BRIDGE_AFFAIR_CODE else "完成此事务并记录完成事件"),
+        **{key: value for key, value in expansion.items() if key != "completion_effect"},
         stage="COMPLETED" if row.status == "COMPLETED" else "ACTIVE", status="COMPLETED" if row.status == "COMPLETED" else "ACTIVE",
         stages=stages, conditions=current, active_stage_id=active["id"] if active else None,
-        current_stage_title=active["title"] if active else "已完成", available=row.status != "COMPLETED",
-        reason="事务已经完成。" if row.status == "COMPLETED" else "", requirements=deepcopy(req),
+        current_stage_title=active["title"] if active else "已完成", available=row.status != "COMPLETED" and not blocked,
+        reason="事务已经完成。" if row.status == "COMPLETED" else blocked_message, blocked_reason=blocked,
+        requirements=deepcopy(req),
         progress={"conditions": progress, **_legacy_totals(req, progress)}, materials=materials, meals=meals,
         gold=portion("gold", "金币", [c for c in all_conditions if c["type"] == "gold"]), labor=labor,
         labor_available=current_labor is not None, locations=list(row.locations), contribution_locations=list(row.locations),

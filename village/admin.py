@@ -140,6 +140,8 @@ class VillageCaravanConfigAdmin(admin.ModelAdmin):
     form = VillageCaravanConfigForm
     list_display = ("config_key", "caravan_normal_capacity", "caravan_emergency_capacity", "caravan_export_capacity")
     fieldsets = (
+        ("限时收购订单", {"fields": ("caravan_orders_enabled",),
+            "description": "发布全村共享限时订单；每次实际交货即收款，整单完成后下一趟商队获得公布的容量或商品奖励。"}),
         ("进出口数量与目录", {"fields": ("caravan_normal_capacity", "caravan_emergency_capacity",
             "caravan_item_ids", "caravan_export_capacity", "caravan_export_item_ids"),
             "description": "修改用于后续到访；当前商队的库存、报价和收购总量保持不变。出口总量由所有品种共同消耗。"}),

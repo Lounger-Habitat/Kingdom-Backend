@@ -12,11 +12,12 @@ from django.utils import timezone
 from items.quality import production_quality, quality_rng
 from inventory.components import copy_batch_attributes
 from inventory.models import InventorySlot, NpcGlobalInventory
-from inventory.serializers import serialize_bag
 from .models import EconomicLedgerEntry, VillageFarmPlot, VillageSimulationConfig, VillageWorldEvent
 from .phase3_catalog import FARM_CROP_RULES, FARM_TOOL_ITEM_ID, farm_crop_catalog
 from .phase3_asset_service import deterministic_rng
 from .professional_catalog import batch_evidence
+from .career_catalog import (CROP_RULES as CAREER_CROPS, content_access, reserve_outputs,
+    record_production, trial_request_id)
 
 BILL_ID = "10011"
 DAY = 1440
@@ -51,13 +52,14 @@ def lease_state(plot, minute):
 
 
 def project_plot(plot, minute):
+    from .farm_expansion import plot_access
     state, deadline = lease_state(plot, minute)
     released = plot.lessee_player_id is not None and state == "AVAILABLE"
     owned = plot.lessee_player_id is not None and not released
     status = "EMPTY" if released else plot.status
     if status == "GROWING" and plot.mature_world_minute is not None and minute >= plot.mature_world_minute:
         status = "MATURE"
-    return dict(plot_code=plot.plot_code, status=status,
+    return dict(plot_code=plot.plot_code, status=status, **plot_access(plot),
         crop_code="" if released else plot.crop_code or "",
         batch_id=str(plot.batch_id) if plot.batch_id and not released else None,
         planted_world_minute=None if released else plot.planted_world_minute,
@@ -73,6 +75,10 @@ def project_plot(plot, minute):
 
 
 def clear_crop(plot):
+    if plot.crop_code in CAREER_CROPS and plot.source_request_id:
+        from .career_development import release_trial_production
+        release_trial_production(trial_request_id(plot.lessee_player_id, plot.source_request_id)
+            if plot.lessee_player_id else plot.source_request_id)
     plot.status, plot.crop_code = "EMPTY", ""
     plot.batch_id = plot.planted_world_minute = plot.mature_world_minute = None
     plot.yield_seed = plot.source_request_id = None
@@ -130,25 +136,29 @@ def _usable(slot, minute):
     return True
 
 
-def farm_overview(player, bag, minute, *, read_only=False):
+def farm_overview(player, bag, minute, *, read_only=False, growth=None, tool_state=None, slots=None):
+    from .farm_expansion import project_expansion_sites
     from .farm_irrigation import project_irrigation
     irrigation = project_irrigation()
     cfg = VillageSimulationConfig.objects.filter(config_key="default").first()
     limits = rules(cfg)
     plots = [project_plot(p, minute) for p in VillageFarmPlot.objects.select_related("lessee_player").order_by("plot_code")]
     count = sum(p["lessee_player_id"] == str(player.pk) for p in plots)
-    tools = list(bag.slots.filter(item_id__in=[FARM_TOOL_ITEM_ID, 4103, 4121], item_amount__gt=0)) if bag.pk else []
+    if slots is None:
+        slots = list(bag.slots.filter(item_amount__gt=0)) if bag.pk else []
+    tools = [s for s in slots if s.item_id in (FARM_TOOL_ITEM_ID, 4103, 4121)]
     remaining = sum(s.remaining_uses * s.item_amount for s in tools
         if s.remaining_uses is not None and s.remaining_uses > 0 and _usable(s, minute))
     enabled = bool(cfg and cfg.village_economy_enabled and cfg.farm_leasing_enabled)
     for p in plots:
         mine = p["lessee_player_id"] == str(player.pk)
         p.update(is_mine=mine,
-            can_lease=enabled and not read_only and p["lease_enabled"] and not p["lessee_player_id"] and p["status"] == "EMPTY" and count < limits["max_plots"],
-            can_renew=enabled and not read_only and mine and (p["lease_ends_world_minute"] - minute) <= (limits["max_days"]-limits["min_days"]) * DAY,
-            can_plant=not read_only and mine and p["lease_state"] == "ACTIVE" and p["status"] == "EMPTY",
-            can_harvest=not read_only and mine and p["status"] == "MATURE")
+            can_lease=p["can_use"] and enabled and not read_only and p["lease_enabled"] and not p["lessee_player_id"] and p["status"] == "EMPTY" and count < limits["max_plots"],
+            can_renew=p["can_use"] and enabled and not read_only and mine and (p["lease_ends_world_minute"] - minute) <= (limits["max_days"]-limits["min_days"]) * DAY,
+            can_plant=p["can_use"] and not read_only and mine and p["lease_state"] == "ACTIVE" and p["status"] == "EMPTY",
+            can_harvest=p["can_use"] and not read_only and mine and p["status"] == "MATURE")
         p["unavailable_reason"] = ("观察模式只可查看。" if read_only else
+            "该田尚未完成开垦，请查看片区公共准备和田块施工进度。" if not p["can_use"] else
             "该田地由其他玩家承租。" if p["lessee_player_id"] and not mine else
             "租约已到期，仅可收获本批作物。" if mine and p["lease_state"] == "HARVEST_ONLY" else
             "田地由 Bill 经营。" if not mine and not p["lease_enabled"] else
@@ -157,7 +167,15 @@ def farm_overview(player, bag, minute, *, read_only=False):
             "租赁暂未开放。" if not enabled and not mine else "")
     from .production_tools import ToolError, resolve_tool
     from player.progression import growth_snapshot
-    level = next(s["level"] for s in growth_snapshot(player, read_only=True)["skills"] if s["code"] == "farming")
+    if growth is None:
+        growth = growth_snapshot(player, read_only=True, compact=True)
+    levels = {s["code"]: s["level"] for s in growth["skills"]}
+    level = levels["farming"]
+    seed_counts = {}
+    for slot in slots:
+        if _usable(slot, minute):
+            seed_counts[slot.item_id] = seed_counts.get(slot.item_id, 0) + slot.item_amount
+    tool_reasons = {}
     crops = farm_crop_catalog(irrigation)
     for crop in crops.values():
         crop.pop("quality", None)
@@ -165,21 +183,28 @@ def farm_overview(player, bag, minute, *, read_only=False):
         crop.update(quality_min=1, quality_max=6)
         crop["required_level"] = crop.get("required_level", 1)
         crop["minimum_tool_tier"] = crop.get("minimum_tool_tier", 1)
-        crop["seed_owned"] = sum(s.item_amount for s in bag.slots.filter(item_id=crop["seed_item_id"], item_amount__gt=0)
-                                  if _usable(s, minute)) if bag.pk else 0
-        reason = "MODE_READ_ONLY" if read_only else "SKILL_LEVEL_REQUIRED" if level < crop["required_level"] else ""
+        crop["seed_owned"] = seed_counts.get(crop["seed_item_id"], 0)
+        access = crop["development"]
+        reason = "MODE_READ_ONLY" if read_only else access["blocked_reason"] if not access["can_produce"] else "SKILL_LEVEL_REQUIRED" if level < crop["required_level"] else ""
         if not reason:
-            try:
-                resolve_tool(player, bag, "farming", minimum_tier=crop["minimum_tool_tier"], minute=minute)
-            except ToolError as exc:
-                reason = exc.code
+            tier = crop["minimum_tool_tier"]
+            if tier not in tool_reasons:
+                tool_reasons[tier] = ""
+                try:
+                    resolve_tool(player, bag, "farming", minimum_tier=tier, minute=minute, levels=levels)
+                except ToolError as exc:
+                    tool_reasons[tier] = exc.code
+            reason = tool_reasons[tier]
         if not reason and crop["seed_owned"] <= 0:
             reason = "SEED_REQUIRED"
         crop.update(can_plant=not reason, reason=reason)
     from .production_tools import tools_overview
-    tool_rows = [row for row in tools_overview(player, bag, minute, read_only=read_only)["tools"] if row["capability"] == "farming"]
+    if tool_state is None:
+        tool_state = tools_overview(player, bag, minute, read_only=read_only, levels=levels, slots=slots, capability="farming")
+    tool_rows = [row for row in tool_state["tools"] if row["capability"] == "farming"]
     return dict(rules=limits, plots=plots, my_plot_count=count, tool_remaining_uses=remaining,
-                tools=tool_rows, farming_level=level, crops=crops, irrigation=irrigation)
+                tools=tool_rows, farming_level=level, crops=crops, irrigation=irrigation,
+                expansion=project_expansion_sites(minute))
 
 
 def _wear_tool(player, bag, minute, instance_id=None, minimum_tier=1):
@@ -219,6 +244,9 @@ def execute_farm_action(player, bag, action, p, rid, clock):
     plot = VillageFarmPlot.objects.select_for_update().filter(plot_code=code).first()
     if plot is None:
         fail("PLOT_NOT_FOUND", "田地尚未同步。")
+    from .farm_expansion import plot_access
+    if not plot_access(plot)["can_use"]:
+        fail("FARM_PLOT_LOCKED", "该田尚未完成开垦，不能租赁、播种或收获。")
     if type(p.get("expected_plot_version")) is not int or p["expected_plot_version"] != plot.plot_version:
         fail("PLOT_VERSION_CHANGED", "田地状态已变化，请刷新后重试。")
     state, _ = lease_state(plot, minute)
@@ -256,6 +284,9 @@ def execute_farm_action(player, bag, action, p, rid, clock):
         bill = NpcGlobalInventory.objects.select_for_update().filter(npc__agent_id=BILL_ID).first()
         if bill is None:
             fail("FARM_UNAVAILABLE", "Bill 的结算账户尚未就绪。")
+        player_state, _ = PlayerState.objects.get_or_create(player_id=str(player.pk))
+        player_state = PlayerState.objects.select_for_update().get(pk=player_state.pk)
+        recover_action_points(player_state)
         bag.money -= total
         bag._money_change_source = "farm_lease"
         bag.save(update_fields=["money"])
@@ -300,10 +331,13 @@ def execute_farm_action(player, bag, action, p, rid, clock):
             rule = FARM_CROP_RULES.get(crop) if isinstance(crop, str) else None
             if rule is None:
                 fail("INVALID_PARAMS", "请选择有效作物。")
+            access = content_access(rule["output_item_id"])
+            if not access["can_produce"]:
+                fail(access["blocked_reason"], access["unavailable_reason"])
             from player.progression import growth_snapshot
-            level = next(s["level"] for s in growth_snapshot(player, read_only=True)["skills"] if s["code"] == "farming")
+            level = next(s["level"] for s in growth_snapshot(player, read_only=True, compact=True)["skills"] if s["code"] == "farming")
             if level < rule.get("required_level", 1):
-                fail("SKILL_LEVEL_REQUIRED", "种植达到4级后开放该作物。")
+                fail("SKILL_LEVEL_REQUIRED", f"种植达到{rule.get('required_level', 1)}级后开放该作物。")
             rule = deepcopy(rule)
             rule.update(rule_version=3 if crop == "PUMPKIN" else 2,
                         bonus_seed_chance=.30 if level >= 2 else .25,
@@ -331,6 +365,8 @@ def execute_farm_action(player, bag, action, p, rid, clock):
         result.update(action_cost=cost, action_points=player_state.action_points)
         rng = deterministic_rng(rid, action, minute // DAY)
         if action == "plant_farm_plot":
+            if not reserve_outputs({rule["output_item_id"]: rule["yield_max"] + 1}, trial_request_id(player.pk, rid), minute):
+                fail("CAREER_TRIAL_LIMIT", "本期试种额度不足，请先完成已有试种与销售。")
             _consume(bag, rule["seed_item_id"], 1, minute)
             result["items_consumed"] = [{"item_id": rule["seed_item_id"], "amount": 1}]
             plot.batch_id, plot.crop_code, plot.status = uuid.uuid4(), crop, "GROWING"
@@ -363,6 +399,7 @@ def execute_farm_action(player, bag, action, p, rid, clock):
                 harvested_mature_world_minute=plot.mature_world_minute,
                 output=dict(item_id=rule["output_item_id"], amount=output),
                 seed_return=dict(item_id=rule["seed_item_id"], amount=seeds))
+            reservation_request_id = trial_request_id(player.pk, plot.source_request_id) if plot.source_request_id else None
             next_index = (bag.slots.aggregate(n=Max("slot_index"))["n"] or 0) + 1
             for item_id, amount in ((rule["output_item_id"], output), (rule["seed_item_id"], seeds)):
                 slot = InventorySlot.objects.create(bag=bag, slot_index=next_index, item_id=item_id,
@@ -379,6 +416,10 @@ def execute_farm_action(player, bag, action, p, rid, clock):
                            amount=output, quality=quality, source_request_id=str(rid), produced_world_minute=minute,
                            tool_tier=result["tool_used"]["equipment_stats"]["tier"], tool_equipment_level=result["tool_used"]["equipment_level"],
                            outputs=[i for i in result["items_added"] if i["item_id"] == rule["output_item_id"]]))]
+            record_production("PLAYER", player.pk, rid, {rule["output_item_id"]: output}, minute,
+                source_kind="HARVEST", plot_code=plot.plot_code,
+                reservation_request_id=reservation_request_id,
+                output_instance_ids=[i["instance_id"] for i in result["items_added"] if i["item_id"] == rule["output_item_id"]])
             clear_crop(plot)
             if state == "HARVEST_ONLY":
                 clear_lease(plot)
@@ -401,5 +442,4 @@ def execute_farm_action(player, bag, action, p, rid, clock):
         hub_summary=lease_notice, private={"farm_lease": lease_details} if lease_details else None)
     EconomicLedgerEntry.objects.create(request_id=uuid.uuid5(uuid.NAMESPACE_URL, f"player:{player.pk}:{rid}"),
         entry_type=action.upper(), changes=changes, world_minute=minute, event=event)
-    result["bag"] = serialize_bag(bag)
     return result

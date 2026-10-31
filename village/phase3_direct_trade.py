@@ -444,6 +444,8 @@ def _do_sell_to_store(npc_id, params, world_minute, request_id):
     if account is None or account.balance < total:
         return _fail(ResultCode.TRADE_INSUFFICIENT_MONEY, data={**sale_data,
             "required_amount": total, "available_amount": account.balance if account else 0, "payer": "STORE"})
+    career_batches = []
+    from .career_trade import transfer_attributes, record_sale
     for row in priced_items:
         item_id, amount = row["item_id"], row["amount"]
         try:
@@ -458,12 +460,13 @@ def _do_sell_to_store(npc_id, params, world_minute, request_id):
                 **({"failure_kind": str(exc), "tool_buyback_policy": "FULL_DURABILITY_ONLY"} if tool_rejected else {}),
             })
         for slot, taken in consumed:
+            career_batches.append((slot, taken))
             VillageStoreInventorySlot.objects.create(
                 store=store, item_id=item_id, item_amount=taken,
                 produced_world_minute=slot.produced_world_minute,
                 expires_world_minute=slot.expires_world_minute, remaining_uses=slot.remaining_uses,
                 source_npc=seller, source_slot_instance_id=slot.instance_id,
-                item_attributes={key: getattr(slot, key) for key in BATCH_ITEM_ATTRIBUTES},
+                item_attributes=transfer_attributes(slot),
             )
     account.balance -= total
     account.account_version += 1
@@ -473,6 +476,8 @@ def _do_sell_to_store(npc_id, params, world_minute, request_id):
     inventory.save(update_fields=["money", "asset_version", "updated_at"])
     store.inventory_version += 1
     store.save(update_fields=["inventory_version", "updated_at"])
+    record_sale("NPC", npc_id, request_id, career_batches, world_minute,
+        income=total, source="GENERAL_STORE_PURCHASE")
     return _ok(
         data={**sale_data, "status": "COMPLETED",
               "personal_wallet": {"delta": total, "balance_after": inventory.money}},
@@ -782,6 +787,7 @@ def _do_respond_trade(
             return _fail(ResultCode.TRADE_INSUFFICIENT_ITEM)
 
         # Transfer items (preserve batch attributes) and money.
+        from .career_trade import transfer_attributes, record_sale
         for slot, taken in consumed:
             if buying_store:
                 VillageStoreInventorySlot.objects.create(
@@ -790,7 +796,7 @@ def _do_respond_trade(
                     expires_world_minute=slot.expires_world_minute,
                     remaining_uses=slot.remaining_uses, source_npc=offer.seller_npc,
                     source_slot_instance_id=slot.instance_id,
-                    item_attributes={key: getattr(slot, key) for key in BATCH_ITEM_ATTRIBUTES},
+                    item_attributes=transfer_attributes(slot),
                 )
             else:
                 add_batch(buyer_inv, item_id, taken, slot.produced_world_minute,
@@ -818,6 +824,8 @@ def _do_respond_trade(
         offer.save(update_fields=[
             "status", "resolved_request_id", "resolved_world_minute", "updated_at",
         ])
+        record_sale("NPC", seller_id, request_id, consumed, world_minute,
+            income=gold_amount, source="DIRECT_TRADE")
 
     effects = {
         ("STORE:" + buying_store.pk if buying_store else buyer_id): {"money": -gold_amount, str(item_id): amount},
@@ -995,6 +1003,7 @@ def _do_list_store_item(
             None,
         )
 
+        from .career_trade import transfer_attributes
         stock_source = params.get("stock_source", "PERSONAL")
         if stock_source not in {"PERSONAL", "STORE"}:
             return _fail(ResultCode.P3_INVALID_PARAMS)
@@ -1037,7 +1046,7 @@ def _do_list_store_item(
                 source_npc=slot.source_npc if stock_source == "STORE" else operator_inv.npc,
                 source_slot_instance_id=slot.source_slot_instance_id if stock_source == "STORE" else slot.instance_id,
                 item_attributes=slot.item_attributes if stock_source == "STORE" else
-                    {key: getattr(slot, key) for key in BATCH_ITEM_ATTRIBUTES},
+                    transfer_attributes(slot),
             )
             placed.append(stored)
         listing = placed[0].listing
@@ -1418,6 +1427,7 @@ def _do_buy_from_store(
         purchased_batches = []
         from .phase3_public_economy import _get_eat_whitelist
         edible_items = _get_eat_whitelist()
+        from .career_trade import source_request_id
         for slot, taken in consumed:
             personal_slot = add_batch(
                 buyer_inv,
@@ -1425,7 +1435,7 @@ def _do_buy_from_store(
                 taken,
                 slot.produced_world_minute,
                 slot.expires_world_minute,
-                request_id,
+                source_request_id(slot, request_id),
                 remaining_uses=slot.remaining_uses,
                 item_attributes=slot.item_attributes,
             )
@@ -1490,6 +1500,10 @@ def _do_buy_from_store(
         "public_fund_asset_version": public_fund.asset_version,
         "purchased_batches": purchased_batches,
     }
+    if str(npc_id) != str(store.operator_npc.agent_id):
+        from .career_trade import record_sale
+        record_sale("NPC", store.operator_npc.agent_id, request_id, consumed, world_minute,
+            income=gross_amount, source="STORE_RETAIL")
 
     return _ok(
         asset_versions={str(npc_id): buyer_inv.asset_version},

@@ -25,6 +25,8 @@ from .player_cooking_rules import (VILLAGE_RECIPES, RULE_VERSION,
     XP_PER_BATCH, FIRST_COOK_BONUS, AP_PER_BATCH)
 
 from .professional_catalog import PROFESSIONAL_RECIPES, batch_evidence
+from .career_catalog import (content_access, reserve_outputs, record_production,
+    trial_request_id, recipe_reference_cost)
 
 class CookingError(Exception):
     def __init__(self, code, message):
@@ -107,12 +109,15 @@ def cooking_overview(player, bag, minute, read_only=False, *, tool_state=None):
         if recipe.village_only and recipe.pk not in VILLAGE_RECIPES or not known:
             continue
         required, tier = VILLAGE_RECIPES.get(recipe.pk, (1, 1))
-        reason = "SKILL_LEVEL_REQUIRED" if level < required else "TOOL_REQUIRED" if not any(t["usable"] and t["tier"] >= tier for t in tools) else ""
+        access = content_access(recipe.item_id)
+        reason = access["blocked_reason"] if not access["can_produce"] else "SKILL_LEVEL_REQUIRED" if level < required else "TOOL_REQUIRED" if not any(t["usable"] and t["tier"] >= tier for t in tools) else ""
         if not recipe.ingredients.all() or not Item.objects.filter(pk=recipe.item_id, is_deleted=False).exists():
             reason = "RECIPE_CATALOG_UNAVAILABLE"
         recipes.append(dict(id=recipe.pk, name=recipe.recipe_name, item_id=recipe.item_id,
             output_quantity=recipe.output_quantity, required_level=required, minimum_tool_tier=tier,
             available=not reason, reason=reason, known=known, quantities_visible=visible,
+            development=access,
+            reference_cost=recipe_reference_cost(recipe.pk),
             ingredients=[dict(item_id=i.item_id, item_name=i.item_name, count=i.count if visible else None)
                          for i in recipe.ingredients.all()]))
     ids = _ingredient_ids()
@@ -178,6 +183,10 @@ def _prepare(player, bag, params, minute, *, execute=False):
         reject("RECIPE_NOT_KNOWN", "该普通菜谱尚未掌握，可通过自由配料探索。")
     if recipe and recipe.village_only and recipe.pk not in VILLAGE_RECIPES:
         reject("RECIPE_NOT_RELEASED", "该村庄配方尚未向玩家开放。")
+    if recipe:
+        access = content_access(recipe.item_id)
+        if not access["can_produce"]:
+            reject(access["blocked_reason"], access["unavailable_reason"])
     required, tier = VILLAGE_RECIPES.get(recipe.pk, (1, 1)) if recipe else (1, 1)
     level = _level(player)
     if level < required:
@@ -228,6 +237,7 @@ def _prepare(player, bag, params, minute, *, execute=False):
         output_quantity=None if mask or not visible else quantity, batches=batches,
         action_cost=AP_PER_BATCH * batches, tool_uses=batches, expires_world_minute=expires,
         freshness_unknown=legacy, ingredient_average_quality=ingredient_average(views), selected_batches=views, missing_items=[],
+        reference_cost=recipe_reference_cost(recipe.pk, batches=batches, tool=tool) if recipe else None,
         warnings=(["数量未显示，成品与配比结果在实际制作后揭晓。"] if not visible else []) + [PITY_POLICY])
     return dict(recipe=recipe if matched else None, exact=exact, output=output, quantity=quantity,
         rows=rows, amounts=amounts, tool=tool, batches=batches, level=level, legacy=legacy,
@@ -284,6 +294,8 @@ def execute_player_cooking(player, bag, params, rid, clock):
     cost = AP_PER_BATCH * plan["batches"]
     if state.action_points < cost:
         reject("INSUFFICIENT_ACTION_POINTS", "行动力不足。")
+    if plan["recipe"] and not reserve_outputs({plan["recipe"].item_id: plan["quantity"]}, trial_request_id(player.pk, rid), clock.world_minute):
+        reject("CAREER_TRIAL_LIMIT", "本期试制额度不足，请先完成已有菜品试卖。")
     consumed = []
     for source, quantity in plan["rows"]:
         source = InventorySlot.objects.select_for_update().get(pk=source.pk)
@@ -376,6 +388,10 @@ def execute_player_cooking(player, bag, params, rid, clock):
     EconomicLedgerEntry.objects.create(request_id=uuid.uuid5(uuid.NAMESPACE_URL, f"player-cooking-ledger:{player.pk}:{rid}"),
         entry_type="PLAYER_COOK", world_minute=clock.world_minute,
         changes={"player_id": str(player.pk), "inputs": consumed, "output": dish, "outputs": dishes, "tool_used": used})
+    record_production("PLAYER", player.pk, rid, {item_id: sum(output.item_amount for output in output_slots)}, clock.world_minute,
+        source_kind="COOK", recipe_id=recipe.pk if recipe else None,
+        reservation_request_id=trial_request_id(player.pk, rid),
+        output_instance_ids=[str(output.instance_id) for output in output_slots])
     return dict(dish=dish, dishes=dishes, items_consumed=consumed, items_added=dishes, tool_used=used,
         action_cost=cost, action_points=state.action_points, growth_rewards=rewards, is_newly_learned=learned,
         recipe_quantities_unlocked=mastered)

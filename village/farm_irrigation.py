@@ -69,6 +69,8 @@ def ensure_irrigation_affair(world_minute):
         import uuid
         from .affairs import _event
         _event(row, world_minute, uuid.uuid4())
+    from .farm_expansion import sync_expansion_effects
+    sync_expansion_effects(row, world_minute)
     return row
 
 

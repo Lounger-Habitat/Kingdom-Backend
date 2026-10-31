@@ -174,6 +174,9 @@ class VillageSimulationConfig(models.Model):
     village_needs_enabled = models.BooleanField(default=False)
     village_economy_enabled = models.BooleanField(default=False)
     farm_leasing_enabled = models.BooleanField(default=True)
+    farm_expansion_enabled = models.BooleanField(default=False, verbose_name="开放新田开垦")
+    caravan_orders_enabled = models.BooleanField(default=False, verbose_name="开放商队限时收购订单")
+    career_development_enabled = models.BooleanField(default=False, verbose_name="开放职业发展与新品试销")
     farm_daily_price = models.PositiveIntegerField(default=10)
     farm_min_days = models.PositiveIntegerField(default=1)
     farm_max_days = models.PositiveIntegerField(default=30)
@@ -1127,6 +1130,12 @@ class VillageFarmPlot(models.Model):
 
     plot_code = models.CharField("地块代码", max_length=32, unique=True)
     lease_enabled = models.BooleanField("开放出租", default=False)
+    # Existing cells remain usable. New expansion cells explicitly start locked.
+    reclamation_status = models.CharField(max_length=24, default="READY")
+    expansion_site_code = models.CharField(max_length=32, blank=True, default="")
+    reclamation_affair = models.OneToOneField("VillageAffair", on_delete=models.PROTECT,
+        null=True, blank=True, related_name="reclaimed_plot")
+    reclaimed_world_minute = models.BigIntegerField(null=True, blank=True)
     lessee_player = models.ForeignKey("account.GameAccount", on_delete=models.PROTECT,
         null=True, blank=True, related_name="leased_farm_plots")
     leased_world_minute = models.BigIntegerField(null=True, blank=True)
@@ -2556,3 +2565,16 @@ class VillageProfessionalContractLink(models.Model):
 
     class Meta:
         constraints = [models.UniqueConstraint(fields=["visit", "template_code"], name="professional_template_once_visit")]
+
+
+# Feature models remain in small domain modules; importing them registers them
+# with Django's existing village app and preserves the normal migration graph.
+from .farm_expansion_models import VillageFarmExpansionSite  # noqa: E402,F401
+from .career_development_models import (  # noqa: E402,F401
+    VillageCareerDevelopment, VillageCareerEvidence, VillageCareerProductionReservation,
+)
+from .caravan_order_models import (  # noqa: E402,F401
+    VillageCaravanOrder, VillageCaravanOrderLine, VillageCaravanOrderWindow,
+    VillageCaravanOrderDelivery, VillageCaravanOrderReceipt,
+    VillageCaravanOrderCompletion, VillageCaravanReward, VillageCaravanVisitAllocation,
+)

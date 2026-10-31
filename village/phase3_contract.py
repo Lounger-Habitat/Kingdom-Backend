@@ -190,9 +190,11 @@ PLOT_CODES = tuple(
         + [f"FARM_PLOT_{region}_{index:02d}" for index in range(2, 10)]
     )
 )
+PLOT_CODES += tuple(f"FARM_PLOT_{region}_{index:02d}" for region in ("E", "F") for index in range(1, 10))
 
 # ── Crop codes ─────────────────────────────────────────────────────
-CROP_CODES = ("CORN", "WHEAT", "CARROT", "POTATO")
+from .phase3_catalog import FARM_CROP_RULES
+CROP_CODES = tuple(FARM_CROP_RULES)
 
 # ── Hunt codes ─────────────────────────────────────────────────────
 HUNT_CODES = ("HUNT_ANIMALS",)
@@ -347,7 +349,7 @@ PARAM_WHITELIST = {
     # ``items`` is the current multi-item form; the scalar fields remain
     # accepted for deployed clients that still send one item per command.
     ActionName.IMPORT_GOODS: frozenset({"items", "item_id", "amount"}),
-    ActionName.EXPORT_GOODS: frozenset({"item_id", "amount", "expected_asset_version"}),
+    ActionName.EXPORT_GOODS: frozenset({"item_id", "amount", "expected_asset_version", "stock_source"}),
     ActionName.REQUEST_DISH_REVIEW: frozenset({"food_instance_id"}),
     ActionName.CANCEL_DISH_REVIEW: frozenset({"review_id"}),
     ActionName.RATE_DISH: frozenset({"review_id", "scores", "comment", "customer_feedback"}),

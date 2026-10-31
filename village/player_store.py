@@ -90,9 +90,11 @@ def sell_to_store(player, bag, params, request_id, location, clock):
         entry_type="SELL_TO_STORE", actor_npc=None, world_minute=clock.world_minute, event=event,
         changes={**result, f"PLAYER:{player.pk}": {"money": total, str(item.pk): -quantity},
                  f"STORE:{store.pk}": {"money": -total, str(item.pk): quantity}})
+    from .career_trade import record_sale
+    record_sale("PLAYER", player.pk, request_id, [(slot, quantity)], clock.world_minute,
+        income=total, source="GENERAL_STORE_PURCHASE")
     from .phase4_visibility import enqueue_event_deliveries
     enqueue_event_deliveries(event)
-    result["bag"] = serialize_bag(bag)
     return result
 
 
@@ -167,11 +169,12 @@ def buy_from_store(player, bag, params, request_id, location, clock):
             fail("TRADE_INSUFFICIENT_ITEM", "商品可售库存不足。")
     next_index = (bag.slots.aggregate(n=Max("slot_index"))["n"] or 0) + 1
     purchased = []
+    from .career_trade import source_request_id
     for source, amount in consumed:
         attributes = source.item_attributes or {}
         target = InventorySlot(bag=bag, slot_index=next_index, item_id=source.item_id,
             item_amount=amount, quality=source.quality, produced_world_minute=source.produced_world_minute,
-            expires_world_minute=source.expires_world_minute, source_request_id=request_id,
+            expires_world_minute=source.expires_world_minute, source_request_id=source_request_id(source, request_id),
             freshness_unknown=bool(attributes.get("freshness_unknown")),
             item_bag_name=attributes.get("item_bag_name", ""))
         for name in COMPONENT_FIELDS:
@@ -222,7 +225,12 @@ def buy_from_store(player, bag, params, request_id, location, clock):
                  "player_display_name": player.username,
                  f"PLAYER:{player.pk}": {"money": -total, str(item.pk): quantity},
                  f"STORE:{store.pk}": {"money": net, str(item.pk): -quantity}, "PUBLIC_FUND": {"money": fee - subsidy}})
+    if not public_meal and store.operator_npc_id:
+        from .career_trade import record_sale
+        record_sale("NPC", store.operator_npc.agent_id, f"PLAYER:{player.pk}:{request_id}",
+            consumed, clock.world_minute, income=total, source="STORE_RETAIL")
     from .phase4_visibility import enqueue_event_deliveries
     enqueue_event_deliveries(event)
-    result["bag"] = serialize_bag(bag)
+    if store.pk != "GENERAL_STORE":
+        result["bag"] = serialize_bag(bag)
     return result

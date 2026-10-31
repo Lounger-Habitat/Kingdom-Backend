@@ -799,6 +799,7 @@ def _location_is_open(opening_hours: dict, world_minute: int) -> bool:
 
 def public_overview(player_id: str) -> dict:
     time_state = GlobalGameTimeState.objects.filter(pk=1).first()
+    from .career_development import project_career_development
     world_minute = time_state.world_minute if time_state else 0
     yesterday = max(0, world_minute // 1440 - 1)
     yesterday_events = public_journal(player_id, {"limit": 100, "day_index": yesterday})["events"]
@@ -837,6 +838,7 @@ def public_overview(player_id: str) -> dict:
         "economy": _public_economy(world_minute),
         "story": _public_story(player_id),
         "locations": locations,
+        "career_development": project_career_development(world_minute),
     }
 
 

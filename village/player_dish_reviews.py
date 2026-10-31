@@ -317,8 +317,10 @@ def complete_player_review(npc_id, params, minute, request_id):
     else:
         _bump(player)
     row.save()
-    # Polling exposes the durable result to the owner. No private batch or XP is
-    # put in NPC events, and no repeat action is invented for reward delivery.
+    from .career_development import record_business_evidence
+    record_business_evidence("REVIEW", request_id, "NPC", npc_id, {slot.item_id: 1}, minute,
+        metadata=dict(review_id=str(row.pk), overall_score=score))
+    # Polling exposes the durable result without publishing private batches or XP.
     if not own:
         from player.tutorials import observe_skill
         observe_skill(player, "dish_review", str(row.pk), {})

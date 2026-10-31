@@ -5,6 +5,7 @@ import uuid
 from types import SimpleNamespace
 
 from django.db import transaction
+from django.db.models import Count
 from inventory.models import NpcGlobalInventory, NpcGlobalInventorySlot
 from items.models import Item
 from recipes.models import Recipe
@@ -16,6 +17,7 @@ from .phase3_asset_service import (_ok, _fail, add_batch, consume_fefo, get_avai
                                   deterministic_rng, BATCH_ITEM_ATTRIBUTES)
 from .phase3_catalog import RECIPE_WHITELIST
 from .public_finance import mark_unavailable
+from .career_catalog import content_access, reserve_outputs, record_production
 
 
 def _pity(npc, quality, seconds, standard, rng):
@@ -69,6 +71,10 @@ def cook_preflight(npc_id, params, minute):
         item_id=recipe.item_id, is_deleted=False,
     ).exists():
         return _fail("P3_RECIPE_NOT_ALLOWED")
+    access = content_access(recipe.item_id)
+    if not access["can_produce"]:
+        return _fail(access["blocked_reason"], data={"development": access,
+            "message": access["unavailable_reason"]})
     inventory = NpcGlobalInventory.objects.select_for_update().get(npc__agent_id=str(npc_id))
     failure = _missing_ingredients(inventory, recipe, minute)
     if failure:
@@ -94,10 +100,16 @@ def cook(npc_id, params, minute, request_id):
         item = Item.objects.filter(item_id=recipe.item_id, is_deleted=False).first()
         if item is None:
             return _fail("P3_RECIPE_NOT_ALLOWED")
+        access = content_access(recipe.item_id)
+        if not access["can_produce"]:
+            return _fail(access["blocked_reason"], data={"development": access,
+                "message": access["unavailable_reason"]})
         # Recheck at settlement: ingredients may have been used or reserved since start.
         failure = _missing_ingredients(inventory, recipe, minute)
         if failure:
             return failure
+        if not reserve_outputs({recipe.item_id: recipe.output_quantity}, request_id, minute):
+            return _fail("CAREER_TRIAL_LIMIT")
         inputs = []
         for ingredient in ingredients:
             try:
@@ -131,15 +143,17 @@ def cook(npc_id, params, minute, request_id):
             name=item.item_name,
             dish_quality=quality, cook_time_seconds=seconds, dish_metadata=metadata,
             default_value=None if cold else default_value(item, quality), expires_world_minute=slot.expires_world_minute)
+        record_production("NPC", npc_id, request_id, {recipe.item_id: recipe.output_quantity}, minute,
+            source_kind="COOK", recipe_id=recipe.pk, output_instance_ids=[str(slot.instance_id)])
     return _ok(asset_versions={str(npc_id): inventory.asset_version},
         effects={"items_consumed": inputs, "items_added": [output]}, data={"dish": output}, external_delta=0)
 
 
-def reservation(slot, minute):
-    rows = VillageDishReview.objects.filter(slot=slot, status="PENDING")
+def reservations(slots, minute):
+    rows = VillageDishReview.objects.filter(slot__in=slots, status="PENDING")
     if minute is not None:
         rows = rows.filter(expires_world_minute__gt=minute)
-    return rows.count()
+    return dict(rows.values("slot_id").annotate(total=Count("pk")).values_list("slot_id", "total"))
 
 
 def _id(value):
@@ -266,6 +280,9 @@ def rate_dish(npc_id, params, minute, request_id):
     row.status, row.scores, row.comment, row.customer_feedback = "COMPLETED", scores, comment, feedback
     row.completed_world_minute, row.completed_request_id = minute, request_id
     row.save()
+    from .career_development import record_business_evidence
+    record_business_evidence("REVIEW", request_id, "NPC", npc_id, {slot.item_id: 1}, minute,
+        metadata=dict(review_id=str(row.pk), overall_score=score))
     inventory.asset_version += 1
     inventory.save(update_fields=["asset_version", "updated_at"])
     changes = {"dish_rated": dict(review_id=str(row.pk), status=row.status, item_id=slot.item_id, food_instance_id=str(slot.instance_id),

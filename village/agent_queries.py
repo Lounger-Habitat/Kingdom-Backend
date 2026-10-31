@@ -59,6 +59,7 @@ QUERY_NAMES = frozenset({
     "INSPECT_TRADE_OFFERS",
     "INSPECT_MARKET_STATE",
     "INSPECT_CARAVAN_REQUESTS",
+    "INSPECT_CARAVAN_ORDERS",
     "INSPECT_FARM_STATE",
     "INSPECT_RESTAURANT_STATE",
     "INSPECT_RATEABLE_DISHES",
@@ -535,20 +536,25 @@ def _farm_state(_npc: NpcDefinition, query_params=None) -> dict:
         plot = project_plot(row, world_minute)
         is_bill = str(_npc.agent_id) == "10011"
         player_owned = row.lessee_player_id is not None
-        plot["harvestable"] = is_bill and not player_owned and plot["status"] == FarmPlotStatus.MATURE
-        plot["plantable"] = is_bill and not player_owned and not row.lease_enabled and plot["status"] == FarmPlotStatus.EMPTY
-        plot["blocked_reason"] = ("PLAYER_LEASED" if player_owned else
+        plot["harvestable"] = plot["can_use"] and is_bill and not player_owned and plot["status"] == FarmPlotStatus.MATURE
+        plot["plantable"] = plot["can_use"] and is_bill and not player_owned and not row.lease_enabled and plot["status"] == FarmPlotStatus.EMPTY
+        plot["blocked_reason"] = (plot["blocked_reason"] if not plot["can_use"] else "PLAYER_LEASED" if player_owned else
             "BILL_ONLY" if not is_bill else "RESERVED_FOR_LEASING" if row.lease_enabled and plot["status"] == "EMPTY" else "")
         if plot["status"] != FarmPlotStatus.EMPTY:
             plot["crop_name"] = crop_catalog.get(row.crop_code, {}).get("display_name", row.crop_code)
             plot["remaining_minutes"] = max(0, (row.mature_world_minute or world_minute)-world_minute)
         plots.append(plot)
-    return {"plots": plots}
+    from .farm_expansion import project_expansion_sites
+    return {"plots": plots, "crop_catalog": crop_catalog,
+            "expansion": project_expansion_sites(world_minute)}
 
 
 def _cooking_recipes() -> list:
+    from .career_catalog import content_access, recipe_reference_cost
     return [{"recipe_id": recipe.pk, "name": recipe.recipe_name,
              "output_item_id": recipe.item_id, "output_quantity": recipe.output_quantity,
+             "development": content_access(recipe.item_id),
+             "reference_cost": recipe_reference_cost(recipe.pk),
              "ingredients": [{"item_id": row.item_id, "name": row.item_name,
                               "required_quantity": row.count} for row in recipe.ingredients.all()]}
             for recipe in Recipe.objects.prefetch_related("ingredients").filter(
@@ -579,7 +585,7 @@ def _restaurant_state(npc: NpcDefinition) -> dict:
     for recipe in recipe_data:
         for ingredient in recipe["ingredients"]:
             ingredient["available_quantity"] = available.get(ingredient["item_id"], 0)
-        recipe["can_cook"] = bool(recipe["ingredients"]) and all(
+        recipe["can_cook"] = recipe["development"]["can_produce"] and bool(recipe["ingredients"]) and all(
             i["available_quantity"] >= i["required_quantity"] for i in recipe["ingredients"])
     finances = store_finances(npc.agent_id, store_code=store.pk)
     if finances and finances["store_code"] == store.pk:
@@ -713,8 +719,12 @@ def _rules(npc: NpcDefinition) -> dict:
     if "SLEEP" in actions:
         actions.add("WAKE_UP")
     data = build_agent_context(actions, profile=npc.village_profile)
+    from .career_development import project_career_development
+    data["career_development"] = project_career_development()
     if "COOK" in actions:
         data["cooking_recipes"] = _cooking_recipes()
+    if "PLANT" in actions:
+        data["farming_crops"] = _farm_catalog_with_output_names()
     return data
 
 
@@ -815,8 +825,17 @@ def _affairs(npc, query_params=None):
         row["my_contributions"] = list(VillageAffairContribution.objects.filter(affair_id=row["affair_id"],
             actor_type="NPC", actor_id=str(npc.agent_id)).order_by("world_minute", "pk").values(
                 "condition_id", "kind", "item_id", "quantity", "world_minute"))
+    from .career_development import project_career_development
     return {"affairs": data, "world_minute": _world_minute(),
+            "career_development": project_career_development(),
             "daily_events": project_daily_events(npc_id=npc.agent_id)}
+
+
+def _caravan_orders(npc, query_params=None):
+    if query_params:
+        raise ValueError("Order inspection takes no parameters")
+    from .caravan_orders import orders_overview
+    return orders_overview("NPC", str(npc.agent_id), _world_minute())
 
 
 _HANDLERS = {
@@ -829,6 +848,7 @@ _HANDLERS = {
     "INSPECT_TRADE_OFFERS": _trade_offers,
     "INSPECT_MARKET_STATE": _market_state,
     "INSPECT_CARAVAN_REQUESTS": _caravan_requests,
+    "INSPECT_CARAVAN_ORDERS": _caravan_orders,
     "INSPECT_FARM_STATE": _farm_state,
     "INSPECT_RESTAURANT_STATE": _restaurant_state,
     "INSPECT_RATEABLE_DISHES": _rateable_dishes,
@@ -865,7 +885,7 @@ def execute_agent_query(npc_id: str, query_name: str, query_params=None) -> tupl
         if query_name in {"BROWSE_MARKETPLACE", "CHECK_MY_MARKETPLACE_LISTINGS", "CHECK_MARKETPLACE_HISTORY"}:
             return True, "OK", add_item_names(_HANDLERS[query_name](npc, query_params))
         handler = _HANDLERS[query_name]
-        if query_name in {"INSPECT_NEARBY", "INSPECT_MARKET_STATE", "INSPECT_FARM_STATE", "INSPECT_INVENTORY", "INSPECT_RATEABLE_DISHES", "INSPECT_PERSONAL_COMMISSIONS", "INSPECT_AFFAIRS", "INSPECT_STORE_INVENTORY", "INSPECT_SOCIAL_STATE"}:
+        if query_name in {"INSPECT_NEARBY", "INSPECT_MARKET_STATE", "INSPECT_CARAVAN_ORDERS", "INSPECT_FARM_STATE", "INSPECT_INVENTORY", "INSPECT_RATEABLE_DISHES", "INSPECT_PERSONAL_COMMISSIONS", "INSPECT_AFFAIRS", "INSPECT_STORE_INVENTORY", "INSPECT_SOCIAL_STATE"}:
             try:
                 return True, "OK", add_item_names(handler(npc, query_params))
             except ValueError:

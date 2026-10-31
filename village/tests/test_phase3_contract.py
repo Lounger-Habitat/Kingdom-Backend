@@ -287,14 +287,15 @@ class EnumStabilityTest(TestCase):
     """Frozen enum values must not change."""
 
     def test_plot_codes(self):
-        self.assertEqual(len(PLOT_CODES), 36)
+        self.assertEqual(len(PLOT_CODES), 54)
         self.assertEqual(PLOT_CODES[:3], ("FARM_PLOT_A", "FARM_PLOT_A_02", "FARM_PLOT_A_03"))
         self.assertIn("FARM_PLOT_B", PLOT_CODES)
         self.assertIn("FARM_PLOT_C", PLOT_CODES)
         self.assertIn("FARM_PLOT_D_09", PLOT_CODES)
 
     def test_crop_codes(self):
-        self.assertEqual(CROP_CODES, ("CORN", "WHEAT", "CARROT", "POTATO"))
+        self.assertEqual(set(CROP_CODES), {"CORN", "WHEAT", "CARROT", "POTATO", "ONION",
+            "GREEN_RADISH", "PUMPKIN", "TOMATO", "SOYBEAN"})
 
     def test_hunt_codes(self):
         self.assertEqual(HUNT_CODES, ("HUNT_ANIMALS",))

@@ -28,7 +28,10 @@ def config():
 
 
 def item_pool(cfg):
-    return sorted(set(cfg.caravan_item_ids)) if cfg else sorted(IMPORT_WHITELIST)
+    pool = set(cfg.caravan_item_ids) if cfg else set(IMPORT_WHITELIST)
+    from .career_catalog import SEED_ITEM_IDS
+    from .career_development import content_access
+    return sorted(item for item in pool if item not in SEED_ITEM_IDS or content_access(item)["can_produce"])
 
 
 def import_capacity(cfg, route=None):
@@ -102,12 +105,15 @@ def sync_visit(minute):
     imports = {str(i): price(i, "import") for i in valid_pool}
     export_pool = Item.objects.filter(item_id__in=cfg.caravan_export_item_ids, is_deleted=False).order_by("item_id")
     exports = {str(i): price(i, "export") for i in export_pool.values_list("item_id", flat=True)}
-    return VillageCaravanVisit.objects.create(
+    visit = VillageCaravanVisit.objects.create(
         day_index=day, created_world_minute=minute, route=route, location_code=location, stock=stock,
         initial_stock=dict(stock), import_prices=imports, export_prices=exports,
         export_capacity=cfg.caravan_export_capacity,
         requested_items=requested, error_code=error or "",
     )
+    from .caravan_orders import apply_visit_rewards
+    apply_visit_rewards(visit)
+    return visit
 
 
 def projection(minute):
@@ -120,6 +126,10 @@ def projection(minute):
     route = visit.route if visit else current_route()
     location = visit.location_code if visit else ("TRADE_ROAD" if route == "NORMAL" else
         EMERGENCY_LOCATION if route == "EMERGENCY" else "")
+    from .caravan_orders import export_allowance
+    from .caravan_order_models import VillageCaravanVisitAllocation
+    allocation = VillageCaravanVisitAllocation.objects.filter(visit=visit).first() if visit else None
+    export_remaining = export_allowance(visit) if visit else 0
     return {
         "day_index": day, "route": route, "route_frozen": bool(visit),
         "location_code": location,
@@ -128,11 +138,20 @@ def projection(minute):
         "next_arrival_world_minute": next_day * 1440 + ARRIVAL,
         "can_import": present and bool(visit.stock) and any(visit.stock.values()),
         "present": present,
-        "can_export": present and visit.exported_amount < visit.export_capacity and bool(visit.export_prices),
+        "can_export": present and any(export_allowance(visit, int(key)) > 0 for key in visit.export_prices),
         "import_total_amount": sum(visit.initial_stock.values()) if present else 0,
         "import_remaining_amount": sum(visit.stock.values()) if present else 0,
         "export_total_amount": visit.export_capacity if present else 0,
-        "export_remaining_amount": max(0, visit.export_capacity - visit.exported_amount) if present else 0,
+        "export_remaining_amount": export_remaining if present else 0,
+        "export_base_capacity": allocation.base_export_capacity if present and allocation else (visit.export_capacity if present else 0),
+        "export_bonus_capacity": allocation.bonus_export_capacity if present and allocation else 0,
+        "export_bonus_remaining_amount": max(0, allocation.bonus_export_capacity - allocation.bonus_export_used) if present and allocation else 0,
+        "export_bonus_item_ids": allocation.bonus_export_item_ids if present and allocation else [],
+        "order_reserved_capacity": allocation.order_reserved_capacity if present and allocation else 0,
+        "order_remaining_capacity": max(0, allocation.order_reserved_capacity - allocation.order_used) if present and allocation else 0,
+        "import_base_capacity": allocation.base_import_capacity if present and allocation else 0,
+        "import_bonus_capacity": allocation.bonus_import_capacity if present and allocation else 0,
+        "order_reward_snapshot": allocation.reward_snapshot if present and allocation else {},
         "reason": (visit.error_code if visit else "") or ("" if present else "CARAVAN_ROUTE_NOT_OPEN" if route == "NONE" else "CARAVAN_CLOSED"),
         "stock": dict(visit.stock) if present else {},
         "initial_stock": dict(visit.initial_stock) if present else {},
@@ -152,7 +171,9 @@ def agent_projection(minute):
     caravan = {"status": "PRESENT" if present else "CLOSED" if readiness["route_open"] else "ROUTE_NOT_OPEN"}
     if present:
         caravan.update(location_code=raw["location_code"], departure_world_minute=raw["departure_world_minute"])
-        for field in ("import_total_amount", "import_remaining_amount", "export_total_amount", "export_remaining_amount"):
+        for field in ("import_total_amount", "import_remaining_amount", "export_total_amount", "export_remaining_amount",
+                      "export_base_capacity", "export_bonus_capacity", "export_bonus_remaining_amount", "export_bonus_item_ids",
+                      "order_reserved_capacity", "order_remaining_capacity", "import_base_capacity", "import_bonus_capacity", "order_reward_snapshot"):
             caravan[field] = raw[field]
     else:
         caravan["next_arrival_world_minute"] = raw["next_arrival_world_minute"]
@@ -189,8 +210,19 @@ def request_projection(minute):
     requested = set(demand.item_ids if demand else [])
     rows = Item.objects.filter(item_id__in=item_pool(cfg), is_deleted=False).order_by("item_id")
     status = route_readiness()
+    from .caravan_order_models import VillageCaravanReward
+    guaranteed = []
+    pending_import_bonus = 0
+    if status["route"] == "NORMAL":
+        for reward in VillageCaravanReward.objects.filter(status="PENDING").order_by("earned_world_minute", "pk"):
+            if not guaranteed and reward.terms.get("extra_kinds"):
+                guaranteed = reward.terms["extra_kinds"]
+            pending_import_bonus = max(pending_import_bonus, reward.terms.get("import_capacity", {}).get("bonus_capacity", 0),
+                                       reward.terms.get("max_import_bonus", 0))
     return {"arrival_world_minute": target_day * 1440 + ARRIVAL,
             "import_total_amount": import_capacity(cfg, status["route"]),
+            "pending_order_import_bonus": pending_import_bonus,
+            "guaranteed_extra_kinds": guaranteed,
             "route_open": status["route_open"], "arrival_conditional": not status["route_open"],
             "requestable_items": [{"item_id": item.item_id, "item_name": item.item_name,
                 **({"requested": True} if item.item_id in requested else {})} for item in rows]}
@@ -326,8 +358,9 @@ def handle_withdraw_item(npc_id, params, minute, request_id):
                      "required_amount": amount, "available_amount": available})
     batches = []
     for slot, taken in consumed:
+        from .career_trade import source_request_id
         received = add_batch(inventory, item, taken, slot.produced_world_minute,
-            slot.expires_world_minute, request_id, remaining_uses=slot.remaining_uses,
+            slot.expires_world_minute, source_request_id(slot, request_id), remaining_uses=slot.remaining_uses,
             item_attributes=slot.item_attributes)
         batches.append({"source_store_instance_id": str(slot.instance_id),
             "source_slot_instance_id": str(slot.source_slot_instance_id) if slot.source_slot_instance_id else None,
@@ -465,14 +498,24 @@ def handle_export(npc_id, params, minute, request_id):
     if error:
         return _fail(error)
     item, amount = params.get("item_id"), params.get("amount")
-    if type(item) is not int or type(amount) is not int or amount <= 0:
+    source = params.get("stock_source", "PERSONAL")
+    if type(item) is not int or type(amount) is not int or amount <= 0 or not isinstance(source, str) or source not in {"PERSONAL", "STORE"}:
         return _fail("P3_INVALID_PARAMS")
     visit = VillageCaravanVisit.objects.select_for_update().get(pk=minute // 1440)
     if str(item) not in visit.export_prices or not Item.objects.filter(item_id=item, is_deleted=False).exists():
         return _fail("CARAVAN_ITEM_UNAVAILABLE")
-    remaining = max(0, visit.export_capacity - visit.exported_amount)
+    from .caravan_orders import export_allowance, record_ordinary_export
+    remaining = export_allowance(visit, item)
     if amount > remaining:
         return _fail("CARAVAN_EXPORT_CAPACITY_EXCEEDED", data={"export_remaining_amount": remaining})
+    store, account = None, None
+    if source == "STORE":
+        store = owned_store(npc_id, "GENERAL_STORE")
+        if store is None:
+            return _fail("TRADE_STORE_FORBIDDEN")
+        account = VillageStoreAccount.objects.select_for_update().filter(store=store).first()
+        if account is None:
+            return _fail("TRADE_STORE_FORBIDDEN")
     inventory = NpcGlobalInventory.objects.select_for_update().get(npc__agent_id=str(npc_id))
     if params.get("expected_asset_version", inventory.asset_version) != inventory.asset_version:
         return _fail("P3_ASSET_VERSION_CONFLICT")
@@ -480,19 +523,38 @@ def handle_export(npc_id, params, minute, request_id):
     if amount > surplus:
         return _fail("EXPORT_SAFETY_STOCK_REQUIRED", data={"maximum_amount": surplus})
     try:
-        consumed = _consume_personal_fefo_available(inventory, item, amount, minute)
+        consumed = consume_unlisted(store, item, amount, minute) if store else _consume_personal_fefo_available(inventory, item, amount, minute)
     except ValueError:
         return _fail("P3_INSUFFICIENT_ITEM")
     price = visit.export_prices[str(item)]
     from items.quality import item_price
     catalog_item = Item.objects.get(pk=item)
     income = sum(item_price(catalog_item, slot.quality, price) * count for slot, count in consumed)
-    inventory.money += income
-    inventory.asset_version += 1
-    inventory.save()
+    if account:
+        account.balance += income
+        account.account_version += 1
+        account.save(update_fields=["balance", "account_version", "updated_at"])
+        store.inventory_version += 1
+        store.save(update_fields=["inventory_version", "updated_at"])
+        recipient = "STORE:" + store.pk
+    else:
+        inventory.money += income
+        inventory.asset_version += 1
+        inventory.save()
+        recipient = str(npc_id)
+    record_ordinary_export(visit, item, amount)
     visit.exported_amount += amount
     visit.save(update_fields=["exported_amount"])
-    data = {"export_remaining_amount": remaining - amount, "income_account": str(npc_id), str(npc_id): {"money": income, str(item): -amount}, "export": {"item_id": item, "amount": amount, "unit_price": price, "total_income": income}, "nora_balance": inventory.money}
+    from .career_trade import record_sale
+    record_sale("NPC", npc_id, request_id, consumed, minute, income=income,
+        external=True, source="STORE_EXPORT" if store else "PERSONAL_EXPORT")
+    data = {"export_remaining_amount": remaining - amount, "income_account": recipient,
+        "stock_source": source, recipient: {"money": income, str(item): -amount},
+        "export": {"item_id": item, "amount": amount, "unit_price": price, "total_income": income},
+        "nora_balance": inventory.money}
+    if account:
+        data.update(store_code=store.pk, store_balance=account.balance,
+            store_account_version=account.account_version, store_inventory_version=store.inventory_version)
     return _ok(asset_versions={str(npc_id): inventory.asset_version}, effects=data, data=data, external_delta=income)
 
 

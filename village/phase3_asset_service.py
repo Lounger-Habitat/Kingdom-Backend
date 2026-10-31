@@ -202,18 +202,25 @@ def _validate_payload(payload: Dict[str, Any]) -> Optional[str]:
 
 
 def get_available_slot_amount(slot: NpcGlobalInventorySlot, world_minute=None, exclude_command_id=None) -> int:
-    """Return *slot* amount minus ACTIVE delivery reservations."""
-    from .models import NpcTradeDelivery
+    return get_available_slot_amounts([slot], world_minute, exclude_command_id)[slot.pk]
 
-    reserved = (
-        NpcTradeDelivery.objects.filter(
-            seller_slot_instance_id=slot.instance_id, status="ACTIVE"
-        ).aggregate(total=models.Sum("reserved_amount"))["total"]
-        or 0
-    )
-    from .jack_production import reserved_amount
-    from .lucy_cooking import reservation
-    return max(0, slot.item_amount - reserved - reserved_amount(slot, exclude_command_id) - reservation(slot, world_minute))
+
+def get_available_slot_amounts(slots, world_minute=None, exclude_command_id=None):
+    """Read reservations once per batch, including delivery, production and review."""
+    from .models import NpcTradeDelivery
+    from .jack_production import reserved_amounts
+    from .lucy_cooking import reservations
+    slots = list(slots)
+    if not slots:
+        return {}
+    delivery = dict(NpcTradeDelivery.objects.filter(
+        seller_slot_instance_id__in=[slot.instance_id for slot in slots], status="ACTIVE"
+    ).values("seller_slot_instance_id").annotate(total=models.Sum("reserved_amount"))
+        .values_list("seller_slot_instance_id", "total"))
+    production = reserved_amounts(slots, exclude_command_id)
+    review = reservations(slots, world_minute)
+    return {slot.pk: max(0, slot.item_amount - delivery.get(slot.instance_id, 0)
+        - production[slot.pk] - review.get(slot.pk, 0)) for slot in slots}
 
 
 def get_available_money(inventory: NpcGlobalInventory) -> int:

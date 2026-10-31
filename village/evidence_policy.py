@@ -21,12 +21,14 @@ def _write(*domains, **extra):
 
 
 POLICIES = {
+    "INSPECT_CARAVAN_ORDERS": _read("caravan-orders:*", "inventory:{self}", seconds=15),
+    "DELIVER_CARAVAN_ORDER": _write("caravan-orders:*", "inventory:{self}", "wallet:{self}"),
     "INSPECT_INVENTORY": _read("inventory:{self}", "wallet:{self}", snapshots=[
         {"domains": ["inventory:{self}"], "fields": ["items", "total_count", "has_more", "filter", "tool_summaries"]},
         {"domains": ["wallet:{self}"], "fields": ["money", "available_money"]},
     ]),
     "INSPECT_NEARBY": _read("position:{self}", "nearby:*", seconds=10),
-    "INSPECT_AFFAIRS": _read("affair:{affair_id}", seconds=30, omit_fields=["available_actions"]),
+    "INSPECT_AFFAIRS": _read("affair:{affair_id}", "career:*", seconds=30, omit_fields=["available_actions"]),
     "OBSERVE": _read("position:{self}", "needs:{self}", "activity:{self}", seconds=30, snapshots=[
         {"domains": ["position:{self}"], "fields": ["self_npc_id", "self_name", "current_location", "current_point_code", "known_locations"]},
         {"domains": ["needs:{self}"], "fields": ["needs", "need_bands", "today_sleep_minutes", "continuous_sleep_minutes", "today_longest_continuous_sleep_minutes", "previous_core_night_sleep_minutes", "previous_core_night_penalized"], "max_age_world_minutes": 1},
@@ -61,6 +63,8 @@ def event_changes(content):
     public = content.get("public_data") or {}
     if kind.startswith("VILLAGE_AFFAIR_") and public.get("affair_id"):
         return ["affair:" + str(public["affair_id"])]
+    if kind.startswith("CAREER_"):
+        return ["career:*", "caravan-orders:*"]
     if kind in {"PLAYER_GIFT", "PLAYER_RESCUE_GIFT", "ECONOMY_GIVE_ITEMS",
                 "ECONOMY_BUY_FROM_STORE", "ECONOMY_PROPOSE_TRADE",
                 "ECONOMY_RESPOND_TRADE", "ECONOMY_CANCEL_TRADE_OFFER", "MARK_DAILY_SALARY"}:

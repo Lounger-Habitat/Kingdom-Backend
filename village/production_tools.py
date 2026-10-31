@@ -49,10 +49,12 @@ def _definition(slot):
     return definition_for(slot)
 
 
-def resolve_tool(player, bag, capability, instance_id=None, minimum_tier=1, *, minute):
+def resolve_tool(player, bag, capability, instance_id=None, minimum_tier=1, *, minute, levels=None):
     """Pure validation. The caller may already hold world/bag locks; no setup writes."""
     if bag.player_id != player.pk or bag.character_id != player.username:
         reject("TOOL_NOT_OWNED", "只能使用本人主背包中的工具。")
+    if not bag.pk:
+        reject("TOOL_MISSING", "背包中没有指定用途的工具。")
     definitions = {d.item_id: d for d in EquipmentDefinition.objects.filter(enabled=True, item__is_deleted=False)
                    if CAPABILITIES[d.category] == capability}
     rows = InventorySlot.objects.filter(bag=bag, item_id__in=definitions, item_amount__gt=0).order_by("slot_index")
@@ -68,7 +70,8 @@ def resolve_tool(player, bag, capability, instance_id=None, minimum_tier=1, *, m
     if not qualified:
         reject("TOOL_TIER_REQUIRED", "该资源需要更高阶工具。")
     permitted = [s for s in qualified if not definitions[s.pk].required_skill or
-                 _level(player, definitions[s.pk].required_skill) >= definitions[s.pk].required_level]
+                 (levels.get(definitions[s.pk].required_skill, 1) if levels is not None
+                  else _level(player, definitions[s.pk].required_skill)) >= definitions[s.pk].required_level]
     if not permitted:
         reject("SKILL_LEVEL_REQUIRED", "技能等级未达到工具使用要求。")
     usable = [s for s in permitted if _fresh(s, minute) and type(s.remaining_uses) is int
@@ -172,26 +175,32 @@ def _quote(player, bag, slot, operation, minute, *, context=None):
         location_code=None, action="upgrade_tool" if operation == "upgrade" else "repair_tool")
 
 
-def tools_overview(player, bag, minute, read_only=False):
-    levels = {s["code"]: s["level"] for s in growth_snapshot(player, read_only=True)["skills"]}
-    slots = list(bag.slots.filter(item_amount__gt=0).order_by("slot_index")) if bag.pk else []
-    materials = {}
-    for source in slots:
-        if _fresh(source, minute):
-            materials[source.item_id] = materials.get(source.item_id, 0) + source.item_amount
+def tools_overview(player, bag, minute, read_only=False, *, levels=None, slots=None, capability=None):
+    if levels is None:
+        levels = {s["code"]: s["level"] for s in growth_snapshot(player, read_only=True, compact=True)["skills"]}
+    slots = (list(bag.slots.filter(item_amount__gt=0).order_by("slot_index")) if bag.pk else []) if slots is None else sorted(slots, key=lambda s: s.slot_index)
     catalog = equipment_catalog()
-    context = dict(catalog=catalog, levels=levels, materials=materials, items=Item.objects.filter(is_deleted=False).in_bulk(),
-        account=VillageStoreAccount.objects.filter(store_id="GENERAL_STORE").first())
+    # Farm/gathering selectors need usable instances, not service quotes or store shelves.
+    if capability is None:
+        materials = {}
+        for source in slots:
+            if _fresh(source, minute):
+                materials[source.item_id] = materials.get(source.item_id, 0) + source.item_amount
+        context = dict(catalog=catalog, levels=levels, materials=materials, items=Item.objects.filter(is_deleted=False).in_bulk(),
+            account=VillageStoreAccount.objects.filter(store_id="GENERAL_STORE").first())
     tools = []
     moves = list(WeaponMove.objects.all())
     for slot in slots:
         stats = catalog.get((slot.item_id, slot.equipment_level))
-        if not stats:
+        if not stats or capability is not None and stats["capability"] != capability:
             continue
-        repair, upgrade = _quote(player, bag, slot, "repair", minute, context=context), _quote(player, bag, slot, "upgrade", minute, context=context)
-        if read_only:
-            for quote in (repair, upgrade):
-                quote.update(available=False, reason="MODE_READ_ONLY")
+        service = {}
+        if capability is None:
+            service = dict(repair=_quote(player, bag, slot, "repair", minute, context=context),
+                           upgrade=_quote(player, bag, slot, "upgrade", minute, context=context))
+            if read_only:
+                for quote in service.values():
+                    quote.update(available=False, reason="MODE_READ_ONLY")
         attributes = equipment_attributes(stats)
         for move in moves:
             if move.category == stats["category"]:
@@ -205,7 +214,9 @@ def tools_overview(player, bag, minute, read_only=False):
             maximum_uses=stats["max_durability"], required_level=stats["required_skill_level"],
             usable=_fresh(slot, minute) and type(slot.remaining_uses) is int and 0 < slot.remaining_uses <= stats["max_durability"]
                 and (not stats["required_skill"] or levels.get(stats["required_skill"], 1) >= stats["required_skill_level"]),
-            repair=repair, upgrade=upgrade))
+            **service))
+    if capability is not None:
+        return dict(tools=tools)
     return dict(tools=tools, can_claim_starter_axe=False,
         claim_reason="MODE_READ_ONLY" if read_only else "STARTER_EQUIPMENT_AUTOMATIC",
         shop=[dict(item_id=l.item_id, item_name=l.item_name, listing_id=str(l.pk), unit_price=l.unit_price, stock=l.stock)
@@ -214,8 +225,10 @@ def tools_overview(player, bag, minute, read_only=False):
 
 def _shop_rows(minute):
     from .lucy_restaurant import store_available
-    for listing in VillageStoreListing.objects.filter(store_id="GENERAL_STORE", item_id__in=[*STOCK_ITEMS, *EquipmentDefinition.objects.filter(enabled=True).values_list("item_id", flat=True)], status="ACTIVE"):
-        item = Item.objects.filter(pk=listing.item_id, is_deleted=False).first()
+    listings = list(VillageStoreListing.objects.filter(store_id="GENERAL_STORE", item_id__in=[*STOCK_ITEMS, *EquipmentDefinition.objects.filter(enabled=True).values_list("item_id", flat=True)], status="ACTIVE").prefetch_related("inventory_slots"))
+    items = Item.objects.filter(pk__in=[listing.item_id for listing in listings], is_deleted=False).in_bulk()
+    for listing in listings:
+        item = items.get(listing.item_id)
         if not item:
             continue
         listing.item_name = item.item_name
@@ -277,6 +290,38 @@ def execute_tool_action(player, bag, action, params, rid, clock):
     return result
 
 
+def _initial_tool_listing(store, item_id, price, remaining_uses):
+    """Join only the known legacy/current initial shelves, preserving stock and history."""
+    legacy = {4101: "kingdom:g1:gathering-tool:initial-stock:v1",
+              4001: "village-reset:general-store-listing:4001"}.get(item_id)
+    if legacy is None:
+        return None
+    markers = [uuid.uuid5(uuid.NAMESPACE_URL, legacy),
+               uuid.uuid5(uuid.NAMESPACE_URL, f"kingdom:g2:production-stock:{item_id}:v1")]
+    shelves = VillageStoreListing.objects.select_for_update().filter(store=store, item_id=item_id,
+        created_request_id__in=markers, status="ACTIVE", public_meal_code="", quality=3,
+        price_mode="ORIGINAL", unit_price=price).prefetch_related("inventory_slots__usage")
+    compatible = []
+    for shelf in shelves:
+        if any(slot.reserved_amount or slot.item_id != item_id or slot.quality != 3
+               or slot.equipment_level != 1 or slot.remaining_uses != remaining_uses
+               for slot in shelf.inventory_slots.all()):
+            continue
+        compatible.append(shelf)
+    if not compatible:
+        return None
+    compatible.sort(key=lambda shelf: shelf.created_request_id != markers[0])
+    target = compatible[0]
+    for duplicate in compatible[1:]:
+        VillageStoreInventorySlot.objects.filter(listing=duplicate).update(listing=target)
+        duplicate.status = "DELISTED"
+        duplicate.save(update_fields=["status", "updated_at"])
+    if len(compatible) > 1:
+        store.inventory_version += 1
+        store.save(update_fields=["inventory_version", "updated_at"])
+    return target
+
+
 @transaction.atomic
 def ensure_production_catalog(minute):
     """Trusted finite initial supply. The ledger marker survives listing removal."""
@@ -284,6 +329,8 @@ def ensure_production_catalog(minute):
     store = _store()
     if not store or not VillageStoreAccount.objects.filter(store=store).exists():
         return []
+    existing = {item.pk: _initial_tool_listing(store, item.pk, max(1, item.item_price), item.max_use_count)
+                for item in Item.objects.filter(pk__in=(4001, 4101), is_deleted=False)}
     installed = []
     for item_id in dict.fromkeys([*STOCK_ITEMS, *EquipmentDefinition.objects.filter(enabled=True).values_list("item_id", flat=True)]):
         marker = uuid.uuid5(uuid.NAMESPACE_URL, "kingdom:g3:cooking-stock:4106:v1" if item_id == 4106
@@ -294,7 +341,7 @@ def ensure_production_catalog(minute):
         item = Item.objects.filter(pk=item_id, is_deleted=False).first()
         if not item:
             continue
-        listing = VillageStoreListing.objects.create(listing_id=uuid.uuid5(marker, "listing"), store=store,
+        listing = existing.get(item_id) or VillageStoreListing.objects.create(listing_id=uuid.uuid5(marker, "listing"), store=store,
             item_id=item_id, unit_price=max(1, item.item_price), price_mode="ORIGINAL", status="ACTIVE",
             listed_by_npc=store.operator_npc, created_request_id=marker, listed_world_minute=minute)
         is_tool = EquipmentDefinition.objects.filter(item_id=item_id, enabled=True).exists()

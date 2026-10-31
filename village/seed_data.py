@@ -1,4 +1,5 @@
 BASE_ACTIONS = [
+    "INSPECT_CARAVAN_ORDERS", "DELIVER_CARAVAN_ORDER",
     "WRITE_SCHEDULE", "INSPECT_SCHEDULE", "UPDATE_SCHEDULE",
     "WRITE_DIARY", "INSPECT_DIARIES", "UPDATE_DIARY",
     "MOVE", "GO_HOME",
@@ -166,6 +167,14 @@ FARM_PLOT_SEEDS = [
         ([f"FARM_PLOT_{region}"] if region != "D" else ["FARM_PLOT_D_01"])
         + [f"FARM_PLOT_{region}_{index:02d}" for index in range(2, 10)]
     )
+]
+
+# Installed by farm_expansion.ensure_expansion_sites, without changing old
+# fields, crops or leases. The first three cells in each site belong to Bill.
+FARM_EXPANSION_PLOT_SEEDS = [
+    {"plot_code": f"FARM_PLOT_{region}_{index:02d}", "expansion_site_code": region,
+     "reclamation_status": "LOCKED", "lease_enabled": index > 3}
+    for region in ("E", "F") for index in range(1, 10)
 ]
 
 # The base Unity catalog already has the four harvested crops, but only corn

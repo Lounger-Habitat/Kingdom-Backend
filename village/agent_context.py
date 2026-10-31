@@ -196,10 +196,11 @@ def build_agent_context(actions, profile=None):
         )
     if "HUNT" in actions:
         rules.append("HUNT使用HUNT_ANIMALS：从猎场入口追击真实鸡/猪/牛，成功击杀后获得对应待处理猎物1件；数据库时长是狩猎期限，到时不自动发奖。PROCESS_GAME在屠宰棚每次处理1件：鸡→鸡肉3+羽毛1；猪→里脊1+排骨1+五花肉2+粗皮革1；牛→牛肉6+粗皮革2。两动作各耗1次猎具，时长只读数据库；猎物产出品质1～6，肉与副产品继承猎物品质，不随时间过期。库存查询提供当日猎次、下一猎额外精力、可处理实例及阻碍；取消已开始的狩猎仍计次。肉可向Lucy报价，副产品可向Nora杂货店报价；采购、售卖和休息自主安排。")
+        rules.append("加工棚改进后可开放新增分割部位和副产品，实际完整产出、工时和可处理批次以库存production目录为准；试制有有限额度，同一猎物只处理一次。既有加工继续可用，已开始工单按冻结结果结算。")
     if "COOK" in actions:
         rules.append(f"COOK：需先 MOVE 到 RESTAURANT，使用允许的配方并消耗真实材料；配方编号、产量和材料清单查GET_RULE.cooking_recipes，个人可用材料查INSPECT_INVENTORY，食物不再过期，食材品质影响成品品质，品质1～6均可制作和售卖。缺料会在开工前拒绝；按missing_items补齐本人可用材料后再重试该配方，未补齐时应采购、换配方或等待补货，不重复烹饪。")
     if actions & {"IMPORT_GOODS", "EXPORT_GOODS"}:
-        rules.append("商队每日到访窗口为11:00–15:00，路线未开通不保证到访；先用INSPECT_MARKET_STATE查询caravan地点与时间，再MOVE；items的import_available_amount/import_unit_price是当趟进货余量与单价，export_unit_price是当趟出口收购单价；INSPECT_CARAVAN_REQUESTS单独返回完整补货目录requestable_items、requested=true登记标记、目标到访时间和配置进口总量，不能当作现货；CONTACT_CARAVAN提交完整item_ids并替换目标批次的旧登记。断桥使用 EMERGENCY_TRADE_POST，修好后后续到访使用 TRADE_ROAD，当趟以查询为准。CONTACT_CARAVAN 在杂货铺提交 item_ids，11点前完成针对本次、否则针对次日，合法需求登记100%成功；首次应急路线由Nora在允许地点个人付费开通，不要求森林侦察或补给。进口按配置总量配货并受本趟余货限制，出口受caravan.export_remaining_amount跨品种共享收购额度限制、收入归个人但保留村庄安全库存；商品目录和浮动报价每趟固定，后台变更从后续批次生效。进货仅扣个人可用金币，货进个人背包，不支持store_code；需要售卖时到自己的商店用LIST_STORE_ITEM、stock_source=PERSONAL自主上架。INSPECT_INVENTORY查看个人背包及自己商店的store_finances.unlisted_stock，INSPECT_STORE_INVENTORY查看指定商店的公开在售商品；提款须保留经营储备。")
+        rules.append("商队每日到访窗口为11:00–15:00，路线未开通不保证到访；先用INSPECT_MARKET_STATE查询caravan地点与时间，再MOVE；items的import_available_amount/import_unit_price是当趟进货余量与单价，export_unit_price是当趟出口收购单价；INSPECT_CARAVAN_REQUESTS单独返回完整补货目录requestable_items、requested=true登记标记、目标到访时间和配置进口总量，不能当作现货；CONTACT_CARAVAN提交完整item_ids并替换目标批次的旧登记。断桥使用 EMERGENCY_TRADE_POST，修好后后续到访使用 TRADE_ROAD，当趟以查询为准。CONTACT_CARAVAN 在杂货铺提交 item_ids，11点前完成针对本次、否则针对次日；首次应急路线由Nora个人付费开通。出口受共享剩余额度和村庄安全库存限制；stock_source=PERSONAL默认扣个人物品、回款个人，STORE扣本人杂货铺未上架未占用库存、回款店铺账户。商品目录和报价每趟固定。进货仅扣个人可用金币、货进个人背包；进口不支持store_code。INSPECT_INVENTORY查看个人背包及store_finances.unlisted_stock，INSPECT_STORE_INVENTORY查看公开在售商品；个人款与店款分别核算。")
     if actions & {"LIST_STORE_ITEM", "UPDATE_STORE_PRICE", "DELIST_STORE_ITEM"}:
         rules.append("商店经营：只能管理自己经营的商店。上架可将个人真实库存转入商店，stock_source=STORE可从店内未上架库存上架；下架只停止售卖，物品仍在商店。Nora店保留自由定价；Lucy饭店普通菜用ORIGINAL，后台按具体菜的默认价值或有效点评价定价，禁止CUSTOM。饭店必须传food_instance_id选择个人或店内未上架批次。")
     if "WITHDRAW_STORE_FUNDS" in actions:
@@ -254,6 +255,10 @@ def build_agent_context(actions, profile=None):
     if "CONTRIBUTE_TO_AFFAIR" in actions:
         rules.append("村庄事务由系统创建和定义，NPC自主决定是否参与。使用INSPECT_AFFAIRS查询；使用CONTRIBUTE_TO_AFFAIR指定affair_id、condition_id和kind，仅贡献available=true的条件。各事务独立推进，无全局剧情阶段、会议、投票或发布决议前置。")
         rules.append("kind=item提交item_id和amount，可用food_instance_id指定批次；kind=gold提交amount，扣个人可用金币。系统按条件品质、地点和剩余需求校验，不能重复贡献或使用公款。kind=labor不传amount，真实完成unit_minutes才计1份，中断不计。最后阶段完成后由系统结算完成效果。")
+        rules.append("INSPECT_AFFAIRS.career_development展示试种、加工棚改进、菜单试卖、品鉴和新品销路等村庄事务，以及各项前置和真实进度；新作物、新分割和新菜须按环境实际开放条件生产。建设后可有限试制，真实生产和付费销售才推进正式开放；既有品类保留。reference_cost是参考成本估算，不是扣款或实际利润。没有销路时可以减产或安排生活，不为凑任务无限生产。")
+    if "INSPECT_CARAVAN_ORDERS" in actions:
+        rules.append("商队限时订单：INSPECT_CARAVAN_ORDERS查看当前公告、各品质冻结报价、交货窗口、剩余需求、本人可交批次和整单奖励。DELIVER_CARAVAN_ORDER只出售本人未占用的合格物品，在商队实际到访地点现场交货，每次成功立即收款；不会获得普通进出口或他人资产权限。全部需求在期限内完成才产生公布的下趟奖励，未完成时已成交货款保留。失败或结果未知先核验原回执，不换编号重复交货；预览和结算按同一品质报价。")
+        rules.append("订单theme_label是本期采购方向，trial_item标明小额新品试销。local_production_required=true时只收有真实本地生产记录的批次，进口成品不能冒充；进口原料经过真实烹饪的合格菜品可交。每期条款发布后固定，后续评鉴只影响下一张实际采用推荐的订单，最多一个条目，不改变本期价格或额度。")
     opportunity_query = "GET_RULE 或 INSPECT_AFFAIRS" if "INSPECT_AFFAIRS" in actions else "GET_RULE"
     common.append(
         "current_daily_events 是与你有关的公开机会和近期结果，不是任务指令；你自主决定是否参与，并照常安排吃饭、休息和职业活动。"

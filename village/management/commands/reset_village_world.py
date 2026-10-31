@@ -91,6 +91,15 @@ from village.models import (
     VillageRouteAttempt,
     VillageCaravanRequest,
     VillageCaravanVisit,
+    VillageCaravanOrder,
+    VillageCaravanOrderDelivery,
+    VillageCaravanOrderReceipt,
+    VillageCaravanReward,
+    VillageFarmExpansionSite,
+    VillageCareerDevelopment,
+    VillageCareerEvidence,
+    VillageCareerProductionReservation,
+    VillageDailyEvent,
     VillageSimulationConfig,
     VillageStore,
     VillageStoreAccount,
@@ -200,6 +209,8 @@ class Command(BaseCommand):
         GlobalGameTimeState.objects.select_for_update().get(pk=1)
         cleared = 0
         formal_npc_ids = tuple(FORMAL_NPC_AGENT_IDS)
+        # Reclamation affairs are protected by surviving authored plots.
+        VillageFarmPlot.objects.update(reclamation_affair=None, reclaimed_world_minute=None)
 
         # Player inventories are reset too. Keep only unrelated test-NPC/system listings.
         for queryset in (
@@ -219,6 +230,15 @@ class Command(BaseCommand):
 
         # Clear children that protect or feed the event/command history first.
         for model in (
+            VillageDailyEvent,
+            VillageCareerProductionReservation,
+            VillageCareerEvidence,
+            VillageCareerDevelopment,  # Its prepared affairs are protected until this record is removed.
+            VillageFarmExpansionSite,
+            VillageCaravanOrderDelivery,  # PROTECTs receipt, line and frozen visit.
+            VillageCaravanOrderReceipt,
+            VillageCaravanReward,  # PROTECTs its applied visit.
+            VillageCaravanOrder,  # Cascades windows, lines and completion.
             VillagePlayerNpcRelationshipChange,  # PROTECTs relation and completed commission.
             VillagePlayerNpcRelationship,
             VillageProfessionalContractLink,  # PROTECTs both commission and frozen caravan visit.
@@ -339,6 +359,8 @@ class Command(BaseCommand):
             source_request_id=None,
             production_rules_snapshot={},
         )
+        VillageFarmPlot.objects.filter(expansion_site_code="").update(reclamation_status="READY")
+        VillageFarmPlot.objects.exclude(expansion_site_code="").update(reclamation_status="LOCKED")
         farm_counts = self._seed_farm_plot_states(time_state.world_minute)
         VillageStore.objects.update(status="OPEN", inventory_version=0)
         VillageStoreAccount.objects.update(balance=0, account_version=0, daily_limits={}, limits_until_world_minute=None)
@@ -378,6 +400,12 @@ class Command(BaseCommand):
         from village.farm_irrigation import ensure_irrigation_affair
         ensure_bridge_affair(time_state.world_minute)
         ensure_irrigation_affair(time_state.world_minute)
+        if VillageSimulationConfig.objects.get(config_key="default").farm_expansion_enabled:
+            from village.farm_expansion import ensure_expansion_sites
+            ensure_expansion_sites(time_state.world_minute)
+        if VillageSimulationConfig.objects.get(config_key="default").career_development_enabled:
+            from village.career_development import ensure_career_development
+            ensure_career_development(time_state.world_minute, bootstrap=True)
         # 二跑复盘（R6）：摘要只写重置那一刻真实存在的事实。
         # 剧情已改为独立事务，bootstrap_story 只读；不声称存在旧剧情阶段。
         reset_wallets = "、".join(
@@ -503,7 +531,9 @@ class Command(BaseCommand):
         empty_count = len(plots) // 3
         half_grown_count = len(plots) // 3
         for index, plot in enumerate(plots[empty_count:], start=empty_count):
-            crop_code = random.choice(tuple(FARM_CROP_RULES))
+            # Fresh-world crops must not bypass the career trial/unlock path.
+            from village.career_catalog import CROP_RULES as CAREER_CROP_RULES
+            crop_code = random.choice(tuple(code for code in FARM_CROP_RULES if code not in CAREER_CROP_RULES))
             crop_rule = FARM_CROP_RULES[crop_code]
             growth_minutes = crop_rule["growth_minutes"]
             elapsed_minutes = (

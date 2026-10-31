@@ -46,6 +46,7 @@ LOCATIONS = {
         "withdraw_stall_dish", "upgrade_player_stall")},
 }
 PARAMS = {
+    "deliver_caravan_order": {"order_id", "item_id", "instance_id", "quantity", "expected_unit_price"},
     "start_mastery": {"skill_code"},
     "contribute_mastery": {"skill_code", "selections", "expected_quote"},
     "claim_mastery": {"skill_code"},
@@ -321,6 +322,10 @@ def overview(player, bag, minute, *, read_only=False):
             "item_type": items[s.item_id].item_type if s.item_id in items else "",
             "general_store_sale": store_sale_quote(s, items.get(s.item_id), minute)}
             for s in bag.slots.filter(item_amount__gt=0).select_related("usage", "dish", "review")] if bag.pk else [])
+    from .caravan_orders import orders_overview
+    projection["caravan_orders"] = orders_overview("PLAYER", str(player.pk), minute)
+    from .career_development import project_career_development
+    projection["career_development"] = project_career_development(minute)
     from player.tutorials import tutorial_overview
     projection["tutorial"] = tutorial_overview(player, bag, minute, projection, read_only=read_only)
     from player.arrival import arrival_overview
@@ -334,6 +339,13 @@ def _execute(player, bag, action, p, rid, location, clock, authority_session_id=
         fail("LOCATION_INVALID", "请前往对应地点再操作。")
     if action == "overview":
         return {}
+    if action == "deliver_caravan_order":
+        from .caravan_orders import deliver_order
+        result = deliver_order("PLAYER", str(player.pk), p, minute, rid, location)
+        if str(result.get("result_code")) not in {"OK", "ResultCode.OK"}:
+            fail(result.get("result_code", "CARAVAN_ORDER_FAILED"),
+                 result.get("message", "本次商队订单交货未完成。"))
+        return result.get("data", {})
     if action in ARRIVAL_PARAMS:
         from player.arrival import control, ArrivalError
         try:

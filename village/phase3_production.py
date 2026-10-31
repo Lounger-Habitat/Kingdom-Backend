@@ -21,6 +21,7 @@ from recipes.models import Recipe, RecipeIngredient
 
 from .models import VillageFarmPlot
 from .player_farm import project_plot
+from .farm_expansion import plot_access
 from .phase3_asset_service import (
     _fail,
     _ok,
@@ -41,6 +42,7 @@ from .phase3_contract import (
     PLOT_CODES,
     ResultCode,
 )
+from .career_catalog import content_access, reserve_outputs, record_production
 
 
 # ── PLANT ────────────────────────────────────────────────────────────────────
@@ -65,6 +67,10 @@ def plant_preflight(npc_id, params, world_minute):
             data={"invalid_field": "crop_code", "received_value": crop_code,
                   "allowed_values": sorted(FARM_CROP_RULES)},
         )
+    access = content_access(crop_rule["output_item_id"])
+    if not access["can_produce"]:
+        return _fail(access["blocked_reason"], data={"development": access,
+            "message": access["unavailable_reason"], "crop_code": crop_code})
 
     # Lock plot first (stable order: plot_code is deterministic)
     try:
@@ -75,6 +81,9 @@ def plant_preflight(npc_id, params, world_minute):
             data={"invalid_field": "plot_code", "received_value": plot_code,
                   "failure_kind": "PLOT_NOT_FOUND"},
         )
+
+    if not plot_access(plot)["can_use"]:
+        return _fail(ResultCode.P3_PLOT_NOT_READY, data={"failure_kind": "FARM_PLOT_LOCKED", **plot_access(plot), "plot_code": plot_code})
 
     # Lock inventory
     if plot.lessee_player_id is not None or plot.lease_enabled:
@@ -139,6 +148,8 @@ def _do_plant(
     seed_item_id = crop_rule["seed_item_id"]
     with transaction.atomic():
         plot = VillageFarmPlot.objects.select_for_update().get(plot_code=params["plot_code"])
+        if not plot_access(plot)["can_use"]:
+            return _fail(ResultCode.P3_PLOT_NOT_READY, data={"failure_kind": "FARM_PLOT_LOCKED", **plot_access(plot), "plot_code": plot.plot_code})
         inventory = NpcGlobalInventory.objects.select_for_update().get(npc__agent_id=str(npc_id))
         # Consume one seed for the selected crop (FEFO).
         try:
@@ -160,6 +171,7 @@ def _do_plant(
         try:
             used_tool = consume_tool_use(npc_id, FARM_TOOL_ITEM_ID, world_minute)
         except ValueError:
+            transaction.set_rollback(True)
             return _fail(
                 ResultCode.P3_TOOL_BROKEN,
                 data={"failure_kind": "FARM_TOOL_UNAVAILABLE", "required_item_id": FARM_TOOL_ITEM_ID},
@@ -169,6 +181,9 @@ def _do_plant(
         day_index = world_minute // 1440
         rng = deterministic_rng(request_id, "PLANT", day_index)
         yield_seed = rng.randint(crop_rule["yield_min"], crop_rule["yield_max"])
+        if not reserve_outputs({crop_rule["output_item_id"]: crop_rule["yield_max"]}, request_id, world_minute):
+            transaction.set_rollback(True)
+            return _fail("CAREER_TRIAL_LIMIT")
         batch_id = uuid.uuid4()
 
         plot.batch_id = batch_id
@@ -231,6 +246,9 @@ def harvest_preflight(npc_id, params, world_minute, request_id=None):
             data={"invalid_field": "plot_code", "received_value": plot_code,
                   "failure_kind": "PLOT_NOT_FOUND"},
         )
+
+    if not plot_access(plot)["can_use"]:
+        return _fail(ResultCode.P3_PLOT_NOT_READY, data={"failure_kind": "FARM_PLOT_LOCKED", **plot_access(plot), "plot_code": plot_code})
 
     try:
         inventory = NpcGlobalInventory.objects.select_for_update().get(
@@ -325,6 +343,7 @@ def _do_harvest(
         harvested_batch_id = str(plot.batch_id) if plot.batch_id else None
         harvested_planted_world_minute = plot.planted_world_minute
         harvested_mature_world_minute = plot.mature_world_minute
+        reservation_request_id = str(plot.source_request_id) if plot.source_request_id else None
 
         # Deterministic yield from the plot's stored yield seed.
         day_index = world_minute // 1440
@@ -342,7 +361,7 @@ def _do_harvest(
 
         # Add harvested crop and returned seed batches.
         added_items = []
-        add_batch(
+        output_slot = add_batch(
             inventory, output_item_id, output_amount,
             world_minute, None, request_id, item_attributes={"quality": (plot.production_rules_snapshot or {}).get("quality", 3)},
         )
@@ -354,6 +373,10 @@ def _do_harvest(
             world_minute, None, request_id,
         )
         added_items.append({"item_id": seed_item_id, "amount": seed_amount})
+
+        record_production("NPC", npc_id, request_id, {output_item_id: output_amount}, world_minute,
+            source_kind="HARVEST", plot_code=plot_code,
+            reservation_request_id=reservation_request_id, output_instance_ids=[str(output_slot.instance_id)])
 
         # Clear plot
         plot.batch_id = None

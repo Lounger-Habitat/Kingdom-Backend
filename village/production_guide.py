@@ -54,14 +54,15 @@ def production_overview(player, bag, minute, *, read_only=False, tool_state=None
         dict(code="boar", title="\u5317\u5761\u91ce\u732a", location_code="NORTH_SLOPE", description="\u6709\u8d77\u624b\u63d0\u793a\u7684\u76f4\u7ebf\u51b2\u649e\uff0c\u547d\u4e2d\u626330\u751f\u547d\u3002",
             requirements=["\u63a8\u8350T3\u5f13\u77db\uff0cG\u6b63\u9762\u683c\u6321\u6216R\u7ffb\u6eda\u3002"], uses=["Jack\u6536\u8d398\u91d1\u52a0\u5de5\u51fa\u771f\u5b9e\u8089\u76ae\u3002"], available=True)])
     for code, rule in FARM_CROP_RULES.items():
-        professional = code == "PUMPKIN"
-        advanced = code in {"ONION", "GREEN_RADISH"}
+        from .career_catalog import content_access
+        access = content_access(rule["output_item_id"])
+        level, tier = rule.get("required_level", 1), rule.get("minimum_tool_tier", 1)
         resources.append(dict(code="crop_" + code, title=rule["display_name"], location_code="BILL_FARM",
             description=f"基础生长 {rule['growth_minutes']} 世界分钟；水渠效果以新播种批次为准。",
-            requirements=["本人有效租田、种子和可用农具。",
-                "\u79cd\u690d7\u7ea7\u53caT3\u519c\u5177\u3002" if professional else "种植 4 级及 T2 农具。" if advanced else "基础作物在种植 1 级开放。"],
+            requirements=["本人有效租田、种子和可用农具。", f"种植 {level} 级及 T{tier} 农具。"]
+                + ([access["unavailable_reason"]] if not access["can_produce"] else []),
             uses=["可按真实报价出售、交付合格订单或用于已有配方。"],
-            available=levels["farming"] >= (7 if professional else 4 if advanced else 1),
+            development=access, available=levels["farming"] >= level and access["can_produce"],
             remaining_quantity=None, next_restore_world_minute=None))
     point = CollectionPoint.objects.filter(collect_type="采集林下食材").first()
     if point is None:

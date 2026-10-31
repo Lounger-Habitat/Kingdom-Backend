@@ -23,6 +23,9 @@ def public_caravan(route, history_page=1):
               "location_code": "TRADE_ROAD" if route == "NORMAL" else caravan.EMERGENCY_LOCATION,
               "status": "UNKNOWN", "items": [], "history": [],
               "history_page": 1, "history_pages": 1, "history_total": 0}
+    if route == "NORMAL" and minute is not None:
+        from .caravan_orders import orders_overview
+        result["caravan_orders"] = orders_overview("PUBLIC", "", minute)
     if minute is None:
         return result
     data = caravan.projection(minute)  # Never sync_visit: viewing must not roll stock.
@@ -44,6 +47,11 @@ def public_caravan(route, history_page=1):
                   departure_world_minute=data["departure_world_minute"],
                   next_arrival_world_minute=data["next_arrival_world_minute"],
                   demand_registered=bool(data["next_requested_items"]))
+    if matching:
+        for key in ("export_base_capacity", "export_bonus_capacity", "export_bonus_remaining_amount",
+                    "export_bonus_item_ids", "order_reserved_capacity", "order_remaining_capacity",
+                    "import_base_capacity", "import_bonus_capacity", "order_reward_snapshot"):
+            result[key] = data.get(key)
 
     # Associate historic imports with the frozen visit on the settlement day.
     days = VillageCaravanVisit.objects.filter(route=route).values("day_index")

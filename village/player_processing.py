@@ -20,6 +20,8 @@ from .phase3_catalog import (BYPRODUCT_ITEM_IDS, HUNT_TOOL_ITEM_ID, PREY_RECIPES
                             PREY_CHICKEN, PREY_PIG, PREY_CATTLE, PREY_DEER)
 
 from .professional_catalog import PREY_BOAR
+from .career_catalog import (NEW_CONTENT_ITEM_IDS, content_access, processing_outputs,
+    processing_duration, reserve_outputs, record_production, trial_request_id)
 
 FEES = {PREY_CHICKEN: 2, PREY_PIG: 4, PREY_CATTLE: 6, PREY_DEER: 5, PREY_BOAR: 8}
 MAX_SUBMISSION_QUANTITY = 100
@@ -112,7 +114,7 @@ def _prey_reason(slot, minute, duration):
 
 
 def _outputs(slot):
-    spec = PREY_RECIPES.get(slot.item_id, {}).get("outputs", {})
+    spec = processing_outputs(slot.item_id)
     names = dict(Item.objects.filter(pk__in=spec, is_deleted=False).values_list("pk", "item_name"))
     if len(names) != len(spec):
         return []
@@ -153,6 +155,8 @@ def _preview(player, bag, slot, minute, *, quantity=1, read_only=False):
         duration = max(1, math.ceil(duration * (1-tool_stats["processing_time_reduction"])))
     reason = "PROCESSING_DURATION_UNAVAILABLE" if not duration else _prey_reason(slot, minute, duration)
     outputs = _outputs(slot) if slot is not None and slot.item_id in FEES else []
+    if duration:
+        duration = processing_duration(duration, {row["item_id"]: row["quantity"] for row in outputs})
     if not outputs:
         reason = reason or "PROCESSING_CATALOG_UNAVAILABLE"
     if slot is not None and slot.item_amount < quantity:
@@ -160,6 +164,14 @@ def _preview(player, bag, slot, minute, *, quantity=1, read_only=False):
     waiting_reason = _jack_reason(minute) or tool_reason
     unit_fee = FEES.get(slot.item_id, 0) if slot is not None else 0
     fee = unit_fee * quantity
+    maximum = max(0, min(MAX_SUBMISSION_QUANTITY, slot.item_amount if slot else 0,
+                        bag.money // unit_fee if unit_fee else 0))
+    for output in outputs:
+        access = content_access(output["item_id"])
+        if access["status"] == "TRIAL":
+            maximum = min(maximum, access.get("trial_remaining", 0) // output["quantity"])
+    if quantity > maximum and maximum < min(MAX_SUBMISSION_QUANTITY, slot.item_amount if slot else 0):
+        reason = reason or ("CAREER_TRIAL_LIMIT" if bag.money >= fee else "INSUFFICIENT_MONEY")
     for output in outputs:
         output["quantity"] *= quantity
     if bag.money < fee:
@@ -172,8 +184,7 @@ def _preview(player, bag, slot, minute, *, quantity=1, read_only=False):
         reason = reason or "MODE_READ_ONLY"
     return dict(available=not reason, reason=reason, quote_hash=quote,
         prey_instance_id=payload["prey_instance_id"], quantity=quantity, fee_gold=fee, unit_fee_gold=unit_fee,
-        max_quantity=max(0, min(MAX_SUBMISSION_QUANTITY, slot.item_amount if slot else 0,
-                                bag.money // unit_fee if unit_fee else 0)),
+        max_quantity=maximum,
         duration_minutes=duration, total_duration_minutes=(duration or 0) * quantity,
         outputs=outputs, waiting_reason=waiting_reason), tool
 
@@ -231,6 +242,12 @@ def _bump(player):
     state.save(update_fields=["revision"])
 
 
+def _release_trial(job):
+    if set(map(int, job.output_spec)) & NEW_CONTENT_ITEM_IDS:
+        from .career_development import release_trial_production
+        release_trial_production(trial_request_id(job.player_id, job.request_id))
+
+
 def _settle_job(job, minute):
     """Caller holds clock/job; failures preserve input and the full fee."""
     if job.status != "RUNNING":
@@ -272,7 +289,7 @@ def _settle_job(job, minute):
                         _fail("PROCESSING_CATALOG_UNAVAILABLE")
                     slot = InventorySlot.objects.create(bag=escrow, slot_index=_next_index(escrow),
                         item_id=item_id, item_bag_name=item.item_name, item_amount=amount, quality=held.quality,
-                        produced_world_minute=held.produced_world_minute,
+                        produced_world_minute=job.ready_world_minute if item_id in NEW_CONTENT_ITEM_IDS else held.produced_world_minute,
                         expires_world_minute=None,
                         source_request_id=job.request_id, freshness_unknown=False)
                     outputs.append(_batch(slot))
@@ -290,9 +307,15 @@ def _settle_job(job, minute):
                 _ledger(job, "complete", job.ready_world_minute, dict(fee_paid=job.fee_gold,
                     input_consumed=1, outputs=outputs, tool_instance_id=str(tool.instance_id),
                     remaining_uses=tool.remaining_uses))
+                record_production("PLAYER", job.player_id, job.request_id,
+                    {int(item): amount for item, amount in job.output_spec.items()}, job.ready_world_minute,
+                    source_kind="PROCESS_GAME", prey_item_id=held.item_id,
+                    reservation_request_id=trial_request_id(job.player_id, job.request_id),
+                    output_instance_ids=[row["instance_id"] for row in outputs], outputs=outputs)
         except (ProcessingError, ValueError) as exc:
             reason = exc.code if isinstance(exc, ProcessingError) else str(exc)
     if reason:
+        _release_trial(job)
         job.status = "FAILED"
         job.failure_reason = reason
         job.save(update_fields=["status", "failure_reason"])
@@ -322,6 +345,7 @@ def _start_queued_jobs(minute):
         held = InventorySlot.objects.select_for_update().get(pk=job.input_slot_id)
         reason = _prey_reason(held, minute, job.duration_minutes)
         if reason:
+            _release_trial(job)
             job.status, job.failure_reason = "FAILED", reason
             job.save(update_fields=["status", "failure_reason"])
             _bump(job.player)
@@ -371,6 +395,8 @@ def execute_processing_action(player, bag, action, params, rid, clock):
         jobs = []
         for index in range(quantity):
             job_request = rid if index == 0 else uuid.uuid5(rid, f"processing:{index}")
+            if not reserve_outputs({row["item_id"]: row["quantity"] // quantity for row in preview["outputs"]}, trial_request_id(player.pk, job_request), minute):
+                _fail("CAREER_TRIAL_LIMIT", "本期试加工额度不足，请先完成已有试制品销售。")
             job_id = uuid.uuid5(job_request, str(player.pk))
             escrow = InventoryBag.objects.create(player=player, character_id=f"jack-processing:{job_id}", money=preview["unit_fee_gold"])
             held = InventorySlot(bag=escrow, slot_index=0, item_id=slot.item_id,
@@ -415,6 +441,7 @@ def execute_processing_action(player, bag, action, params, rid, clock):
         escrow.save(update_fields=["money"])
         job.status, job.claimed_world_minute = "CANCELLED", minute
         job.save(update_fields=["status", "claimed_world_minute"])
+        _release_trial(job)
         _ledger(job, "cancel", minute, dict(refunded_gold=job.fee_gold, returned_instance_id=str(held.instance_id)), rid=rid)
         return dict(job=_entry(job, minute), returned_instance_ids=[str(held.instance_id)])
     if action != "claim_game_processing":

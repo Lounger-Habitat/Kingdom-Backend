@@ -1,5 +1,8 @@
 """Jack's server-owned hunt/process lifecycle, reservations and fatigue."""
 import uuid
+from collections import Counter
+
+from django.db.models import Count
 
 from inventory.models import NpcGlobalInventory, NpcGlobalInventorySlot
 from items.quality import production_quality, quality_rng
@@ -10,6 +13,8 @@ from .phase3_catalog import (
     BYPRODUCT_ITEM_IDS, HUNT_ANIMALS_CODE, HUNT_MEAT_SPOILAGE_MINUTES,
     HUNT_TOOL_ITEM_ID, PREY_ITEM_IDS, PREY_RECIPES,
 )
+from .career_catalog import (NEW_CONTENT_ITEM_IDS, processing_outputs, processing_duration,
+    reserve_outputs, record_production)
 
 JACK_ACTIONS = frozenset({"HUNT", "PROCESS_GAME"})
 RULE_VERSION = 1
@@ -33,21 +38,27 @@ def validate_intent(action, params):
     return None
 
 
-def reserved_amount(slot, exclude_command_id=None):
+def reserved_amounts(slots, exclude_command_id=None):
     rows = NpcCommandState.objects.filter(
-        npc_id=slot.bag.npc_id, kind__in=JACK_ACTIONS, status__in={"RUNNING", "SETTLING"},
+        npc_id__in={slot.bag.npc_id for slot in slots},
+        kind__in=JACK_ACTIONS, status__in={"RUNNING", "SETTLING"},
     )
     if exclude_command_id is not None:
         rows = rows.exclude(command_id=exclude_command_id)
-    instance = str(slot.instance_id)
+    reserved = Counter()
+    for npc_id, state in rows.values_list("npc_id", "production_state"):
+        if state.get("rule_version") == RULE_VERSION:
+            for key in ("tool_instance_id", "prey_instance_id"):
+                if isinstance(state.get(key), str):
+                    reserved[(npc_id, state[key])] += 1
     from .models import VillagePlayerProcessingJob
-    player_reserved = VillagePlayerProcessingJob.objects.filter(
-        status="RUNNING", tool_instance_id=slot.instance_id).count() if str(slot.bag.npc.agent_id) == "10012" else 0
-    return player_reserved + sum(
-        int(state.get("tool_instance_id") == instance) + int(state.get("prey_instance_id") == instance)
-        for state in rows.values_list("production_state", flat=True)
-        if state.get("rule_version") == RULE_VERSION
-    )
+    tools = [slot.instance_id for slot in slots if str(slot.bag.npc.agent_id) == "10012"]
+    player_reserved = dict(VillagePlayerProcessingJob.objects.filter(
+        status="RUNNING", tool_instance_id__in=tools).values("tool_instance_id")
+        .annotate(total=Count("pk")).values_list("tool_instance_id", "total"))
+    return {slot.pk: reserved[(slot.bag.npc_id, str(slot.instance_id))]
+        + (player_reserved.get(slot.instance_id, 0) if str(slot.bag.npc.agent_id) == "10012" else 0)
+        for slot in slots}
 
 
 def is_jack_work(command):
@@ -117,7 +128,11 @@ def start_work(runtime, command, minute):
         if tool_stats:
             command.duration_minutes = max(1, math.ceil(command.duration_minutes * (1-tool_stats["processing_time_reduction"])))
         state["prey_instance_id"] = str(prey.instance_id)
-        state["outputs"] = {str(i): n for i, n in PREY_RECIPES[prey.item_id]["outputs"].items()}
+        outputs = processing_outputs(prey.item_id)
+        if not reserve_outputs(outputs, command.request_id, minute):
+            return "CAREER_TRIAL_LIMIT"
+        command.duration_minutes = processing_duration(command.duration_minutes, outputs)
+        state["outputs"] = {str(i): n for i, n in outputs.items()}
     else:
         day = minute // 1440
         previous = NpcCommandState.objects.filter(
@@ -214,12 +229,17 @@ def finish_work(npc_id, params, minute, request_id):
     item_names = dict(Item.objects.filter(item_id__in=[*outputs, HUNT_TOOL_ITEM_ID]).values_list("item_id", "item_name"))
     for item_id, amount in outputs.items():
         expiry = None if item_id in BYPRODUCT_ITEM_IDS else expires
-        slot = add_batch(inventory, item_id, amount, produced, expiry, request_id, item_attributes={"quality": quality})
+        item_produced = minute if command.kind == "PROCESS_GAME" and item_id in NEW_CONTENT_ITEM_IDS else produced
+        slot = add_batch(inventory, item_id, amount, item_produced, expiry, request_id, item_attributes={"quality": quality})
         added.append({"item_id": item_id, "item_name": item_names.get(item_id, str(item_id)),
                       "amount": amount, "instance_id": str(slot.instance_id), "quality": slot.quality,
-                      "produced_world_minute": produced, "expires_world_minute": expiry})
+                      "produced_world_minute": item_produced, "expires_world_minute": expiry})
     inventory.asset_version += 1
     inventory.save(update_fields=["asset_version", "updated_at"])
+    if command.kind == "PROCESS_GAME":
+        record_production("NPC", npc_id, request_id, outputs, minute,
+            source_kind="PROCESS_GAME", prey_item_id=prey.item_id,
+            output_instance_ids=[row["instance_id"] for row in added], outputs=added)
     return _ok(asset_versions={str(npc_id): inventory.asset_version}, effects={
         "items_added": added, "items_consumed": consumed,
         "tool_used": {"item_id": HUNT_TOOL_ITEM_ID, "item_name": item_names.get(HUNT_TOOL_ITEM_ID, "猎具"),
@@ -265,6 +285,8 @@ def production_info(npc, minute):
         "next_hunt_extra_energy": config.jack_repeat_hunt_energy if count and config else 0,
         "durations": {a: VillageActionDurationConfig.configured_duration(a) for a in sorted(JACK_ACTIONS)},
         "processing_location": "BUTCHER_YARD",
-        "recipes": [{"prey_item_id": i, **r} for i, r in PREY_RECIPES.items()],
+        "recipes": [{"prey_item_id": i, **r, "outputs": processing_outputs(i),
+                     "career_duration_percent": 125 if processing_duration(100, processing_outputs(i)) > 100 else 100}
+                    for i, r in PREY_RECIPES.items()],
         "prey": prey_rows,
     }
