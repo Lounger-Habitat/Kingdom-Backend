@@ -2,7 +2,7 @@ import importlib
 from io import StringIO
 
 from django.apps import apps as global_apps
-from django.db import IntegrityError, transaction
+from django.db import IntegrityError, connection, transaction
 from django.test import TestCase
 from django.core.management import call_command
 
@@ -19,6 +19,14 @@ from village.seed_data import NPC_SEEDS
 
 
 class PhaseTwoModelConstraintTests(TestCase):
+    def test_system_receipt_equality_lookup_uses_partial_index(self):
+        if connection.vendor != "sqlite":
+            self.skipTest("SQLite query planner regression")
+        from village.models import VillageActionReceipt
+        for kind in ("TIME_ADVANCE", "VILLAGE_TICK"):
+            query = VillageActionReceipt.objects.filter(action_kind=kind, world_minute=100).order_by("request_id")[:1]
+            self.assertIn("USING INDEX receipt_system_kind_wm_unique", query.explain())
+
     @classmethod
     def setUpTestData(cls):
         cls.low_npc = NpcDefinition.objects.create(agent_id="P2-LOW", name="low")

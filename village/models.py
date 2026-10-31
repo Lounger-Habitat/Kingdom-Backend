@@ -763,7 +763,8 @@ class VillageActionReceipt(models.Model):
             models.UniqueConstraint(
                 fields=["action_kind", "world_minute"],
                 name="receipt_system_kind_wm_unique",
-                condition=models.Q(action_kind__in=["TIME_ADVANCE", "VILLAGE_TICK"]),
+                # OR lets SQLite match bound equality lookups to this partial index.
+                condition=models.Q(action_kind="TIME_ADVANCE") | models.Q(action_kind="VILLAGE_TICK"),
             ),
         ]
 
@@ -1129,13 +1130,13 @@ class VillageFarmPlot(models.Model):
     """A single farm plot on the village."""
 
     plot_code = models.CharField("地块代码", max_length=32, unique=True)
-    lease_enabled = models.BooleanField("开放出租", default=False)
     # Existing cells remain usable. New expansion cells explicitly start locked.
     reclamation_status = models.CharField(max_length=24, default="READY")
     expansion_site_code = models.CharField(max_length=32, blank=True, default="")
     reclamation_affair = models.OneToOneField("VillageAffair", on_delete=models.PROTECT,
         null=True, blank=True, related_name="reclaimed_plot")
     reclaimed_world_minute = models.BigIntegerField(null=True, blank=True)
+    lease_enabled = models.BooleanField("开放出租", default=False)
     lessee_player = models.ForeignKey("account.GameAccount", on_delete=models.PROTECT,
         null=True, blank=True, related_name="leased_farm_plots")
     leased_world_minute = models.BigIntegerField(null=True, blank=True)
