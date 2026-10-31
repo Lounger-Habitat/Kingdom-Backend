@@ -4,6 +4,7 @@ import uuid
 
 from django.db import connection, connections
 from django.test import TestCase, TransactionTestCase
+from django.test.utils import CaptureQueriesContext
 
 from account.models import GameAccount
 from game_time.models import GlobalGameTimeState
@@ -111,6 +112,7 @@ class PersonalCommissionTests(CommissionFixture, TestCase):
         result = complete_commission_labor(row.pk, "PLAYER", str(self.player.pk), "labor", rid, 115, location="COMMISSION_YARD")
         self.assertEqual(result["status"], "COMPLETED")
         self.assertEqual(result["earned_gold"], 80)
+        self.assertEqual(result["delivery_items"], [dict(item_id=1002, quantity=2, status="DELIVERED")])
         self.assertEqual(result, complete_commission_labor(row.pk, "PLAYER", str(self.player.pk), "labor", rid, 116, location="COMMISSION_YARD"))
         self.player_bag.refresh_from_db(); self.assertEqual(self.player_bag.money, 180)
         delivered = self.publisher_bag.slots.get()
@@ -119,6 +121,21 @@ class PersonalCommissionTests(CommissionFixture, TestCase):
                          (source.source_request_id, {"origin": "wild"}, 7))
         self.assertEqual(VillageWorldEvent.objects.filter(event_type="PERSONAL_COMMISSION_COMPLETED").count(), 1)
         row.refresh_from_db(); self.assertEqual(row.reserved_reward_gold, 0)
+
+    def test_delivery_items_are_aggregated_once_and_private_to_the_assignee(self):
+        row = self.publish(); self.accept(row); source = self.stock()
+        self.give(row, amount=1, instance_id=str(source.instance_id))
+        self.give(row, amount=1, instance_id=str(source.instance_id))
+        row.refresh_from_db()
+        expected = [dict(item_id=1002, quantity=2, status="HELD")]
+        self.assertEqual(project_commission(row, actor_type="PLAYER", actor_id=self.player.pk)["delivery_items"], expected)
+        for actor_type, actor_id in ((None, None), ("PLAYER", self.other.pk), ("NPC", self.npc.pk)):
+            self.assertNotIn("delivery_items", project_commission(row, actor_type=actor_type, actor_id=actor_id))
+        with CaptureQueriesContext(connection) as queries:
+            board = list_commissions(100, "PLAYER", self.player.pk)
+        self.assertEqual(next(item for item in board if item["commission_id"] == str(row.pk))["delivery_items"], expected)
+        self.assertEqual(sum(VillagePersonalCommissionEscrow._meta.db_table in query["sql"]
+            and "SUM(" in query["sql"] for query in queries), 1)
 
     def test_stage_location_override_and_default_inheritance(self):
         row = self.publish(); self.accept(row); self.stock()
@@ -156,6 +173,7 @@ class PersonalCommissionTests(CommissionFixture, TestCase):
         result = abandon_commission(row.pk, "PLAYER", str(self.player.pk), request_id, 120)
         self.assertEqual(result, abandon_commission(row.pk, "PLAYER", str(self.player.pk), request_id, 121))
         self.assertEqual(result["status"], "ABANDONED")
+        self.assertEqual(result["delivery_items"], [])
         source.refresh_from_db(); self.assertEqual(source.item_amount, 5)
         self.assertEqual(source.expires_world_minute, 500)
         self.player_bag.refresh_from_db(); self.publisher_bag.refresh_from_db()

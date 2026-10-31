@@ -534,7 +534,17 @@ def expire_commissions(world_minute):
     return expired
 
 
-def project_commission(row, *, actor_type=None, actor_id=None):
+def _delivery_items(commission_ids):
+    items = {}
+    batches = VillagePersonalCommissionEscrow.objects.filter(commission_id__in=commission_ids,
+        status__in=("HELD", "DELIVERED")).values("commission_id", "item_id", "status").annotate(
+            quantity=models.Sum("quantity")).order_by("commission_id", "item_id", "status")
+    for batch in batches:
+        items.setdefault(batch.pop("commission_id"), []).append(batch)
+    return items
+
+
+def project_commission(row, *, actor_type=None, actor_id=None, delivery_items=None):
     # Pure public-affair projection is reused; no public reducer/event is called.
     proxy = SimpleNamespace(code=str(row.pk), kind="PERSONAL_COMMISSION", title=row.title,
         status=row.status, requirements=row.requirements, locations=row.locations, progress=row.progress,
@@ -571,6 +581,9 @@ def project_commission(row, *, actor_type=None, actor_id=None):
     if tutorial:
         data["tutorial_player_id"] = str(tutorial.player_id)
         data["can_accept"] = data["can_accept"] and str(actor_id) == str(tutorial.player_id)
+    if mine and actor_type == "PLAYER":
+        deliveries = delivery_items if delivery_items is not None else _delivery_items([row.pk])
+        data["delivery_items"] = deliveries.get(row.pk, [])
     if mine or publisher:
         data.update(reserved_reward_gold=row.reserved_reward_gold, escrow_gold=row.escrow_gold)
         clock = GlobalGameTimeState.objects.filter(pk=1).first()
@@ -608,4 +621,7 @@ def list_commissions(world_minute, actor_type=None, actor_id=None):
         rows.extend(base.filter(owned).exclude(status__in=OPEN_STATUSES)
                     .order_by("-completed_world_minute", "-commission_id")[:30])
     unique = {row.pk: row for row in rows}
-    return [project_commission(row, actor_type=actor_type, actor_id=actor_id) for row in unique.values()]
+    deliveries = _delivery_items([row.pk for row in unique.values()
+        if actor_type == "PLAYER" and row.actor_type == "PLAYER" and row.actor_id == str(actor_id)])
+    return [project_commission(row, actor_type=actor_type, actor_id=actor_id, delivery_items=deliveries)
+            for row in unique.values()]
