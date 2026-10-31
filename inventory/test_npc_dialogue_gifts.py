@@ -137,6 +137,9 @@ class NpcDialogueGiftTests(TestCase):
     def test_old_receipt_returns_current_inventory_separately(self):
         self.assertEqual(self.post().status_code, 200)
         InventoryBag.objects.filter(pk=self.bag.pk).update(money=42)
+        repeated = self.post()
+        self.assertEqual(repeated.status_code, 200)
+        self.assertEqual(repeated.json()["data"]["initiatorInventory"]["money"], 42)
         receipt = self.client.post("/api/env/actions/character-trade/receipt", {"requestId": self.body["requestId"], "requesterId": str(self.player.pk)}, format="json")
         self.assertEqual(receipt.json()["receipt"]["data"]["initiatorInventory"]["money"], 85)
         self.assertEqual(receipt.json()["currentInventory"]["money"], 42)

@@ -1739,16 +1739,6 @@ def character_trade(request):
         requester = player_owners[0] if player_owners else None
         requester_id = str(requester["account"].id) if requester else ""
 
-    receipt = None
-    if requester is not None:
-        receipt = EnvActionReceipt.objects.select_for_update().filter(
-            player=requester["account"], request_id=request_id
-        ).first()
-    if receipt is not None:
-        if receipt.response_data:
-            return Response(receipt.response_data)
-        receipt.delete()
-
     # Lock both owner rows before validating or mutating any slot.  The tables
     # are different for players and NPCs, but deterministic ordering prevents
     # two concurrent player/NPC transactions from waiting in opposite order.
@@ -1771,7 +1761,11 @@ def character_trade(request):
         ).first()
         if receipt is not None:
             if receipt.response_data:
-                return Response(receipt.response_data)
+                result = receipt.response_data
+                if dialogue_gift:
+                    result = {**result, "data": {**result["data"],
+                        "initiatorInventory": serialize_bag(initiator["bag"])}}
+                return Response(result)
             receipt.delete()
 
     give_items, error = _character_trade_items(request.data.get("giveItem"), "giveItem")
