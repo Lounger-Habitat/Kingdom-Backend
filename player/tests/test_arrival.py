@@ -37,7 +37,7 @@ class ArrivalTests(PlayerFixture, TestCase):
         finished = self.run_action("arrival_finish", {"reason": "skipped"})
         self.assertTrue(finished["data"]["result"]["arrival_finished_now"])
         self.assertEqual(finished["data"]["overview"]["arrival"]["revision"], 2)
-        self.assertTrue(finished["data"]["overview"]["tutorial"]["show_welcome"])
+        self.assertTrue(self.run_action("overview")["data"]["overview"]["tutorial"]["show_welcome"])
         self.assertFalse(self.run_action("arrival_finish", {"reason": "completed"})
             ["data"]["result"]["arrival_finished_now"])
         state = PlayerArrivalState.objects.get(player=self.a)
@@ -47,6 +47,15 @@ class ArrivalTests(PlayerFixture, TestCase):
         self.bag_a.refresh_from_db()
         self.assertEqual(self.bag_a.money, money_before)
         self.assertEqual(EconomicLedgerEntry.objects.count(), ledger_before)
+
+    def test_arrival_receipts_do_not_initialize_inventory_or_build_gameplay_panels(self):
+        with patch("village.player_actions.overview", side_effect=AssertionError("full overview on arrival")), \
+                patch("village.player_actions.get_player_main_bag", side_effect=AssertionError("inventory on arrival")):
+            for action in ("arrival_begin", "arrival_finish"):
+                answer = self.run_action(action)
+                self.assertTrue(answer["success"], answer)
+                self.assertTrue(answer["data"]["overview_partial"])
+                self.assertEqual(set(answer["data"]["overview"]), {"arrival"})
 
     def test_existing_accounts_are_excluded_and_missing_state_does_not_reenable(self):
         PlayerArrivalState.objects.filter(player=self.a).delete()

@@ -21,6 +21,52 @@ from village.player_actions import execute_player_action
 
 
 class PlantGatheringTests(TestCase):
+    def test_http_timing_is_separate_from_the_saved_receipt_and_replay(self):
+        from rest_framework.test import APIRequestFactory, force_authenticate
+        from village.player_views import player_action
+        from village.models import VillagePlayerActionReceipt
+
+        payload = dict(player_id=str(self.player.pk), request_id=str(uuid.uuid4()), action="plant_start",
+                       params=dict(node_id=self.node), current_location_code="FOREST_EDGE",
+                       authority_session_id=self.session)
+        first = None
+        for _ in range(2):
+            request = APIRequestFactory().post("/api/village/player/action/", payload, format="json")
+            force_authenticate(request, user=self.player)
+            reply = player_action(request)
+            self.assertTrue(reply.data["success"], reply.data)
+            metrics = dict(part.strip().split(";dur=") for part in reply["Server-Timing"].split(","))
+            self.assertEqual(set(metrics), {"db_connect", "db_wait", "execute", "commit", "total", "request"})
+            self.assertTrue(all(float(value) >= 0 for value in metrics.values()))
+            self.assertGreaterEqual(float(metrics["request"]), float(metrics["total"]))
+            receipt = VillagePlayerActionReceipt.objects.get(player=self.player, request_id=payload["request_id"])
+            self.assertEqual(reply.data, receipt.response)
+            if first is not None:
+                self.assertEqual(reply.data, first)
+            first = reply.data
+        self.assertEqual(VillagePlayerActionReceipt.objects.filter(player=self.player).count(), 1)
+
+    def test_overview_uses_locked_clock_when_world_advances_before_projection(self):
+        from village.player_actions import overview as player_overview
+        self.clock.world_minute += 1
+        self.clock.save(update_fields=["world_minute"])
+        snapshot = player_overview(self.player, self.bag, self.clock.world_minute - 1)
+        self.assertEqual(snapshot["world_minute"], self.clock.world_minute)
+
+    def test_panel_and_plant_queries_do_not_hold_the_settlement_transaction(self):
+        from village.models import VillagePlayerActionReceipt
+        depth = len(connection.atomic_blocks)
+        receipts = VillagePlayerActionReceipt.objects.count()
+
+        def project(*args, **kwargs):
+            self.assertEqual(len(connection.atomic_blocks), depth)
+            return overview(*args, **kwargs)
+
+        with patch("village.plant_gathering.overview", side_effect=project):
+            for action in ("plant_state", "overview"):
+                self.assertTrue(self.call(action)["success"])
+        self.assertEqual(VillagePlayerActionReceipt.objects.count(), receipts)
+
     def test_plant_poll_is_read_only_and_avoids_full_panel_projection(self):
         from village.models import VillagePlayerActionReceipt
         receipt_count = VillagePlayerActionReceipt.objects.count()
@@ -51,6 +97,37 @@ class PlantGatheringTests(TestCase):
         self.assertTrue(cancelled["success"], cancelled)
         self.assertIsNone(cancelled["data"]["plants"]["attempt"])
         self.assertEqual(self.ap(), 200)
+
+    def test_preparation_and_cancel_only_project_the_touched_node(self):
+        started = self.call("plant_start", dict(node_id=self.node))
+        plants = started["data"]["plants"]
+        self.assertTrue(plants["nodes_partial"])
+        self.assertEqual([row["node_id"] for row in plants["nodes"]], [self.node])
+        self.assertTrue(plants["nodes"][0]["occupied"])
+        cancelled = self.call("plant_cancel", dict(attempt_id=plants["attempt"]["attempt_id"]))
+        self.assertEqual([row["node_id"] for row in cancelled["data"]["plants"]["nodes"]], [self.node])
+        self.assertFalse(cancelled["data"]["plants"]["nodes"][0]["occupied"])
+        self.assertGreater(len(self.call("plant_state")["data"]["plants"]["nodes"]), 1)
+
+    def test_settlement_delta_contains_new_material_and_worn_tool_but_not_other_slots(self):
+        unrelated = InventorySlot.objects.create(bag=self.bag, item_id=1035, item_amount=7, slot_index=1)
+        tool = self.tool(uses=1)
+        self.assertTrue(self.call("equip_gathering_tool", dict(instance_id=str(tool.instance_id)))["success"])
+        response = self.finish(self.start())
+        self.assertTrue(response["success"], response)
+        data = response["data"]
+        self.assertTrue(data["inventory_partial"])
+        inventory = {row["instance_id"]: row for row in data["overview"]["inventory"]}
+        self.assertEqual(set(inventory), {str(tool.instance_id), data["result"]["collected_items"][0]["instance_id"]})
+        self.assertEqual(inventory[str(tool.instance_id)]["remaining_uses"], 0)
+        unrelated.refresh_from_db()
+        self.assertEqual(unrelated.item_amount, 7)
+        self.assertNotIn("equipment_definitions", data["overview"]["growth"])
+        self.assertEqual(len(data["overview"]["plants"]["nodes"]), 1)
+        full = self.call("overview", read_only=True)["data"]["overview"]
+        self.assertEqual(len(full["inventory"]), 3)
+        self.assertIn("equipment_definitions", full["growth"])
+        self.assertEqual(full["money"], data["overview"]["money"])
 
     def setUp(self):
         VillageSimulationConfig.objects.update_or_create(config_key="default", defaults=dict(village_economy_enabled=True))
@@ -94,14 +171,34 @@ class PlantGatheringTests(TestCase):
         attempt = self.start()
         self.assertEqual(self.ap(), 200)
         rid = uuid.uuid4()
-        reply = self.finish(attempt, rid=rid)
+        started = perf_counter()
+        with CaptureQueriesContext(connection) as queries, \
+                patch("village.player_farm.farm_overview", side_effect=AssertionError("unrelated panels")), \
+                patch("village.player_gathering.ensure_gathering_catalog", side_effect=AssertionError("catalog rebuild")), \
+                patch("village.production_tools.ensure_production_catalog", side_effect=AssertionError("catalog rebuild")), \
+                patch("village.production_tools.tools_overview", side_effect=AssertionError("tool panel rebuild")), \
+                patch("player.starter.starter_overview", side_effect=AssertionError("unrelated task panel")), \
+                patch("village.daily_events.evaluate_daily_events", side_effect=AssertionError("unrelated world events")), \
+                patch("village.personal_commissions.expire_commissions", side_effect=AssertionError("world maintenance")):
+            reply = self.finish(attempt, rid=rid)
+        print(f"Plant settlement: {len(queries)} queries/{(perf_counter()-started)*1000:.1f}ms/{len(json.dumps(reply))} bytes")
         self.assertTrue(reply["success"], reply)
+        self.assertTrue(reply["data"]["overview_partial"])
+        self.assertNotIn("farm", reply["data"]["overview"])
+        self.assertNotIn("starter", reply["data"]["overview"])
+        self.assertNotIn("cooperation", reply["data"]["overview"])
+        self.assertEqual(reply["data"]["overview"]["action_points"], 195)
+        self.assertEqual(reply["data"]["overview"]["inventory"][0]["quantity"], 3)
+        self.assertIsNone(reply["data"]["overview"]["plants"]["attempt"])
         self.assertEqual([(b["item_id"], b["quantity"]) for b in reply["data"]["result"]["collected_items"]], [(1035, 3)])
         self.assertEqual(self.ap(), 195)
         repeated = self.finish(attempt, rid=rid, replay_only=True)
         self.assertTrue(repeated["success"], repeated)
+        self.assertTrue(repeated["replayed"])
         self.assertEqual(self.ap(), 195)
         self.assertEqual(self.bag.slots.filter(item_id=1035).count(), 1)
+        from village.models import StarterSupplyBatch
+        self.assertEqual(StarterSupplyBatch.objects.count(), 1, "First collection still opens the starter supply batch.")
 
     def test_bill_house_node_uses_its_trusted_location_for_start_and_collection(self):
         node_id, definition = next((key, row) for key, row in NODES.items()

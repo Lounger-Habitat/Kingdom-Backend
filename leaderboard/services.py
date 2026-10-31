@@ -281,6 +281,15 @@ def calculate_rankings(board_type, season_id="default", game_day=None):
         usernames[str(acc.id)] = acc.username
         ai_flags[str(acc.id)] = acc.is_ai
 
+    active_titles = {}
+    try:
+        # Match QuerySet.first(): the lowest primary key wins if several titles are active.
+        for title_player, title_name in PlayerTitle.objects.filter(
+                player_id__in=player_ids, is_active=True).order_by("pk").values_list("player_id", "title_name"):
+            active_titles.setdefault(str(title_player), title_name)
+    except Exception:
+        pass
+
     entries = []
     for rank, item in enumerate(ranked, start=1):
         if is_freshness:
@@ -290,15 +299,6 @@ def calculate_rankings(board_type, season_id="default", game_day=None):
             dish_name = ""
         display_name = usernames.get(player_id, player_id)
 
-        # Get active title
-        title = ""
-        try:
-            active_title = PlayerTitle.objects.filter(player_id=player_id, is_active=True).first()
-            if active_title:
-                title = active_title.title_name
-        except Exception:
-            pass
-
         entries.append(LeaderboardEntry(
             board_type=board_type,
             season_id=season_id,
@@ -307,7 +307,7 @@ def calculate_rankings(board_type, season_id="default", game_day=None):
             is_ai=ai_flags.get(player_id, False),
             score=score,
             rank=rank,
-            title=title,
+            title=active_titles.get(player_id, ""),
             avatar_id=f"avatar_{player_id}",
             dish_name=dish_name,
             game_day=entry_game_day,

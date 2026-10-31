@@ -108,7 +108,9 @@ class PlayerActionTests(PlayerFixture, TestCase):
         payload = self.payload("commission_contribute", self.delivery_params(ca, 5))
         first = execute_player_action(payload)
         self.assertTrue(first["success"], first)
-        self.assertEqual(first, execute_player_action(copy.deepcopy(payload)))
+        repeated = execute_player_action(copy.deepcopy(payload))
+        self.assertTrue(repeated.pop("replayed"))
+        self.assertEqual(first, repeated)
         second = self.run_action("commission_contribute", self.delivery_params(cb, 6), player=self.b)
         self.assertTrue(second["success"], second)
         self.bag_a.refresh_from_db(); self.bag_b.refresh_from_db(); self.lucy.refresh_from_db()
@@ -219,7 +221,9 @@ class PlayerActionTests(PlayerFixture, TestCase):
         self.assertFalse(VillagePlayerActionReceipt.objects.filter(request_id=payload["request_id"]).exists())
         first = execute_player_action(payload)
         self.assertTrue(first["success"], first)
-        self.assertEqual(execute_player_action(remote), first)
+        repeated = execute_player_action(remote)
+        self.assertTrue(repeated.pop("replayed"))
+        self.assertEqual(repeated, first)
         remote["params"] = {**remote["params"], "quantity": 1}
         self.assertEqual(execute_player_action(remote)["result_code"], "REQUEST_CONFLICT")
 

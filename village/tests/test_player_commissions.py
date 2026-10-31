@@ -160,7 +160,9 @@ class PlayerCommissionTests(PlayerFixture, TestCase):
         self.assertEqual(execute_player_action({**payload, "read_only": True})["result_code"], "MODE_READ_ONLY")
         first = execute_player_action(payload)
         self.assertTrue(first["success"], first)
-        self.assertEqual(first, execute_player_action(copy.deepcopy(payload)))
+        repeated = execute_player_action(copy.deepcopy(payload))
+        self.assertTrue(repeated.pop("replayed"))
+        self.assertEqual(first, repeated)
         overview = self.run_action("overview")["data"]["overview"]
         self.assertEqual(overview["my_commissions"][0]["commission_id"], commission["commission_id"])
 

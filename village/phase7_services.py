@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import uuid
+import json
 from datetime import date
 
 from django.db import connection
@@ -798,8 +799,8 @@ def _location_is_open(opening_hours: dict, world_minute: int) -> bool:
 
 
 def public_overview(player_id: str) -> dict:
-    time_state = GlobalGameTimeState.objects.filter(pk=1).first()
     from .career_development import project_career_development
+    time_state = GlobalGameTimeState.objects.filter(pk=1).first()
     world_minute = time_state.world_minute if time_state else 0
     yesterday = max(0, world_minute // 1440 - 1)
     yesterday_events = public_journal(player_id, {"limit": 100, "day_index": yesterday})["events"]
@@ -837,16 +838,19 @@ def public_overview(player_id: str) -> dict:
         },
         "economy": _public_economy(world_minute),
         "story": _public_story(player_id),
-        "locations": locations,
         "career_development": project_career_development(world_minute),
+        "locations": locations,
     }
 
 
-def public_store(store_code: str) -> dict | None:
+def public_store(store_code: str, *, section=None) -> dict | None:
     """Return a bounded, player-safe projection for one physical village shop."""
     store_code = str(store_code or "").upper()
     if store_code not in PUBLIC_STORE_CODES:
         return None
+    include_listings = section in (None, "listings")
+    include_history = section in (None, "history")
+    include_transactions = section in (None, "transactions")
     store = VillageStore.objects.select_related("operator_npc", "account").filter(
         store_code=store_code
     ).first()
@@ -868,7 +872,7 @@ def public_store(store_code: str) -> dict | None:
     listing_by_id = {str(row.listing_id): row for row in listing_rows}
     items = {item.item_id: item for item in Item.objects.filter(
         item_id__in={row.item_id for row in listing_rows}
-    )}
+    ).select_related("equipment_definition").prefetch_related("equipment_definition__levels")}
     item_names = {key: item.item_name for key, item in items.items()}
     from inventory.batches import project_public_batch
     npc_names = {
@@ -881,12 +885,16 @@ def public_store(store_code: str) -> dict | None:
         if listing.status != "ACTIVE":
             continue
         batches = []
+        batch_groups = {}
         available_amount = 0
         for slot in listing.inventory_slots.all():
             if slot.item_amount <= 0:
                 continue
             available = store_available(slot, world_minute)
             if available <= 0:
+                continue
+            available_amount += available
+            if not include_listings:
                 continue
             attributes = slot.item_attributes if isinstance(slot.item_attributes, dict) else {}
             batch = {
@@ -908,8 +916,17 @@ def public_store(store_code: str) -> dict | None:
             ):
                 if attributes.get(source) not in (None, ""):
                     batch[target] = attributes[source]
+            if section == "listings":
+                # Identical public tool instances need one tooltip, not twenty copies.
+                signature = json.dumps({**batch, "available_amount": 0,
+                    "batch": {**batch["batch"], "quantity": 0}}, sort_keys=True)
+                if signature in batch_groups:
+                    batch_groups[signature]["available_amount"] += available
+                    batch_groups[signature]["batch"]["quantity"] += available
+                    continue
+                batch_groups[signature] = batch
             batches.append(batch)
-            available_amount += available
+        equipment = getattr(items.get(listing.item_id), "equipment_definition", None)
         listings.append({
             "listing_id": str(listing.listing_id),
             "item_id": listing.item_id,
@@ -920,6 +937,8 @@ def public_store(store_code: str) -> dict | None:
             "price_mode": listing.price_mode,
             "listed_world_minute": listing.listed_world_minute,
             "public_meal_code": listing.public_meal_code or None,
+            "equipment_category": equipment.category if equipment else None,
+            "equipment_advanced": equipment.advanced if equipment else False,
             "batches": batches,
         })
 
@@ -938,13 +957,14 @@ def public_store(store_code: str) -> dict | None:
     buyback_entries = EconomicLedgerEntry.objects.filter(
         entry_type="PROPOSE_TRADE",
     ).filter(Exists(buyback_receipts)).select_related("actor_npc").order_by("-world_minute", "-id")
-    entries = [
-        *matching_entries.filter(entry_type__in=STORE_HISTORY_TYPES)[:30],
-        *matching_entries.filter(entry_type="BUY_FROM_STORE")[:30],
-        *buyback_entries[:30],
-        *EconomicLedgerEntry.objects.filter(entry_type="SELL_TO_STORE", changes__store_code=store_code)
-            .select_related("actor_npc").order_by("-world_minute", "-id")[:30],
-    ]
+    entries = list(matching_entries.filter(entry_type__in=STORE_HISTORY_TYPES)[:30]) if include_history else []
+    if include_transactions:
+        entries.extend([
+            *matching_entries.filter(entry_type="BUY_FROM_STORE")[:30],
+            *buyback_entries[:30],
+            *EconomicLedgerEntry.objects.filter(entry_type="SELL_TO_STORE", changes__store_code=store_code)
+                .select_related("actor_npc").order_by("-world_minute", "-id")[:30],
+        ])
     receipts = {
         str(row.request_id): row.response_data
         for row in VillageActionReceipt.objects.filter(
@@ -1059,15 +1079,20 @@ def public_store(store_code: str) -> dict | None:
             "today_transaction_count": len(today_changes),
             "today_gross": today_gross,
         },
-        "listings": listings,
-        "listing_history": listing_history,
-        "transactions": transactions,
     }
+    if include_listings:
+        result["listings"] = listings
+    if include_history:
+        result["listing_history"] = listing_history
+    if include_transactions:
+        result["transactions"] = transactions
     if store_code == "GENERAL_STORE":
         account = getattr(store, "account", None)
         result["coin_balance"] = account.balance if account is not None else None
-        result["inventory"] = _public_store_inventory(store, world_minute)
-        result["warehouse"] = _public_store_inventory(store, world_minute, unlisted_only=True)
+        if section is None:
+            result["inventory"] = _public_store_inventory(store, world_minute)
+        if section in (None, "warehouse"):
+            result["warehouse"] = _public_store_inventory(store, world_minute, unlisted_only=True)
     return result
 
 
@@ -1082,7 +1107,8 @@ def _public_store_inventory(store, world_minute, *, unlisted_only=False):
     slots = list(slots
                  .select_related("listing", "usage", "dish", "review")
                  .order_by("item_id", "id"))
-    items = {item.item_id: item for item in Item.objects.filter(item_id__in={s.item_id for s in slots})}
+    items = {item.item_id: item for item in Item.objects.filter(item_id__in={s.item_id for s in slots})
+        .select_related("equipment_definition").prefetch_related("equipment_definition__levels")}
     rows = {}
     for slot in slots:
         item = items.get(slot.item_id)

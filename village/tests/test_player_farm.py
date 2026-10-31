@@ -1,7 +1,8 @@
 import uuid
 
-from django.db import transaction
+from django.db import connection, transaction
 from django.test import TestCase
+from django.test.utils import CaptureQueriesContext
 
 from account.models import GameAccount
 from game_time.models import GlobalGameTimeState
@@ -40,6 +41,10 @@ class PlayerFarmTests(TestCase):
         rid = uuid.uuid4()
         first = self.lease(7, rid)
         self.assertTrue(first["success"], first)
+        self.assertTrue(first["data"]["farm_settlement"])
+        self.assertTrue(first["data"]["overview_partial"])
+        self.assertNotIn("bag", first["data"]["result"])
+        self.assertNotIn("affairs", first["data"]["overview"])
         replay = self.lease(7, rid)
         self.assertTrue(replay["replayed"])
         self.bag.refresh_from_db(); self.bill.refresh_from_db(); self.plot.refresh_from_db()
@@ -102,6 +107,7 @@ class PlayerFarmTests(TestCase):
         self.clock.world_minute = 105; self.clock.save()
         planted = self.action("plant_farm_plot", dict(crop_code="CORN", expected_plot_version=1))
         self.assertTrue(planted["success"], planted)
+        self.assertFalse(any(slot["item_id"] == 1051 for slot in planted["data"]["overview"]["inventory"]))
         self.plot.refresh_from_db()
         self.assertEqual(sorted(self.bag.slots.filter(item_id=4001).values_list("usage__remaining", flat=True)), [19, 20])
         batch = str(self.plot.batch_id)
@@ -123,6 +129,8 @@ class PlayerFarmTests(TestCase):
         tool = InventorySlot.objects.create(bag=self.bag, slot_index=0, item_id=4001, item_amount=1, remaining_uses=20)
         response = self.action("plant_farm_plot", dict(crop_code="CORN", expected_plot_version=1))
         self.assertFalse(response["success"])
+        farm = response["data"]["overview"]["farm"]
+        self.assertTrue(next(plot for plot in farm["plots"] if plot["plot_code"] == self.plot.plot_code)["can_plant"])
         tool.refresh_from_db(); self.plot.refresh_from_db()
         self.assertEqual(tool.remaining_uses, 20)
         self.assertEqual(self.plot.plot_version, 1)
@@ -132,3 +140,29 @@ class PlayerFarmTests(TestCase):
         self.plot.refresh_from_db()
         self.assertIsNone(self.plot.lessee_player_id)
         self.assertEqual(self.plot.plot_version, 2)
+
+    def test_scoped_farm_refresh_preserves_permissions_without_writes(self):
+        self.assertTrue(self.lease()["success"])
+        payload = dict(player_id=str(self.player.pk), request_id=str(uuid.uuid4()),
+            action="overview", params={"section": "farm"})
+        with CaptureQueriesContext(connection) as queries:
+            answer = execute_player_action(payload)
+        self.assertTrue(answer["success"], answer)
+        self.assertFalse(any(query["sql"].lstrip().upper().startswith(("INSERT", "UPDATE", "DELETE")) for query in queries))
+        self.assertTrue(answer["data"]["overview_partial"])
+        self.assertNotIn("farm_settlement", answer["data"])
+        self.assertNotIn("affairs", answer["data"]["overview"])
+        plots = answer["data"]["overview"]["farm"]["plots"]
+        self.assertTrue(next(plot for plot in plots if plot["plot_code"] == self.plot.plot_code)["can_plant"])
+        observed = execute_player_action(dict(payload, read_only=True))
+        self.assertFalse(any(plot["can_plant"] for plot in observed["data"]["overview"]["farm"]["plots"]))
+        self.assertEqual(execute_player_action(dict(payload, params={"section": "unknown"}))["result_code"], "INVALID_PARAMS")
+
+    def test_failed_first_lease_returns_current_state_after_bag_rollback(self):
+        player = GameAccount.objects.create(username="new-farmer")
+        answer = execute_player_action(dict(player_id=str(player.pk), request_id=str(uuid.uuid4()),
+            action="lease_farm_plot", current_location_code="BILL_FARM", params=dict(
+                plot_code=self.plot.plot_code, days=1, expected_plot_version=0, expected_daily_price=11)))
+        self.assertEqual(answer["result_code"], "PRICE_CHANGED")
+        self.assertTrue(answer["data"]["farm_settlement"])
+        self.assertFalse(InventoryBag.objects.filter(player=player).exists())

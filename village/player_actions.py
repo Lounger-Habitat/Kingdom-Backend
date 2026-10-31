@@ -6,10 +6,13 @@ price, reward, or stock. A failed action rolls back before its receipt is saved.
 import copy
 import hashlib
 import json
+import logging
 import random
 import uuid
+from contextlib import nullcontext
+from time import perf_counter
 
-from django.db import models, transaction
+from django.db import connection, models, transaction
 from django.utils import timezone
 
 from account.models import GameAccount
@@ -59,7 +62,7 @@ PARAMS = {
     "start_game_processing": {"prey_instance_id", "quantity", "expected_quote"},
     "cancel_game_processing": {"job_id"},
     "claim_game_processing": {"job_id"},
-    "overview": set(),
+    "overview": {"section"},
     "plant_state": set(),
     "contribute": {"affair_id", "condition_id", "kind", "item_id", "quantity", "instance_id"},
     "labor_start": {"affair_id", "condition_id"}, "labor_cancel": set(),
@@ -222,7 +225,7 @@ def _get_affair(params, minute):
     return affair
 
 
-def overview(player, bag, minute, *, read_only=False):
+def overview(player, bag, minute, *, read_only=False, compact=False, plant_result=None, store_only=False, farm_only=False):
     from player.progression import growth_snapshot
     from player.mastery import mastery_overview
     from .cooperation import cooperation_overview
@@ -244,31 +247,101 @@ def overview(player, bag, minute, *, read_only=False):
     from .affairs import project_affairs
     from .personal_commissions import list_commissions
     from .cooperation import decorate_commission_rewards
-    from .models import VillageAffairContribution
+    from .models import VillageAffairContribution, VillageStore
     from inventory.models import CollectionPoint
     from player.models import PlayerState
     from player.services import recover_action_points
-    if read_only:
+    if read_only or compact:
         state = PlayerState.objects.filter(player_id=str(player.pk)).first() or PlayerState(player_id=str(player.pk))
+        if store_only and not read_only:
+            if not state.pk:
+                state.save()
+            recover_action_points(state)
     else:
-        state, _ = PlayerState.objects.get_or_create(player_id=str(player.pk))
-        state = PlayerState.objects.select_for_update().get(pk=state.pk)
-        recover_action_points(state)
+        # Initialization/recovery is short; building panels must not hold the writer lock.
+        with transaction.atomic():
+            clock = GlobalGameTimeState.objects.select_for_update().get(pk=1)
+            minute = clock.world_minute
+            state, _ = PlayerState.objects.get_or_create(player_id=str(player.pk))
+            state = PlayerState.objects.select_for_update().get(pk=state.pk)
+            recover_action_points(state)
+            from .affairs import ensure_bridge_affair
+            ensure_bridge_affair(minute)
+            from .personal_commissions import expire_commissions
+            from .starter_supply import expire_supply
+            from .player_farm import maintain_leases
+            expire_commissions(minute)
+            expire_supply(minute)
+            maintain_leases(minute, clock.time_revision)
+            from .production_tools import _initial_tool_listing
+            store = VillageStore.objects.select_for_update().filter(pk="GENERAL_STORE").first()
+            if store:
+                for item in Item.objects.filter(pk__in=(4001, 4101), is_deleted=False):
+                    _initial_tool_listing(store, item.pk, max(1, item.item_price), item.max_use_count)
     from .player_affair_labor import current_labor
-    if not read_only:
-        from .affairs import ensure_bridge_affair
-        ensure_bridge_affair(minute)
-    items = {item.pk: item for item in Item.objects.filter(is_deleted=False)}
+    slots = bag.slots.filter(item_amount__gt=0).select_related("usage", "dish", "review") if bag.pk else []
+    if plant_result is not None:
+        changed = [row["instance_id"] for row in plant_result["collected_items"]]
+        if plant_result.get("tool_used"):
+            changed.append(plant_result["tool_used"]["instance_id"])
+        slots = slots.filter(instance_id__in=changed)
+    slots = list(slots)
+    item_rows = Item.objects.filter(is_deleted=False)
+    if plant_result is not None or store_only or farm_only:
+        item_rows = item_rows.filter(pk__in={slot.item_id for slot in slots})
+    items = {item.pk: item for item in item_rows}
     names = {item_id: item.item_name for item_id, item in items.items()}
     from .player_store import store_sale_quote
-    from .models import VillageStore
-    general_store = VillageStore.objects.filter(pk="GENERAL_STORE").values("status", "account__balance").first()
+    if bag.pk:
+        bag.refresh_from_db()
+    from .plant_gathering import overview as plant_overview
+    growth = growth_snapshot(player, read_only=read_only or compact, compact=plant_result is not None or store_only or farm_only)
+    gathering_level = next(skill["level"] for skill in growth["skills"] if skill["code"] == "gathering")
+    projection = dict(world_minute=minute, player_id=str(player.pk), player_name=player.username, money=bag.money,
+        action_points=state.action_points, action_points_max=state.action_points_max,
+        growth=growth,
+        inventory=[{**_batch_data(s, minute, names),
+            "batch": project_batch(s, items.get(s.item_id), minute),
+            "item_type": items[s.item_id].item_type if s.item_id in items else "",
+            "general_store_sale": store_sale_quote(s, items.get(s.item_id), minute)}
+            for s in slots])
+    if store_only or farm_only:
+        # Site receipts refresh assets and onboarding without rebuilding unrelated panels.
+        from player.tutorials import tutorial_overview
+        projection["starter"] = starter_overview(player, bag, minute, read_only=read_only)
+        if farm_only:
+            projection["farm"] = farm_overview(player, bag, minute, read_only=read_only, growth=growth, slots=slots)
+            tutorial_context = projection
+        else:
+            from .models import VillageFarmPlot
+            from .player_farm import project_plot
+            general_store = VillageStore.objects.filter(pk="GENERAL_STORE").values("status", "account__balance").first()
+            projection["general_store"] = dict(status=general_store["status"], coin_balance=general_store["account__balance"]) if general_store else None
+            projection["starter"]["gathering"] = gathering_overview(player, bag, minute)
+            tutorial_context = dict(projection, farm=dict(plots=[project_plot(plot, minute)
+                for plot in VillageFarmPlot.objects.select_related("lessee_player").filter(lessee_player=player)]))
+        projection["tutorial"] = tutorial_overview(player, bag, minute, tutorial_context, read_only=read_only)
+        return projection
+    projection["plants"] = plant_overview(player, bag, minute, level=gathering_level,
+        node_id=plant_result["node_id"] if plant_result is not None else None)
+    # Collection acknowledges assets immediately; the existing client refresh loads the other panels afterward.
+    if plant_result is not None:
+        return projection
     commissions = list_commissions(minute, actor_type="PLAYER", actor_id=str(player.pk))
     cooperation = cooperation_overview(player, minute, read_only=read_only)
     decorate_commission_rewards(commissions, player, cooperation)
-    affairs = project_affairs(minute)
     from .task_progress import decorate_task_progress
-    decorate_task_progress(affairs, commissions)
+    decorate_task_progress([], commissions)
+    starter = starter_overview(player, bag, minute, read_only=read_only)
+    starter["gathering"] = gathering_overview(player, bag, minute)
+    projection.update(starter=starter, cooperation=cooperation, commissions=commissions,
+        my_commissions=[c for c in commissions
+            if c.get("actor_type") == "PLAYER" and str(c.get("actor_id")) == str(player.pk)])
+    if compact:
+        return projection
+    general_store = VillageStore.objects.filter(pk="GENERAL_STORE").values("status", "account__balance").first()
+    affairs = project_affairs(minute)
+    decorate_task_progress(affairs, [])
     contributions = dict(delivery_quantity=0, earned_gold=0, item_quantity=0,
                          material_quantity=0, meal_quantity=0, event_count=0)
     for row in VillagePlayerContribution.objects.filter(player=player).values("kind").annotate(
@@ -286,21 +359,10 @@ def overview(player, bag, minute, *, read_only=False):
             continue
         market.append(dict(listing_id=str(listing.pk), item_id=listing.item_id, item_name=listing.item_name_snapshot,
             remaining_quantity=listing.remaining_amount, unit_price=listing.price, quality=listing.quality, expires_world_minute=None))
-    if bag.pk:
-        bag.refresh_from_db()
-    starter = starter_overview(player, bag, minute, read_only=read_only)
-    starter["gathering"] = gathering_overview(player, bag, minute)
-    from .plant_gathering import overview as plant_overview
-    plants = plant_overview(player, bag, minute)
     from .production_tools import tools_overview
     tool_state = tools_overview(player, bag, minute, read_only=read_only)
-    projection = dict(world_minute=minute, player_id=str(player.pk), player_name=player.username, money=bag.money,
-        action_points=state.action_points, action_points_max=state.action_points_max,
-        growth=growth_snapshot(player, read_only=read_only),
-        starter=starter,
-        plants=plants,
+    projection.update(
         mastery=mastery_overview(player, bag, minute, read_only=read_only),
-        cooperation=cooperation,
         professional_contracts=professional_contracts_overview(player, minute, read_only=read_only),
         production=production_overview(player, bag, minute, read_only=read_only, tool_state=tool_state),
         collection_points=collection_points_projection(player, bag, minute, tool_state=tool_state),
@@ -311,17 +373,11 @@ def overview(player, bag, minute, *, read_only=False):
         business=business_overview(player, bag, minute, read_only=read_only),
         business_orders=business_orders_overview(player, minute, read_only=read_only),
         contributions=contributions, project=_project(minute)[0], market=market,
-        commissions=commissions, my_commissions=[c for c in commissions
-            if c.get("actor_type") == "PLAYER" and str(c.get("actor_id")) == str(player.pk)],
         affairs=affairs, daily_events=project_daily_events(minute),
         public_meals=public_meal_quota(minute, player_id=player.pk),
-        my_labor=current_labor(player), farm=farm_overview(player, bag, minute, read_only=read_only),
-        general_store=dict(status=general_store["status"], coin_balance=general_store["account__balance"]) if general_store else None,
-        inventory=[{**_batch_data(s, minute, names),
-            "batch": project_batch(s, items.get(s.item_id), minute),
-            "item_type": items[s.item_id].item_type if s.item_id in items else "",
-            "general_store_sale": store_sale_quote(s, items.get(s.item_id), minute)}
-            for s in bag.slots.filter(item_amount__gt=0).select_related("usage", "dish", "review")] if bag.pk else [])
+        my_labor=current_labor(player), farm=farm_overview(player, bag, minute, read_only=read_only,
+            growth=growth, tool_state=tool_state, slots=slots),
+        general_store=dict(status=general_store["status"], coin_balance=general_store["account__balance"]) if general_store else None)
     from .caravan_orders import orders_overview
     projection["caravan_orders"] = orders_overview("PLAYER", str(player.pk), minute)
     from .career_development import project_career_development
@@ -638,8 +694,32 @@ def _execute(player, bag, action, p, rid, location, clock, authority_session_id=
                     affected_npc_ids=[listing.seller_npc.agent_id] if listing.seller_npc_id else [])
 
 
-@transaction.atomic
-def execute_player_action(payload):
+def execute_player_action(payload, *, timings=None):
+    # Queries neither queue behind a SQLite IMMEDIATE transaction nor store a large receipt.
+    query = isinstance(payload, dict) and payload.get("action") in ("overview", "plant_state", "preview_cooking", "preview_game_processing")
+    tracked = isinstance(payload, dict) and payload.get("action") in {"plant_start", "plant_cancel", "collect", "buy_store", "sell_store", *FARM_ACTIONS}
+    started = perf_counter()
+    if tracked:
+        connection.ensure_connection()
+    connected = perf_counter()
+    with nullcontext() if query else transaction.atomic():
+        acquired = perf_counter()
+        response = _execute_player_action(payload, query=query)
+        executed = perf_counter()
+    finished = perf_counter()
+    elapsed = (finished - started) * 1000
+    if tracked and timings is not None:
+        timings.update(db_connect=(connected-started)*1000, db_wait=(acquired-connected)*1000,
+                       execute=(executed-acquired)*1000, commit=(finished-executed)*1000, total=elapsed)
+    if tracked and elapsed >= 250:
+        logging.getLogger(__name__).warning(
+            "[%s] step=backend action=%s request=%s elapsed_ms=%.1f transaction_wait_ms=%.1f",
+            "FarmActionTiming" if payload.get("action") in FARM_ACTIONS else "StoreActionTiming" if payload.get("action") in {"buy_store", "sell_store"} else "PlantActionTiming",
+            payload.get("action"), payload.get("request_id"), elapsed, (acquired - connected) * 1000)
+    return response
+
+
+def _execute_player_action(payload, *, query=False):
     rid = payload.get("request_id") if isinstance(payload, dict) else ""
     try:
         if not isinstance(payload, dict) or set(payload)-{"player_id", "request_id", "action", "params", "current_location_code", "replay_only", "read_only", "authority_session_id"}:
@@ -649,7 +729,7 @@ def execute_player_action(payload):
         if type(player_id) not in (str, int) or not str(player_id).isascii() or not str(player_id).isdigit() or len(str(player_id)) > 18:
             fail("PLAYER_NOT_FOUND", "玩家身份无效。")
         # Same first lock as NPC economics/marketplace, before any private bags.
-        clocks = GlobalGameTimeState.objects if payload.get("action") == "plant_state" else GlobalGameTimeState.objects.select_for_update()
+        clocks = GlobalGameTimeState.objects if query else GlobalGameTimeState.objects.select_for_update()
         clock = clocks.filter(pk=1).first()
         if clock is None:
             fail("WORLD_NOT_READY", "村庄时间尚未初始化。")
@@ -659,6 +739,8 @@ def execute_player_action(payload):
         action, params = payload.get("action"), payload.get("params", {})
         if not isinstance(action, str) or action not in PARAMS or not isinstance(params, dict) or set(params)-PARAMS[action]:
             fail("INVALID_PARAMS", "动作参数无效。")
+        if action == "overview" and "section" in params and params["section"] != "farm":
+            fail("INVALID_PARAMS", "总览分区无效。")
         digest = hashlib.sha256(json.dumps(dict(action=action, params=params), sort_keys=True, separators=(",", ":")).encode()).hexdigest()
         old = VillagePlayerActionReceipt.objects.filter(player=player, request_id=rid).first()
         if old:
@@ -678,7 +760,7 @@ def execute_player_action(payload):
                 current = answer["data"]["current_labor"]
                 if current and current["labor_id"] == saved.get("labor_id"):
                     answer["data"]["receipt_labor"] = current
-            if action in FARM_ACTIONS or action in ARRIVAL_PARAMS:
+            if action in FARM_ACTIONS or action in ARRIVAL_PARAMS or action in {"buy_store", "sell_store"} or answer.get("data", {}).get("overview_partial"):
                 answer["replayed"] = True
             return answer
         if "read_only" in payload and type(payload["read_only"]) is not bool:
@@ -717,7 +799,9 @@ def execute_player_action(payload):
                 fail("MODE_READ_ONLY", "观察模式不能发起交易。")
             bag = InventoryBag.objects.filter(player=player, character_id=player.username).first()
             bag = bag or InventoryBag(player=player, character_id=player.username)
-            return response(rid, data=dict(result={}, overview=overview(player, bag, clock.world_minute, read_only=True)))
+            farm_only = params.get("section") == "farm"
+            return response(rid, data=dict(result={}, overview=overview(player, bag, clock.world_minute,
+                read_only=True, farm_only=farm_only), **({"overview_partial": True} if farm_only else {})))
         if payload.get("replay_only") is True:
             fail("LOCATION_REQUIRED", "请前往现场再执行操作。")
         if "replay_only" in payload and type(payload["replay_only"]) is not bool:
@@ -727,6 +811,27 @@ def execute_player_action(payload):
         cfg = VillageSimulationConfig.objects.filter(config_key="default", village_economy_enabled=True).first()
         if not cfg:
             fail("FEATURE_DISABLED", "村庄经济尚未开放。")
+        if action in ARRIVAL_PARAMS:
+            # Room allocation waits for this receipt. No economy maintenance, inventory
+            # initialization or panel projection belongs on the opening's critical path.
+            from player.arrival import arrival_overview
+            try:
+                result = _execute(player, None, action, params, rid, payload.get("current_location_code", ""), clock)
+                answer = response(rid, data=dict(result=result, overview=dict(arrival=arrival_overview(player)),
+                    overview_partial=True))
+            except ActionError as exc:
+                answer = response(rid, exc.code, exc.message)
+            VillagePlayerActionReceipt.objects.create(player=player, request_id=rid, payload_hash=digest,
+                action=action, response=answer, world_minute=clock.world_minute)
+            return answer
+        if action == "overview":
+            if params.get("section") == "farm":
+                bag = InventoryBag.objects.filter(player=player, character_id=player.username).first()
+                bag = bag or InventoryBag(player=player, character_id=player.username)
+                return response(rid, data=dict(result={}, overview_partial=True,
+                    overview=overview(player, bag, clock.world_minute, compact=True, farm_only=True)))
+            bag, _ = get_player_main_bag(player)
+            return response(rid, data=dict(result={}, overview=overview(player, bag, clock.world_minute)))
         if action in {"plant_start", "plant_cancel"}:
             # A lease neither moves inventory nor advances the world economy.
             # Avoid rebuilding every gameplay panel just to begin/cancel a timer.
@@ -737,19 +842,25 @@ def execute_player_action(payload):
                     bag = InventoryBag.objects.select_for_update().get(pk=bag.pk)
                     result = _execute(player, bag, action, params, rid, payload.get("current_location_code", ""),
                         clock, payload.get("authority_session_id"))
-                answer = response(rid, data=dict(result=result, plants=plant_overview(player, bag, clock.world_minute)))
+                answer = response(rid, data=dict(result=result, plants=plant_overview(player, bag, clock.world_minute,
+                    node_id=params.get("node_id") or result.get("node_id"))))
             except ActionError as exc:
                 answer = response(rid, exc.code, exc.message)
             VillagePlayerActionReceipt.objects.create(player=player, request_id=rid, payload_hash=digest,
                 action=action, response=answer, world_minute=clock.world_minute)
             return answer
-        # Expiry is world maintenance: it survives a rejected player action.
-        from .personal_commissions import expire_commissions
-        expire_commissions(clock.world_minute)
-        from .starter_supply import expire_supply
-        expire_supply(clock.world_minute)
-        from .player_farm import maintain_leases
-        maintain_leases(clock.world_minute, clock.time_revision)
+        compact = action in {"commission_accept", "commission_contribute", "commission_abandon"} or action == "collect" and "node_id" in params
+        store_settlement = action in {"buy_store", "sell_store"} and payload.get("current_location_code") == "GENERAL_STORE"
+        farm_settlement = action in FARM_ACTIONS
+        if not compact or action.startswith("commission_"):
+            # Commission expiry refunds escrow even when the requested contribution is rejected.
+            from .personal_commissions import expire_commissions
+            expire_commissions(clock.world_minute)
+        if not compact:
+            from .starter_supply import expire_supply
+            expire_supply(clock.world_minute)
+            from .player_farm import maintain_leases
+            maintain_leases(clock.world_minute, clock.time_revision)
         try:
             with transaction.atomic():
                 bag, _ = get_player_main_bag(player)
@@ -764,29 +875,48 @@ def execute_player_action(payload):
                     observe_action(player, bag, action, result, rid)
                     if action == "collect":
                         from .starter_supply import ensure_supply_batch
-                        from .player_gathering import GatheringError, ensure_gathering_catalog
-                        from .production_tools import ToolError, ensure_production_catalog
                         ensure_supply_batch(clock.world_minute)
-                        try:
-                            ensure_gathering_catalog(clock.world_minute)
-                            ensure_production_catalog(clock.world_minute)
-                        except (GatheringError, ToolError) as exc:
-                            fail(exc.code, exc.message)
+                        if not compact:
+                            from .player_gathering import GatheringError, ensure_gathering_catalog
+                            from .production_tools import ToolError, ensure_production_catalog
+                            try:
+                                ensure_gathering_catalog(clock.world_minute)
+                                ensure_production_catalog(clock.world_minute)
+                            except (GatheringError, ToolError) as exc:
+                                fail(exc.code, exc.message)
                     elif action in {"lease_farm_plot", "claim_starter_axe", "repair_tool", "upgrade_tool"}:
                         from .production_tools import ToolError, ensure_production_catalog
                         try:
                             ensure_production_catalog(clock.world_minute)
                         except ToolError as exc:
                             fail(exc.code, exc.message)
-                    from .daily_events import evaluate_daily_events
-                    evaluate_daily_events(clock.world_minute)
-            answer = response(rid, data=dict(result=result, overview=overview(player, bag, clock.world_minute)))
+                    # Plant pickups only change this player's assets; world events are evaluated by the world tick.
+                    if action != "collect" or "node_id" not in params:
+                        from .daily_events import evaluate_daily_events
+                        evaluate_daily_events(clock.world_minute)
+            plant_result = result if action == "collect" and "node_id" in params else None
+            data = dict(result=result, overview=overview(player, bag, clock.world_minute, compact=compact or store_settlement or farm_settlement,
+                plant_result=plant_result, store_only=store_settlement, farm_only=farm_settlement))
+            if store_settlement:
+                data["store_settlement"] = True
+            if farm_settlement:
+                data["farm_settlement"] = True
+            if plant_result is not None:
+                data["inventory_partial"] = True
+            if compact or store_settlement or farm_settlement:
+                data["overview_partial"] = True
+            answer = response(rid, data=data)
         except ActionError as exc:
             data = {}
-            if action == "buy_store":
+            if store_settlement or farm_settlement:
+                current_bag = InventoryBag.objects.filter(pk=bag.pk).first() or InventoryBag(player=player, character_id=player.username)
+                data = {"store_settlement" if store_settlement else "farm_settlement": True, "overview_partial": True,
+                    "overview": overview(player, current_bag, clock.world_minute, read_only=store_settlement,
+                        compact=True, store_only=store_settlement, farm_only=farm_settlement)}
+            elif action == "buy_store":
                 # Failed claims still refresh the caller's quota and funds snapshot.
                 data["overview"] = overview(player, bag, clock.world_minute, read_only=True)
-            if action in FARM_ACTIONS or action == "sell_store":
+            if not store_settlement and action == "sell_store":
                 # Failed savepoints may have changed the in-memory bag. Reload
                 # before returning the new quote/version for a fresh confirmation.
                 existing_bag = InventoryBag.objects.filter(pk=bag.pk).first()

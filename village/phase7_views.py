@@ -119,9 +119,10 @@ def store(request, store_code):
         return Response({"success": False, "resultCode": "PLAYER_AUTH_REQUIRED"}, status=403)
     if not presentation_enabled():
         return _disabled()
-    if request.query_params:
+    section = request.query_params.get("section")
+    if set(request.query_params) - {"section"} or section not in (None, "listings", "warehouse", "history", "transactions", "summary"):
         return Response({"success": False, "resultCode": "INVALID_QUERY_PARAMETER"}, status=400)
-    data = public_store(store_code)
+    data = public_store(store_code, section=section)
     if data is None:
         return Response({"success": False, "resultCode": "STORE_NOT_FOUND"}, status=404)
     return Response({"success": True, "data": data})

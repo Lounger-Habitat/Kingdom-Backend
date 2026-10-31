@@ -470,10 +470,9 @@ class Phase3EconomyApiTests(TestCase):
         self.assertIn("public_fund_balance", inner)
         self.assertIn("npc_asset_versions", inner)
         self.assertEqual(len(inner["farm_plots"]), 36)
-        self.assertEqual(len(inner["allowed_plot_codes"]), 36)
-        self.assertEqual(
-            inner["allowed_crop_codes"], ["CORN", "WHEAT", "CARROT", "POTATO"]
-        )
+        self.assertEqual(len(inner["allowed_plot_codes"]), 54)
+        self.assertEqual(set(inner["allowed_crop_codes"]), {"CORN", "WHEAT", "CARROT", "POTATO",
+            "ONION", "GREEN_RADISH", "PUMPKIN", "TOMATO", "SOYBEAN"})
         self.assertIn("batch_id", inner["farm_plots"][0])
 
     def test_snapshot_mature_projection(self):
