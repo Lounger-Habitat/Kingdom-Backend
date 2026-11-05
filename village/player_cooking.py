@@ -27,6 +27,7 @@ from .player_cooking_rules import (VILLAGE_RECIPES, RULE_VERSION,
 from .professional_catalog import PROFESSIONAL_RECIPES, batch_evidence
 from .career_catalog import (content_access, reserve_outputs, record_production,
     trial_request_id, recipe_reference_cost)
+from .player_cooking_technique import CUTS, technique_for, ingredient_feedback
 
 class CookingError(Exception):
     def __init__(self, code, message):
@@ -34,7 +35,7 @@ class CookingError(Exception):
         super().__init__(message)
 
 
-PITY_POLICY = "正确配比的普通单批料理沿用旧保底；食材品质、技能和炊具共同影响成品，品质1～6均可正常制作和售卖。"
+PITY_POLICY = "正确配比的普通单批料理沿用旧保底；食材品质、技能和炊具共同影响成品，从略逊到绝品均可正常制作和售卖。"
 
 
 def reject(code, message):
@@ -98,11 +99,14 @@ def _available_ap(player):
     return min(NATURAL_ACTION_POINT_CAP, state.action_points + elapsed // ACTION_POINT_RECOVERY_SECONDS)
 
 
-def cooking_overview(player, bag, minute, read_only=False, *, tool_state=None):
-    level = _level(player)
+def cooking_overview(player, bag, minute, read_only=False, *, tool_state=None, levels=None, slots=None):
+    if levels is None:
+        levels = {row["code"]: row["level"] for row in growth_snapshot(player, read_only=True, compact=True)["skills"]}
+    level = levels.get("cooking", 1)
     knowledge = _knowledge(player)
-    tool_state = tool_state if tool_state is not None else tools_overview(player, bag, minute, read_only=read_only)
+    tool_state = tool_state if tool_state is not None else tools_overview(player, bag, minute, read_only=read_only, levels=levels, slots=slots)
     tools = [row for row in tool_state["tools"] if row["capability"] == "cooking"]
+    available_items = set(Item.objects.filter(is_deleted=False).values_list("pk", flat=True))
     recipes = []
     for recipe in Recipe.objects.prefetch_related("ingredients").order_by("pk"):
         known, visible = _visibility(recipe, knowledge)
@@ -111,32 +115,37 @@ def cooking_overview(player, bag, minute, read_only=False, *, tool_state=None):
         required, tier = VILLAGE_RECIPES.get(recipe.pk, (1, 1))
         access = content_access(recipe.item_id)
         reason = access["blocked_reason"] if not access["can_produce"] else "SKILL_LEVEL_REQUIRED" if level < required else "TOOL_REQUIRED" if not any(t["usable"] and t["tier"] >= tier for t in tools) else ""
-        if not recipe.ingredients.all() or not Item.objects.filter(pk=recipe.item_id, is_deleted=False).exists():
+        if not recipe.ingredients.all() or recipe.item_id not in available_items:
             reason = "RECIPE_CATALOG_UNAVAILABLE"
         recipes.append(dict(id=recipe.pk, name=recipe.recipe_name, item_id=recipe.item_id,
             output_quantity=recipe.output_quantity, required_level=required, minimum_tool_tier=tier,
             available=not reason, reason=reason, known=known, quantities_visible=visible,
-            development=access,
+            development=access, technique=technique_for(recipe, level=level),
             reference_cost=recipe_reference_cost(recipe.pk),
             ingredients=[dict(item_id=i.item_id, item_name=i.item_name, count=i.count if visible else None)
                          for i in recipe.ingredients.all()]))
     ids = _ingredient_ids()
     items = {i.pk: i for i in Item.objects.filter(pk__in=ids, is_deleted=False)}
-    ingredients = [_ingredient_view(s, items[s.item_id], minute) for s in bag.slots.filter(item_amount__gt=0).order_by("slot_index")
+    slots = (bag.slots.filter(item_amount__gt=0).select_related("usage", "dish").order_by("slot_index") if bag.pk else []) if slots is None else sorted(slots, key=lambda s: s.slot_index)
+    ingredients = [_ingredient_view(s, items[s.item_id], minute) for s in slots
                    if _is_ingredient(s, items.get(s.item_id), ids)] if bag.pk else []
     goals = [dict(code=code, title=title, completed=PlayerMilestoneProgress.objects.filter(player=player, code=code).exists(),
                   location_code=location) for code, title, location in (
         ("first_player_cooking", "亲自制作合格料理", "RESTAURANT"),
         ("first_formal_dish_review", "完成本人料理的正式点评", "RECORD_HALL"))]
+    from .player_cooking_sessions import active_session
     return dict(revision=PlayerGrowthState.objects.filter(player=player).values_list("revision", flat=True).first() or 0,
         observed_world_minute=minute, level=level, max_batches=max((t["cooking_batches"] for t in tools if t["usable"]), default=1),
-        recipes=recipes, ingredients=ingredients, tools=tools, goals=goals, pity_policy=PITY_POLICY)
+        recipes=recipes, ingredients=ingredients, tools=tools, goals=goals, pity_policy=PITY_POLICY,
+        active_session=active_session(player), action_cost_per_batch=AP_PER_BATCH, tool_uses_per_batch=1)
 
 
 def _prepare(player, bag, params, minute, *, execute=False):
-    allowed = {"recipe_id", "batches", "selections", "tool_instance_id"}
+    allowed = {"recipe_id", "batches", "selections", "tool_instance_id", "cut_style"}
     if not isinstance(params, dict) or set(params) - allowed:
         reject("INVALID_PARAMS", "烹饪参数无效。")
+    if not isinstance(params.get("cut_style", "WHOLE"), str) or params.get("cut_style", "WHOLE") not in CUTS:
+        reject("INVALID_PARAMS", "切法请选择整份、切块或切片，本锅主料统一使用。")
     if not bag.pk or bag.player_id != player.pk or bag.character_id != player.username:
         reject("INGREDIENT_NOT_OWNED", "只能使用本人主背包中的食材。")
     batches = params.get("batches", 1)
@@ -229,6 +238,8 @@ def _prepare(player, bag, params, minute, *, execute=False):
         batches=batches, level=level, tool_instance_id=str(tool.instance_id), tool_item_id=tool.item_id,
         tool_uses=tool.remaining_uses, tool_amount=tool.item_amount, tool_configuration=tool_stats,
         inputs=sorted(views, key=lambda v: v["instance_id"]), rule_version=RULE_VERSION)
+    if "cut_style" in params:
+        payload["cut_style"] = params["cut_style"]
     preview = dict(available=True, reason="", quote_hash=hmac.new(settings.SECRET_KEY.encode(),
         json.dumps(payload, sort_keys=True).encode(), hashlib.sha256).hexdigest(),
         recipe_id=None if mask else recipe.pk if recipe else None,
@@ -238,7 +249,9 @@ def _prepare(player, bag, params, minute, *, execute=False):
         action_cost=AP_PER_BATCH * batches, tool_uses=batches, expires_world_minute=expires,
         freshness_unknown=legacy, ingredient_average_quality=ingredient_average(views), selected_batches=views, missing_items=[],
         reference_cost=recipe_reference_cost(recipe.pk, batches=batches, tool=tool) if recipe else None,
-        warnings=(["数量未显示，成品与配比结果在实际制作后揭晓。"] if not visible else []) + [PITY_POLICY])
+        warnings=(["数量未显示，成品与配比结果在实际制作后揭晓。"] if not visible else []) + [PITY_POLICY],
+        technique=technique_for(None if mask else recipe, ingredients=views if mask or not recipe else None,
+            level=level, tier=tool_stats["tier"]))
     return dict(recipe=recipe if matched else None, exact=exact, output=output, quantity=quantity,
         rows=rows, amounts=amounts, tool=tool, batches=batches, level=level, legacy=legacy,
         expires=expires, preview=preview)
@@ -281,6 +294,14 @@ def _visible_missing(player, bag, params, minute):
 
 @transaction.atomic
 def execute_player_cooking(player, bag, params, rid, clock):
+    session = None
+    if isinstance(params, dict) and "session_id" in params:
+        if set(params) != {"session_id"}:
+            reject("INVALID_PARAMS", "手动出锅只需提供本人的烹饪会话。")
+        from .player_cooking_sessions import owned_session, advance_active
+        session = owned_session(player, params["session_id"])
+        advance_active(session, timezone.now())
+        params = dict(deepcopy(session.plan["parameters"]), expected_quote=session.plan["expected_quote"])
     if not isinstance(params, dict) or "expected_quote" not in params:
         reject("INVALID_PARAMS", "请先预览并确认本次烹饪。")
     supplied_quote = params["expected_quote"]
@@ -316,11 +337,18 @@ def execute_player_cooking(player, bag, params, rid, clock):
     rng = quality_rng(rid, "PLAYER_COOK")
     from cooking.views import FAILED_DISH_ITEM_ID, _apply_pity
     item_id = recipe.item_id if recipe else FAILED_DISH_ITEM_ID
-    seconds = max(0, recipe.default_cook_time + rng.randint(-40 if plan["exact"] else -50, 40 if plan["exact"] else 50)) if recipe else 0
     amounts = {key: value / plan["batches"] for key, value in plan["amounts"].items()}
-    quality = calculate_quality(recipe, amounts, plan["exact"], seconds, rng) if recipe else 1
     average = ingredient_average(consumed)
-    quality = cooking_quality(quality, average, plan["level"], stats_for(tool)["quality_bonus_chance"], rng) if recipe and plan["batches"] == 1 else quality
+    if session:
+        from .player_cooking_technique import evaluate
+        quality, seconds, feedback = evaluate(session, average, plan["exact"], recipe)
+    else:
+        seconds = max(0, recipe.default_cook_time + rng.randint(-40 if plan["exact"] else -50, 40 if plan["exact"] else 50)) if recipe else 0
+        quality = calculate_quality(recipe, amounts, plan["exact"], seconds, rng) if recipe else 1
+        quality = cooking_quality(quality, average, plan["level"], stats_for(tool)["quality_bonus_chance"], rng) if recipe and plan["batches"] == 1 else quality
+        feedback = dict(ingredients=ingredient_feedback(average), cut="本次沿用自动切配。",
+            heat="本次沿用原有自动烹饪规则。", timing="本次由自动流程决定出锅。",
+            suggestion="可尝试手动切配与控火，在最佳区间出锅。")
     pity_counts, pity_changed = None, False
     if recipe and not recipe.village_only and plan["exact"] and not plan["legacy"] and plan["batches"] == 1:
         # Keep the original player's counters/config and the original tier rules.
@@ -328,8 +356,13 @@ def execute_player_cooking(player, bag, params, rid, clock):
         from cooking.models import PityCounter
         PityCounter.objects.select_for_update().get_or_create(player=player)
         normal_quality, normal_seconds = quality, seconds
-        quality, seconds, pity_counts = _apply_pity(player, recipe.item_id, quality, seconds, recipe.default_cook_time)
+        quality, pity_seconds, pity_counts = _apply_pity(player, recipe.item_id, quality, seconds, recipe.default_cook_time)
+        if not session:
+            seconds = pity_seconds
         pity_changed = (quality, seconds) != (normal_quality, normal_seconds)
+    if pity_changed:
+        feedback["pity_applied"] = True
+        feedback["suggestion"] += " 本次沿用原有保底提升了最终结果。"
     batch_id = str(uuid.uuid5(uuid.NAMESPACE_URL, f"player-cooking:{player.pk}:{rid}"))
     metadata = dict(rule_version=RULE_VERSION, maker_player_id=str(player.pk), production_request_id=str(rid),
         production_batch_id=batch_id, recipe_id=recipe.pk if recipe else None, recipe_name=recipe.recipe_name if recipe else "失败的菜品",
@@ -337,14 +370,18 @@ def execute_player_cooking(player, bag, params, rid, clock):
         ingredients=deepcopy(consumed), ingredients_exact=plan["exact"], standard_batches=plan["batches"],
         output_quantity=plan["quantity"], quality=quality,
         ingredient_average_quality=average, quality_rule="quality-v2",
-        cook_time_source="LEGACY_PITY_SECONDS" if pity_changed else "RECIPE_RANDOM_SECONDS" if recipe else "FAILED_RECIPE",
+        cook_time_source="MANUAL_COOKING" if session else "LEGACY_PITY_SECONDS" if pity_changed else "RECIPE_RANDOM_SECONDS" if recipe else "FAILED_RECIPE",
+        cooking_feedback=feedback,
         freshness_policy="QUALITY_ONLY")
+    if session:
+        metadata.update(cooking_session_id=str(session.session_id), cut_style=session.plan["cut_style"],
+            cooking_progress=round(session.state["progress"], 3), cooking_technique=deepcopy(session.plan["technique"]))
     if pity_counts is not None:
         metadata["pity_counts"] = pity_counts
     quality_groups = {}
     for _ in range(plan["batches"] if plan["exact"] else 1):
         improved = quality
-        if recipe and plan["exact"] and plan["batches"] > 1:
+        if not session and recipe and plan["exact"] and plan["batches"] > 1:
             improved = cooking_quality(calculate_quality(recipe, amounts, True, seconds, rng), average, plan["level"], stats_for(tool)["quality_bonus_chance"], rng)
         quality_groups[improved] = quality_groups.get(improved, 0) + 1
     output_slots = []
@@ -393,9 +430,15 @@ def execute_player_cooking(player, bag, params, rid, clock):
         source_kind="COOK", recipe_id=recipe.pk if recipe else None,
         reservation_request_id=trial_request_id(player.pk, rid),
         output_instance_ids=[str(output.instance_id) for output in output_slots])
-    return dict(dish=dish, dishes=dishes, items_consumed=consumed, items_added=dishes, tool_used=used,
+    result = dict(dish=dish, dishes=dishes, items_consumed=consumed, items_added=dishes, tool_used=used,
         action_cost=cost, action_points=state.action_points, growth_rewards=rewards, is_newly_learned=learned,
-        recipe_quantities_unlocked=mastered)
+        recipe_quantities_unlocked=mastered, cooking_feedback=feedback)
+    if session:
+        from .player_cooking_sessions import project_session
+        session.status = "FINISHED"; session.settlement_request_id = rid; session.updated_at = timezone.now()
+        session.save(update_fields=["status", "state", "updated_at", "settlement_request_id"])
+        result["cooking_session"] = project_session(session)
+    return result
 
 
 def is_player_cooked(slot, player):
@@ -413,6 +456,10 @@ def is_player_cooked(slot, player):
     dish = next((candidate for candidate in candidates if candidate.get("quality") == slot.quality
         and (candidate.get("dish_metadata") or {}).get("production_batch_id") == metadata.get("production_batch_id")), {})
     original = dish.get("dish_metadata") or {}
+    if original.get("cook_time_source") == "MANUAL_COOKING" and (
+            slot.cook_time != dish.get("cook_time_seconds") or any(metadata.get(key) != original.get(key) for key in
+                ("cook_time_source", "cooking_session_id", "cut_style", "cooking_progress", "cooking_technique", "cooking_feedback"))):
+        return False
     return (dish.get("item_id") == slot.item_id and metadata.get("recipe_id") is not None
         and original.get("ingredients_exact") is True
         and str(slot.source_request_id) == str(rid)

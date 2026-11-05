@@ -2504,7 +2504,7 @@ class VillageGatheringResourceState(models.Model):
 
 
 class VillagePlayerProcessingJob(models.Model):
-    """One physical carcass and its service fee, held until real Jack work settles."""
+    """One carcass and fee held until the automatic workshop finishes processing."""
     job_id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
     player = models.ForeignKey("account.GameAccount", on_delete=models.PROTECT)
     request_id = models.UUIDField(unique=True)
@@ -2515,13 +2515,13 @@ class VillagePlayerProcessingJob(models.Model):
     input_snapshot = models.JSONField(default=dict)
     output_spec = models.JSONField(default=dict)
     output_snapshot = models.JSONField(default=list)
-    tool_instance_id = models.UUIDField(null=True, blank=True)
+    tool_instance_id = models.UUIDField(null=True, blank=True)  # Legacy jobs only; no personal tool reservation.
     fee_gold = models.PositiveIntegerField()
     duration_minutes = models.PositiveIntegerField()
     status = models.CharField(max_length=16, default="RUNNING")
     started_world_minute = models.BigIntegerField()
     ready_world_minute = models.BigIntegerField()
-    needs_until = models.BigIntegerField()
+    needs_until = models.BigIntegerField()  # Legacy progress cursor; no NPC needs are charged.
     completed_world_minute = models.BigIntegerField(null=True, blank=True)
     claimed_world_minute = models.BigIntegerField(null=True, blank=True)
     failure_reason = models.CharField(max_length=64, default="", blank=True)
@@ -2579,3 +2579,4 @@ from .caravan_order_models import (  # noqa: E402,F401
     VillageCaravanOrderDelivery, VillageCaravanOrderReceipt,
     VillageCaravanOrderCompletion, VillageCaravanReward, VillageCaravanVisitAllocation,
 )
+from .player_cooking_models import VillagePlayerCookingSession  # noqa: E402,F401

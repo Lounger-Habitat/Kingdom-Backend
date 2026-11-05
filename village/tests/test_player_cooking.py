@@ -3,12 +3,14 @@ import copy
 import importlib
 from types import SimpleNamespace
 import uuid
+from datetime import timedelta
 from unittest.mock import patch
 
 from django.apps import apps
 from django.db import connection
 from django.test import TestCase
 from django.test.utils import CaptureQueriesContext
+from django.utils import timezone
 
 from account.models import GameAccount
 from cooking.models import PityConfig, PityCounter
@@ -28,6 +30,104 @@ from village.tests.test_player_actions import PlayerFixture
 
 
 class PlayerCookingTests(PlayerFixture, TestCase):
+    def _manual_start(self, raw, cut="WHOLE"):
+        params = dict(self.params(raw), cut_style=cut)
+        preview = preview_cooking(self.a, self.bag_a, params, self.clock.world_minute)
+        self.assertTrue(preview["available"], preview)
+        payload = self.payload("start_cooking", dict(params, expected_quote=preview["quote_hash"]), location="RESTAURANT")
+        answer = execute_player_action(payload)
+        self.assertTrue(answer["success"], answer)
+        return answer["data"]["result"]["cooking_session"], payload
+
+    def test_manual_session_settles_once_and_proves_cooking_without_control_rewards(self):
+        raw = self.raw()
+        now = timezone.now()
+        forbidden = AssertionError("Process-only controls must not run world or reward work")
+        with patch("village.player_cooking_sessions.timezone.now", return_value=now), \
+             patch("village.daily_events.evaluate_daily_events", side_effect=forbidden), \
+             patch("player.starter.post_action_progress", side_effect=forbidden), \
+             patch("village.personal_commissions.expire_commissions", side_effect=forbidden):
+            session, _ = self._manual_start(raw)
+        self.assert_uncharged(raw)
+        with patch("village.player_cooking_sessions.timezone.now", return_value=now + timedelta(seconds=3)):
+            tuned = self.run_action("set_cooking_heat", dict(session_id=session["session_id"], heat="MEDIUM"), location="RESTAURANT")
+        self.assertTrue(tuned["success"], tuned)
+        self.assertEqual(tuned["data"]["result"]["cooking_session"]["progress"], 30)
+        self.assert_uncharged(raw)
+        payload = self.payload("cook_dish", dict(session_id=session["session_id"]), location="RESTAURANT")
+        with patch("village.player_cooking_sessions.timezone.now", return_value=now + timedelta(seconds=9)):
+            cooked = execute_player_action(payload)
+            replay = execute_player_action(copy.deepcopy(payload))
+            duplicate = self.run_action("cook_dish", payload["params"], location="RESTAURANT")
+        self.assertTrue(cooked["success"], cooked)
+        self.assertTrue(replay["replayed"])
+        self.assertEqual(duplicate["result_code"], "COOKING_SESSION_FINISHED")
+        dish = cooked["data"]["result"]["dish"]
+        self.assertEqual(dish["quality"], 4)
+        self.assertEqual(dish["dish_metadata"]["cook_time_source"], "MANUAL_COOKING")
+        self.assertTrue(is_player_cooked(self.bag_a.slots.get(instance_id=dish["instance_id"]), self.a))
+        raw.refresh_from_db(); self.tool.refresh_from_db(); self.state.refresh_from_db()
+        self.assertEqual((raw.item_amount, self.tool.remaining_uses, self.state.action_points), (4, 19, 195))
+        self.assertEqual(EconomicLedgerEntry.objects.filter(entry_type="PLAYER_COOK").count(), 1)
+        self.assertEqual(SkillRewardReceipt.objects.filter(player=self.a, source_type="player_cooking").count(), 1)
+
+    def test_manual_bad_cut_fire_and_late_finish_lower_quality(self):
+        raw = self.raw()
+        now = timezone.now()
+        with patch("village.player_cooking_sessions.timezone.now", return_value=now):
+            session, _ = self._manual_start(raw, cut="SLICE")
+        with patch("village.player_cooking_sessions.timezone.now", return_value=now + timedelta(seconds=16)):
+            cooked = self.run_action("cook_dish", dict(session_id=session["session_id"]), location="RESTAURANT")
+        self.assertTrue(cooked["success"], cooked)
+        dish = cooked["data"]["result"]["dish"]
+        self.assertLess(dish["quality"], 4)
+        self.assertEqual(cooked["data"]["result"]["cooking_session"]["progress"], 100)
+        feedback = dish["dish_metadata"]["cooking_feedback"]
+        self.assertIn("不同", feedback["cut"])
+        self.assertIn("不匹配", feedback["heat"])
+        self.assertIn("偏晚", feedback["timing"])
+
+    def test_manual_cancel_and_old_start_replay_never_revive_a_session(self):
+        raw = self.raw()
+        session, payload = self._manual_start(raw)
+        cancelled = self.run_action("cancel_cooking", dict(session_id=session["session_id"]), location="")
+        self.assertTrue(cancelled["success"], cancelled)
+        replay = execute_player_action(payload)
+        self.assertEqual(replay["data"]["result"]["cooking_session"]["status"], "CANCELLED")
+        self.assertIsNone(cooking_overview(self.a, self.bag_a, 100)["active_session"])
+        newer, _ = self._manual_start(raw)
+        self.assertNotEqual(newer["session_id"], session["session_id"])
+        self.assertIsNone(execute_player_action(payload)["data"]["result"]["cooking_session"])
+        self.assert_uncharged(raw)
+
+    def test_manual_finish_revalidates_inputs_and_rolls_back_costs(self):
+        raw = self.raw()
+        session, _ = self._manual_start(raw)
+        raw.item_amount = 5; raw.save(update_fields=["item_amount"])
+        failed = self.run_action("cook_dish", dict(session_id=session["session_id"]), location="RESTAURANT")
+        self.assertEqual(failed["result_code"], "QUOTE_CHANGED")
+        self.assert_uncharged(raw, 5)
+        self.assertEqual(cooking_overview(self.a, self.bag_a, 100)["active_session"]["session_id"], session["session_id"])
+
+    def test_manual_rejects_forged_progress_foreign_sessions_and_expiry(self):
+        raw = self.raw()
+        now = timezone.now()
+        with patch("village.player_cooking_sessions.timezone.now", return_value=now):
+            session, _ = self._manual_start(raw)
+        for action, params, player in (
+            ("set_cooking_heat", dict(session_id=session["session_id"], heat="LOW", progress=80), self.a),
+            ("set_cooking_heat", dict(session_id=session["session_id"], heat=[]), self.a),
+            ("set_cooking_heat", dict(session_id=session["session_id"], heat="LOW"), self.b),
+            ("cook_dish", dict(session_id=session["session_id"]), self.b),
+        ):
+            reply = self.run_action(action, params, player=player, location="RESTAURANT")
+            self.assertFalse(reply["success"], reply)
+        with patch("village.player_cooking_sessions.timezone.now", return_value=now + timedelta(seconds=121)):
+            expired = self.run_action("cook_dish", dict(session_id=session["session_id"]), location="RESTAURANT")
+            self.assertEqual(expired["result_code"], "COOKING_SESSION_EXPIRED")
+            self.assertIsNone(cooking_overview(self.a, self.bag_a, 100)["active_session"])
+        self.assert_uncharged(raw)
+
     def test_quality_bonus_is_rolled_per_standard_batch_and_each_output_has_proof(self):
         from unittest.mock import Mock
         from player.models import EquipmentLevel
@@ -108,7 +208,7 @@ class PlayerCookingTests(PlayerFixture, TestCase):
         self.assertIn("cooking_prepare", state.completed)
         self.assertIn("cooking_first", state.completed)
         self.assertNotIn("cooking_review", state.completed)
-        self.assertEqual(execute_player_action(copy.deepcopy(payload)), answer)
+        self.assertEqual(execute_player_action(copy.deepcopy(payload)), dict(answer, replayed=True))
         self.assertEqual(SkillRewardReceipt.objects.filter(player=self.a, source_type="player_cooking").count(), 1)
 
     def test_exact_batch_real_receipt_and_retry_do_not_duplicate_assets_or_xp(self):
@@ -116,9 +216,13 @@ class PlayerCookingTests(PlayerFixture, TestCase):
         cooked, payload = self.cook(self.params(raw))
         self.assertTrue(cooked["success"], cooked)
         dish = cooked["data"]["result"]["dish"]
+        self.assertEqual(cooked["data"]["settlement_section"], "cooking")
+        self.assertTrue(cooked["data"]["overview_partial"])
+        self.assertNotIn("inventory_partial", cooked["data"])
+        self.assertIn(dish["instance_id"], [row["instance_id"] for row in cooked["data"]["overview"]["inventory"]])
         self.assertEqual((dish["quantity"], dish["produced_world_minute"], dish["expires_world_minute"]), (2, 100, None))
         self.assertEqual(cooked["data"]["result"]["growth_rewards"][0]["xp_gained"], 40)
-        self.assertEqual(cooked, execute_player_action(copy.deepcopy(payload)))
+        self.assertEqual(dict(cooked, replayed=True), execute_player_action(copy.deepcopy(payload)))
         raw.refresh_from_db(); self.tool.refresh_from_db(); self.state.refresh_from_db()
         self.assertEqual((raw.item_amount, self.tool.remaining_uses, self.state.action_points), (4, 19, 195))
         self.assertEqual(self.bag_a.slots.filter(item_id=29201).count(), 1)
@@ -227,7 +331,7 @@ class PlayerCookingTests(PlayerFixture, TestCase):
         self.assertEqual((learned.show_ingredient_count, learned.catalog_recipe_id), (True, self.ordinary.pk))
         row = next(r for r in cooked["data"]["overview"]["cooking"]["recipes"] if r["id"] == self.ordinary.pk)
         self.assertEqual([i["count"] for i in row["ingredients"]], [2, 1])
-        self.assertEqual(cooked, execute_player_action(copy.deepcopy(payload)))
+        self.assertEqual(dict(cooked, replayed=True), execute_player_action(copy.deepcopy(payload)))
         self.assertEqual(PlayerRecipe.objects.filter(player=self.state, recipe_name=self.ordinary.recipe_name).count(), 1)
 
     def test_wrong_ordinary_ratios_and_failed_exploration_give_no_success_xp(self):
@@ -312,7 +416,7 @@ class PlayerCookingTests(PlayerFixture, TestCase):
         dish = cooked["data"]["result"]["dish"]
         self.assertEqual((dish["quality"], dish["cook_time_seconds"]), (6, 60))
         self.assertEqual(dish["dish_metadata"]["cook_time_source"], "LEGACY_PITY_SECONDS")
-        self.assertEqual(cooked, execute_player_action(copy.deepcopy(payload)))
+        self.assertEqual(dict(cooked, replayed=True), execute_player_action(copy.deepcopy(payload)))
         counter.refresh_from_db()
         self.assertEqual((counter.count_4, counter.count_5, counter.count_6), (0, 0, 0))
         # Neither ordinary multi-batch nor village cooking can spend old pity.

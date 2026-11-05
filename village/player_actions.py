@@ -43,6 +43,8 @@ LOCATIONS = {
     "sell_store": {"GENERAL_STORE"},
     "supply_deliver": {"GENERAL_STORE"},
     "cook_dish": {"RESTAURANT"},
+    "start_cooking": {"RESTAURANT"},
+    "set_cooking_heat": {"RESTAURANT"},
     "prepare_business_orders": {"RESTAURANT"},
     "request_dish_review": {"RECORD_HALL"},
     **{action: {"PLAYER_STALL"} for action in ("open_player_stall", "list_stall_dish",
@@ -84,8 +86,11 @@ PARAMS = {
     "repair_tool": {"instance_id", "expected_quote"},
     "upgrade_tool": {"instance_id", "expected_quote"},
     "claim_starter_axe": set(),
-    "preview_cooking": {"recipe_id", "batches", "selections", "tool_instance_id"},
-    "cook_dish": {"recipe_id", "batches", "selections", "tool_instance_id", "expected_quote"},
+    "preview_cooking": {"recipe_id", "batches", "selections", "tool_instance_id", "cut_style"},
+    "cook_dish": {"recipe_id", "batches", "selections", "tool_instance_id", "expected_quote", "cut_style", "session_id"},
+    "start_cooking": {"recipe_id", "batches", "selections", "tool_instance_id", "expected_quote", "cut_style"},
+    "set_cooking_heat": {"session_id", "heat"},
+    "cancel_cooking": {"session_id"},
     "request_dish_review": {"instance_id"},
     "cancel_dish_review": {"review_id"},
     "claim_dish_review": {"review_id"},
@@ -100,6 +105,7 @@ from .professional_catalog import PROFESSIONAL_COLLECT_TYPES
 COLLECTION_LOCATIONS.update({name: "DEEP_FOREST" for name in PROFESSIONAL_COLLECT_TYPES})
 LOCATIONS["prepare_professional_contracts"] = {"GENERAL_STORE"}
 from .player_farm import ACTIONS as FARM_ACTIONS
+COOKING_CONTROLS = {"start_cooking", "set_cooking_heat", "cancel_cooking"}
 from .plant_catalog import ACTIONS as PLANT_ACTIONS
 PARAMS.update(PLANT_ACTIONS)
 PARAMS.update(FARM_ACTIONS)
@@ -457,6 +463,13 @@ def _execute(player, bag, action, p, rid, location, clock, authority_session_id=
         from .player_cooking import CookingError, execute_player_cooking
         try:
             return execute_player_cooking(player, bag, p, rid, clock)
+        except CookingError as exc:
+            fail(exc.code, exc.message)
+    if action in COOKING_CONTROLS:
+        from .player_cooking import CookingError
+        from .player_cooking_sessions import control_session
+        try:
+            return control_session(player, bag, action, p, minute)
         except CookingError as exc:
             fail(exc.code, exc.message)
     if action in {"request_dish_review", "cancel_dish_review", "claim_dish_review"}:
@@ -830,6 +843,20 @@ def _execute_player_action(payload, *, query=False):
                     overview=overview(player, bag, clock.world_minute, compact=True, farm_only=True)))
             bag, _ = get_player_main_bag(player)
             return response(rid, data=dict(result={}, overview=overview(player, bag, clock.world_minute)))
+        if action in COOKING_CONTROLS:
+            # Process-only controls never tick the economy, debit inventory, recover AP,
+            # run tutorials, or rebuild a full cooking/equipment projection.
+            try:
+                with transaction.atomic():
+                    bag = InventoryBag.objects.select_for_update().filter(player=player, character_id=player.username).first()
+                    bag = bag or InventoryBag(player=player, character_id=player.username)
+                    result = _execute(player, bag, action, params, rid, payload.get("current_location_code", ""), clock)
+                answer = response(rid, data=dict(result=result, cooking_control=True))
+            except ActionError as exc:
+                answer = response(rid, exc.code, exc.message)
+            VillagePlayerActionReceipt.objects.create(player=player, request_id=rid, payload_hash=digest,
+                action=action, response=answer, world_minute=clock.world_minute)
+            return answer
         if action in {"plant_start", "plant_cancel"}:
             # A lease neither moves inventory nor advances the world economy.
             # Avoid rebuilding every gameplay panel just to begin/cancel a timer.
