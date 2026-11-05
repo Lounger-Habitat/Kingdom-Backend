@@ -19,6 +19,7 @@ env/
 *.sqlite3-*
 *.sqlite3.bak
 data_backup.json
+/backups/
 
 # Django static files
 staticfiles/
