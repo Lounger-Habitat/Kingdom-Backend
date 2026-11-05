@@ -43,6 +43,9 @@ def _stop(labor, reason, status="CANCELLED"):
     labor.stop_reason = reason
     labor.accumulated_minutes = 0
     labor.save(update_fields=["status", "stop_reason", "accumulated_minutes"])
+    from .farm_supplies import work_cost, touch_supply
+    if work_cost(labor.affair_id, labor.condition_id):
+        touch_supply()
     return labor_data(labor)
 
 
@@ -83,11 +86,17 @@ def _start_session(player, condition, rid, location, clock, authority_session_id
         condition_id=condition["id"], unit_minutes=condition["unit_minutes"],
         authority_session_id=nonce, location_code=location, last_world_minute=clock.world_minute,
         last_time_revision=clock.time_revision, last_seen_at=timezone.now())
+    from .farm_supplies import work_cost, touch_supply
+    if affair and work_cost(affair.pk, condition["id"]):
+        touch_supply()
     return dict(labor_data(labor), locations=condition["locations"])
 
 
-def cancel_labor(player, reason="CANCELLED_BY_PLAYER"):
-    labor = VillagePlayerAffairLabor.objects.select_for_update().filter(player=player, status="ACTIVE").first()
+def cancel_labor(player, reason="CANCELLED_BY_PLAYER", *, labor_id=None):
+    sessions = VillagePlayerAffairLabor.objects.select_for_update().filter(player=player, status="ACTIVE")
+    if labor_id is not None:
+        sessions = sessions.filter(pk=labor_id)
+    labor = sessions.first()
     return _stop(labor, reason) if labor else None
 
 
@@ -96,7 +105,7 @@ def tick_player_labor(payload):
     """Endpoint called only by Env's own presence loop, not its client router."""
     from .affairs import AffairError, complete_labor, labor_unavailable, resolve_condition
     from .player_actions import ActionError, fail, key, response
-    from .personal_commissions import (CommissionError, expire_commissions, validate_commission_condition,
+    from .personal_commissions import (CommissionError, validate_commission_condition,
                                        complete_commission_labor)
     try:
         if not isinstance(payload, dict) or set(payload) != {
@@ -114,7 +123,6 @@ def tick_player_labor(payload):
         clock = GlobalGameTimeState.objects.select_for_update().filter(pk=1).first()
         if not clock:
             fail("WORLD_NOT_READY", "村庄时间尚未初始化。")
-        expire_commissions(clock.world_minute)
         labor = VillagePlayerAffairLabor.objects.select_for_update().filter(pk=labor_id, player_id=player_id).first()
         if not labor or labor.authority_session_id != nonce:
             fail("LABOR_SESSION_INVALID", "施工连接已失效，请重新开始劳动。")
@@ -159,6 +167,9 @@ def tick_player_labor(payload):
         labor.last_seen_at = now
         labor.location_code = payload["current_location_code"]
         credited = 0
+        affair_update = None
+        stage_changed = False
+        presentation_changed = False
         growth_rewards = []
         affected_npcs, earned_gold = [], 0
         while labor.accumulated_minutes >= labor.unit_minutes:
@@ -178,8 +189,12 @@ def tick_player_labor(payload):
                     condition_closed = finished or not any(c.get("id") == labor.condition_id and c.get("available")
                                                           for c in result.get("conditions", []))
                 else:
-                    complete_labor(affair, world_minute=clock.world_minute, request_id=receipt,
-                                   condition_id=labor.condition_id, player_id=str(labor.player_id))
+                    progress = complete_labor(affair, world_minute=clock.world_minute, request_id=receipt,
+                                             condition_id=labor.condition_id, player_id=str(labor.player_id))
+                    affair_update = {key: value for key, value in progress.items()
+                                     if key not in {"stage_changed", "presentation_changed"}}
+                    stage_changed |= progress.get("stage_changed", False)
+                    presentation_changed |= progress.get("presentation_changed", False)
                     finished = affair.status == "COMPLETED"
                     condition_closed = labor_unavailable(affair, condition_id=labor.condition_id)
             except (AffairError, CommissionError) as exc:
@@ -192,11 +207,15 @@ def tick_player_labor(payload):
                 labor.stop_reason = ("COMMISSION_COMPLETED" if labor.commission_id else "AFFAIR_COMPLETED") if finished else "CONDITION_COMPLETED"
                 labor.accumulated_minutes = 0
                 break
-        labor.save()
+        labor.save(update_fields=["status", "stop_reason", "accumulated_minutes", "last_world_minute",
+                                  "last_time_revision", "last_seen_at", "location_code", "completed_units"])
         if credited:
             from .daily_events import evaluate_daily_events
             evaluate_daily_events(clock.world_minute)
         return response(labor_id, data=dict(labor=labor_data(labor), credited_units=credited,
+                                           affair=affair_update,
+                                           stage_changed=stage_changed,
+                                           presentation_changed=presentation_changed,
                                            earned_gold=earned_gold, affected_npc_ids=affected_npcs,
                                            growth_rewards=growth_rewards))
     except ActionError as exc:

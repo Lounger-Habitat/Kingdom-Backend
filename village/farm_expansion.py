@@ -8,11 +8,12 @@ from django.db import transaction
 from .farm_expansion_models import VillageFarmExpansionSite
 from .models import VillageAffair, VillageFarmPlot, VillageLocationDefinition, VillageSimulationConfig
 from .seed_data import FARM_EXPANSION_PLOT_SEEDS
+from .farm_supplies import SUPPLY_CODE, DEPOT_LOCATION, DEPOT_POSITION
 
 AFFAIR_PREFIX = "FARM_EXPANSION_"
 SITE_LABELS = {"E": "扩展一号区", "F": "扩展二号区"}
 # Scene geometry is shared with the Unity fixed-field catalogue.
-SITE_ORIGINS = {"E": (-44.2, 0.01, -78.0), "F": (-17.8, 0.01, -78.0)}
+SITE_ORIGINS = {"E": (-43.2, 0.01, -77.6), "F": (-18.8, 0.01, -77.6)}
 
 
 def preparation_code(site_code):
@@ -58,6 +59,8 @@ def affair_blocked_reason(affair):
         return "", ""
     if not enabled():
         return "FARM_EXPANSION_DISABLED", "新田开垦暂未开放。"
+    if affair.code == SUPPLY_CODE:
+        return "", ""
     if not irrigation_ready():
         return "FARM_IRRIGATION_REQUIRED", "请先完成农田水渠通水。"
     site_code = affair.code.removeprefix(AFFAIR_PREFIX).split("_", 1)[0]
@@ -65,7 +68,9 @@ def affair_blocked_reason(affair):
     if site is None:
         return "FARM_EXPANSION_UNAVAILABLE", "片区定义尚未同步。"
     if affair.pk != site.preparation_affair_id and not _complete(site.preparation_affair):
-        return "FARM_PREPARATION_REQUIRED", "请先完成该片区的公共准备。"
+        from .affairs import condition_progress
+        if condition_progress(affair).get("clearing_labor", 0) >= 1:
+            return "FARM_PREPARATION_REQUIRED", "请先完成该片区的公共准备，再进行整地。"
     if affair.pk != site.preparation_affair_id and not VillageFarmPlot.objects.filter(
             plot_code__in=site.plot_codes, reclamation_affair=affair).exists():
         return "FARM_EXPANSION_UNAVAILABLE", "田块开垦定义尚未同步。"
@@ -104,11 +109,8 @@ def plot_access(plot):
 def _preparation_requirements():
     return {"stages": [
         dict(id="entrance", title="整理入口与通路", conditions=[
-            dict(id="entrance_wood", type="item", label="通路木材", item_ids=[1002], target=6),
             dict(id="entrance_labor", type="labor", label="整理入口与通路", target=1, unit_minutes=30)]),
         dict(id="water_access", title="准备水渠接入", conditions=[
-            dict(id="water_wood", type="item", label="公共支渠木材", item_ids=[1002], target=6),
-            dict(id="water_gold", type="gold", label="公共支渠资金", target=20),
             dict(id="water_labor", type="labor", label="公共支渠接入", target=1, unit_minutes=30)]),
     ]}
 
@@ -118,7 +120,6 @@ def _plot_requirements():
         dict(id="clearing", title="清障", conditions=[
             dict(id="clearing_labor", type="labor", label="清理该块荒地", target=1, unit_minutes=20)]),
         dict(id="leveling", title="整地", conditions=[
-            dict(id="leveling_wood", type="item", label="田埂木材", item_ids=[1002], target=2),
             dict(id="leveling_labor", type="labor", label="翻整土壤与田埂", target=1, unit_minutes=20)]),
         dict(id="opening", title="接渠与开放", conditions=[
             dict(id="opening_labor", type="labor", label="接通该块支渠", target=1, unit_minutes=15)]),
@@ -126,22 +127,45 @@ def _plot_requirements():
 
 
 def _location(code, label, position):
-    VillageLocationDefinition.objects.get_or_create(location_code=code, defaults=dict(
+    location, created = VillageLocationDefinition.objects.get_or_create(location_code=code, defaults=dict(
         display_name=label, center_anchor_code="LOC_" + code, location_type="work",
         bounds={"center": list(position)}, opening_hours={"alwaysOpen": True},
         supported_action_types=["CONTRIBUTE_TO_AFFAIR"], capacity=4, is_public=True, is_active=True))
+    if not created and (location.display_name != label or location.bounds.get("center") != list(position)):
+        location.display_name = label
+        location.bounds = {**location.bounds, "center": list(position)}
+        location.save(update_fields=["display_name", "bounds"])
 
 
 @transaction.atomic
 def ensure_expansion_sites(world_minute):
     from game_time.models import GlobalGameTimeState
-    from .affairs import create_resource_affair
+    from .affairs import create_resource_affair, normalize_definition, condition_progress, _legacy_totals
+    from .farm_supplies import ensure_supply
     GlobalGameTimeState.objects.select_for_update().filter(pk=1).first()
+    _location(DEPOT_LOCATION, "农田公共备料点", DEPOT_POSITION)
+    ensure_supply(world_minute)
+
+    def upgrade(row, requirements, location):
+        normalized = normalize_definition(requirements, [location])
+        if row.requirements == normalized and row.locations == [location]:
+            return
+        progress = condition_progress(row)
+        row.requirements, row.locations = normalized, [location]
+        row.progress = {**row.progress, "conditions": progress, **_legacy_totals(normalized, progress)}
+        complete = all(progress.get(c["id"], 0) >= c["target"]
+                       for stage in normalized["stages"] for c in stage["conditions"])
+        row.status = "COMPLETED" if complete else "ACTIVE"
+        if complete and row.completed_world_minute is None:
+            row.completed_world_minute = world_minute
+        row.version += 1
+        row.save(update_fields=["requirements", "locations", "progress", "status", "completed_world_minute", "version"])
     for site_code, label in SITE_LABELS.items():
         location = "FARM_EXPANSION_" + site_code
         _location(location, label + "·公共准备", SITE_ORIGINS[site_code])
         preparation = create_resource_affair(preparation_code(site_code), label + "公共准备",
             _preparation_requirements(), [location], world_minute)
+        upgrade(preparation, _preparation_requirements(), location)
         seeds = [seed for seed in FARM_EXPANSION_PLOT_SEEDS if seed["expansion_site_code"] == site_code]
         site, _ = VillageFarmExpansionSite.objects.get_or_create(site_code=site_code, defaults=dict(
             label=label, plot_codes=[s["plot_code"] for s in seeds], location_code=location,
@@ -152,9 +176,15 @@ def ensure_expansion_sites(world_minute):
             _location(worksite, f"{label}·{index:02d}号田边", plot_position(site_code, index))
             affair = create_resource_affair(plot_affair_code(code), f"开垦{site_code}{index:02d}号田",
                 _plot_requirements(), [worksite], world_minute)
-            VillageFarmPlot.objects.get_or_create(plot_code=code, defaults={
+            upgrade(affair, _plot_requirements(), worksite)
+            plot, _ = VillageFarmPlot.objects.get_or_create(plot_code=code, defaults={
                 **{key: value for key, value in seed.items() if key != "plot_code"},
                 "reclamation_affair": affair})
+            # World reset retains plots but recreates affairs; defaults do not restore existing links.
+            if plot.reclamation_affair_id != affair.pk:
+                plot.reclamation_affair = affair
+                plot.plot_version += 1
+                plot.save(update_fields=["reclamation_affair", "plot_version", "updated_at"])
     sync_expansion_effects(None, world_minute)
     return project_expansion_sites(world_minute)
 
@@ -201,11 +231,11 @@ def sync_expansion_effects(affair, world_minute):
             if plot.reclamation_status == "READY":
                 continue
             status = "LOCKED"
-            if water_ready and prep_ready:
+            if water_ready:
                 child = plot.reclamation_affair
                 from .affairs import condition_progress
                 progress = condition_progress(child) if child else {}
-                status = "READY" if _complete(child) else "LEVELED" if progress.get("leveling_labor", 0) >= 1 and progress.get("leveling_wood", 0) >= 2 else "CLEARED" if progress.get("clearing_labor", 0) >= 1 else "AVAILABLE"
+                status = "READY" if prep_ready and _complete(child) else "LEVELED" if prep_ready and progress.get("leveling_labor", 0) >= 1 else "CLEARED" if progress.get("clearing_labor", 0) >= 1 else "AVAILABLE"
             if status != plot.reclamation_status:
                 plot.reclamation_status = status
                 plot.plot_version += 1
@@ -232,6 +262,8 @@ def sync_expansion_effects(affair, world_minute):
 
 
 def affair_metadata(affair):
+    if affair.code == SUPPLY_CODE:
+        return dict(shared_stock=True, completion_effect="木材和金币统一入库；公共工程与18块田施工时自动消耗，不再逐田交料。")
     if not affair.code.startswith(AFFAIR_PREFIX):
         return {}
     site_code = affair.code.removeprefix(AFFAIR_PREFIX).split("_", 1)[0]
@@ -247,14 +279,17 @@ def project_expansion_sites(world_minute=None):
     from .player_farm import project_plot
     if world_minute is None:
         world_minute = GlobalGameTimeState.objects.filter(pk=1).values_list("world_minute", flat=True).first() or 0
-    result = dict(enabled=enabled(), irrigation_ready=irrigation_ready(), sites=[])
+    from .farm_supplies import stock_state
+    shared = stock_state()
+    result = dict(enabled=enabled(), irrigation_ready=irrigation_ready(), sites=[],
+                  shared_supply=project_affair(shared["pool"], farm_stock=shared) if shared["pool"] else None)
     for site in VillageFarmExpansionSite.objects.select_related("preparation_affair").order_by("site_code"):
         plots = [project_plot(plot, world_minute) for plot in VillageFarmPlot.objects.select_related(
             "lessee_player").filter(plot_code__in=site.plot_codes).order_by("plot_code")]
         blocked, message = affair_blocked_reason(site.preparation_affair)
         result["sites"].append(dict(site_code=site.pk, label=site.label, status=site.status,
             location_code=site.location_code, blocked_reason=blocked, unavailable_reason=message,
-            preparation_affair=project_affair(site.preparation_affair), plots=plots,
+            preparation_affair=project_affair(site.preparation_affair, farm_stock=shared), plots=plots,
             ready_plot_count=sum(plot["can_use"] for plot in plots), total_plot_count=9,
             opened_world_minute=site.opened_world_minute, completed_world_minute=site.completed_world_minute))
     return result

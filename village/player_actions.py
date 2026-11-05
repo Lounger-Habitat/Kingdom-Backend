@@ -65,7 +65,7 @@ PARAMS = {
     "overview": {"section"},
     "plant_state": set(),
     "contribute": {"affair_id", "condition_id", "kind", "item_id", "quantity", "instance_id"},
-    "labor_start": {"affair_id", "condition_id"}, "labor_cancel": set(),
+    "labor_start": {"affair_id", "condition_id"}, "labor_cancel": {"labor_id"},
     "commission_accept": {"commission_id"},
     "commission_contribute": {"commission_id", "condition_id", "quantity", "item_id", "instance_id"},
     "commission_labor_start": {"commission_id", "condition_id"},
@@ -649,7 +649,7 @@ def _execute(player, bag, action, p, rid, location, clock, authority_session_id=
                            condition_id=p.get("condition_id"))
     if action == "labor_cancel":
         from .player_affair_labor import cancel_labor
-        return dict(labor=cancel_labor(player))
+        return dict(labor=cancel_labor(player, labor_id=key(p["labor_id"]) if "labor_id" in p else None))
     if action == "buy_store":
         from .player_store import buy_from_store
         return buy_from_store(player, bag, p, rid, location, clock)

@@ -75,13 +75,39 @@ class FlexibleAffairTests(TestCase):
         self.assertEqual(events.exclude(event_type="VILLAGE_AFFAIR_PROGRESS").count(), 3)
         self.assertEqual(events.filter(event_type="VILLAGE_AFFAIR_PROGRESS").count(), 1)
 
-    def test_same_stage_labor_does_not_invent_preparation_requirement(self):
-        row = self.create([dict(id="wood", type="item", item_ids=[1002], target=1), dict(id="work", type="labor", target=1, unit_minutes=10)])
+    def test_construction_waits_for_all_same_stage_materials_and_gold(self):
+        row = self.create([dict(id="wood", type="item", item_ids=[1002], target=1),
+                           dict(id="gold", type="gold", target=5),
+                           dict(id="work", type="labor", target=1, unit_minutes=10)])
+        self.assertFalse(project_affair(row)["labor_available"])
+        with self.assertRaises(AffairError) as error:
+            complete_labor(row, condition_id="work", world_minute=10, request_id=uuid.uuid4(), actor_npc=self.npc)
+        self.assertEqual(error.exception.code, "AFFAIR_PREPARATION_INCOMPLETE")
+        self.add(row, "item", 1, "wood", 1002)
+        self.assertFalse(project_affair(row)["labor_available"])
+        self.add(row, "gold", 5, "gold")
         self.assertTrue(project_affair(row)["labor_available"])
         complete_labor(row, condition_id="work", world_minute=10, request_id=uuid.uuid4(), actor_npc=self.npc)
-        self.assertEqual(row.status, "ACTIVE")
-        self.add(row, "item", 1, "wood", 1002)
         self.assertEqual(row.status, "COMPLETED")
+
+    def test_silt_clearing_and_land_clearance_do_not_wait_for_materials(self):
+        for condition_id in ("clear_west", "clear_south_west", "clear_south_east", "clear_east", "clearing_labor"):
+            with self.subTest(condition=condition_id):
+                row = self.create([dict(id="wood", type="item", item_ids=[1002], target=2),
+                                   dict(id=condition_id, type="labor", target=1, unit_minutes=20)],
+                                  code="FREE_" + condition_id.upper())
+                self.assertTrue(project_affair(row)["labor_available"])
+                complete_labor(row, condition_id=condition_id, world_minute=20,
+                               request_id=uuid.uuid4(), actor_npc=self.npc)
+                self.assertEqual(row.progress["conditions"][condition_id], 1)
+                self.assertEqual(row.progress["conditions"].get("wood", 0), 0)
+
+    def test_labor_in_later_stage_cannot_skip_earlier_requirements(self):
+        row = self.create(stages=[dict(id="materials", conditions=[dict(id="wood", type="item", item_ids=[1002], target=1)]),
+                                 dict(id="work", conditions=[dict(id="clearing_labor", type="labor", target=1, unit_minutes=20)])],
+                          code="ORDERED_CLEARANCE")
+        with self.assertRaises(AffairError):
+            resolve_condition(row, "clearing_labor", "labor")
 
     def test_ambiguous_conditions_require_id_and_replay_cannot_credit_next_stage(self):
         row = self.create(stages=[

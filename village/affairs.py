@@ -223,6 +223,14 @@ def get_affair(code, world_minute, *, arc=None, fact=None):
     return row
 
 
+def labor_materials_ready(stage, progress, condition):
+    """Clearance is independent; construction uses the receipts for its own stage."""
+    if condition["type"] != "labor" or condition["id"].startswith(("clear_", "clearing_")):
+        return True
+    return all(progress.get(c["id"], 0) >= c["target"] for c in stage["conditions"]
+               if c["type"] in {"item", "gold"})
+
+
 def resolve_condition(row, condition_id=None, kind=None, item_id=None):
     """Resolve only an open, unmet condition. Missing IDs are legacy shorthand."""
     if row.status == "COMPLETED":
@@ -261,6 +269,13 @@ def resolve_condition(row, condition_id=None, kind=None, item_id=None):
         raise AffairError("PROJECT_NEED_FILLED", "此条件已经完成。")
     if len(remaining) != 1:
         raise AffairError("AFFAIR_CONDITION_REQUIRED", "有多个可贡献的条件，请指定条件标识。")
+    if not labor_materials_ready(stage, progress, remaining[0]):
+        raise AffairError("AFFAIR_PREPARATION_INCOMPLETE", "请先备齐本阶段施工所需的材料和金币。")
+    if remaining[0]["type"] == "labor":
+        from .farm_supplies import work_ready
+        ready, message = work_ready(row.code, remaining[0]["id"])
+        if not ready:
+            raise AffairError("FARM_SHARED_STOCK_INSUFFICIENT", message)
     return remaining[0]
 
 
@@ -347,10 +362,11 @@ def _event(row, world_minute, request_id, actor_npc=None, player_id=None, *, pro
         player_ids=[str(player_id)] if player_id is not None else [], participant_npc_ids=[str(actor_npc.agent_id)] if actor_npc else [],
         location_code=(event_stage["conditions"][0]["locations"] or [""])[0],
         visibility="PUBLIC", player_summary=summary, hub_summary=summary,
-        public_data={**facts, "status": row.status, "summary": summary,
+        public_data={**facts, "affair": projection, "status": row.status, "summary": summary,
             "bridge_condition": "REPAIRED" if row.code == BRIDGE_AFFAIR_CODE and stage is None else None}))
     if created:
         enqueue_event_deliveries(event)
+    return projection
 
 
 def sync_bridge_fact(row, fact=None):
@@ -385,9 +401,10 @@ def contribute(row, kind, quantity, *, item_id=None, condition_id=None, world_mi
     condition = validate_contribution(row, kind, quantity, item_id, condition_id)
     old_stage = active_stage(row)
     progress = condition_progress(row)
+    first_bridge_labor = row.code == BRIDGE_AFFAIR_CODE and condition["id"] == "legacy_labor" and not progress.get("legacy_labor", 0)
     progress[condition["id"]] = progress.get(condition["id"], 0) + quantity
     row.requirements = definition(row)
-    row.progress = {"conditions": progress, **_legacy_totals(row.requirements, progress)}
+    row.progress = {**row.progress, "conditions": progress, **_legacy_totals(row.requirements, progress)}
     next_stage = active_stage(row)
     row.status = "ACTIVE" if next_stage else "COMPLETED"
     if next_stage is None:
@@ -396,14 +413,20 @@ def contribute(row, kind, quantity, *, item_id=None, condition_id=None, world_mi
     row.save(update_fields=["requirements", "progress", "status", "completed_world_minute", "version"])
     VillageAffairContribution.objects.create(affair=row, request_id=request_id, condition_id=condition["id"], actor_type=actor_type,
         actor_id=actor_id, kind=kind, item_id=item_id or 0, quantity=quantity, world_minute=world_minute)
+    if condition["type"] == "labor":
+        from .farm_supplies import work_cost, touch_supply
+        if work_cost(row.code, condition["id"]):
+            touch_supply()
     sync_bridge_fact(row)
     from .farm_expansion import sync_expansion_effects
     sync_expansion_effects(row, world_minute)
     from .career_development import sync_career_development
     sync_career_development(row, world_minute)
-    _event(row, world_minute, request_id, actor_npc, player_id,
+    projection = _event(row, world_minute, request_id, actor_npc, player_id,
            progress_only=(old_stage or {}).get("id") == (next_stage or {}).get("id"))
-    return project_affair(row)
+    stage_changed = (old_stage or {}).get("id") != (next_stage or {}).get("id")
+    return dict(projection, stage_changed=stage_changed,
+                presentation_changed=stage_changed or first_bridge_labor)
 
 
 def complete_labor(row, *, condition_id=None, world_minute, request_id, actor_npc=None, player_id=None):
@@ -411,20 +434,75 @@ def complete_labor(row, *, condition_id=None, world_minute, request_id, actor_np
         actor_npc=actor_npc, player_id=player_id)
 
 
-def project_affair(row):
+def _material_usage(code, stages, progress):
+    """Read-only scene stock derived from earned labor; submitted stays cumulative.
+
+    Items use known construction associations. Gold funds same-stage or later
+    work, falling back to all labor; neither projection spends player money.
+    """
+    result = {}
+    all_conditions = {c["id"]: c for stage in stages for c in stage["conditions"]}
+    for stage_index, stage in enumerate(stages):
+        for material in stage["conditions"]:
+            if material["type"] not in {"item", "gold"}:
+                continue
+            labor_ids = []
+            if material["type"] == "gold":
+                if code == BRIDGE_AFFAIR_CODE and material["id"] == "legacy_gold":
+                    labor_ids = ["legacy_labor"]
+                elif code == "FARM_IRRIGATION" and material["id"] == "canal_gold":
+                    labor_ids = ["water_labor"]
+                elif code.startswith("CAREER_") and code.endswith("_PREP") and "labor" in all_conditions:
+                    labor_ids = ["labor"]
+                else:
+                    labor_ids = [c["id"] for c in stage["conditions"] if c["type"] == "labor"]
+                    if not labor_ids:
+                        labor_ids = [c["id"] for later in stages[stage_index+1:]
+                                     for c in later["conditions"] if c["type"] == "labor"]
+                    if not labor_ids:
+                        labor_ids = [c["id"] for c in all_conditions.values() if c["type"] == "labor"]
+            elif code == BRIDGE_AFFAIR_CODE and material["id"].startswith(("legacy_material_", "legacy_meals")):
+                labor_ids = ["legacy_labor"]
+            elif code == "FARM_IRRIGATION" and material["id"] == "canal_wood":
+                labor_ids = ["water_labor"]
+            elif code in {"CAREER_BILL_1_PREP", "CAREER_BILL_2_PREP", "CAREER_JACK_1_PREP", "CAREER_LUCY_1_PREP"} and material["id"] == "wood":
+                labor_ids = ["labor"]
+            elif code.startswith("FARM_EXPANSION_"):
+                labor_ids = [c["id"] for c in stage["conditions"] if c["type"] == "labor"]
+            labor = [all_conditions[key] for key in labor_ids if key in all_conditions]
+            target = sum(c["target"] for c in labor)
+            completed = sum(min(c["target"], max(0, progress.get(c["id"], 0))) for c in labor)
+            submitted = max(0, progress.get(material["id"], 0))
+            used = min(submitted, material["target"] * completed // target) if target else 0
+            result[material["id"]] = dict(used_quantity=used, stock_quantity=submitted-used)
+    return result
+
+
+def project_affair(row, *, item_names=None, farm_stock=None):
     from items.models import Item
     from .farm_irrigation import IRRIGATION_AFFAIR_CODE, COMPLETION_EFFECT
     req, progress = definition(row), condition_progress(row)
     from .farm_expansion import affair_blocked_reason, affair_metadata
+    from .farm_supplies import SUPPLY_CODE, WORK_CODES, stock_state, supply_snapshot, work_cost, work_ready
+    shared = (farm_stock if farm_stock is not None else stock_state()) if row.code in (*WORK_CODES, SUPPLY_CODE) else None
     blocked, blocked_message = affair_blocked_reason(row)
     expansion = affair_metadata(row)
     from .career_development import affair_blocked_reason as career_blocked_reason, affair_metadata as career_metadata
     if not blocked:
         blocked, blocked_message = career_blocked_reason(row)
     expansion.update(career_metadata(row))
+    if row.code in WORK_CODES:
+        if shared["pool"] is not None and "projection" not in shared:
+            shared["projection"] = project_affair(shared["pool"], item_names=item_names, farm_stock=shared)
+        expansion["resource_pool"] = shared.get("projection")
+    usage = _material_usage(row.code, req["stages"], progress)
+    if row.code == SUPPLY_CODE:
+        usage.update({c["id"]: {key: c[key] for key in
+            ("used_quantity", "stock_quantity", "reserved_quantity", "available_quantity")}
+            for c in supply_snapshot(shared)["stages"][0]["conditions"]})
     active = active_stage(row)
     ids = {item for s in req["stages"] for c in s["conditions"] for item in c.get("item_ids", [])}
-    names = dict(Item.objects.filter(pk__in=ids).values_list("item_id", "item_name"))
+    names = item_names if item_names is not None else dict(Item.objects.filter(pk__in=ids).values_list("item_id", "item_name"))
     stages, after_active = [], False
     for stage in req["stages"]:
         status = "ACTIVE" if active and stage["id"] == active["id"] else "LOCKED" if after_active else "COMPLETED"
@@ -436,6 +514,17 @@ def project_affair(row):
             condition.update(condition_id=raw["id"], stage_id=stage["id"], submitted=submitted,
                 remaining=max(0, raw["target"] - submitted), available=status == "ACTIVE" and submitted < raw["target"],
                 label=raw.get("label") or (" / ".join(item_names) if raw["type"] == "item" else "金币" if raw["type"] == "gold" else "劳动"))
+            if condition["available"] and not labor_materials_ready(stage, progress, raw):
+                condition.update(available=False, blocked_reason="AFFAIR_PREPARATION_INCOMPLETE",
+                                 unavailable_reason="请先备齐本阶段施工所需的材料和金币。")
+            cost = work_cost(row.code, raw["id"]) if raw["type"] == "labor" else {}
+            if cost:
+                condition["shared_stock_cost"] = cost
+                ready, message = work_ready(row.code, raw["id"], shared)
+                if condition["available"] and not ready:
+                    condition.update(available=False, blocked_reason="FARM_SHARED_STOCK_INSUFFICIENT", unavailable_reason=message)
+            if raw["type"] in {"item", "gold"}:
+                condition.update(usage.get(raw["id"], {}))
             if raw["type"] == "item":
                 condition.update(item_names=item_names, items=[dict(item_id=item, item_name=names.get(item, str(item))) for item in raw["item_ids"]])
             conditions.append(condition)
@@ -455,17 +544,22 @@ def project_affair(row):
         target = sum(c["target"] for c in conditions)
         submitted = sum(c["submitted"] for c in conditions)
         return dict(kind=kind, label=label, target=target, submitted=submitted, remaining=max(0, target-submitted))
-    materials = [dict(portion("material", c["label"], [c]), item_id=c["item_ids"][0], item_name=c["label"], condition_id=c["id"])
+    materials = [dict(portion("material", c["label"], [c]), item_id=c["item_ids"][0], item_name=c["label"], condition_id=c["id"],
+                      used_quantity=c.get("used_quantity", 0), stock_quantity=c.get("stock_quantity", c["submitted"]))
                  for c in all_conditions if c["type"] == "item" and c["id"] != "legacy_meals" and len(c["item_ids"]) == 1]
     meal_conditions = [c for c in all_conditions if c["id"] == "legacy_meals"]
     meals = portion("meal", "成品餐食", meal_conditions)
     meals.update(item_ids=list(MEALS), min_quality=1, min_remaining_minutes=0, requires_freshness=False)
+    gold_conditions = [c for c in all_conditions if c["type"] == "gold"]
+    gold = portion("gold", "金币", gold_conditions)
+    gold.update(used_quantity=sum(c["used_quantity"] for c in gold_conditions),
+                stock_quantity=sum(c["stock_quantity"] for c in gold_conditions))
     labor_conditions = [c for c in all_conditions if c["type"] == "labor"]
     current_labor = next((c for c in current if c["type"] == "labor" and c["available"]), None)
     labor = portion("labor", "劳动", labor_conditions)
     labor.update(completed=labor["submitted"], duration_minutes=(current_labor or {}).get("unit_minutes", 60),
         unit_minutes=(current_labor or {}).get("unit_minutes", 60), locations=(current_labor or {}).get("locations", []))
-    return dict(affair_id=row.code, code=row.code, kind=row.kind, title=row.title,
+    result = dict(affair_id=row.code, code=row.code, kind=row.kind, title=row.title,
         completion_effect=expansion.get("completion_effect") or (COMPLETION_EFFECT if row.code == IRRIGATION_AFFAIR_CODE else "恢复旧桥通行和正常商路" if row.code == BRIDGE_AFFAIR_CODE else "完成此事务并记录完成事件"),
         **{key: value for key, value in expansion.items() if key != "completion_effect"},
         stage="COMPLETED" if row.status == "COMPLETED" else "ACTIVE", status="COMPLETED" if row.status == "COMPLETED" else "ACTIVE",
@@ -474,16 +568,30 @@ def project_affair(row):
         reason="事务已经完成。" if row.status == "COMPLETED" else blocked_message, blocked_reason=blocked,
         requirements=deepcopy(req),
         progress={"conditions": progress, **_legacy_totals(req, progress)}, materials=materials, meals=meals,
-        gold=portion("gold", "金币", [c for c in all_conditions if c["type"] == "gold"]), labor=labor,
+        gold=gold, labor=labor,
         labor_available=current_labor is not None, locations=list(row.locations), contribution_locations=list(row.locations),
         default_location_code=(row.locations or [""])[0], default_locations=list(row.locations),
         location_code=(row.locations or [""])[0], meal_location_code=(row.locations or [""])[0], version=row.version, story_version=row.version,
         opened_world_minute=row.opened_world_minute, completed_world_minute=row.completed_world_minute,
         bridge_condition=("REPAIRED" if row.status == "COMPLETED" else "REPAIRING" if preparation_ready(row) and progress.get("legacy_labor", 0)
             else "MATERIALS_READY" if preparation_ready(row) else "BROKEN") if row.code == BRIDGE_AFFAIR_CODE else None)
+    if row.code == SUPPLY_CODE:
+        # Fully deposited stock remains inspectable while the fields are still consuming it.
+        spent = shared["used"]["wood"] >= 60 and shared["used"]["gold"] >= 40
+        result.update(status="COMPLETED" if spent else "ACTIVE", stage="COMPLETED" if spent else "ACTIVE",
+                      current_stage_title="公共库存", active_stage_id="supply", labor_available=False)
+        result["stages"][0].update(title="公共库存", status="COMPLETED" if spent else "ACTIVE")
+        result["conditions"] = result["stages"][0]["conditions"]
+    return result
 
 
 def project_affairs(world_minute):
     """Read-only projection; inspecting never starts or settles an affair."""
-    rows = list(VillageAffair.objects.all().order_by("opened_world_minute", "code"))
-    return [project_affair(row) for row in rows if row.kind == "RESOURCE_PROJECT"]
+    rows = list(VillageAffair.objects.filter(kind="RESOURCE_PROJECT").order_by("opened_world_minute", "code"))
+    item_ids = {item for row in rows for stage in definition(row)["stages"]
+                for condition in stage["conditions"] for item in condition.get("item_ids", [])}
+    from items.models import Item
+    names = dict(Item.objects.filter(pk__in=item_ids).values_list("item_id", "item_name"))
+    from .farm_supplies import SUPPLY_CODE, WORK_CODES, stock_state
+    shared = stock_state() if any(row.code in (*WORK_CODES, SUPPLY_CODE) for row in rows) else None
+    return [project_affair(row, item_names=names, farm_stock=shared) for row in rows]

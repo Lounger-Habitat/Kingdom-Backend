@@ -1,11 +1,14 @@
 import importlib
 import uuid
+from contextlib import ExitStack
 from datetime import timedelta
 from types import SimpleNamespace
+from unittest.mock import patch
 
 from django.apps import apps
 from django.db import connection
 from django.test import TestCase
+from django.test.utils import CaptureQueriesContext
 from django.utils import timezone
 from rest_framework.test import APIClient
 from rest_framework_simplejwt.tokens import AccessToken
@@ -71,7 +74,9 @@ class PlayerAffairTests(PlayerFixture, TestCase):
         rid = uuid.uuid4()
         result = self.action("contribute", dict(affair_id=self.affair.pk, kind="fund", quantity=500), rid=rid)
         self.assertTrue(result["success"], result)
-        self.assertEqual(result, self.action("contribute", dict(affair_id=self.affair.pk, kind="fund", quantity=500), rid=rid))
+        replay = self.action("contribute", dict(affair_id=self.affair.pk, kind="fund", quantity=500), rid=rid)
+        self.assertTrue(replay.pop("replayed"))
+        self.assertEqual(result, replay)
         self.bag_a.refresh_from_db(); self.affair.refresh_from_db()
         self.assertEqual((self.bag_a.money, self.affair.status, self.affair.progress["labor"]), (100, "ACTIVE", 0))
         self.start()
@@ -101,6 +106,8 @@ class PlayerAffairTests(PlayerFixture, TestCase):
         self.tick(labor, 30)
         result = self.tick(labor, 30)
         self.assertEqual(result["data"]["credited_units"], 1)
+        self.assertTrue(result["data"]["presentation_changed"], "The first real bridge work still updates its construction presentation")
+        self.assertFalse(result["data"]["stage_changed"])
         result = self.tick(labor, 1, current_location_code="REPAIR_YARD")
         self.assertEqual(result["data"]["labor"]["stop_reason"], "LEFT_WORKSITE")
         self.affair.refresh_from_db()
@@ -273,3 +280,83 @@ class PlayerAffairTests(PlayerFixture, TestCase):
             payload["authority_session_id"] = self.nonce; payload[flag] = True
             self.assertFalse(execute_player_action(payload)["success"])
         self.assertFalse(VillagePlayerAffairLabor.objects.exists())
+
+    def test_labor_controls_do_not_rebuild_panels_maintain_world_or_change_growth(self):
+        from player.models import PlayerGrowthState
+        from player.progression import ensure_growth
+        growth = ensure_growth(self.a)
+        self.ready()
+        unrelated = ("village.player_actions.overview", "village.personal_commissions.expire_commissions",
+            "village.starter_supply.expire_supply", "village.player_farm.maintain_leases",
+            "village.daily_events.evaluate_daily_events", "player.starter.post_action_progress",
+            "player.tutorials.observe_action")
+        with ExitStack() as stack:
+            for target in unrelated:
+                stack.enter_context(patch(target, side_effect=AssertionError(target)))
+            with CaptureQueriesContext(connection) as start_queries:
+                labor = self.start()
+            self.tick(labor, 30)
+            with CaptureQueriesContext(connection) as cancel_queries:
+                cancelled = self.action("labor_cancel", {"labor_id": labor["labor_id"]})
+        self.assertTrue(cancelled["success"], cancelled)
+        self.assertTrue(cancelled["data"]["labor_control"])
+        self.assertNotIn("overview", cancelled["data"])
+        self.assertLess(len(start_queries), 25)
+        self.assertLess(len(cancel_queries), 15)
+        self.assertEqual(PlayerGrowthState.objects.get(pk=growth.pk).revision, growth.revision)
+        self.bag_a.refresh_from_db()
+        self.assertEqual(self.bag_a.money, 100)
+        self.assertEqual(cancelled["data"]["result"]["labor"]["accumulated_minutes"], 0)
+
+    def test_targeted_cancel_cannot_stop_another_or_later_labor_session(self):
+        self.ready()
+        first = self.start()
+        rid = uuid.uuid4()
+        params = {"labor_id": first["labor_id"]}
+        self.assertTrue(self.action("labor_cancel", params, rid=rid)["success"])
+        second = self.start()
+        self.assertIsNone(self.action("labor_cancel", params)["data"]["result"]["labor"])
+        replay = self.action("labor_cancel", params, rid=rid)
+        self.assertEqual(replay["data"]["current_labor"]["labor_id"], second["labor_id"])
+        self.assertEqual(replay["data"]["receipt_labor"]["labor_id"], first["labor_id"])
+        self.assertEqual(VillagePlayerAffairLabor.objects.get(pk=second["labor_id"]).status, "ACTIVE")
+        self.assertEqual(self.action("labor_cancel", {"labor_id": "invalid"})["result_code"], "INVALID_PARAMS")
+
+    def test_contribution_returns_scoped_assets_without_global_maintenance_or_progression(self):
+        self.slot(5, item_id=REPAIR_WOOD_ITEM_ID)
+        rid = uuid.uuid4()
+        params = dict(affair_id=self.affair.pk, kind="material", item_id=REPAIR_WOOD_ITEM_ID, quantity=1)
+        with ExitStack() as stack:
+            for target in ("village.personal_commissions.expire_commissions", "village.starter_supply.expire_supply",
+                    "village.player_farm.maintain_leases", "player.starter.post_action_progress",
+                    "player.tutorials.observe_action", "village.player_cooking.cooking_overview",
+                    "village.production_tools.tools_overview", "village.player_store.store_sale_quote"):
+                stack.enter_context(patch(target, side_effect=AssertionError(target)))
+            with CaptureQueriesContext(connection) as queries:
+                result = self.action("contribute", params, rid=rid)
+        self.assertTrue(result["success"], result)
+        self.assertTrue(result["data"]["overview_partial"])
+        self.assertTrue(result["data"]["affair_settlement"])
+        self.assertEqual(result["data"]["settlement_section"], "affairs")
+        self.assertFalse(result["data"]["result"]["stage_changed"])
+        state = result["data"]["overview"]
+        self.assertFalse({"cooking", "hunting", "market", "farm", "production", "business"} & state.keys())
+        self.assertTrue({"inventory", "affairs", "contributions"}.issubset(state))
+        self.assertLess(len(queries), 160)
+        replay = self.action("contribute", params, rid=rid)
+        self.assertTrue(replay["replayed"])
+        self.bag_a.refresh_from_db()
+        self.assertEqual(self.bag_a.slots.get().item_amount, 4)
+        self.assertEqual(VillageAffairContribution.objects.filter(affair=self.affair).count(), 1)
+
+    def test_affair_poll_is_read_only_and_omits_unrelated_panels(self):
+        with CaptureQueriesContext(connection) as queries:
+            result = self.action("overview", {"section": "affairs"})
+        self.assertTrue(result["success"], result)
+        self.assertEqual(result["data"]["overview_section"], "affairs")
+        self.assertIn("affairs", result["data"]["overview"])
+        self.assertNotIn("cooking", result["data"]["overview"])
+        self.assertNotIn("inventory", result["data"]["overview"])
+        self.assertNotIn("growth", result["data"]["overview"])
+        writes = [q["sql"] for q in queries if q["sql"].lstrip().split(" ", 1)[0].upper() in {"INSERT", "UPDATE", "DELETE"}]
+        self.assertEqual(writes, [])

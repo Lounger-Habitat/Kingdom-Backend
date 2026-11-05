@@ -103,4 +103,9 @@ class DevelopmentResetIntegrationTests(TestCase):
             self.assertFalse(model.objects.exists(), model.__name__)
         self.assertEqual(VillageFarmExpansionSite.objects.count(), 2)
         self.assertEqual(VillageFarmPlot.objects.filter(expansion_site_code__in=["E", "F"], reclamation_status="LOCKED").count(), 18)
+        from village.farm_expansion import plot_affair_code
+        from village.player_farm import project_plot
+        for plot in VillageFarmPlot.objects.filter(expansion_site_code__in=["E", "F"]):
+            self.assertEqual(plot.reclamation_affair_id, plot_affair_code(plot.plot_code))
+            self.assertEqual(project_plot(plot, 100)["reclamation_status"], "LOCKED")
         self.assertTrue(VillageDailyEventTemplate.objects.filter(pk=template.pk).exists())

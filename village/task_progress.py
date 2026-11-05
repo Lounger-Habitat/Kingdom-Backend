@@ -64,8 +64,13 @@ def decorate_task_progress(affairs, commissions):
     public_records = list(VillageAffairContribution.objects.filter(affair_id__in=affair_ids)
         .order_by("pk").values("affair_id", "condition_id", "actor_type", "actor_id", "quantity", "world_minute"))
     _name_records(public_records)
+    from .farm_supplies import SUPPLY_CODE, WORK_CODES, WOOD_CONDITION, GOLD_CONDITION
     for record in public_records:
-        entries[("affair", record.pop("affair_id"), record.pop("condition_id"))].append(record)
+        affair_id, condition_id = record.pop("affair_id"), record.pop("condition_id")
+        entries[("affair", affair_id, condition_id)].append(record)
+        if affair_id in WORK_CODES and condition_id in {"entrance_wood", "water_wood", "leveling_wood", "water_gold"}:
+            shared_id = GOLD_CONDITION if condition_id == "water_gold" else WOOD_CONDITION
+            entries[("affair", SUPPLY_CODE, shared_id)].append(dict(record, source_affair_id=affair_id))
     for record in _commission_records(commission_ids):
         entries[("commission", record.pop("task_id"), record.pop("condition_id"))].append(record)
 

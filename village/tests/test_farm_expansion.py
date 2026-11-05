@@ -40,6 +40,14 @@ class FarmExpansionTests(TestCase):
         affair.refresh_from_db()
         while stage := active_stage(affair):
             for condition in stage["conditions"]:
+                from village.farm_supplies import work_cost, stock_state, SUPPLY_CODE, DEPOT_LOCATION
+                for kind, quantity in work_cost(affair.pk, condition["id"]).items():
+                    missing = quantity-stock_state()["available"][kind]
+                    if missing > 0:
+                        params = dict(affair_id=SUPPLY_CODE, condition_id="shared_wood" if kind == "wood" else "shared_gold",
+                                      kind="item" if kind == "wood" else "gold", quantity=missing)
+                        if kind == "wood": params["item_id"] = 1002
+                        _execute(self.player, self.bag, "contribute", params, uuid.uuid4(), DEPOT_LOCATION, self.clock)
                 condition = resolve_condition(affair, condition["id"])
                 location = condition["locations"][0]
                 if condition["type"] == "labor":
@@ -128,3 +136,36 @@ class FarmExpansionTests(TestCase):
         self.assertEqual((old.reclamation_status, old.expansion_site_code, old.batch_id, old.lease_ends_world_minute),
                          ("READY", "", batch, 1500))
         self.assertTrue(project_plot(old, 999)["can_use"])
+
+    def test_recovery_relinks_existing_expansion_plots_without_resetting_saved_state(self):
+        plots = VillageFarmPlot.objects.filter(expansion_site_code__in=["E", "F"])
+        plots.update(reclamation_affair=None)
+        # World reset keeps the authored plots, and existing open land can carry crops and leases.
+        batch = uuid.uuid4()
+        plots.filter(plot_code="FARM_PLOT_E_04").update(
+            reclamation_status="READY", reclaimed_world_minute=90,
+            lessee_player=self.player, leased_world_minute=95, lease_ends_world_minute=1500,
+            status="GROWING", crop_code="CORN", batch_id=batch,
+            planted_world_minute=100, mature_world_minute=1000,
+            production_rules_snapshot={"growth_minutes": 900}, plot_version=7)
+        saved_fields = ["reclamation_status", "reclaimed_world_minute", "lessee_player_id",
+            "leased_world_minute", "lease_ends_world_minute", "lease_enabled", "status",
+            "crop_code", "batch_id", "planted_world_minute", "mature_world_minute",
+            "production_rules_snapshot"]
+        saved = plots.get(plot_code="FARM_PLOT_E_04")
+        before = {field: getattr(saved, field) for field in saved_fields}
+
+        ensure_expansion_sites(100)
+
+        self.assertEqual(plots.count(), 18)
+        for plot in plots:
+            self.assertEqual(plot.reclamation_affair_id, plot_affair_code(plot.plot_code))
+            self.assertNotEqual(project_plot(plot, 100)["reclamation_status"], "UNKNOWN")
+        saved.refresh_from_db()
+        self.assertEqual({field: getattr(saved, field) for field in saved_fields}, before)
+        self.assertGreater(saved.plot_version, 7)
+        versions = dict(plots.values_list("plot_code", "plot_version"))
+        events = VillageWorldEvent.objects.count()
+        ensure_expansion_sites(101)
+        self.assertEqual(dict(plots.values_list("plot_code", "plot_version")), versions)
+        self.assertEqual(VillageWorldEvent.objects.count(), events)

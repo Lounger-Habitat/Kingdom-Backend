@@ -53,7 +53,7 @@ EXPANSION_EVENT_TYPES = {"FARM_EXPANSION_AVAILABLE", "FARM_EXPANSION_PREPARED",
 ORDER_EVENT_TYPES = {"CARAVAN_ORDER_PUBLISHED", "CARAVAN_ORDER_EXPIRED", "CARAVAN_ORDER_COMPLETED",
                      "CARAVAN_ORDER_LINE_FILLED", "CARAVAN_ORDER_REWARD_APPLIED"}
 CAREER_EVENT_TYPES = {"CAREER_AVAILABLE", "CAREER_TRIAL_OPENED", "CAREER_COMPLETED", "CAREER_REVIEW_COMPLETED"}
-PUBLIC_AFFAIR_FIELDS = ("affair_id", "stage_id", "current_stage_title", "open_needs", "completion_effect", "version")
+PUBLIC_AFFAIR_FIELDS = ("affair_id", "stage_id", "current_stage_title", "open_needs", "completion_effect", "version", "affair")
 PUBLIC_AFFAIR_NEED_FIELDS = ("condition_id", "label", "kind", "item_id", "remaining", "unit_minutes", "locations")
 PUBLIC_STORY_EVENT_FIELDS = (
     "id", "template_code", "title", "status", "summary", "participation_hint", "resolution_summary",
