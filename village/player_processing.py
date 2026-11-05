@@ -1,23 +1,21 @@
-"""Player-owned carcass escrow using Jack's real work, tool and wallet."""
+"""Automatic workshop processing with player-owned carcass and fee escrow."""
 import copy
 import hashlib
 import json
 import uuid
-import math
 
 from django.db import transaction
 
 from game_time.models import GlobalGameTimeState
-from inventory.components import BATCH_COPY_FIELDS, copy_batch_attributes
+from inventory.components import BATCH_COPY_FIELDS
+from inventory.storage import add_inventory_items, attributes_from_slot
 from inventory.models import InventoryBag, InventorySlot, NpcGlobalInventory
 from items.models import Item
-from player.models import PlayerGrowthState, EquipmentDefinition
-from player.equipment import stats_for
+from player.models import PlayerGrowthState
 from player.progression import ensure_growth
-from .models import (EconomicLedgerEntry, NpcRuntimeState, VillageActionDurationConfig,
+from .models import (EconomicLedgerEntry, VillageActionDurationConfig,
                      VillagePlayerProcessingJob)
-from .phase3_catalog import (BYPRODUCT_ITEM_IDS, HUNT_TOOL_ITEM_ID, PREY_RECIPES,
-                            PREY_CHICKEN, PREY_PIG, PREY_CATTLE, PREY_DEER)
+from .phase3_catalog import PREY_CHICKEN, PREY_PIG, PREY_CATTLE, PREY_DEER
 
 from .professional_catalog import PREY_BOAR
 from .career_catalog import (NEW_CONTENT_ITEM_IDS, content_access, processing_outputs,
@@ -44,50 +42,15 @@ def _uuid(value):
         _fail("INVALID_PARAMS", "猎物或工单编号无效。")
 
 
-def jack_processing_busy(npc_id):
-    """Shared NPC command gate. npc_id is the public agent id, not a DB PK."""
-    return str(npc_id) == "10012" and VillagePlayerProcessingJob.objects.filter(status="RUNNING").exists()
-
-
-def _runtime_reason(rt, minute):
-    from .runtime_services import CommandService
-    if rt is None:
-        return "JACK_UNAVAILABLE"
-    if rt.action_status == "AWAY" or (rt.away_until_world_minute is not None and rt.away_until_world_minute > minute):
-        return "NPC_AWAY"
-    if rt.action_status == "SLEEPING":
-        return "JACK_UNAVAILABLE"
-    if rt.active_command_id is not None or rt.action_status not in ("IDLE", "BLOCKED"):
-        return "NPC_BUSY"
-    if rt.current_location_code != "BUTCHER_YARD":
-        return "JACK_NOT_AT_WORK"
-    return CommandService.unavailable_reason("PROCESS_GAME", rt) or ""
-
-
-def _jack_reason(minute, *, exclude_job=None):
-    rt = NpcRuntimeState.objects.select_related("npc").filter(npc__agent_id="10012").first()
-    reason = _runtime_reason(rt, minute)
-    if reason:
-        return reason
-    jobs = VillagePlayerProcessingJob.objects.filter(status="RUNNING")
-    if exclude_job:
-        jobs = jobs.exclude(pk=exclude_job)
-    else:
-        # An accepted NPC command owns the next work slot even before start.
-        from .models import NpcCommandState
-        if NpcCommandState.objects.filter(npc__agent_id="10012",
-                status__in=("RECEIVED", "QUEUED", "RUNNING", "SETTLING")).exists():
-            return "NPC_BUSY"
-    return "NPC_BUSY" if jobs.exists() else ""
-
-
-def _next_index(bag):
-    return max(bag.slots.values_list("slot_index", flat=True), default=-1) + 1
+def _workshop_waiting_reason():
+    # The base workshop has one slot, also enforced by processing_one_jack_job.
+    # A future capacity upgrade must widen this gate and its DB constraint together.
+    return "PROCESSING_QUEUE_BUSY" if VillagePlayerProcessingJob.objects.filter(status="RUNNING").exists() else ""
 
 
 def _batch(slot):
     return dict(instance_id=str(slot.instance_id), item_id=slot.item_id,
-        item_name=slot.item_bag_name or Item.objects.filter(pk=slot.item_id).values_list("item_name", flat=True).first() or str(slot.item_id),
+        item_name=Item.objects.filter(pk=slot.item_id).values_list("item_name", flat=True).first() or str(slot.item_id),
         quantity=slot.item_amount, quality=slot.quality,
         produced_world_minute=slot.produced_world_minute, expires_world_minute=None,
         freshness_unknown=False)
@@ -124,44 +87,21 @@ def _outputs(slot):
                  freshness_unknown=False) for item_id, amount in spec.items()]
 
 
-def _tool(minute, *, include_reserved=False):
-    from .phase3_asset_service import get_available_slot_amount
-    inv = NpcGlobalInventory.objects.filter(npc__agent_id="10012").first()
-    if inv is None:
-        return None, "JACK_UNAVAILABLE"
-    reason = "P3_TOOL_MISSING"
-    reserved = None
-    tool_ids = EquipmentDefinition.objects.filter(category="processing", enabled=True).values_list("item_id", flat=True)
-    for slot in inv.slots.filter(item_id__in=tool_ids, item_amount__gt=0).order_by("slot_index"):
-        if slot.remaining_uses is None:
-            reason = "P3_TOOL_DURABILITY_UNKNOWN"
-        elif slot.remaining_uses <= 0:
-            reason = "P3_TOOL_BROKEN"
-        elif stats_for(slot) is None:
-            reason = "TOOL_CONFIGURATION_UNAVAILABLE"
-        elif get_available_slot_amount(slot, minute) > 0:
-            return slot, ""
-        else:
-            reserved = reserved or slot
-            reason = "PRODUCTION_RESOURCE_UNAVAILABLE"
-    return (reserved if include_reserved else None), reason
-
-
-def _preview(player, bag, slot, minute, *, quantity=1, read_only=False):
-    duration = VillageActionDurationConfig.configured_duration("PROCESS_GAME")
-    tool, tool_reason = _tool(minute, include_reserved=True)
-    tool_stats = stats_for(tool) if tool else None
-    if duration and tool_stats:
-        duration = max(1, math.ceil(duration * (1-tool_stats["processing_time_reduction"])))
+def _preview(player, bag, slot, minute, *, quantity=1, read_only=False, context=None):
+    if context is None:
+        duration = VillageActionDurationConfig.configured_duration("PROCESS_GAME")
+        waiting_reason = _workshop_waiting_reason()
+    else:
+        duration, waiting_reason = context
     reason = "PROCESSING_DURATION_UNAVAILABLE" if not duration else _prey_reason(slot, minute, duration)
     outputs = _outputs(slot) if slot is not None and slot.item_id in FEES else []
     if duration:
+        # Workshop speed belongs here; each accepted job freezes its duration/output spec.
         duration = processing_duration(duration, {row["item_id"]: row["quantity"] for row in outputs})
     if not outputs:
         reason = reason or "PROCESSING_CATALOG_UNAVAILABLE"
     if slot is not None and slot.item_amount < quantity:
         reason = reason or "PREY_QUANTITY_UNAVAILABLE"
-    waiting_reason = _jack_reason(minute) or tool_reason
     unit_fee = FEES.get(slot.item_id, 0) if slot is not None else 0
     fee = unit_fee * quantity
     maximum = max(0, min(MAX_SUBMISSION_QUANTITY, slot.item_amount if slot else 0,
@@ -178,7 +118,7 @@ def _preview(player, bag, slot, minute, *, quantity=1, read_only=False):
         reason = reason or "INSUFFICIENT_MONEY"
     payload = dict(player_id=str(player.pk), prey_instance_id=str(slot.instance_id) if slot else None,
         input=_snapshot(slot) if slot else None, quantity=quantity, fee_gold=fee,
-        duration_minutes=duration, outputs=outputs, tool_configuration=tool_stats)
+        duration_minutes=duration, outputs=outputs, processing_mode="AUTOMATIC_WORKSHOP_V1")
     quote = hashlib.sha256(json.dumps(payload, sort_keys=True, separators=(",", ":"), default=str).encode()).hexdigest()
     if read_only:
         reason = reason or "MODE_READ_ONLY"
@@ -186,18 +126,24 @@ def _preview(player, bag, slot, minute, *, quantity=1, read_only=False):
         prey_instance_id=payload["prey_instance_id"], quantity=quantity, fee_gold=fee, unit_fee_gold=unit_fee,
         max_quantity=maximum,
         duration_minutes=duration, total_duration_minutes=(duration or 0) * quantity,
-        outputs=outputs, waiting_reason=waiting_reason), tool
+        outputs=outputs, waiting_reason=waiting_reason)
 
 
-def _entry(job, minute):
+def _entry(job, minute, *, names=None):
+    prey = copy.deepcopy(job.input_snapshot)
     outputs = copy.deepcopy(job.output_snapshot or [dict(item_id=int(i), quantity=n)
                                                    for i, n in job.output_spec.items()])
-    names = dict(Item.objects.filter(pk__in={row["item_id"] for row in outputs}).values_list("pk", "item_name"))
+    if names is None:
+        item_ids = {row["item_id"] for row in outputs} | {prey.get("item_id")}
+        names = dict(Item.objects.filter(pk__in=item_ids).values_list("pk", "item_name"))
+    # Legacy snapshots may contain inventory storage names with appended UUIDs.
+    # Repair only the projection; escrow snapshots remain frozen for settlement.
+    prey["item_name"] = names.get(prey.get("item_id"), prey.get("item_name") or "猎物名称待同步")
     for row in outputs:
-        row["item_name"] = row.get("item_name") or names.get(row["item_id"], "产物名称待同步")
+        row["item_name"] = names.get(row["item_id"], row.get("item_name") or "产物名称待同步")
         if not job.output_snapshot:
             row["quality"] = job.input_snapshot.get("quality")
-    return dict(job_id=str(job.pk), status=job.status, input=copy.deepcopy(job.input_snapshot),
+    return dict(job_id=str(job.pk), status=job.status, input=prey,
         outputs=outputs,
         fee_gold=job.fee_gold, duration_minutes=job.duration_minutes,
         started_world_minute=None if job.status == "QUEUED" else job.started_world_minute,
@@ -207,25 +153,29 @@ def _entry(job, minute):
         (job.status in ("QUEUED", "FAILED") or minute < job.ready_world_minute), can_claim=job.status == "READY")
 
 
-def processing_overview(player, bag, minute, read_only=False):
+def processing_overview(player, bag, minute, read_only=False, *, slots=None):
     """Never initializes inventory, completes work or mutates any world state."""
+    slots = (bag.slots.filter(item_id__in=FEES, item_amount__gt=0).select_related("usage", "dish").order_by("slot_index") if bag.pk else []) if slots is None else sorted(slots, key=lambda s: s.slot_index)
+    slots = [slot for slot in slots if slot.item_id in FEES and slot.item_amount > 0] if bag.pk and bag.player_id == player.pk and bag.character_id == player.username else []
+    duration = VillageActionDurationConfig.configured_duration("PROCESS_GAME")
+    reason = _workshop_waiting_reason()
+    context = (duration, reason)
     inputs = []
-    if bag.pk and bag.player_id == player.pk and bag.character_id == player.username:
-        for slot in bag.slots.filter(item_id__in=FEES, item_amount__gt=0).order_by("slot_index"):
-            preview, _ = _preview(player, bag, slot, minute, read_only=read_only)
-            inputs.append(dict(**_batch(slot), can_start=preview["available"], reason=preview["reason"],
-                               max_quantity=preview["max_quantity"],
-                               fee_gold=preview["fee_gold"], duration_minutes=preview["duration_minutes"],
-                               outputs=preview["outputs"]))
-    reason = _jack_reason(minute)
-    if not VillageActionDurationConfig.configured_duration("PROCESS_GAME"):
-        reason = reason or "PROCESSING_DURATION_UNAVAILABLE"
-    if not reason:
-        _, reason = _tool(minute)
+    for slot in slots:
+        preview = _preview(player, bag, slot, minute, read_only=read_only, context=context)
+        inputs.append(dict(**_batch(slot), can_start=preview["available"], reason=preview["reason"],
+                           max_quantity=preview["max_quantity"],
+                           fee_gold=preview["fee_gold"], duration_minutes=preview["duration_minutes"],
+                           outputs=preview["outputs"]))
+    reason = reason or ("PROCESSING_DURATION_UNAVAILABLE" if not duration else "")
+    jobs = list(VillagePlayerProcessingJob.objects.filter(player=player).order_by("-submitted_at", "job_id"))
+    item_ids = {job.input_snapshot.get("item_id") for job in jobs}
+    item_ids.update(int(item_id) for job in jobs for item_id in job.output_spec)
+    names = dict(Item.objects.filter(pk__in=item_ids).values_list("pk", "item_name")) if jobs else {}
     return dict(revision=PlayerGrowthState.objects.filter(player=player).values_list("revision", flat=True).first() or 0,
-        observed_world_minute=minute, available=bool(VillageActionDurationConfig.configured_duration("PROCESS_GAME")),
+        observed_world_minute=minute, available=bool(duration),
         reason="", waiting_reason=reason, inputs=inputs,
-        jobs=[_entry(job, minute) for job in VillagePlayerProcessingJob.objects.filter(player=player).order_by("-submitted_at", "job_id")],
+        jobs=[_entry(job, minute, names=names) for job in jobs],
         max_submission_quantity=MAX_SUBMISSION_QUANTITY,
         fee_rules=[dict(item_id=i, fee_gold=n) for i, n in FEES.items()])
 
@@ -250,70 +200,47 @@ def _release_trial(job):
 
 def _settle_job(job, minute):
     """Caller holds clock/job; failures preserve input and the full fee."""
-    if job.status != "RUNNING":
+    if job.status != "RUNNING" or minute < job.ready_world_minute:
         return False
-    from .phase2_services import settle_action_needs_locked
-    from .phase3_asset_service import consume_tool_use
-    rt = NpcRuntimeState.objects.select_for_update().filter(npc__agent_id="10012").first()
-    reason = _jack_reason(job.needs_until, exclude_job=job.pk)
-    end = min(minute, job.ready_world_minute)
-    while job.needs_until < end and not reason:
-        reason = settle_action_needs_locked(rt, "PROCESS_GAME", job.needs_until, job.needs_until + 1,
-                                           base_until=job.needs_until + 1)
-        job.needs_until += 1
-        reason = reason or _runtime_reason(rt, job.needs_until)
-    if rt is not None:
-        rt.save()
-    job.save(update_fields=["needs_until"])
-    if not reason and minute < job.ready_world_minute:
-        return False
-    if not reason:
-        try:
-            with transaction.atomic():
-                held = InventorySlot.objects.select_for_update().get(pk=job.input_slot_id)
-                escrow = InventoryBag.objects.select_for_update().get(pk=job.escrow_bag_id)
-                if (held.bag_id != escrow.pk or held.item_amount != 1 or escrow.money != job.fee_gold
-                        or _snapshot(held)["attributes"] != {"equipment_level": 1, **job.input_snapshot["attributes"]}):
-                    _fail("PROCESSING_ESCROW_INVALID")
-                # Release only this reservation inside the atomic completion savepoint.
-                job.status = "SETTLING"
-                job.save(update_fields=["status"])
-                tool = consume_tool_use("10012", HUNT_TOOL_ITEM_ID, job.ready_world_minute,
-                                        slot_instance_id=job.tool_instance_id)
-                inv = NpcGlobalInventory.objects.select_for_update().get(npc__agent_id="10012")
-                outputs = []
-                for item_id, amount in job.output_spec.items():
-                    item_id = int(item_id)
-                    item = Item.objects.filter(pk=item_id, is_deleted=False).first()
-                    if item is None:
-                        _fail("PROCESSING_CATALOG_UNAVAILABLE")
-                    slot = InventorySlot.objects.create(bag=escrow, slot_index=_next_index(escrow),
-                        item_id=item_id, item_bag_name=item.item_name, item_amount=amount, quality=held.quality,
-                        produced_world_minute=job.ready_world_minute if item_id in NEW_CONTENT_ITEM_IDS else held.produced_world_minute,
-                        expires_world_minute=None,
-                        source_request_id=job.request_id, freshness_unknown=False)
-                    outputs.append(_batch(slot))
-                held.item_amount = 0
-                held.save(update_fields=["item_amount"])
-                escrow.money = 0
-                escrow.save(update_fields=["money"])
-                inv.money += job.fee_gold
-                inv.asset_version += 1
-                inv.save(update_fields=["money", "asset_version", "updated_at"])
-                job.status = "READY"
-                job.output_snapshot = outputs
-                job.completed_world_minute = job.ready_world_minute
-                job.save(update_fields=["status", "output_snapshot", "completed_world_minute"])
-                _ledger(job, "complete", job.ready_world_minute, dict(fee_paid=job.fee_gold,
-                    input_consumed=1, outputs=outputs, tool_instance_id=str(tool.instance_id),
-                    remaining_uses=tool.remaining_uses))
-                record_production("PLAYER", job.player_id, job.request_id,
-                    {int(item): amount for item, amount in job.output_spec.items()}, job.ready_world_minute,
-                    source_kind="PROCESS_GAME", prey_item_id=held.item_id,
-                    reservation_request_id=trial_request_id(job.player_id, job.request_id),
-                    output_instance_ids=[row["instance_id"] for row in outputs], outputs=outputs)
-        except (ProcessingError, ValueError) as exc:
-            reason = exc.code if isinstance(exc, ProcessingError) else str(exc)
+    reason = ""
+    try:
+        with transaction.atomic():
+            held = InventorySlot.objects.select_for_update().get(pk=job.input_slot_id)
+            escrow = InventoryBag.objects.select_for_update().get(pk=job.escrow_bag_id)
+            if (held.bag_id != escrow.pk or held.item_amount != 1 or escrow.money != job.fee_gold
+                    or _snapshot(held)["attributes"] != {"equipment_level": 1, **job.input_snapshot["attributes"]}):
+                _fail("PROCESSING_ESCROW_INVALID")
+            # Jack remains the service owner/payee; his body and tools do no work here.
+            inv = NpcGlobalInventory.objects.select_for_update().get(npc__agent_id="10012")
+            outputs = []
+            for item_id, amount in job.output_spec.items():
+                item_id = int(item_id)
+                item = Item.objects.filter(pk=item_id, is_deleted=False).first()
+                if item is None:
+                    _fail("PROCESSING_CATALOG_UNAVAILABLE")
+                for slot, delta in add_inventory_items(escrow, item_id, amount,
+                        attributes=dict(item_bag_name=item.item_name, quality=held.quality)):
+                    outputs.append(dict(_batch(slot), amount=delta, quantity=delta))
+            held.item_amount = 0
+            held.save(update_fields=["item_amount"])
+            escrow.money = 0
+            escrow.save(update_fields=["money"])
+            inv.money += job.fee_gold
+            inv.asset_version += 1
+            inv.save(update_fields=["money", "asset_version", "updated_at"])
+            job.status = "READY"
+            job.output_snapshot = outputs
+            job.completed_world_minute = job.needs_until = job.ready_world_minute
+            job.save(update_fields=["status", "output_snapshot", "completed_world_minute", "needs_until"])
+            _ledger(job, "complete", job.ready_world_minute, dict(fee_paid=job.fee_gold,
+                input_consumed=1, outputs=outputs))
+            record_production("PLAYER", job.player_id, job.request_id,
+                {int(item): amount for item, amount in job.output_spec.items()}, job.ready_world_minute,
+                source_kind="PROCESS_GAME", prey_item_id=held.item_id,
+                reservation_request_id=trial_request_id(job.player_id, job.request_id),
+                output_instance_ids=[row["instance_id"] for row in outputs], outputs=outputs)
+    except (ProcessingError, ValueError) as exc:
+        reason = exc.code if isinstance(exc, ProcessingError) else str(exc)
     if reason:
         _release_trial(job)
         job.status = "FAILED"
@@ -331,19 +258,28 @@ def settle_processing_jobs(minute):
         return []
     minute = min(int(minute), clock.world_minute)
     affected = []
-    for job in VillagePlayerProcessingJob.objects.select_for_update().filter(status="RUNNING").select_related("player"):
-        if _settle_job(job, minute):
+    # A coalesced Tick still processes the queue on its original work timeline.
+    while True:
+        job = VillagePlayerProcessingJob.objects.select_for_update().filter(
+            status="RUNNING", ready_world_minute__lte=minute).select_related("player").order_by("ready_world_minute", "job_id").first()
+        if job is None:
+            break
+        if _settle_job(job, job.ready_world_minute):
             affected.append(job.player_id)
+        affected.extend(_start_queued_jobs(job.ready_world_minute))
     affected.extend(_start_queued_jobs(minute))
     return list(dict.fromkeys(affected))
 
 
 def _start_queued_jobs(minute):
-    """Only actual arrival and a free work slot start the clock and reserve a tool."""
+    """A free workshop slot starts the next job, independently of any NPC."""
     affected = []
+    if _workshop_waiting_reason():
+        return affected
     for job in VillagePlayerProcessingJob.objects.select_for_update().filter(status="QUEUED").select_related("player").order_by("submitted_at", "started_world_minute", "job_id"):
         held = InventorySlot.objects.select_for_update().get(pk=job.input_slot_id)
-        reason = _prey_reason(held, minute, job.duration_minutes)
+        started = max(minute, job.started_world_minute)
+        reason = _prey_reason(held, started, job.duration_minutes)
         if reason:
             _release_trial(job)
             job.status, job.failure_reason = "FAILED", reason
@@ -351,29 +287,45 @@ def _start_queued_jobs(minute):
             _bump(job.player)
             affected.append(job.player_id)
             continue
-        if _jack_reason(minute):
-            continue
-        tool, reason = _tool(minute)
-        if reason:
-            continue
         job.status = "RUNNING"
-        job.tool_instance_id = tool.instance_id
-        job.started_world_minute = job.needs_until = minute
-        job.ready_world_minute = minute + job.duration_minutes
+        job.tool_instance_id = None
+        job.started_world_minute = job.needs_until = started
+        job.ready_world_minute = started + job.duration_minutes
         job.save(update_fields=["status", "tool_instance_id", "started_world_minute", "needs_until", "ready_world_minute"])
-        _ledger(job, "begin_work", minute, dict(tool_instance_id=str(tool.instance_id)))
+        _ledger(job, "begin_work", started, {})
         _bump(job.player)
         affected.append(job.player_id)
         break
     return affected
 
 
+def _claim_job(job, bag, minute, rid):
+    if job.status != "READY":
+        _fail("PROCESSING_NOT_READY", "工单尚未完成，或已领取。")
+    escrow = InventoryBag.objects.select_for_update().get(pk=job.escrow_bag_id)
+    returned = []
+    for snapshot in job.output_snapshot:
+        slot = escrow.slots.select_for_update().filter(instance_id=snapshot["instance_id"],
+            item_id=snapshot["item_id"], item_amount=snapshot["quantity"]).first()
+        if slot is None:
+            _fail("PROCESSING_ESCROW_INVALID")
+        restored = add_inventory_items(bag, slot.item_id, snapshot["quantity"], attributes=attributes_from_slot(slot))
+        slot.item_amount = 0
+        slot.save(update_fields=["item_amount"])
+        returned.extend(str(s.instance_id) for s, _ in restored)
+    job.status, job.claimed_world_minute = "CLAIMED", minute
+    job.save(update_fields=["status", "claimed_world_minute"])
+    _ledger(job, "claim", minute, dict(returned_instance_ids=returned), rid=rid)
+    return returned
+
+
 @transaction.atomic
 def execute_processing_action(player, bag, action, params, rid, clock):
     """Mutations run in player_actions' existing clock/player/bag transaction."""
     minute = clock.world_minute
+    claim_all = action == "claim_game_processing" and params.get("all_ready") is True
     allowed = {"prey_instance_id"} if action == "preview_game_processing" else (
-        {"prey_instance_id", "expected_quote"} if action == "start_game_processing" else {"job_id"})
+        {"prey_instance_id", "expected_quote"} if action == "start_game_processing" else {"all_ready"} if claim_all else {"job_id"})
     if set(params) - (allowed | {"quantity"}) or not allowed.issubset(params) or (
             action not in ("preview_game_processing", "start_game_processing") and "quantity" in params):
         _fail("INVALID_PARAMS")
@@ -382,10 +334,23 @@ def execute_processing_action(player, bag, action, params, rid, clock):
         _fail("INVALID_PARAMS", f"每次可提交 1–{MAX_SUBMISSION_QUANTITY} 份委托。")
     if not bag.pk or bag.player_id != player.pk or bag.character_id != player.username:
         _fail("INVALID_BAG")
+    if action != "preview_game_processing":
+        settle_processing_jobs(minute)
+    if claim_all:
+        jobs = list(VillagePlayerProcessingJob.objects.select_for_update().filter(player=player, status="READY")
+            .order_by("submitted_at", "job_id"))
+        if not jobs:
+            _fail("PROCESSING_NOT_READY", "暂无已完成且未领取的工单。")
+        entries, returned = [], []
+        for job in jobs:
+            returned.extend(_claim_job(job, bag, minute, uuid.uuid5(rid, f"claim:{job.pk}")))
+            entries.append(_entry(job, minute))
+        return dict(job=entries[0], jobs=entries, claimed_count=len(entries),
+            claimed_items=[item for entry in entries for item in entry["outputs"]], returned_instance_ids=returned)
     if action in ("preview_game_processing", "start_game_processing"):
         query = bag.slots if action == "preview_game_processing" else bag.slots.select_for_update()
         slot = query.filter(instance_id=_uuid(params["prey_instance_id"]), item_id__in=FEES).first()
-        preview, _ = _preview(player, bag, slot, minute, quantity=quantity)
+        preview = _preview(player, bag, slot, minute, quantity=quantity)
         if action == "preview_game_processing":
             return dict(preview=preview)
         if not preview["available"]:
@@ -399,10 +364,7 @@ def execute_processing_action(player, bag, action, params, rid, clock):
                 _fail("CAREER_TRIAL_LIMIT", "本期试加工额度不足，请先完成已有试制品销售。")
             job_id = uuid.uuid5(job_request, str(player.pk))
             escrow = InventoryBag.objects.create(player=player, character_id=f"jack-processing:{job_id}", money=preview["unit_fee_gold"])
-            held = InventorySlot(bag=escrow, slot_index=0, item_id=slot.item_id,
-                                 item_bag_name=slot.item_bag_name, item_amount=1, hide_in_shop=slot.hide_in_shop)
-            copy_batch_attributes(slot, held)
-            held.save()
+            held = add_inventory_items(escrow, slot.item_id, 1, attributes=attributes_from_slot(slot))[0][0]
             snapshot = _snapshot(held)
             job = VillagePlayerProcessingJob.objects.create(job_id=job_id, player=player, request_id=job_request,
                 escrow_bag=escrow, input_slot=held, source_instance_id=slot.instance_id, input_snapshot=snapshot,
@@ -433,8 +395,9 @@ def execute_processing_action(player, bag, action, params, rid, clock):
         escrow = InventoryBag.objects.select_for_update().get(pk=job.escrow_bag_id)
         if held.bag_id != escrow.pk or held.item_amount != 1 or escrow.money != job.fee_gold:
             _fail("PROCESSING_ESCROW_INVALID")
-        held.bag, held.slot_index = bag, _next_index(bag)
-        held.save(update_fields=["bag", "slot_index"])
+        restored = add_inventory_items(bag, held.item_id, 1, attributes=attributes_from_slot(held))
+        held.item_amount = 0
+        held.save(update_fields=["item_amount"])
         bag.money += escrow.money
         bag.save(update_fields=["money"])
         escrow.money = 0
@@ -442,23 +405,11 @@ def execute_processing_action(player, bag, action, params, rid, clock):
         job.status, job.claimed_world_minute = "CANCELLED", minute
         job.save(update_fields=["status", "claimed_world_minute"])
         _release_trial(job)
-        _ledger(job, "cancel", minute, dict(refunded_gold=job.fee_gold, returned_instance_id=str(held.instance_id)), rid=rid)
-        return dict(job=_entry(job, minute), returned_instance_ids=[str(held.instance_id)])
+        _ledger(job, "cancel", minute, dict(refunded_gold=job.fee_gold, returned_instance_ids=[str(s.instance_id) for s, _ in restored]), rid=rid)
+        _start_queued_jobs(minute)
+        return dict(job=_entry(job, minute), returned_instance_ids=[str(s.instance_id) for s, _ in restored])
     if action != "claim_game_processing":
         _fail("INVALID_ACTION")
-    if job.status != "READY":
-        _fail("PROCESSING_NOT_READY", "工单尚未完成，或已领取。")
-    escrow = InventoryBag.objects.select_for_update().get(pk=job.escrow_bag_id)
-    returned = []
-    for snapshot in job.output_snapshot:
-        slot = escrow.slots.select_for_update().filter(instance_id=snapshot["instance_id"],
-            item_id=snapshot["item_id"], item_amount=snapshot["quantity"]).first()
-        if slot is None:
-            _fail("PROCESSING_ESCROW_INVALID")
-        slot.bag, slot.slot_index = bag, _next_index(bag)
-        slot.save(update_fields=["bag", "slot_index"])
-        returned.append(str(slot.instance_id))
-    job.status, job.claimed_world_minute = "CLAIMED", minute
-    job.save(update_fields=["status", "claimed_world_minute"])
-    _ledger(job, "claim", minute, dict(returned_instance_ids=returned), rid=rid)
-    return dict(job=_entry(job, minute), returned_instance_ids=returned)
+    returned = _claim_job(job, bag, minute, rid)
+    entry = _entry(job, minute)
+    return dict(job=entry, claimed_count=1, claimed_items=entry["outputs"], returned_instance_ids=returned)

@@ -63,7 +63,7 @@ PARAMS = {
     "preview_game_processing": {"prey_instance_id", "quantity"},
     "start_game_processing": {"prey_instance_id", "quantity", "expected_quote"},
     "cancel_game_processing": {"job_id"},
-    "claim_game_processing": {"job_id"},
+    "claim_game_processing": {"job_id", "all_ready"},
     "overview": {"section"},
     "plant_state": set(),
     "contribute": {"affair_id", "condition_id", "kind", "item_id", "quantity", "instance_id"},

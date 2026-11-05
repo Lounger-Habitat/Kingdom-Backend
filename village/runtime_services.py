@@ -1617,10 +1617,6 @@ class CommandService:
                 message="此指令已停用。", allow_prestart_failure=True)
             return False, "ACTION_RETIRED", command
 
-        from .player_processing import jack_processing_busy
-        if jack_processing_busy(str(command.npc.agent_id)):
-            return False, ResultCode.NPC_BUSY, command
-
         # SOCIALIZE acquires both runtime rows in stable agent-id order before
         # any reservation is created.  Every later start sees the HELD shared
         # reservation and refuses to claim either participant.
