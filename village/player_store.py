@@ -1,10 +1,8 @@
 """Player store settlements under the player action savepoint."""
-import copy
 import uuid
 
-from django.db.models import Max
 
-from inventory.components import COMPONENT_FIELDS
+from inventory.storage import add_inventory_items, add_store_items, attributes_from_slot
 from inventory.models import InventorySlot
 from inventory.serializers import serialize_bag
 from items.models import Item
@@ -16,7 +14,7 @@ from .phase3_direct_trade import _compute_fee, _consume_store_fefo_available, _T
 from .phase5_story import get_store_purchase_limit
 
 
-def store_sale_quote(slot, item, minute):
+def store_sale_quote(slot, item, minute, *, equipment_catalog=None):
     from .phase3_direct_trade import general_store_tool_sale_reason
     reason = None
     if item is None or item.is_deleted or item.item_price <= 0:
@@ -27,7 +25,8 @@ def store_sale_quote(slot, item, minute):
         if has_quality(item) and not valid_quality(slot.quality):
             reason = "物品品质记录无效"
         else:
-            tool_reason = general_store_tool_sale_reason(item.item_type, item.max_use_count, slot.remaining_uses, slot=slot)
+            tool_reason = general_store_tool_sale_reason(item.item_type, item.max_use_count, slot.remaining_uses,
+                slot=slot, equipment_catalog=equipment_catalog)
             if tool_reason:
                 reason = "仅收购满耐久工具" if tool_reason == "TOOL_NOT_FULL_DURABILITY" else "工具耐久无效或未核实，暂不能收购"
     return dict(allowed=reason is None, reason=reason,
@@ -58,14 +57,9 @@ def sell_to_store(player, bag, params, request_id, location, clock):
     total = quote["unit_price"] * quantity
     if account is None or account.balance < total:
         fail("TRADE_INSUFFICIENT_MONEY", "商店金币不足，无法收购。")
-    target = VillageStoreInventorySlot(store=store, item_id=slot.item_id, item_amount=quantity,
-        quality=slot.quality, produced_world_minute=slot.produced_world_minute,
-        expires_world_minute=slot.expires_world_minute, source_slot_instance_id=slot.instance_id,
+    add_store_items(store, slot.item_id, quantity, attributes=dict(attributes_from_slot(slot),
         common_attributes=dict(freshness_unknown=slot.freshness_unknown, item_bag_name=slot.item_bag_name,
-            source_player_id=str(player.pk), source_request_id=str(slot.source_request_id) if slot.source_request_id else None))
-    for name in COMPONENT_FIELDS:
-        setattr(target, name, copy.deepcopy(getattr(slot, name)))
-    target.save()
+            source_player_id=str(player.pk))), source_instance_id=slot.instance_id)
     slot.item_amount -= quantity
     slot.save(update_fields=["item_amount"])
     bag.money += total
@@ -167,24 +161,14 @@ def buy_from_store(player, bag, params, request_id, location, clock):
             consumed = _consume_store_fefo_available(store, listing, quantity, clock.world_minute)
         except ValueError:
             fail("TRADE_INSUFFICIENT_ITEM", "商品可售库存不足。")
-    next_index = (bag.slots.aggregate(n=Max("slot_index"))["n"] or 0) + 1
     purchased = []
-    from .career_trade import source_request_id
     for source, amount in consumed:
-        attributes = source.item_attributes or {}
-        target = InventorySlot(bag=bag, slot_index=next_index, item_id=source.item_id,
-            item_amount=amount, quality=source.quality, produced_world_minute=source.produced_world_minute,
-            expires_world_minute=source.expires_world_minute, source_request_id=source_request_id(source, request_id),
-            freshness_unknown=bool(attributes.get("freshness_unknown")),
-            item_bag_name=attributes.get("item_bag_name", ""))
-        for name in COMPONENT_FIELDS:
-            setattr(target, name, getattr(source, name))
+        attributes = attributes_from_slot(source)
         if claim:
-            target.dish_metadata = claim["attributes"]["dish_metadata"]
-        target.save()
-        next_index += 1
-        purchased.append(dict(instance_id=str(target.instance_id), item_id=target.item_id,
-            quantity=amount, quality=target.quality, expires_world_minute=None))
+            attributes["dish_metadata"] = claim["attributes"]["dish_metadata"]
+        for target, delta in add_inventory_items(bag, source.item_id, amount, attributes=attributes):
+            purchased.append(dict(instance_id=str(target.instance_id), item_id=target.item_id,
+                quantity=delta, quality=target.quality, expires_world_minute=None))
     bag.money -= total
     bag._money_change_source = "village_store_buy"
     bag.save(update_fields=["money"])

@@ -124,18 +124,18 @@ def confirmed_felling(command):
 
 
 def settle_npc_wood(npc_id, params, world_minute, request_id):
-    from .phase3_asset_service import _ok, _fail, add_batch
+    from .phase3_asset_service import _ok, _fail
+    from inventory.storage import add_inventory_items
     command = NpcCommandState.objects.filter(request_id=request_id, kind="CHOP_TREE", npc__agent_id=str(npc_id), status="RUNNING").first()
     attempt = confirmed_felling(command) if command else None
     if attempt is None:
         return _fail("TREE_FELL_REQUIRED")
     inventory = NpcGlobalInventory.objects.select_for_update().get(npc=command.npc)
-    batch = add_batch(inventory, attempt.output_item_id, attempt.wood_amount, expires_world_minute=None,
-                      produced_world_minute=attempt.node.felled_world_minute, source_request_id=request_id)
+    outputs = add_inventory_items(inventory, attempt.output_item_id, attempt.wood_amount)
     inventory.asset_version += 1
     inventory.save(update_fields=["asset_version"])
     return _ok(asset_versions={str(npc_id): inventory.asset_version},
-               effects={"items_added": [dict(item_id=attempt.output_item_id, amount=attempt.wood_amount, instance_id=str(batch.instance_id))]},
+               effects={"items_added": [dict(item_id=attempt.output_item_id, amount=delta, instance_id=str(slot.instance_id)) for slot, delta in outputs]},
                data={"node_id": str(attempt.node_id), "generation": attempt.generation})
 
 
@@ -292,11 +292,11 @@ def _execute(action, p, clock):
         player, bag, tool, _ = player_capability(attempt.actor_id, node, clock.world_minute,
                                                 attempt.tool_instance_id)
         bag = InventoryBag.objects.select_for_update().get(pk=bag.pk)
-        index = bag.slots.aggregate(n=models.Max("slot_index"))["n"]
-        slot = InventorySlot.objects.create(bag=bag, slot_index=0 if index is None else index+1,
-            item_id=attempt.output_item_id, item_amount=attempt.wood_amount, quality=4 if node.species == "DURABLE_OAK" else 0, produced_world_minute=minute,
-            source_request_id=identifier(p["request_id"]), item_bag_name=item.item_name)
-        added = [dict(batch_evidence(slot), item_name=item.item_name, amount=attempt.wood_amount)]
+        from inventory.storage import add_inventory_items
+        quality = 4 if node.species == "DURABLE_OAK" else 0
+        outputs = add_inventory_items(bag, attempt.output_item_id, attempt.wood_amount,
+            attributes=dict(quality=quality, item_bag_name=item.item_name))
+        added = [dict(batch_evidence(slot), item_name=item.item_name, amount=delta, quantity=delta) for slot, delta in outputs]
         tool_used = wear_tool(tool)
         reward = award_skill(player, source_type="forestry", source_id=f"{node.pk}:{generation}",
             skill_code="forestry", xp=6 if node.species == "DURABLE_OAK" else 4 if node.species == "HARDWOOD" else 2,
@@ -304,7 +304,7 @@ def _execute(action, p, clock):
             facts=dict(node_id=str(node.pk), generation=generation, species=node.species,
                        output_item_id=attempt.output_item_id, output_quantity=attempt.wood_amount,
                        tool_instance_id=tool_used["instance_id"], source_request_id=str(p["request_id"]),
-                       produced_world_minute=minute, quality=slot.quality,
+                       produced_world_minute=minute, quality=quality,
                        tool_tier=stats_for(tool)["tier"], tool_equipment_level=tool.equipment_level, outputs=added))
         VillageWorldEvent.objects.create(dedupe_key=f"forestry:{node.pk}:{generation}", event_type="PLAYER_CHOP_TREE",
             world_minute=minute, time_revision=clock.time_revision, player_ids=[attempt.actor_id],

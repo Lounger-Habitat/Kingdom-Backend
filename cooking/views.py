@@ -370,27 +370,10 @@ def _clear_slot_if_empty(slot):
 
 
 def _add_dish_to_bag(bag, item_id, ingredient, cook_time, dish_quality):
-    """在背包中找空槽位放入菜品。"""
-    empty = bag.slots.filter(item_amount=0).first()
-    if not empty:
-        max_index = bag.slots.aggregate(Max("slot_index"))["slot_index__max"]
-        next_index = (max_index + 1) if max_index is not None else 0
-        empty = InventorySlot.objects.create(bag=bag, slot_index=next_index)
-
-    item_name = ""
-    try:
-        item_name = Item.objects.get(item_id=item_id).item_name
-    except Item.DoesNotExist:
-        pass
-
-    empty.item_id = item_id
-    empty.item_amount = 1
-    empty.ingredient = ingredient
-    empty.cook_time = cook_time
-    empty.dish_quality = dish_quality
-    empty.dish_metadata = {}
-    empty.item_bag_name = f"{item_name}_{empty.slot_index}"
-    empty.save()
+    """Add one independently identified dish."""
+    from inventory.storage import add_inventory_items
+    add_inventory_items(bag, item_id, 1, attributes=dict(ingredient=ingredient,
+        cook_time=cook_time, dish_quality=dish_quality))
 
 
 def _calculate_dish_quality(recipe, player_ing_map, ingredients_exact, cook_time):

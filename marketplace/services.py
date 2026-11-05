@@ -7,6 +7,7 @@ from django.db.models import Max, Q
 from django.utils import timezone
 
 from account.models import GameAccount
+from inventory.storage import add_inventory_items
 from inventory.models import (
     InventoryBag,
     InventorySlot,
@@ -319,67 +320,20 @@ def _listing_seller_owner(listing):
 
 
 def _return_items_to_bag(bag, listing, amount):
-    snap = _listing_batch(listing)
-    special = is_special_instance(snap)
-
-    if not special:
-        existing = bag.slots.filter(item_id=listing.item_id, item_amount__gt=0,
-            produced_world_minute__isnull=True, expires_world_minute__isnull=True, freshness_unknown=False,
-            usage__remaining__isnull=True).first()
-        if existing:
-            existing.item_amount += amount
-            existing.save(update_fields=["item_amount"])
-            return existing
-
-    slot = find_empty_slot(bag)
-    slot.item_id = listing.item_id
-    slot.item_amount = amount
-    slot.rated = listing.rated
-    slot.rating_price = listing.rating_price
-    slot.overall_score = listing.overall_score
-    slot.ingredient = listing.ingredient
-    slot.item_bag_name = listing.item_bag_name
-    slot.cook_time = listing.cook_time
-    slot.dish_quality = listing.dish_quality
-    slot.remaining_uses = listing.remaining_uses
-    slot.equipment_level = listing.equipment_level
-    slot.review_comment = listing.review_comment
-    _apply_batch(slot, snap)
-    slot.save()
-    return slot
+    return _add_snapshot_item_to_bag(bag, _listing_batch(listing), amount)
 
 
 def _add_snapshot_item_to_bag(bag, snap, amount):
-    special = is_special_instance(snap)
-
-    if not special:
-        existing = bag.slots.filter(item_id=snap.get("itemID", 0), item_amount__gt=0,
-            produced_world_minute__isnull=True, expires_world_minute__isnull=True, freshness_unknown=False,
-            usage__remaining__isnull=True).first()
-        if existing:
-            existing.item_amount += amount
-            existing.save(update_fields=["item_amount"])
-            return existing
-
-    slot = find_empty_slot(bag)
-    slot.item_id = snap.get("itemID", 0)
-    slot.item_amount = amount
-    slot.rated = snap.get("rated", False)
-    slot.rating_price = snap.get("ratingPrice", -1)
-    slot.overall_score = snap.get("overallScore", 0)
-    slot.ingredient = snap.get("ingredient", "")
-    item = Item.objects.filter(item_id=slot.item_id).first()
-    item_name = item.item_name if item else f"物品#{slot.item_id}"
-    slot.item_bag_name = f"{item_name}_{slot.slot_index}"
-    slot.cook_time = snap.get("cookTime", 0)
-    slot.dish_quality = snap.get("dishQuality", 3)
-    slot.hide_in_shop = False
-    slot.equipment_level = snap.get("equipmentLevel", 1)
-    slot.remaining_uses = snap.get("remainingUses")
-    slot.review_comment = snap.get("reviewComment", "")
-    _apply_batch(slot, snap)
-    slot.save()
-    return slot
+    attributes = {
+        "rated": snap.get("rated", False), "rating_price": snap.get("ratingPrice", -1),
+        "overall_score": snap.get("overallScore", 0), "ingredient": snap.get("ingredient", ""),
+        "cook_time": snap.get("cookTime", 0), "quality": snap.get("dishQuality", 3),
+        "equipment_level": snap.get("equipmentLevel", 1), "remaining_uses": snap.get("remainingUses"),
+        "review_comment": snap.get("reviewComment", ""), "dish_metadata": dict(snap.get("dishMetadata") or {}),
+        "produced_world_minute": snap.get("producedWorldMinute"), "expires_world_minute": snap.get("expiresWorldMinute"),
+        "freshness_unknown": bool(snap.get("freshnessUnknown", False)), "source_request_id": snap.get("sourceRequestId"),
+    }
+    return add_inventory_items(bag, snap.get("itemID", 0), amount, attributes=attributes)
 
 
 def _expire_single_listing(listing):
@@ -537,7 +491,7 @@ def _delist_listing_for_owner(owner, listing_id, *, expected_asset_version=None,
         received = _return_items_to_bag(owner["bag"], listing, listing.remaining_amount)
         if include_returned_items:
             from village.agent_feedback import received_batch
-            returned_items.append(received_batch(received, listing.remaining_amount))
+            returned_items.extend(received_batch(slot, delta) for slot, delta in received)
 
     listing.remaining_amount = 0
     listing.status = MarketListingStatus.DELISTED
@@ -651,7 +605,7 @@ def _buy_listing_for_owner(buyer_owner, listing_id, amount, *, expected_asset_ve
 
     result = {"bag": buyer_owner["bag"], "transaction": tx, "listing": listing}
     from village.agent_feedback import received_batch
-    result["purchased_batches"] = [received_batch(received, amount)]
+    result["purchased_batches"] = [received_batch(slot, delta) for slot, delta in received]
     return result, None
 
 

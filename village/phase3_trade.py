@@ -18,14 +18,13 @@ from typing import Any, Dict, Optional
 
 from django.db import models, transaction
 
+from inventory.storage import add_inventory_items, attributes_from_slot
 from inventory.models import NpcGlobalInventory, NpcGlobalInventorySlot
 
 from .models import NpcTradeDelivery, NpcTradeOrder
 from .phase3_asset_service import (
-    BATCH_ITEM_ATTRIBUTES,
     _fail,
     _ok,
-    add_batch,
     get_available_slot_amount,
 )
 from .phase3_contract import DELIVERY_POINTS, ResultCode
@@ -467,16 +466,7 @@ def _do_start_delivery(
         seller_slot.save(update_fields=["item_amount"])
 
         # Buyer add same-batch items (new slot, preserving batch properties)
-        add_batch(
-            buyer_inv,
-            item_id,
-            transfer_amount,
-            seller_slot.produced_world_minute or world_minute,
-            seller_slot.expires_world_minute,
-            request_id,
-            remaining_uses=seller_slot.remaining_uses,
-            item_attributes={key: getattr(seller_slot, key) for key in BATCH_ITEM_ATTRIBUTES},
-        )
+        add_inventory_items(buyer_inv, item_id, transfer_amount, attributes=attributes_from_slot(seller_slot))
 
         # Money transfer: buyer pays seller
         buyer_inv.money -= transfer_money

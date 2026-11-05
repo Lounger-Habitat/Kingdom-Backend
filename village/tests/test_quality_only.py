@@ -10,7 +10,7 @@ from django.apps import apps
 from django.db import connection
 from django.test import SimpleTestCase, TestCase
 
-from inventory.batches import project_batch
+from inventory.batches import project_item_attributes
 from inventory.models import InventorySlot
 from items.models import Item, ItemType
 from items.quality import (PRODUCTION_WEIGHTS, cooking_quality, ingredient_average,
@@ -103,9 +103,9 @@ class QualityCookingTests(PlayerFixture, TestCase):
 
     def test_projection_hides_expiry_without_changing_stored_audit_fields(self):
         source = self.slot(2, quality=2, expires_world_minute=1, freshness_unknown=True)
-        projected = project_batch(source, Item.objects.get(pk=1030), 100)
+        projected = project_item_attributes(source, Item.objects.get(pk=1030), 100)
         self.assertEqual(projected["quality"], 2)
-        self.assertIsNone(projected["freshness"])
+        self.assertNotIn("freshness", projected)
         source.refresh_from_db()
         self.assertEqual((source.quality, source.expires_world_minute, source.freshness_unknown), (2, 1, True))
 
@@ -146,7 +146,7 @@ class QualityStoreTests(PlayerFixture, TestCase):
         item = Item.objects.get(pk=1030)
         self.assertEqual(item.item_type, ItemType.COMMODITY)
         self.assertTrue(item.quality_enabled)
-        self.assertEqual(project_batch(source, item, 100)["quality"], 5)
+        self.assertEqual(project_item_attributes(source, item, 100)["quality"], 5)
         self.assertEqual(store_sale_quote(source, item, 100)["unit_price"], 15)
 
     def test_buyback_prices_old_batches_by_quality_and_replay_conserves_assets(self):

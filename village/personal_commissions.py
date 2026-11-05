@@ -14,7 +14,8 @@ from django.db import models, transaction
 
 from account.models import GameAccount
 from game_time.models import GlobalGameTimeState
-from inventory.components import BATCH_COPY_FIELDS, copy_batch_attributes, same_batch_attributes
+from inventory.storage import add_inventory_items
+from inventory.components import BATCH_COPY_FIELDS
 from inventory.models import InventoryBag, InventorySlot, NpcDefinition, NpcGlobalInventory, NpcGlobalInventorySlot
 from .affairs import AffairError, active_stage, condition_progress, normalize_definition, project_affair, resolve_condition
 from .models import (NpcProfile, VillagePersonalCommission, VillagePersonalCommissionEscrow,
@@ -367,20 +368,7 @@ def _release_items(row, bag, status):
         snapshot = deepcopy(batch.batch_snapshot)
         if snapshot.get("source_request_id"):
             snapshot["source_request_id"] = uuid.UUID(snapshot["source_request_id"])
-        source = SimpleNamespace(**snapshot)
-        slot = None
-        if status == "REFUNDED":
-            slot = slot_model.objects.select_for_update().filter(bag=bag, instance_id=batch.source_instance_id,
-                                                                item_id=batch.item_id).first()
-            if slot and not same_batch_attributes(slot, source):
-                slot = None
-        if slot is None:
-            maximum = slot_model.objects.filter(bag=bag).aggregate(index=models.Max("slot_index"))["index"]
-            slot = slot_model(bag=bag, slot_index=(maximum + 1 if maximum is not None else 0), item_id=batch.item_id,
-                              item_amount=0, instance_id=uuid.uuid4())
-            copy_batch_attributes(source, slot)
-        slot.item_amount += batch.quantity
-        slot.save()
+        add_inventory_items(bag, batch.item_id, batch.quantity, attributes=snapshot)
         batch.status = status
         batch.save(update_fields=["status"])
     _save_bag(bag)

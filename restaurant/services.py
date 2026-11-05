@@ -5,6 +5,7 @@ import requests
 from django.db import transaction
 from django.conf import settings
 from account.models import GameAccount
+from inventory.storage import add_inventory_items
 from inventory.models import InventoryBag, InventorySlot
 from items.models import Item
 from .models import (
@@ -231,38 +232,11 @@ class RestaurantService:
                 defaults={"money": 0}
             )
 
-            # 查找是否有同类物品可堆叠
-            candidates = InventorySlot.objects.filter(
-                bag=bag,
-                item_id=menu_item.item_id,
-                quality=menu_item.dish_quality,
-            )
-            matching_fields = ("rated", "rating_price", "overall_score", "ingredient", "cook_time")
-            existing_slot = next((row for row in candidates if all(
-                getattr(row, name) == getattr(menu_item, name) for name in matching_fields
-            )), None)
-
-            if existing_slot:
-                existing_slot.item_amount += menu_item.quantity
-                existing_slot.save()
-            else:
-                # 找一个空槽位
-                max_index = InventorySlot.objects.filter(bag=bag).order_by("-slot_index").first()
-                new_index = (max_index.slot_index + 1) if max_index else 0
-                InventorySlot.objects.create(
-                    bag=bag,
-                    slot_index=new_index,
-                    instance_id=menu_item.instance_id,
-                    item_id=menu_item.item_id,
-                    item_amount=menu_item.quantity,
-                    rated=menu_item.rated,
-                    rating_price=menu_item.rating_price,
-                    overall_score=menu_item.overall_score,
-                    ingredient=menu_item.ingredient,
-                    item_bag_name=f"{menu_item.item_id}_{new_index}",
-                    cook_time=menu_item.cook_time,
-                    dish_quality=menu_item.dish_quality,
-                )
+            add_inventory_items(bag, menu_item.item_id, menu_item.quantity, attributes={
+                "rated": menu_item.rated, "rating_price": menu_item.rating_price,
+                "overall_score": menu_item.overall_score, "ingredient": menu_item.ingredient,
+                "cook_time": menu_item.cook_time, "quality": menu_item.dish_quality,
+            })
 
             menu_item.delete()
 
@@ -476,14 +450,8 @@ class RestaurantService:
                     if item_obj and item_obj.item_type == "Usable":
                         remaining_uses = item_obj.max_use_count
                     item_name = item_obj.item_name if item_obj else f"物品#{item_id}"
-                    InventorySlot.objects.create(
-                        bag=bag,
-                        slot_index=new_index,
-                        item_id=item_id,
-                        item_amount=amount,
-                        item_bag_name=f"{item_name}_{new_index}",
-                        remaining_uses=remaining_uses,
-                    )
+                    add_inventory_items(bag, item_id, amount, attributes={"remaining_uses": remaining_uses})
+
 
         # 读取升级后的金币余额
         try:

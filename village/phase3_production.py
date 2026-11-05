@@ -25,7 +25,6 @@ from .farm_expansion import plot_access
 from .phase3_asset_service import (
     _fail,
     _ok,
-    add_batch,
     consume_fefo,
     consume_tool_use,
     get_available_slot_amount,
@@ -361,22 +360,19 @@ def _do_harvest(
 
         # Add harvested crop and returned seed batches.
         added_items = []
-        output_slot = add_batch(
-            inventory, output_item_id, output_amount,
-            world_minute, None, request_id, item_attributes={"quality": (plot.production_rules_snapshot or {}).get("quality", 3)},
-        )
+        from inventory.storage import add_inventory_items
+        output_slots = add_inventory_items(inventory, output_item_id, output_amount,
+            attributes={"quality": (plot.production_rules_snapshot or {}).get("quality", 3)})
         added_items.append({"item_id": output_item_id, "amount": output_amount})
 
         # Add seed returns
-        add_batch(
-            inventory, seed_item_id, seed_amount,
-            world_minute, None, request_id,
-        )
+        if seed_amount:
+            add_inventory_items(inventory, seed_item_id, seed_amount)
         added_items.append({"item_id": seed_item_id, "amount": seed_amount})
 
         record_production("NPC", npc_id, request_id, {output_item_id: output_amount}, world_minute,
             source_kind="HARVEST", plot_code=plot_code,
-            reservation_request_id=reservation_request_id, output_instance_ids=[str(output_slot.instance_id)])
+            reservation_request_id=reservation_request_id, output_instance_ids=[str(slot.instance_id) for slot, _ in output_slots])
 
         # Clear plot
         plot.batch_id = None

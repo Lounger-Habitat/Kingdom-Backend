@@ -874,7 +874,7 @@ def public_store(store_code: str, *, section=None) -> dict | None:
         item_id__in={row.item_id for row in listing_rows}
     ).select_related("equipment_definition").prefetch_related("equipment_definition__levels")}
     item_names = {key: item.item_name for key, item in items.items()}
-    from inventory.batches import project_public_batch
+    from inventory.batches import project_public_attributes
     npc_names = {
         str(row.npc.agent_id): row.display_name
         for row in NpcProfile.objects.select_related("npc").filter(is_active=True)
@@ -885,7 +885,6 @@ def public_store(store_code: str, *, section=None) -> dict | None:
         if listing.status != "ACTIVE":
             continue
         batches = []
-        batch_groups = {}
         available_amount = 0
         for slot in listing.inventory_slots.all():
             if slot.item_amount <= 0:
@@ -900,10 +899,8 @@ def public_store(store_code: str, *, section=None) -> dict | None:
             batch = {
                 "available_amount": available,
                 "expires_world_minute": None,
-                "batch": project_public_batch(
+                "attributes": project_public_attributes(
                     slot, items.get(slot.item_id), world_minute, available,
-                    expires_world_minute=slot.expires_world_minute,
-                    freshness_unknown=bool(attributes.get("freshness_unknown")),
                 ),
             }
             if slot.remaining_uses is not None:
@@ -916,15 +913,6 @@ def public_store(store_code: str, *, section=None) -> dict | None:
             ):
                 if attributes.get(source) not in (None, ""):
                     batch[target] = attributes[source]
-            if section == "listings":
-                # Identical public tool instances need one tooltip, not twenty copies.
-                signature = json.dumps({**batch, "available_amount": 0,
-                    "batch": {**batch["batch"], "quantity": 0}}, sort_keys=True)
-                if signature in batch_groups:
-                    batch_groups[signature]["available_amount"] += available
-                    batch_groups[signature]["batch"]["quantity"] += available
-                    continue
-                batch_groups[signature] = batch
             batches.append(batch)
         equipment = getattr(items.get(listing.item_id), "equipment_definition", None)
         listings.append({
@@ -939,7 +927,7 @@ def public_store(store_code: str, *, section=None) -> dict | None:
             "public_meal_code": listing.public_meal_code or None,
             "equipment_category": equipment.category if equipment else None,
             "equipment_advanced": equipment.advanced if equipment else False,
-            "batches": batches,
+            "items": batches,
         })
 
     listing_ids = list(listing_by_id)
@@ -1098,7 +1086,7 @@ def public_store(store_code: str, *, section=None) -> dict | None:
 
 def _public_store_inventory(store, world_minute, *, unlisted_only=False):
     """Store-owned stock; the warehouse excludes batches on active shelves."""
-    from inventory.batches import project_public_batch
+    from inventory.batches import project_public_attributes
     from .lucy_restaurant import store_available
 
     slots = store.inventory_slots.filter(item_amount__gt=0)
@@ -1115,7 +1103,7 @@ def _public_store_inventory(store, world_minute, *, unlisted_only=False):
         row = rows.setdefault(slot.item_id, {
             "item_id": slot.item_id, "item_name": item.item_name if item else f"物品#{slot.item_id}",
             "total_amount": 0, "available_amount": 0, "listed_amount": 0,
-            "unlisted_amount": 0, "reserved_amount": 0, "unavailable_amount": 0, "batches": [],
+            "unlisted_amount": 0, "reserved_amount": 0, "unavailable_amount": 0, "items": [],
         })
         available = store_available(slot, world_minute)
         reserved = min(slot.item_amount, max(0, slot.reserved_amount))
@@ -1127,11 +1115,9 @@ def _public_store_inventory(store, world_minute, *, unlisted_only=False):
         for key, amount in amounts.items():
             row[key] += amount
         attributes = slot.item_attributes or {}
-        row["batches"].append({
+        row["items"].append({
             **amounts, "is_listed": listed,
-            "batch": project_public_batch(slot, item, world_minute, slot.item_amount,
-                expires_world_minute=slot.expires_world_minute,
-                freshness_unknown=bool(attributes.get("freshness_unknown"))),
+            "attributes": project_public_attributes(slot, item, world_minute, slot.item_amount),
         })
     return list(rows.values())
 

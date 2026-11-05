@@ -11,10 +11,12 @@ def compatibility_tier(level):
     return 3 if level >= 5 else 2 if level >= 3 else 1
 
 
-def stats_for(slot, *, level=None):
+def stats_for(slot, *, level=None, catalog=None):
     level = slot.equipment_level if level is None else level
     if type(level) is not int or not 1 <= level <= 5:
         return None
+    if catalog is not None:
+        return catalog.get((slot.item_id, level))
     row = EquipmentLevel.objects.select_related("equipment__item").filter(
         equipment__item_id=slot.item_id, equipment__enabled=True,
         equipment__item__is_deleted=False, level=level).first()
@@ -55,9 +57,9 @@ def definition_for(slot):
     return definition
 
 
-def weapon_moves(category):
+def weapon_moves(category, *, moves=None):
     return {row.code: dict(name=row.name, multiplier=row.multiplier, minimum_multiplier=row.minimum_multiplier)
-            for row in WeaponMove.objects.filter(category=category)}
+            for row in (WeaponMove.objects.filter(category=category) if moves is None else moves) if row.category == category}
 
 
 def equipment_attributes(stats):

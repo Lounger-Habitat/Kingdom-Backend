@@ -153,6 +153,8 @@ class BatchComponents(models.Model):
         if not changes:
             return super().save(*args, **kwargs)
         using = kwargs.get("using") or router.db_for_write(type(self), instance=self)
+        # A fresh parent cannot have detail rows. Explicit PK saves can update an existing parent.
+        new_owner = self._state.adding and (self.pk is None or kwargs.get("force_insert", False))
         with transaction.atomic(using=using):
             if not self._state.adding:
                 # Also serialize detail-only saves, which do not UPDATE the parent.
@@ -167,13 +169,18 @@ class BatchComponents(models.Model):
                 detail_model = self._meta.get_field(relation).related_model
                 # Do not allocate a detail row for default-only ordinary items.
                 defaults = {field: default for rel, field, default in COMPONENT_FIELDS.values() if rel == relation}
-                rows = detail_model.objects.using(using).filter(owner_id=self.pk)
-                if all(value == defaults[field] for field, value in values.items()):
-                    rows.update(**values)
+                only_defaults = all(value == defaults[field] for field, value in values.items())
+                if new_owner:
+                    if not only_defaults:
+                        detail_model.objects.using(using).create(owner_id=self.pk, **values)
                 else:
-                    detail_model.objects.using(using).update_or_create(owner_id=self.pk, defaults=values)
-                # Remove now-empty optional rows (e.g. slot cleared or reused).
-                rows.filter(**defaults).delete()
+                    rows = detail_model.objects.using(using).filter(owner_id=self.pk)
+                    if only_defaults:
+                        rows.update(**values)
+                    else:
+                        detail_model.objects.using(using).update_or_create(owner_id=self.pk, defaults=values)
+                    # Remove now-empty optional rows (e.g. slot cleared or reused).
+                    rows.filter(**defaults).delete()
                 self._state.fields_cache.pop(relation, None)
         original = self.__dict__.setdefault("_component_original", {})
         original.update(deepcopy(changes))

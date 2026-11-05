@@ -16,17 +16,17 @@ class PublicTooltipTests(TestCase):
             dish_metadata={"private": "secret"},
         )
         data = serialize_listing(listing)
-        batch = data["batch"]
+        batch = data["attributes"]
         self.assertEqual(batch["dish"]["cookTime"], 42)
         self.assertEqual(batch["dish"]["ingredients"], "玉米×2")
         self.assertEqual(batch["dish"]["review"], {"rated": True, "price": 88, "score": 77, "comment": "好吃"})
         self.assertEqual(batch["quantity"], 2)
         self.assertEqual(batch["quality"], 4)
-        self.assertEqual(batch["freshness"]["expiresWorldMinute"], 800)
+        self.assertNotIn("freshness", batch)
         self.assertIsNone(data["expiresAt"])
-        self.assertEqual(batch["id"], "")
-        self.assertIsNone(batch["origin"])
-        self.assertEqual(batch["dish"]["metadata"], {})
+        self.assertNotIn("id", batch)
+        self.assertNotIn("origin", batch)
+        self.assertNotIn("metadata", batch["dish"])
         self.assertEqual(data["price"], 90)
 
     def test_market_null_usage_is_unknown_and_context_is_bulk_loaded(self):
@@ -36,6 +36,6 @@ class PublicTooltipTests(TestCase):
         listings = list(MarketListing.objects.filter(pk__in=[row.pk for row in listings]))
         with self.assertNumQueries(2):
             data = serialize_listings(listings)
-        self.assertEqual(data[0]["batch"]["usage"], {"mode": "UNKNOWN", "remaining": None, "maximum": 20})
-        self.assertIsNone(data[0]["batch"]["quality"])
-        self.assertIsNone(data[0]["batch"]["dish"])
+        self.assertEqual(data[0]["attributes"]["usage"], {"mode": "UNKNOWN", "remaining": None, "maximum": 20})
+        self.assertIsNone(data[0]["attributes"]["quality"])
+        self.assertIsNone(data[0]["attributes"]["dish"])

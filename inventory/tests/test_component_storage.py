@@ -4,9 +4,10 @@ import uuid
 from unittest.mock import patch
 
 from django.contrib.admin.sites import AdminSite
-from django.db import IntegrityError, transaction
+from django.db import IntegrityError, transaction, connection
 from django.forms import modelform_factory
 from django.test import RequestFactory, TestCase
+from django.test.utils import CaptureQueriesContext
 from rest_framework.test import APIRequestFactory, force_authenticate
 
 from account.models import GameAccount
@@ -63,6 +64,33 @@ class ComponentStorageTests(TestCase):
         self.assertFalse(InventorySlotReview.objects.filter(owner=row).exists())
         self.assertFalse(row.rated)
         self.assertIsNone(row.remaining_uses)
+
+    def test_fresh_details_are_inserted_without_probing_missing_rows(self):
+        with CaptureQueriesContext(connection) as queries:
+            row = self.make_slot()
+        details = [q["sql"] for q in queries if any(name in q["sql"] for name in
+            ('"inventory_inventoryslotusage"', '"inventory_inventoryslotdish"', '"inventory_inventoryslotreview"'))]
+        self.assertEqual(len(details), 3)
+        self.assertTrue(all(sql.startswith("INSERT") for sql in details))
+        row.refresh_from_db()
+        self.assertEqual((row.remaining_uses, row.ingredient, row.rating_price), (7, "玉米×2", 73))
+
+    def test_fresh_detail_failure_rolls_back_all_new_rows(self):
+        with patch.object(InventorySlotReview, "save", side_effect=IntegrityError("test new detail failure")):
+            with self.assertRaises(IntegrityError):
+                self.make_slot()
+        self.assertFalse(self.bag.slots.exists())
+        for model in (InventorySlotDish, InventorySlotUsage, InventorySlotReview):
+            self.assertFalse(model.objects.exists())
+
+    def test_explicit_existing_primary_key_still_updates_its_details(self):
+        row = self.make_slot()
+        replacement = InventorySlot(pk=row.pk, bag=self.bag, slot_index=row.slot_index,
+            item_id=row.item_id, item_amount=3, ingredient="更新食材")
+        replacement.save()
+        row.refresh_from_db()
+        self.assertEqual((row.item_amount, row.ingredient, row.rating_price), (3, "更新食材", 73))
+        self.assertEqual(row.dish_metadata, self.attributes["dish_metadata"])
 
     def test_partial_save_does_not_commit_other_pending_component_changes(self):
         row = self.make_slot()

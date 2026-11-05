@@ -48,39 +48,39 @@ def live(attempt, now):
     return bool(attempt) and attempt.get("lease_until", 0) > now.timestamp()
 
 
-def tool_data(player, bag, instance, minute):
+def tool_data(player, bag, instance, minute, *, context=None):
     if not instance:
         return None, 0, {}
     try:
-        slot = resolve_tool(player, bag, "targeted_gathering", instance, minute=minute)
+        slot = resolve_tool(player, bag, "targeted_gathering", instance, minute=minute, context=context)
     except ToolError as exc:
         reject(exc.code, exc.message)
     if slot.item_amount != 1:
         reject("TOOL_STACK_INVALID", "请使用独立的一件采集工具。")
-    stats = stats_for(slot)
+    stats = stats_for(slot, catalog=context["catalog"] if context is not None else None)
     tier = stats["tier"]
     if tier not in (1, 2, 3):
         reject("TOOL_UNAVAILABLE", "采集工具尚未配置。")
     return slot, tier, stats
 
 
-def overview(player, bag, minute, *, node_id=None, level=None):
+def overview(player, bag, minute, *, node_id=None, level=None, include_nodes=True, context=None):
     """Read-only, including mature-state calculations; no regrowth writes."""
     now = timezone.now()
     own = VillagePlayerGathering.objects.filter(player=player).first()
-    definitions = {node_id: NODES[node_id]} if node_id else NODES
+    definitions = ({node_id: NODES[node_id]} if node_id else NODES) if include_nodes else {}
     rows = {str(row.pk): row for row in VillagePlantNode.objects.filter(pk__in=definitions)}
     busy = {row.attempt.get("node_id"): row.attempt for row in VillagePlayerGathering.objects.exclude(attempt={})
-            if live(row.attempt, now)}
+            if live(row.attempt, now)} if include_nodes else {}
     items = {row.pk: row for row in Item.objects.filter(
         pk__in={PLANTS[d["species"]]["item_id"] for d in definitions.values()}, is_deleted=False)}
-    level = level_for(player) if level is None else level
+    level = (context["levels"].get("gathering", 1) if context is not None else level_for(player)) if level is None else level
     equipped = str(own.equipped_instance_id) if own and own.equipped_instance_id else None
     tier, tool_reason = 0, None
     equipped_stats = {}
     if equipped:
         try:
-            _, tier, equipped_stats = tool_data(player, bag, equipped, minute)
+            _, tier, equipped_stats = tool_data(player, bag, equipped, minute, context=context)
         except PlantError as exc:
             tool_reason = exc.code
     nodes = []
@@ -99,7 +99,7 @@ def overview(player, bag, minute, *, node_id=None, level=None):
             base_seconds=spec["seconds"], regrow_minutes=spec["regrow_minutes"],
             ready=ready, occupied=occupied, unlocked=level >= spec["level"],
             ready_world_minute=row.ready_world_minute if row else 0, revision=row.revision if row else 0))
-    return dict(schema_version=1, nodes_partial=node_id is not None, revision=own.revision if own else 0, observed_at=now.timestamp(),
+    return dict(schema_version=1, nodes_partial=not include_nodes or node_id is not None, revision=own.revision if own else 0, observed_at=now.timestamp(),
         observed_world_minute=minute, level=level, equipped_instance_id=equipped, tool_tier=tier,
         equipment_level=equipped_stats.get("level", 0),
         time_reduction=equipped_stats.get("gathering_time_reduction", 0), quality_bonus_chance=equipped_stats.get("quality_bonus_chance", 0), tool_reason=tool_reason,
@@ -198,11 +198,10 @@ def execute(player, bag, action, params, rid, location, minute, authority_sessio
     ap.action_points -= spec["action_cost"]
     ap.action_points_recovered_at = now
     ap.save(update_fields=["action_points", "action_points_recovered_at"])
-    index = (bag.slots.aggregate(n=models.Max("slot_index"))["n"] or 0)+1
     quality = attempt.get("quality", spec["quality"])
-    slot = InventorySlot.objects.create(bag=bag, slot_index=index, item_id=item.pk,
-        item_amount=spec["quantity"], quality=quality, produced_world_minute=minute,
-        expires_world_minute=None, source_request_id=rid, item_bag_name=f"{item.item_name}_{index}")
+    from inventory.storage import add_inventory_items
+    outputs = add_inventory_items(bag, item.pk, spec["quantity"],
+        attributes=dict(quality=quality, item_bag_name=item.item_name))
     node.ready_world_minute = minute+spec["regrow_minutes"]
     node.revision += 1
     node.save()
@@ -210,7 +209,8 @@ def execute(player, bag, action, params, rid, location, minute, authority_sessio
     state.revision += 1
     state.save()
     from .player_actions import _batch_data
-    collected = [_batch_data(slot, minute, {item.pk: item.item_name})]
+    collected = [dict(_batch_data(slot, minute, {item.pk: item.item_name}), quantity=delta, amount=delta)
+                 for slot, delta in outputs]
     reward_type = "professional_collect" if spec["level"] >= 7 else "advanced_collect" if spec["level"] >= 4 else "collect"
     reward = settle_growth(player, source_type=reward_type, source_id=rid,
         facts=dict(collect_type=spec["collect_type"], node_id=node_id,

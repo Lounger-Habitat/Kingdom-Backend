@@ -51,12 +51,12 @@ class PlayerSiteTradeTests(PlayerFixture, TestCase):
                 answer = self.run_action("overview")
                 self.assertTrue(answer["success"], answer)
                 trade = answer["data"]["overview"]["inventory"]
-                bag_batches = [row["batch"] for row in serialize_bag(self.bag_a)["items"]]
-                self.assertEqual([row["batch"] for row in trade], bag_batches)
-                self.assertEqual(trade[0]["batch"]["stacking"], {"stackable": True, "maxPerSlot": 10})
-                self.assertEqual(trade[0]["batch"]["quality"], 2)
-                self.assertFalse(trade[4]["batch"]["stacking"]["stackable"])
-                self.assertFalse(trade[5]["batch"]["stacking"]["stackable"])
+                bag_batches = [row["attributes"] for row in serialize_bag(self.bag_a)["items"]]
+                self.assertEqual([row["attributes"] for row in trade], bag_batches)
+                self.assertEqual(trade[0]["attributes"]["stacking"], {"stackable": True, "maxPerSlot": 10})
+                self.assertEqual(trade[0]["attributes"]["quality"], 2)
+                self.assertFalse(trade[4]["attributes"]["stacking"]["stackable"])
+                self.assertFalse(trade[5]["attributes"]["stacking"]["stackable"])
 
     def test_store_fefo_components_fee_receipt_and_sale_history(self):
         listing, first = self.shelf(amount=1, quality=4, remaining_uses=8, ingredient="corn",

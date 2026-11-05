@@ -14,7 +14,8 @@ from village.models import (NpcProfile, NpcRuntimeState, VillageSimulationConfig
     MarkDailySalary, NpcCookingCounter)
 from village.lucy_catalog import RECIPE_DEFINITIONS, MEALS, PUBLIC_MEALS, RELIEF_PACK
 from village.lucy_configuration import configure_lucy
-from village.phase3_asset_service import commit_economy_action, add_batch, get_available_slot_amount
+from village.phase3_asset_service import commit_economy_action, get_available_slot_amount
+from inventory.storage import add_inventory_items
 from village.tests.test_phase3_production import _payload
 from village.phase3_direct_trade import query_store_inventory
 from village.public_finance import reconcile
@@ -48,7 +49,7 @@ class LucyRestaurantTests(TestCase):
         configure_lucy()
         self.lucy = self.bags["10014"]
         for item_id in {i for spec in RECIPE_DEFINITIONS.values() for i in spec["ingredients"]}:
-            add_batch(self.lucy, item_id, 100, 500, 3500, uuid.uuid4())
+            add_inventory_items(self.lucy, item_id, 100)
 
     def act(self, action, params, npc="10014", expect="OK"):
         result = commit_economy_action(_payload(action, int(npc), "RESTAURANT", params))
@@ -86,7 +87,8 @@ class LucyRestaurantTests(TestCase):
             with self.subTest(recipe=recipe_id):
                 before = {i: sum(self.lucy.slots.filter(item_id=i).values_list("item_amount", flat=True)) for i in spec["ingredients"]}
                 slot = self.cook(recipe_id)
-                self.assertEqual(slot.item_amount, spec["output"])
+                self.assertEqual(slot.item_amount, 1)
+                self.assertEqual(self.lucy.slots.filter(item_id=recipe_id, item_amount__gt=0).count(), spec["output"])
                 self.assertEqual(slot.dish_metadata["base_quality"], 3)
                 self.assertEqual(slot.dish_metadata["recipe_id"], recipe_id)
                 self.assertIn(slot.dish_quality, range(2,7))
@@ -98,7 +100,7 @@ class LucyRestaurantTests(TestCase):
     def test_personal_procurement_from_three_suppliers_and_next_round(self):
         self.lucy.slots.all().delete()
         for npc, item, amount, gold in (("10011",1030,1,8),("10012",1056,1,12),("10015",1049,1,2)):
-            add_batch(self.bags[npc],item,2,500,3500,uuid.uuid4())
+            add_inventory_items(self.bags[npc], item, 2)
         for round_index in range(2):
             for npc, item, amount, gold in (("10011",1030,1,8),("10012",1056,1,12),("10015",1049,1,2)):
                 offer=self.act("PROPOSE_TRADE",{"target_npc_id":npc,"item_id":item,"amount":amount,
@@ -272,7 +274,7 @@ class LucyRestaurantTests(TestCase):
         after_needs = NpcRuntimeState.objects.get(npc=self.npcs["10014"])
         self.assertEqual((after_needs.energy_fp, after_needs.hunger_fp), (before_needs.energy_fp, before_needs.hunger_fp))
         self.assertEqual(GlobalGameTimeState.get_instance().world_minute, 600)
-        add_batch(self.lucy, 1049, 10, 600, 3500, uuid.uuid4())
+        add_inventory_items(self.lucy, 1049, 10)
         command = accept()
         ok, code, started = CommandService.start_command(command.pk)
         self.assertTrue(ok, code)
@@ -550,7 +552,7 @@ class LucyRestaurantTests(TestCase):
         self.listing(dish)
         VillageStore.objects.update_or_create(store_code="GENERAL_STORE", defaults=dict(display_name="Nora", location_code="GENERAL_STORE",
             operator_npc=self.npcs["10015"], status="OPEN"))
-        add_batch(self.bags["10015"], 1025, 1, 500, 3500, uuid.uuid4())
+        add_inventory_items(self.bags["10015"], 1025, 1)
         nora = self.agent_query("INSPECT_INVENTORY", "10015")["items"][0]
         self.assertEqual(nora["sale"], {"allowed": False, "reason": "TRADE_STORE_FORBIDDEN"})
 
@@ -602,7 +604,7 @@ class LucyRestaurantTests(TestCase):
         from items.models import ItemType
         Item.objects.update_or_create(item_id=4002, defaults=dict(item_name="tool", item_type=ItemType.COLLECT_TOOL,
             item_price=20, max_use_count=20))
-        slot = add_batch(self.lucy, 4002, 1, 500, None, uuid.uuid4(), remaining_uses=20)
+        slot = add_inventory_items(self.lucy, 4002, 1, attributes={"remaining_uses": 20})[0][0]
         for uses, reason in ((20, None), (10, "TOOL_NOT_FULL_DURABILITY"),
                 (0, "TOOL_BROKEN"), (None, "TOOL_DURABILITY_UNKNOWN")):
             slot.remaining_uses = uses; slot.save()

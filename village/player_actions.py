@@ -147,7 +147,6 @@ def _batch_data(slot, minute, names=None):
     return dict(instance_id=str(slot.instance_id), item_id=slot.item_id,
         item_name=(names or {}).get(slot.item_id, str(slot.item_id)), quantity=slot.item_amount,
         quality=slot.quality, remaining_uses=slot.remaining_uses, expires_world_minute=None,
-        produced_world_minute=slot.produced_world_minute, source_request_id=str(slot.source_request_id) if slot.source_request_id else None,
         remaining_freshness_minutes=None, freshness_unknown=False,
         usable=slot.item_amount > 0)
 
@@ -241,7 +240,7 @@ def overview(player, bag, minute, *, read_only=False, compact=False, plant_resul
     from .business_orders import business_orders_overview
     from .advanced_gathering import collection_points_projection
     from .daily_events import project_daily_events
-    from inventory.batches import project_batch
+    from inventory.batches import project_item_attributes
     from .lucy_restaurant import public_meal_quota
     from .player_farm import farm_overview
     from .affairs import project_affairs
@@ -301,7 +300,7 @@ def overview(player, bag, minute, *, read_only=False, compact=False, plant_resul
         action_points=state.action_points, action_points_max=state.action_points_max,
         growth=growth,
         inventory=[{**_batch_data(s, minute, names),
-            "batch": project_batch(s, items.get(s.item_id), minute),
+            "attributes": project_item_attributes(s, items.get(s.item_id), minute),
             "item_type": items[s.item_id].item_type if s.item_id in items else "",
             "general_store_sale": store_sale_quote(s, items.get(s.item_id), minute)}
             for s in slots])
@@ -588,16 +587,14 @@ def _execute(player, bag, action, p, rid, location, clock, authority_session_id=
             if remaining_resource is not None:
                 amount = min(amount, remaining_resource)
                 remaining_resource -= amount
-            # New production has explicit server provenance and a frozen quality. Never
-            # merge it into a historical/expired stack or refresh old shelf life.
             quality = production_quality(player_skill_level(player, "gathering"),
                 quality_rng(rid, "COLLECT:" + str(next_index)), (tool_stats or {}).get("quality_bonus_chance", 0))
-            slot = InventorySlot.objects.create(bag=bag, slot_index=next_index, item_id=item.pk,
-                item_amount=amount, quality=quality, produced_world_minute=minute,
-                expires_world_minute=None, source_request_id=rid,
-                item_bag_name=f"{item.item_name}_{next_index}")
+            from inventory.storage import add_inventory_items
+            for slot, added in add_inventory_items(bag, item.pk, amount, attributes={"quality": quality,
+                    "produced_world_minute": minute, "source_request_id": rid,
+                    "item_bag_name": f"{item.item_name}_{next_index}"}):
+                collected.append({**_batch_data(slot, minute, {item.pk: item.item_name}), "quantity": added})
             next_index += 1
-            collected.append(_batch_data(slot, minute, {item.pk: item.item_name}))
         from player.progression import settle_growth
         if professional:
             finish_professional_collection(resource, sum(b["quantity"] for b in collected))
@@ -746,7 +743,8 @@ def _execute_player_action(payload, *, query=False):
         if old:
             if old.payload_hash != digest:
                 fail("REQUEST_CONFLICT", "同一请求编号不能用于不同操作。")
-            answer = copy.deepcopy(old.response)
+            from inventory.batches import normalize_legacy_attributes
+            answer = normalize_legacy_attributes(copy.deepcopy(old.response))
             if action in ("labor_start", "commission_labor_start", "labor_cancel"):
                 from .player_affair_labor import current_labor, labor_data
                 from .models import VillagePlayerAffairLabor

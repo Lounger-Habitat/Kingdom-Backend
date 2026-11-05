@@ -49,6 +49,7 @@ from typing import Any, Dict, List, Optional, Tuple
 
 from django.db import models, transaction
 
+from inventory.storage import add_inventory_items, add_store_items, attributes_from_slot
 from inventory.models import NpcDefinition, NpcGlobalInventory, NpcGlobalInventorySlot
 from items.models import Item, ItemType
 
@@ -67,10 +68,8 @@ from .models import (
     VillageWorldEvent,
 )
 from .phase3_asset_service import (
-    BATCH_ITEM_ATTRIBUTES,
     _fail,
     _ok,
-    add_batch,
     get_available_slot_amount,
 )
 from .phase3_catalog import BASE_PRICES, SAFE_STOCKS
@@ -132,7 +131,7 @@ def _get_buyer_available_money(inventory: NpcGlobalInventory) -> int:
     return max(0, inventory.money - reserved)
 
 
-def general_store_tool_sale_reason(item_type, max_use_count, remaining_uses, *, slot=None):
+def general_store_tool_sale_reason(item_type, max_use_count, remaining_uses, *, slot=None, equipment_catalog=None):
     """Fixed-price automatic buyback accepts only tools at configured full durability.
 
     Negotiated personal trades and operator listings retain their own pricing.
@@ -144,7 +143,7 @@ def general_store_tool_sale_reason(item_type, max_use_count, remaining_uses, *, 
         return None
     if slot is not None:
         from player.equipment import stats_for
-        stats = stats_for(slot)
+        stats = stats_for(slot, catalog=equipment_catalog)
         if stats:
             max_use_count = stats["max_durability"]
     if remaining_uses is None:
@@ -445,7 +444,7 @@ def _do_sell_to_store(npc_id, params, world_minute, request_id):
         return _fail(ResultCode.TRADE_INSUFFICIENT_MONEY, data={**sale_data,
             "required_amount": total, "available_amount": account.balance if account else 0, "payer": "STORE"})
     career_batches = []
-    from .career_trade import transfer_attributes, record_sale
+    from .career_trade import record_sale
     for row in priced_items:
         item_id, amount = row["item_id"], row["amount"]
         try:
@@ -461,13 +460,8 @@ def _do_sell_to_store(npc_id, params, world_minute, request_id):
             })
         for slot, taken in consumed:
             career_batches.append((slot, taken))
-            VillageStoreInventorySlot.objects.create(
-                store=store, item_id=item_id, item_amount=taken,
-                produced_world_minute=slot.produced_world_minute,
-                expires_world_minute=slot.expires_world_minute, remaining_uses=slot.remaining_uses,
-                source_npc=seller, source_slot_instance_id=slot.instance_id,
-                item_attributes=transfer_attributes(slot),
-            )
+            add_store_items(store, item_id, taken, attributes=dict(attributes_from_slot(slot), source_npc=seller),
+                source_instance_id=slot.instance_id)
     account.balance -= total
     account.account_version += 1
     account.save(update_fields=["balance", "account_version", "updated_at"])
@@ -787,21 +781,13 @@ def _do_respond_trade(
             return _fail(ResultCode.TRADE_INSUFFICIENT_ITEM)
 
         # Transfer items (preserve batch attributes) and money.
-        from .career_trade import transfer_attributes, record_sale
+        from .career_trade import record_sale
         for slot, taken in consumed:
             if buying_store:
-                VillageStoreInventorySlot.objects.create(
-                    store=buying_store, item_id=item_id, item_amount=taken,
-                    produced_world_minute=slot.produced_world_minute,
-                    expires_world_minute=slot.expires_world_minute,
-                    remaining_uses=slot.remaining_uses, source_npc=offer.seller_npc,
-                    source_slot_instance_id=slot.instance_id,
-                    item_attributes=transfer_attributes(slot),
-                )
+                add_store_items(buying_store, item_id, taken, attributes=dict(attributes_from_slot(slot),
+                    source_npc=offer.seller_npc), source_instance_id=slot.instance_id)
             else:
-                add_batch(buyer_inv, item_id, taken, slot.produced_world_minute,
-                          slot.expires_world_minute, slot.source_request_id, remaining_uses=slot.remaining_uses,
-                          item_attributes={key: getattr(slot, key) for key in BATCH_ITEM_ATTRIBUTES})
+                add_inventory_items(buyer_inv, item_id, taken, attributes=attributes_from_slot(slot))
 
         if store_account:
             store_account.balance -= gold_amount
@@ -1035,24 +1021,14 @@ def _do_list_store_item(
         placed = []
         # Preserve source attributes while assigning a quality-specific shelf.
         for slot, taken in consumed:
-            stored = VillageStoreInventorySlot.objects.create(
-                store=store,
-                listing=listing,
-                item_id=item_id,
-                item_amount=taken,
-                remaining_uses=slot.remaining_uses,
-                produced_world_minute=slot.produced_world_minute,
-                expires_world_minute=slot.expires_world_minute,
-                source_npc=slot.source_npc if stock_source == "STORE" else operator_inv.npc,
-                source_slot_instance_id=slot.source_slot_instance_id if stock_source == "STORE" else slot.instance_id,
-                item_attributes=slot.item_attributes if stock_source == "STORE" else
-                    transfer_attributes(slot),
-            )
-            placed.append(stored)
-        listing = placed[0].listing
+            stored = add_store_items(store, item_id, taken, listing=listing, attributes=dict(attributes_from_slot(slot),
+                source_npc=slot.source_npc if stock_source == "STORE" else operator_inv.npc),
+                source_instance_id=slot.source_slot_instance_id if stock_source == "STORE" else slot.instance_id)
+            placed.extend(stored)
+        listing = placed[0][0].listing
         unit_price, listing_price_mode = listing.unit_price, listing.price_mode
         shelves = [{"listing_id": str(row.listing_id), "quality": row.quality,
-                    "unit_price": row.listing.unit_price, "quantity": row.item_amount} for row in placed]
+                    "unit_price": row.listing.unit_price, "quantity": delta} for row, delta in placed]
 
         if params.get("stock_source", "PERSONAL") == "PERSONAL":
             operator_inv.asset_version += 1
@@ -1427,26 +1403,17 @@ def _do_buy_from_store(
         purchased_batches = []
         from .phase3_public_economy import _get_eat_whitelist
         edible_items = _get_eat_whitelist()
-        from .career_trade import source_request_id
         for slot, taken in consumed:
-            personal_slot = add_batch(
-                buyer_inv,
-                slot.item_id,
-                taken,
-                slot.produced_world_minute,
-                slot.expires_world_minute,
-                source_request_id(slot, request_id),
-                remaining_uses=slot.remaining_uses,
-                item_attributes=slot.item_attributes,
-            )
-            batch = {"instance_id": str(personal_slot.instance_id), "item_id": slot.item_id,
-                     "amount": taken, "source": "PERSONAL_INVENTORY",
-                     "expires_world_minute": slot.expires_world_minute}
-            if slot.item_id in edible_items:
-                batch["food_instance_id"] = str(personal_slot.instance_id)
-            if personal_slot.remaining_uses is not None:
-                batch["remaining_uses"] = personal_slot.remaining_uses
-            purchased_batches.append(batch)
+            personal_slot = add_inventory_items(buyer_inv, slot.item_id, taken, attributes=attributes_from_slot(slot))
+            for target, delta in personal_slot:
+                batch = {"instance_id": str(target.instance_id), "item_id": slot.item_id,
+                         "amount": delta, "source": "PERSONAL_INVENTORY",
+                         "expires_world_minute": slot.expires_world_minute}
+                if slot.item_id in edible_items:
+                    batch["food_instance_id"] = str(target.instance_id)
+                if target.remaining_uses is not None:
+                    batch["remaining_uses"] = target.remaining_uses
+                purchased_batches.append(batch)
 
         # Money: buyer pays gross, store keeps net, fee goes to PUBLIC_FUND.
         buyer_inv.money -= gross_amount

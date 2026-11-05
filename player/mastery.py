@@ -3,16 +3,14 @@ from copy import deepcopy
 import hashlib
 import hmac
 import json
-import uuid
 
 from django.conf import settings
 from django.db import transaction
-from django.db.models import Max
 from django.utils import timezone
 from account.models import GameAccount
 from game_time.models import GlobalGameTimeState
-from inventory.components import copy_batch_attributes
-from inventory.models import InventoryBag, InventorySlot, NpcGlobalInventory, NpcGlobalInventorySlot
+from inventory.storage import add_inventory_items, attributes_from_slot
+from inventory.models import InventoryBag, InventorySlot, NpcGlobalInventory
 from items.models import Item
 from .models import (PlayerMasteryChallenge, PlayerGrowthState, PlayerMilestoneProgress,
                      PlayerState, PlayerTitle, PlayerCombatReceipt, SkillRewardReceipt)
@@ -21,7 +19,7 @@ from .progression_rules import SKILLS
 from village.professional_catalog import (PROFESSIONAL_MUSHROOM, MOUNTAIN_HERB, FOREST_BERRY,
     PROFESSIONAL_WOOD, PROFESSIONAL_RECIPES, batch_evidence)
 
-RULE_VERSION = 1
+RULE_VERSION = 2
 SKILL_NAMES = dict(SKILLS)
 
 
@@ -66,11 +64,11 @@ def _rules(skill):
             row.update(minimum_quality=4, minimum_remaining=60)
     title = f"{SKILL_NAMES[skill]}大师"
     descriptions = {
-        "gathering": "亲采三种专业原料，各交一份给Nora。",
-        "farming": "亲自收获专业南瓜和另一种作物，各交两份给Bill。",
-        "forestry": "以对应工具亲伐不同节点的韧木和硬木，各交两份给Jack。",
-        "cooking": "正确制作三种专业料理，各交一份品质至少4的样品给Lucy。",
-        "hunting": "同一只真实野猪完成可信格挡或翻滚、本人最终击杀，并领取本人加工产物。",
+        "gathering": "本人完成三种专业原料的合格采集记录，并各交一份对应品质原料给Nora。",
+        "farming": "本人完成专业南瓜和另一种作物的合格收获记录，并各交两份对应品质作物给Bill。",
+        "forestry": "本人以对应工具完成韧木和硬木的合格采伐记录，并各交两份对应品质木材给Jack。",
+        "cooking": "正确制作三种专业料理，各交一份品质为优秀及以上的样品给Lucy。",
+        "hunting": "同一只真实野猪完成可信格挡或翻滚及本人最终击杀，并完成一次野猪加工领取。",
         "business": "完成专业合同，并有至少三份采购成本可追溯的合格终端销售，收入覆盖这些采购成本。",
     }
     return dict(code=f"{skill}_mastery", title=f"{SKILL_NAMES[skill]}专业考核", description=descriptions[skill],
@@ -80,40 +78,52 @@ def _rules(skill):
 
 
 def _production_proofs(player, skill, since):
-    result = {}
-    for receipt in SkillRewardReceipt.objects.filter(player=player, skill_code=skill):
+    """Actual behavior receipts remain valid after output stock is merged or sold."""
+    result = []
+    for receipt in SkillRewardReceipt.objects.filter(player=player, skill_code=skill).order_by("pk"):
         facts = receipt.result.get("facts") or {}
-        source, minute = facts.get("source_request_id"), facts.get("produced_world_minute")
-        if not source or type(minute) is not int or minute < since:
+        minute = facts.get("produced_world_minute")
+        if type(minute) is not int or minute < since:
             continue
         for output in facts.get("outputs", []):
-            if (isinstance(output, dict) and output.get("instance_id") and output.get("source_request_id") == source
-                    and output.get("produced_world_minute") == minute):
-                result[(source, output["instance_id"])] = (receipt, facts, output)
+            if (isinstance(output, dict) and type(output.get("quantity")) is int
+                    and output["quantity"] > 0):
+                result.append((receipt, facts, output))
     return result
 
 
 def _sample_proof(slot, requirement, proofs, minute, skill):
-    proof = proofs.get((str(slot.source_request_id), str(slot.instance_id)))
-    if not proof:
+    from items.quality import valid_quality
+    if (slot.item_id not in requirement["item_ids"] or not valid_quality(slot.quality)
+            or slot.quality < requirement["minimum_quality"]):
         return None
-    receipt, facts, output = proof
-    if (slot.item_id not in requirement['item_ids'] or facts.get('tool_tier', 0) < requirement['minimum_tool_tier'] or type(output.get('quantity')) is not int or (slot.item_amount > output['quantity']) or (slot.quality < requirement['minimum_quality']) or (output.get('item_id') != slot.item_id) or (output.get('quality') != slot.quality) or (output.get('produced_world_minute') != slot.produced_world_minute) or (output.get('expires_world_minute') != slot.expires_world_minute) or (slot.produced_world_minute is None) or (slot.produced_world_minute > minute)):
+    evidence = []
+    for receipt, facts, output in proofs:
+        quality = output.get("quality")
+        if (output.get("item_id") != slot.item_id or not valid_quality(quality)
+                or quality < requirement["minimum_quality"]
+                or facts.get("tool_tier", 0) < requirement["minimum_tool_tier"]
+                or facts["produced_world_minute"] > minute):
+            continue
+        if requirement.get("crop_code") and facts.get("crop_code") != requirement["crop_code"]:
+            continue
+        if skill == "farming" and not facts.get("batch_id"):
+            continue
+        if requirement.get("species") and (facts.get("species") != requirement["species"]
+                or not facts.get("node_id") or type(facts.get("generation")) is not int):
+            continue
+        if requirement.get("recipe_id"):
+            from village.player_cooking import is_player_cooked
+            if facts.get("recipe_id") != requirement["recipe_id"] or not is_player_cooked(slot, receipt.player):
+                continue
+        evidence.append(dict(source_id=receipt.source_id, quantity=output["quantity"], quality=quality,
+            tool_tier=facts["tool_tier"], node_id=facts.get("node_id"), generation=facts.get("generation"),
+            batch_id=facts.get("batch_id")))
+    if not evidence:
         return None
-    if requirement.get("crop_code") and facts.get("crop_code") != requirement["crop_code"]:
-        return None
-    if skill == "farming" and not facts.get("batch_id"):
-        return None
-    if requirement.get("species") and (facts.get("species") != requirement["species"]
-            or not facts.get("node_id") or type(facts.get("generation")) is not int):
-        return None
-    if requirement.get("recipe_id"):
-        from village.player_cooking import is_player_cooked
-        if facts.get("recipe_id") != requirement["recipe_id"] or not is_player_cooked(slot, receipt.player):
-            return None
-    return dict(code=requirement["code"], title=requirement["title"], source_id=receipt.source_id,
-        **batch_evidence(slot), tool_tier=facts["tool_tier"],
-        node_id=facts.get("node_id"), generation=facts.get("generation"), batch_id=facts.get("batch_id"))
+    return dict(code=requirement["code"], title=requirement["title"], source_id=evidence[0]["source_id"],
+        **batch_evidence(slot), production_quantity=sum(row["quantity"] for row in evidence),
+        production_evidence=evidence)
 
 
 def _hunting_evidence(player, since):
@@ -134,16 +144,14 @@ def _hunting_evidence(player, since):
                 break
         if defense is None:
             continue
-        outputs = facts.get("outputs") or []
-        for job in VillagePlayerProcessingJob.objects.filter(player=player, status="CLAIMED", claimed_world_minute__gte=death):
-            attributes = job.input_snapshot.get("attributes") or {}
-            if any(str(job.source_instance_id) == output.get("instance_id")
-                   and attributes.get("source_request_id") == output.get("source_request_id")
-                   for output in outputs):
-                results = [dict(code="boar_chain", title="同一野猪防御、亲杀并领取加工产物", source_id=prey_id,
-                    defense_request_id=str(defense.request_id), kill_source_id=kill.source_id,
-                    processing_job_id=str(job.pk), quantity=1, complete=True)]
-                return results
+        for job in VillagePlayerProcessingJob.objects.filter(player=player, status="CLAIMED",
+                started_world_minute__gte=since):
+            if job.input_snapshot.get("item_id") != 29108:
+                continue
+            results = [dict(code="boar_chain", title="同一野猪防御和亲杀，并完成野猪加工领取", source_id=prey_id,
+                defense_request_id=str(defense.request_id), kill_source_id=kill.source_id,
+                processing_job_id=str(job.pk), quantity=1, complete=True)]
+            return results
     return results
 
 
@@ -181,6 +189,7 @@ def _quote(player, challenge, selections, evidence, minute):
 
 def _project(player, bag, skill, level, challenge, minute, read_only):
     rule = deepcopy(challenge.rules_snapshot if challenge else _rules(skill))
+    rule["description"] = _rules(skill)["description"]
     selections, evidence, requirements, missing = [], [], [], []
     contributed = bool(challenge and challenge.contributed_world_minute is not None)
     if challenge and rule["requirements"]:
@@ -195,9 +204,12 @@ def _project(player, bag, skill, level, challenge, minute, read_only):
             used = {}
             for req in rule["requirements"]:
                 remaining = req["quantity"]
+                produced_used = {}
                 for slot in slots:
                     sample = _sample_proof(slot, req, proofs, minute, skill)
                     available = slot.item_amount-used.get(slot.pk, 0)
+                    if sample is not None:
+                        available = min(available, sample["production_quantity"] - produced_used.get(slot.item_id, 0))
                     if sample is None or available <= 0:
                         continue
                     quantity = min(remaining, available)
@@ -205,9 +217,10 @@ def _project(player, bag, skill, level, challenge, minute, read_only):
                     selections.append(dict(requirement_code=req["code"], instance_id=str(slot.instance_id),
                         item_id=slot.item_id, item_name=name, quantity=quantity, quality=slot.quality,
                         expires_world_minute=slot.expires_world_minute, freshness_unknown=slot.freshness_unknown,
-                        produced_world_minute=slot.produced_world_minute, source_request_id=str(slot.source_request_id)))
+                        produced_world_minute=slot.produced_world_minute, source_request_id=str(slot.source_request_id) if slot.source_request_id else None))
                     evidence.append(dict(sample, quantity=quantity))
                     used[slot.pk] = used.get(slot.pk, 0)+quantity
+                    produced_used[slot.item_id] = produced_used.get(slot.item_id, 0)+quantity
                     remaining -= quantity
                     if remaining == 0:
                         break
@@ -215,10 +228,10 @@ def _project(player, bag, skill, level, challenge, minute, read_only):
                 requirements.append(dict(code=req["code"], title=req["title"], required_quantity=req["quantity"],
                                          current_quantity=req["quantity"]-remaining, complete=complete))
                 if not complete:
-                    missing.append(f"{req['title']}缺少{remaining}份可核验本人新生产的合格样品。")
+                    missing.append(f"{req['title']}缺少{remaining}份合格样品或对应的本人合格生产记录。")
     elif challenge:
         evidence = _hunting_evidence(player, challenge.started_world_minute) if skill == "hunting" else _business_evidence(player, challenge.started_world_minute)
-        expected = [("boar_chain", "同一野猪完成防御、亲杀、加工领取", 1)] if skill == "hunting" else [
+        expected = [("boar_chain", "同一野猪完成防御和亲杀，并完成一次野猪加工领取", 1)] if skill == "hunting" else [
             ("professional_contract", "完成本人专业合同", 1), ("terminal_sales", "至少三份采购成本可追溯且收入覆盖成本的合格终端销售", 3)]
         for code, title, quantity in expected:
             row = next((e for e in evidence if e["code"] == code), {})
@@ -289,27 +302,23 @@ def execute_mastery_action(player, bag, action, params, rid, clock):
             if challenge.contributed_world_minute is not None:
                 reject("ALREADY_CONTRIBUTED", "该路线样品已经交付，不会再次扣除。")
             if not view["can_contribute"]:
-                reject("EVIDENCE_REQUIRED", "需要完整合格样品包及真实生产证据；历史缺证物品需重新生产。")
+                reject("EVIDENCE_REQUIRED", "需要本人完成合格生产的记录，并交足对应品质和数量的样品。")
             expected = [{k: s[k] for k in ("requirement_code", "instance_id", "quantity")} for s in view["recommended_selections"]]
             if params["selections"] != expected or not isinstance(params["expected_quote"], str) or not hmac.compare_digest(params["expected_quote"], view["quote_hash"]):
                 reject("QUOTE_CHANGED", "所选真实批次或鲜期已变化，请重新确认完整样品包。")
             target = NpcGlobalInventory.objects.select_for_update().get(npc__agent_id=challenge.rules_snapshot["npc_id"], npc__is_test_only=False)
             InventoryBag.objects.select_for_update().get(pk=bag.pk)
-            index = target.slots.aggregate(n=Max("slot_index"))["n"]
-            index = 0 if index is None else index+1
             for selection in view["recommended_selections"]:
                 slot = InventorySlot.objects.select_for_update().get(bag=bag, instance_id=selection["instance_id"])
                 count = selection["quantity"]
                 if slot.item_amount < count:
                     reject("QUOTE_CHANGED", "所选样品批次已变化。")
-                sample = NpcGlobalInventorySlot(bag=target, slot_index=index, item_id=slot.item_id,
-                    item_amount=count, item_bag_name=slot.item_bag_name)
-                copy_batch_attributes(slot, sample)
-                sample.save()
+                received = add_inventory_items(target, slot.item_id, count, attributes=attributes_from_slot(slot))
                 slot.item_amount -= count
                 slot.save(update_fields=["item_amount"])
-                transferred.append(dict(selection, recipient_instance_id=str(sample.instance_id), recipient_name=view["recipient_name"]))
-                index += 1
+                for sample, delta in received:
+                    transferred.append(dict(selection, quantity=delta, recipient_instance_id=str(sample.instance_id),
+                                            recipient_name=view["recipient_name"]))
             target.asset_version += 1
             target.save(update_fields=["asset_version"])
             challenge.contributed_world_minute = clock.world_minute

@@ -228,13 +228,12 @@ def _execute(action, p, clock):
         item = Item.objects.filter(pk=item_id, is_deleted=False).first()
         if item is None:
             reject("PREY_ITEM_UNAVAILABLE")
-        index = bag.slots.aggregate(n=models.Max("slot_index"))["n"]
-        slot = InventorySlot.objects.create(bag=bag, slot_index=0 if index is None else index+1,
-            item_id=item_id, item_amount=1, quality=production_quality(player_skill_level(player, "hunting"),
-                quality_rng(prey.pk, "HUNT")), produced_world_minute=death,
-            expires_world_minute=None, source_request_id=identifier(p['request_id']),
-            item_bag_name=item.item_name)
-        added = [dict(batch_evidence(slot), item_name=item.item_name, amount=1)]
+        from inventory.storage import add_inventory_items
+        outputs = add_inventory_items(bag, item_id, 1, attributes=dict(
+            quality=production_quality(player_skill_level(player, "hunting"), quality_rng(prey.pk, "HUNT")),
+            item_bag_name=item.item_name))
+        added = [dict(batch_evidence(slot), item_name=item.item_name, amount=delta, quantity=delta)
+                 for slot, delta in outputs]
         result = None
         VillageWorldEvent.objects.create(dedupe_key=f"wildlife:{prey.pk}", event_type="PLAYER_WILDLIFE_HUNT",
             world_minute=death, time_revision=clock.time_revision, player_ids=[attempt.actor_id],

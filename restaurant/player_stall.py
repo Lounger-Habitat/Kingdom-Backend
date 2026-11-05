@@ -10,11 +10,14 @@ from django.conf import settings
 from django.db import models, transaction
 
 from game_time.models import GlobalGameTimeState
-from inventory.components import BATCH_COPY_FIELDS, copy_batch_attributes
+from inventory.components import BATCH_COPY_FIELDS
+from inventory.normalization import purchase_source_identity
+from inventory.storage import add_inventory_items, attributes_from_slot
 from inventory.models import InventoryBag, InventorySlot
 from items.models import Item, ItemType
-from player.models import PlayerGrowthState, PlayerRecipe, PlayerState
-from player.progression import award_skill, growth_snapshot
+from player.models import PlayerGrowthState, PlayerRecipe, PlayerState, PlayerSkillProgress
+from player.progression import award_skill
+from player.progression_rules import level_for_xp
 from recipes.models import Recipe
 from village.models import EconomicLedgerEntry, VillagePlayerActionReceipt, VillageSimulationConfig
 from village.phase3_asset_service import deterministic_rng
@@ -46,7 +49,8 @@ def _index(bag):
 
 
 def _skill(player):
-    return next(row["level"] for row in growth_snapshot(player, read_only=True)["skills"] if row["code"] == "business")
+    xp = PlayerSkillProgress.objects.filter(player=player, skill_code="business").values_list("total_xp", flat=True).first() or 0
+    return level_for_xp(xp)
 
 
 def _config():
@@ -54,17 +58,21 @@ def _config():
     return RestaurantConfig.objects.filter(pk=1).first() or RestaurantConfig()
 
 
-def _capacity(config, level):
-    bonus = sum(row.reward_menu_capacity_bonus for row in RestaurantLevelConfig.objects.filter(level__lte=level))
+def _capacity(config, level, level_configs=None):
+    if level_configs is None:
+        level_configs = RestaurantLevelConfig.objects.filter(level__lte=level)
+    bonus = sum(row.reward_menu_capacity_bonus for row in level_configs if row.level <= level)
     return max(0, config.base_menu_capacity + max(0, level - 1) * config.menu_capacity_per_level + bonus)
 
 
-def _quota(config, level):
-    bonus = sum(row.reward_customer_bonus for row in RestaurantLevelConfig.objects.filter(level__lte=level))
+def _quota(config, level, level_configs=None):
+    if level_configs is None:
+        level_configs = RestaurantLevelConfig.objects.filter(level__lte=level)
+    bonus = sum(row.reward_customer_bonus for row in level_configs if row.level <= level)
     return max(0, config.base_hourly_sales + max(0, level - 1) * config.hourly_sales_per_level + bonus)
 
 
-def _price(slot, item, level):
+def _price(slot, item, level, price_bonus=None):
     if slot.rated:
         if type(slot.rating_price) is not int or slot.rating_price <= 0 or not 0 <= slot.overall_score <= 100:
             return None
@@ -73,8 +81,9 @@ def _price(slot, item, level):
         if item.item_price <= 0:
             return None
         base = quality_price(item.item_price, slot.quality, dish=True)
-    bonus = sum(row.reward_price_bonus_pct for row in RestaurantLevelConfig.objects.filter(level__lte=level))
-    return max(1, int(base * (100 + bonus) / 100))
+    if price_bonus is None:
+        price_bonus = sum(row.reward_price_bonus_pct for row in RestaurantLevelConfig.objects.filter(level__lte=level))
+    return max(1, int(base * (100 + price_bonus) / 100))
 
 
 def _reason(slot, item, minute):
@@ -98,27 +107,37 @@ def _batch_snapshot(slot):
     return dict(result, instance_id=str(slot.instance_id), item_id=slot.item_id)
 
 
-def _purchase_cost(player, slot):
-    """Only a uniquely identified receipt batch proves a purchase price."""
-    matches = []
-    for receipt in VillagePlayerActionReceipt.objects.filter(player=player, action__in=["buy_store", "buy_marketplace"]):
-        if not receipt.response.get("success"):
-            continue
-        result = receipt.response.get("data", {}).get("result", {})
+def _purchase_costs(player):
+    # Purchase results prove cost; the saved full-panel overviews do not.
+    purchases = {}
+    receipts = VillagePlayerActionReceipt.objects.filter(player=player,
+        action__in=["buy_store", "buy_marketplace"], response__success=True).values_list(
+            "action", "request_id", "response__data__result")
+    for action, request_id, result in receipts:
+        result = result or {}
         for batch in result.get("purchased_batches", []):
-            if batch.get("instance_id") == str(slot.instance_id) and batch.get("item_id") == slot.item_id:
-                amount = batch.get("quantity", batch.get("amount"))
-                price = result.get("unit_price")
-                if type(amount) is int and amount >= slot.item_amount and type(price) is int and price > 0:
-                    matches.append((price, dict(source=receipt.action, request_id=str(receipt.request_id),
-                        purchased_instance_id=str(slot.instance_id), purchased_quantity=amount)))
+            amount = batch.get("quantity", batch.get("amount"))
+            price = result.get("unit_price")
+            if type(amount) is int and type(price) is int and price > 0:
+                identity = batch.get("instance_id"), batch.get("item_id")
+                purchases.setdefault(identity, []).append((price, dict(source=action, request_id=str(request_id),
+                    purchased_instance_id=identity[0], purchased_quantity=amount)))
+    return purchases
+
+
+def _purchase_cost(player, slot, *, purchases=None):
+    """Only a uniquely identified receipt batch proves a purchase price."""
+    if purchases is None:
+        purchases = _purchase_costs(player)
+    identity = purchase_source_identity(player, slot), slot.item_id
+    matches = [row for row in purchases.get(identity, []) if row[1]["purchased_quantity"] >= slot.item_amount]
     # Merged/reused identities or several purchase prices are deliberately unknown.
     return matches[0] if len(matches) == 1 else (None, {})
 
 
-def _row(slot, item, minute, level, cost=None, provenance=None):
+def _row(slot, item, minute, level, cost=None, provenance=None, *, price_bonus=None):
     reason = _reason(slot, item, minute)
-    price = _price(slot, item, level) if not reason else None
+    price = _price(slot, item, level, price_bonus) if not reason else None
     if not reason and (price is None or price <= 0):
         reason = "PRICE_UNAVAILABLE"
     return dict(instance_id=str(slot.instance_id), item_id=slot.item_id, item_name=item.item_name if item else str(slot.item_id),
@@ -146,16 +165,22 @@ def _configured_items(rows):
     return result
 
 
-def _upgrade_quote(player, bag, state, minute, read_only=False):
+def _upgrade_quote(player, bag, state, minute, read_only=False, *, base_config=None, level_configs=None, skill_level=None):
     level = state.current_level if state else 1
-    config = RestaurantLevelConfig.objects.filter(level=level + 1).first()
+    if level_configs is None:
+        level_configs = list(RestaurantLevelConfig.objects.filter(level__lte=level + 1))
+    config = next((row for row in level_configs if row.level == level + 1), None)
+    base_config = base_config or _config()
     required_skill = 2 if level + 1 == 2 else 4
     base = dict(available=False, reason="MAX_LEVEL", quote_hash=None, target_level=level + 1,
         required_skill_level=required_skill, gold_cost=0, required_ratings=0, required_sold=0,
         required_dish_ids=[], required_dish_scores=[], materials=[], reward_materials=[], reward_recipes=[],
-        capacity_after=_capacity(_config(), level + 1), hourly_quota_after=_quota(_config(), level + 1))
+        capacity_after=_capacity(base_config, level + 1, level_configs),
+        hourly_quota_after=_quota(base_config, level + 1, level_configs))
     if not config:
         return base, []
+    if skill_level is None:
+        skill_level = _skill(player)
     consumed, material_views, rewards, recipes, missing_material = {}, [], [], [], False
     try:
         costs = _configured_items(config.cost_items)
@@ -206,7 +231,7 @@ def _upgrade_quote(player, bag, state, minute, read_only=False):
         if config.cost_money < 0 or config.required_dishes_sold < 0 or config.required_total_ratings < 0:
             reject("CONFIG_INVALID", "设施价格或条件无效。")
         reason = ("MODE_READ_ONLY" if read_only else "STALL_NOT_OPEN" if not state or state.stall_opened_world_minute is None else
-            "SKILL_LEVEL_REQUIRED" if _skill(player) < required_skill else
+            "SKILL_LEVEL_REQUIRED" if skill_level < required_skill else
             "RATINGS_REQUIRED" if state.total_ratings_received < config.required_total_ratings else
             "SALES_REQUIRED" if state.total_dishes_sold < config.required_dishes_sold else
             "DISH_SALES_REQUIRED" if set(config.required_dish_ids) - set(state.dishes_sold_set) else
@@ -218,7 +243,7 @@ def _upgrade_quote(player, bag, state, minute, read_only=False):
         required_dish_ids=config.required_dish_ids, required_dish_scores=config.required_dish_scores,
         materials=material_views, reward_materials=rewards, reward_recipes=recipes)
     payload = dict(configuration={f.name: getattr(config, f.name) for f in config._meta.concrete_fields},
-        level=level, skill=_skill(player), money=bag.money, sold=state.total_dishes_sold if state else 0,
+        level=level, skill=skill_level, money=bag.money, sold=state.total_dishes_sold if state else 0,
         ratings=state.total_ratings_received if state else 0, dish_sales=state.dishes_sold_set if state else [],
         inputs=[dict(instance_id=str(s.instance_id), item_id=s.item_id, quantity=q, amount=s.item_amount,
             quality=s.quality, score=s.overall_score, expiry=s.expires_world_minute) for s, q in consumed.values()],
@@ -253,18 +278,30 @@ def business_trend(player, minute):
         legacy_undated=project(transactions.filter(world_minute__isnull=True).aggregate(**aggregates)))
 
 
-def business_overview(player, bag, minute, read_only=False):
+def business_overview(player, bag, minute, read_only=False, *, slots=None, items=None, skill_level=None,
+                      include_sales=True, revision=None):
     state = PlayerRestaurantState.objects.filter(player=player).first()
     level, config = state.current_level if state else 1, _config()
+    level_configs = list(RestaurantLevelConfig.objects.filter(level__lte=level + 1))
+    if skill_level is None:
+        skill_level = _skill(player)
     opened = bool(state and state.stall_opened_world_minute is not None)
-    menus = list(MenuItem.objects.filter(player=player).select_related("batch_slot"))
+    menus = list(MenuItem.objects.filter(player=player).select_related(
+        "batch_slot__bag", "batch_slot__usage", "batch_slot__dish", "batch_slot__review"))
+    if slots is None:
+        slots = list(bag.slots.filter(item_amount__gt=0).select_related("usage", "dish", "review")) if bag.pk else []
+    item_ids = {row.item_id for row in [*slots, *menus]}
+    items = dict(items) if items is not None else {}
+    if item_ids - items.keys():
+        items.update(Item.objects.in_bulk(item_ids - items.keys()))
+    price_bonus = sum(row.reward_price_bonus_pct for row in level_configs if row.level <= level)
     occupied = sum(max(0, menu.quantity) for menu in menus)
-    capacity = _capacity(config, level)
+    capacity = _capacity(config, level, level_configs)
     menu_views = []
     for menu in menus:
         if menu.batch_slot_id:
-            row = _row(menu.batch_slot, Item.objects.filter(pk=menu.item_id).first(), minute, level,
-                       menu.purchase_unit_cost, menu.cost_provenance)
+            row = _row(menu.batch_slot, items.get(menu.item_id), minute, level,
+                       menu.purchase_unit_cost, menu.cost_provenance, price_bonus=price_bonus)
             if not _escrow_valid(player, menu):
                 row.update(usable=False, reason="BATCH_MISMATCH")
             row["menu_id"] = menu.pk
@@ -276,37 +313,48 @@ def business_overview(player, bag, minute, read_only=False):
                 purchase_unit_cost=None, total_purchase_cost=None, cost_source="UNKNOWN")
         menu_views.append(row)
     inventory = []
-    for slot in bag.slots.filter(item_amount__gt=0).order_by("slot_index") if bag.pk else []:
-        item = Item.objects.filter(pk=slot.item_id, item_type=ItemType.FOOD).first()
-        if not item:
+    purchases = None
+    for slot in sorted(slots, key=lambda row: row.slot_index):
+        item = items.get(slot.item_id)
+        if not item or item.item_type != ItemType.FOOD:
             continue
-        cost, provenance = _purchase_cost(player, slot)
-        row = _row(slot, item, minute, level, cost, provenance)
+        if purchases is None:
+            purchases = _purchase_costs(player)
+        cost, provenance = _purchase_cost(player, slot, purchases=purchases)
+        row = _row(slot, item, minute, level, cost, provenance, price_bonus=price_bonus)
         reason = row["reason"] or ("MODE_READ_ONLY" if read_only else "STALL_NOT_OPEN" if not opened else
             "MENU_CAPACITY_REACHED" if occupied >= capacity else "")
         row.update(reason=reason, usable=not reason, available_quantity=min(slot.item_amount, max(0, capacity - occupied)) if not reason else 0)
         inventory.append(row)
+    if revision is None:
+        revision = PlayerGrowthState.objects.filter(player=player).values_list("revision", flat=True).first() or 0
+    hour = (minute % 1440) // 60
+    projection = dict(revision=revision,
+        observed_world_minute=minute, is_open=opened, is_operating=opened and config.opening_hour <= hour < config.closing_hour,
+        level=level, skill_level=skill_level, capacity=capacity, occupied=occupied, hourly_quota=_quota(config, level, level_configs),
+        opening_hour=config.opening_hour, closing_hour=config.closing_hour, menu=menu_views, inventory=inventory,
+        upgrade=_upgrade_quote(player, bag, state, minute, read_only,
+            base_config=config, level_configs=level_configs, skill_level=skill_level)[0])
+    # Listing/withdrawal do not change sales. Full refreshes still load accounts and history.
+    if not include_sales:
+        return projection
     transactions = CustomerTransaction.objects.filter(player=player)
     rows = list(transactions.order_by("-id")[:20])
-    totals = transactions.aggregate(revenue=models.Sum("amount_paid"), known_cost=models.Sum("unit_cost"), sold=models.Count("id"))
+    totals = transactions.aggregate(revenue=models.Sum("amount_paid"), known_cost=models.Sum("unit_cost"), sold=models.Count("id"),
+        unknown_cost=models.Count("id", filter=models.Q(unit_cost__isnull=True)))
     recorded_revenue = totals["revenue"] or 0
     revenue = state.total_gold_earned if state else recorded_revenue
     sold_count = state.total_dishes_sold if state else totals["sold"]
-    complete = (not transactions.filter(unit_cost__isnull=True).exists()
-                and revenue == recorded_revenue and sold_count == totals["sold"])
+    complete = totals["unknown_cost"] == 0 and revenue == recorded_revenue and sold_count == totals["sold"]
     known_cost = totals["known_cost"] or 0
-    hour = (minute % 1440) // 60
-    return dict(revision=PlayerGrowthState.objects.filter(player=player).values_list("revision", flat=True).first() or 0,
-        observed_world_minute=minute, is_open=opened, is_operating=opened and config.opening_hour <= hour < config.closing_hour,
-        level=level, skill_level=_skill(player), capacity=capacity, occupied=occupied, hourly_quota=_quota(config, level),
-        opening_hour=config.opening_hour, closing_hour=config.closing_hour, menu=menu_views, inventory=inventory,
-        upgrade=_upgrade_quote(player, bag, state, minute, read_only)[0],
+    projection.update(
         summary=dict(revenue=revenue, known_cost=known_cost, net_income_nullable=revenue-known_cost if complete else None,
             cost_complete=complete, sold_count=sold_count),
         trend=business_trend(player, minute),
         history=[dict(id=t.pk, world_minute=t.world_minute, item_id=t.item_id, item_name=t.item_name,
             quantity=1, amount_paid=t.amount_paid, unit_cost=t.unit_cost, rating=t.rating,
             comment=t.review_comment, feedback_source=t.feedback_source) for t in rows])
+    return projection
 
 
 def _escrow_code(player):
@@ -328,18 +376,18 @@ def withdraw_menu_batch(player, bag, menu):
         reject("BATCH_MISSING", "这份营业菜品的实际托管批次缺失，不能凭菜单重建库存。")
     if source and not _escrow_valid(player, menu):
         reject("BATCH_MISMATCH", "营业托管批次与菜单不一致，请核实。")
-    returned = InventorySlot(bag=bag, slot_index=_index(bag), item_id=menu.item_id, item_amount=menu.quantity)
     if source:
-        copy_batch_attributes(source, returned)
-        source.item_amount = 0
+        attributes = attributes_from_slot(source)
+        source.item_amount -= menu.quantity
         source.save(update_fields=["item_amount"])
     else:
-        for name in ("rated", "rating_price", "overall_score", "ingredient", "cook_time"):
-            setattr(returned, name, getattr(menu, name))
-        returned.quality, returned.freshness_unknown = menu.dish_quality, True
-    returned.save()
-    result = dict(menu_id=menu.pk, returned_instance_id=str(returned.instance_id), item_id=returned.item_id,
-                  quantity=returned.item_amount, freshness_unknown=returned.freshness_unknown)
+        attributes = {name: getattr(menu, name) for name in
+            ("rated", "rating_price", "overall_score", "ingredient", "cook_time")}
+        attributes.update(quality=menu.dish_quality, freshness_unknown=True)
+    received = add_inventory_items(bag, menu.item_id, menu.quantity, attributes=attributes)
+    result = dict(menu_id=menu.pk, returned_instance_id=str(received[0][0].instance_id), item_id=menu.item_id,
+                  quantity=menu.quantity, returned_items=[dict(instance_id=str(slot.instance_id), quantity=delta)
+                                                       for slot, delta in received])
     menu.delete()
     return result
 
@@ -360,7 +408,8 @@ def execute_stall_action(player, bag, action, params, rid, clock):
     elif action == "withdraw_stall_dish":
         if set(params) != {"menu_id"} or type(params["menu_id"]) is not int:
             reject("INVALID_PARAMS", "菜单标识无效。")
-        menu = MenuItem.objects.select_for_update().filter(player=player, pk=params["menu_id"]).first()
+        menu = MenuItem.objects.select_for_update(of=("self",)).select_related(
+            "batch_slot__bag", "batch_slot__usage", "batch_slot__dish", "batch_slot__review").filter(player=player, pk=params["menu_id"]).first()
         if not menu:
             reject("MENU_NOT_OWNED", "本人菜单中没有这份菜品。")
         result = withdraw_menu_batch(player, bag, menu)
@@ -370,30 +419,35 @@ def execute_stall_action(player, bag, action, params, rid, clock):
         if action == "list_stall_dish":
             if set(params) != {"instance_id", "quantity"} or type(params["quantity"]) is not int or params["quantity"] <= 0:
                 reject("INVALID_PARAMS", "请选择实际菜品批次和正整数份数。")
-            source = bag.slots.select_for_update().filter(instance_id=_uuid(params["instance_id"]), item_amount__gt=0).first()
+            source = bag.slots.select_for_update().select_related("usage", "dish", "review").filter(
+                instance_id=_uuid(params["instance_id"]), item_amount__gt=0).first()
             if not source:
                 reject("ITEM_NOT_OWNED", "本人主背包中没有这批菜品。")
             item = Item.objects.filter(pk=source.item_id).first()
             cost, provenance = _purchase_cost(player, source)
-            row = _row(source, item, clock.world_minute, state.current_level, cost, provenance)
+            level_configs = list(RestaurantLevelConfig.objects.filter(level__lte=state.current_level))
+            price_bonus = sum(config.reward_price_bonus_pct for config in level_configs)
+            row = _row(source, item, clock.world_minute, state.current_level, cost, provenance, price_bonus=price_bonus)
             if not row["usable"]:
                 reject(row["reason"], "该批次当前不能用于营业，请核对来源与鲜期。")
             quantity = params["quantity"]
             if quantity > source.item_amount:
                 reject("INSUFFICIENT_ITEMS", "该批次实际份数不足。")
             occupied = sum(MenuItem.objects.filter(player=player).values_list("quantity", flat=True))
-            if occupied + quantity > _capacity(_config(), state.current_level):
+            if occupied + quantity > _capacity(_config(), state.current_level, level_configs):
                 reject("MENU_CAPACITY_REACHED", "菜单总份数超过设施容量。")
             escrow, _ = InventoryBag.objects.get_or_create(player=player, character_id=_escrow_code(player))
-            target = InventorySlot(bag=escrow, slot_index=_index(escrow), item_id=source.item_id, item_amount=quantity)
-            copy_batch_attributes(source, target); target.save()
+            received = add_inventory_items(escrow, source.item_id, quantity, attributes=attributes_from_slot(source))
             source.item_amount -= quantity; source.save(update_fields=["item_amount"])
-            menu = MenuItem.objects.create(player=player, instance_id=str(target.instance_id), item_id=target.item_id,
-                item_name=item.item_name, dish_quality=target.quality, rated=target.rated, rating_price=target.rating_price,
-                overall_score=target.overall_score, ingredient=target.ingredient, cook_time=target.cook_time, quantity=quantity,
-                batch_slot=target, listed_world_minute=clock.world_minute, purchase_unit_cost=cost, cost_provenance=provenance)
-            result = dict(menu_id=menu.pk, instance_id=str(target.instance_id), item_id=target.item_id,
-                          quantity=quantity, unit_price=row["unit_price"], purchase_unit_cost=cost)
+            menus = []
+            for target, delta in received:
+                menu = MenuItem.objects.create(player=player, instance_id=str(target.instance_id), item_id=target.item_id,
+                    item_name=item.item_name, dish_quality=target.quality, rated=target.rated, rating_price=target.rating_price,
+                    overall_score=target.overall_score, ingredient=target.ingredient, cook_time=target.cook_time, quantity=delta,
+                    batch_slot=target, listed_world_minute=clock.world_minute, purchase_unit_cost=cost, cost_provenance=provenance)
+                menus.append(menu)
+            result = dict(menu_id=menus[0].pk, menu_ids=[m.pk for m in menus], instance_id=str(received[0][0].instance_id),
+                          item_id=source.item_id, quantity=quantity, unit_price=row["unit_price"], purchase_unit_cost=cost)
         elif action == "upgrade_player_stall":
             if set(params) != {"expected_quote"}:
                 reject("INVALID_PARAMS", "请确认设施改良报价。")
@@ -416,10 +470,10 @@ def execute_stall_action(player, bag, action, params, rid, clock):
                 item = Item.objects.get(pk=reward["item_id"])
                 uses = item.max_use_count if item.item_type in {ItemType.USABLE, ItemType.COLLECT_TOOL,
                     ItemType.HOE_TOOL, ItemType.CHOP_TOOL, ItemType.BREAK_TOOL, ItemType.REAP_TOOL, ItemType.WATER_TOOL} else None
-                slot = InventorySlot.objects.create(bag=bag, slot_index=_index(bag), item_id=item.pk,
-                    item_amount=reward["quantity"], remaining_uses=uses, source_request_id=rid,
-                    produced_world_minute=clock.world_minute, freshness_unknown=item.item_type == ItemType.FOOD)
-                rewards.append(dict(instance_id=str(slot.instance_id), item_id=item.pk, quantity=slot.item_amount))
+                for slot, delta in add_inventory_items(bag, item.pk, reward["quantity"], attributes=dict(
+                        remaining_uses=uses, source_request_id=rid, produced_world_minute=clock.world_minute,
+                        freshness_unknown=item.item_type == ItemType.FOOD)):
+                    rewards.append(dict(instance_id=str(slot.instance_id), item_id=item.pk, quantity=delta))
             ps, _ = PlayerState.objects.get_or_create(player_id=str(player.pk))
             for recipe in quote["reward_recipes"]:
                 PlayerRecipe.objects.get_or_create(player=ps, recipe_name=recipe["recipe_name"],

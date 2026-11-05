@@ -63,20 +63,20 @@ def is_local_production(slot):
 
 def record_sale(actor_type, actor_id, request_id, batches, world_minute,
                 *, income, external=False, source=""):
-    """Only paid sales of verified career output advance a milestone."""
+    """Paid sales of career goods advance milestones regardless of stock origin."""
     if income <= 0:
         return
     from .career_development import record_business_evidence
     items, sources = {}, set()
     for slot, amount in batches:
-        if slot.item_id not in NEW_CONTENT_ITEM_IDS or amount <= 0 or not is_local_production(slot):
+        if slot.item_id not in NEW_CONTENT_ITEM_IDS or amount <= 0:
             continue
         items[slot.item_id] = items.get(slot.item_id, 0) + amount
         sources.update(str(value) for value in _source_ids(slot))
     if items:
         record_business_evidence("SALE", request_id, actor_type, str(actor_id), items,
             world_minute, metadata=dict(income=income, external=external, source=source,
-                provenance_valid=True, source_request_ids=sorted(sources)))
+                source_request_ids=sorted(sources)))
 
 
 def item_theme(item_id):
@@ -94,7 +94,7 @@ def item_theme(item_id):
 
 
 def local_stock(item_id, minute):
-    """Count qualified local batches, retaining private holdings on the server."""
+    """Count available village stock; production provenance is audit data only."""
     from .models import VillageStoreInventorySlot
     rows = list(NpcGlobalInventorySlot.objects.filter(item_id=item_id, item_amount__gt=0,
         bag__npc__is_test_only=False, bag__npc__agent_id__in=["10011", "10012", "10013", "10014", "10015"]))
@@ -104,7 +104,7 @@ def local_stock(item_id, minute):
     rows += list(VillageStoreInventorySlot.objects.filter(item_id=item_id, item_amount__gt=0))
     total = 0
     for slot in rows:
-        if not valid_quality(slot.quality) or not is_local_production(slot) or (slot.produced_world_minute or 0) > minute:
+        if not valid_quality(slot.quality) or (slot.produced_world_minute or 0) > minute:
             continue
         if isinstance(slot, NpcGlobalInventorySlot):
             total += get_available_slot_amount(slot, minute)

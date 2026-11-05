@@ -18,22 +18,22 @@ class InventorySlotSerializer(serializers.ModelSerializer):
     remainingUses = serializers.IntegerField(source="remaining_uses", required=False, default=-1)
     equipmentLevel = serializers.IntegerField(source="equipment_level", read_only=True)
     reviewComment = serializers.CharField(source="review_comment", required=False, allow_blank=True)
-    batch = serializers.SerializerMethodField()
+    attributes = serializers.SerializerMethodField()
 
-    def get_batch(self, instance):
+    def get_attributes(self, instance):
         from game_time.models import GlobalGameTimeState
-        from .batches import project_batch
+        from .batches import project_item_attributes
         # A list serializer shares context, so resolve the catalog in one query.
-        if "batch_items" not in self.context:
+        if "attribute_items" not in self.context:
             rows = self.parent.instance if isinstance(self.parent, serializers.ListSerializer) else [instance]
-            self.context["batch_items"] = Item.objects.select_related("equipment_definition").prefetch_related("equipment_definition__levels").in_bulk({row.item_id for row in rows if row.item_id})
-        if "batch_minute" not in self.context:
-            self.context["batch_minute"] = GlobalGameTimeState.objects.filter(pk=1).values_list("world_minute", flat=True).first()
-        return project_batch(instance, self.context["batch_items"].get(instance.item_id), self.context["batch_minute"])
+            self.context["attribute_items"] = Item.objects.select_related("equipment_definition").prefetch_related("equipment_definition__levels").in_bulk({row.item_id for row in rows if row.item_id})
+        if "attribute_minute" not in self.context:
+            self.context["attribute_minute"] = GlobalGameTimeState.objects.filter(pk=1).values_list("world_minute", flat=True).first()
+        return project_item_attributes(instance, self.context["attribute_items"].get(instance.item_id), self.context["attribute_minute"])
 
     class Meta:
         model = InventorySlot
-        fields = ["slotIndex", "instanceID", "itemID", "itemAmount", "rated", "ratingPrice", "overallScore", "ingredient", "itemBagName", "cookTime", "dishQuality", "hideInShop", "remainingUses", "equipmentLevel", "reviewComment", "batch"]
+        fields = ["slotIndex", "instanceID", "itemID", "itemAmount", "rated", "ratingPrice", "overallScore", "ingredient", "itemBagName", "cookTime", "dishQuality", "hideInShop", "remainingUses", "equipmentLevel", "reviewComment", "attributes"]
 
     def to_representation(self, instance):
         data = super().to_representation(instance)
@@ -43,8 +43,8 @@ class InventorySlotSerializer(serializers.ModelSerializer):
 
 
 def serialize_bag(bag):
-    """Serialize an InventoryBag with all its slots (including empty ones)."""
-    slots = bag.slots.all().order_by("slot_index")
+    """Serialize current inventory rows; retired empty records stay server-side."""
+    slots = bag.slots.filter(item_amount__gt=0).order_by("slot_index")
     # 兜底：补全缺失的 item_bag_name
     dirty = []
     for slot in slots:
@@ -108,6 +108,6 @@ class ErrorResponseSerializer(serializers.Serializer):
 def serialize_npc_global_bag(bag):
     """Serialize an NpcGlobalInventory with all its slots."""
     from .models import NpcGlobalInventorySlot
-    slots = bag.slots.all().order_by("slot_index")
+    slots = bag.slots.filter(item_amount__gt=0).order_by("slot_index")
     items = InventorySlotSerializer(slots, many=True).data
     return {"money": bag.money, "items": items}

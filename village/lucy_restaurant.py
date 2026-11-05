@@ -3,10 +3,11 @@ import copy
 import uuid
 
 from django.db import models
+from inventory.storage import add_inventory_items, add_store_items
 from inventory.models import NpcGlobalInventory
 from .models import (VillageStore, VillageStoreAccount, VillageStoreListing, VillageStoreInventorySlot,
                      VillageAccount, VillageCommunityMealDailyUsage, VillageStoryFact)
-from .phase3_asset_service import _ok, _fail, add_batch, BATCH_ITEM_ATTRIBUTES, get_available_slot_amount
+from .phase3_asset_service import _ok, _fail, BATCH_ITEM_ATTRIBUTES, get_available_slot_amount
 from .lucy_catalog import PUBLIC_MEALS
 from .lucy_cooking import fixed_price, _id
 from .public_governance import integer
@@ -152,11 +153,10 @@ def list_meal(npc_id, params, minute, request_id):
         listed_by_npc=inventory.npc, created_request_id=request_id, listed_world_minute=minute)
     slot.item_amount -= amount
     slot.save(update_fields=["item_amount"])
-    VillageStoreInventorySlot.objects.create(store=store, listing=listing, item_id=item_id, item_amount=amount,
+    add_store_items(store, item_id, amount, listing=listing, attributes=dict(item_attributes=attrs,
         remaining_uses=slot.remaining_uses, produced_world_minute=slot.produced_world_minute,
-        expires_world_minute=slot.expires_world_minute, item_attributes=attrs,
-        source_npc=inventory.npc if source == "PERSONAL" else slot.source_npc,
-        source_slot_instance_id=slot.instance_id if source == "PERSONAL" else slot.source_slot_instance_id)
+        source_npc=inventory.npc if source == "PERSONAL" else slot.source_npc),
+        source_instance_id=slot.instance_id if source == "PERSONAL" else slot.source_slot_instance_id)
     if source == "PERSONAL":
         inventory.asset_version += 1
         inventory.save(update_fields=["asset_version", "updated_at"])
@@ -256,8 +256,8 @@ def buy_public_meal(npc_id, params, minute, request_id):
     if error:
         return _fail(error)
     slot, subsidy = claim["slot"], claim["subsidy_amount"]
-    received = add_batch(buyer, slot.item_id, 1, slot.produced_world_minute, slot.expires_world_minute,
-        request_id, item_attributes=claim["attributes"])
+    received_items = add_inventory_items(buyer, slot.item_id, 1, attributes={**(claim["attributes"]), "produced_world_minute": slot.produced_world_minute, "expires_world_minute": slot.expires_world_minute, "source_request_id": request_id})
+    received = received_items[0][0]
     buyer.asset_version += 1
     buyer.save(update_fields=["asset_version", "updated_at"])
     store.inventory_version += 1

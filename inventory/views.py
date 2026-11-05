@@ -19,6 +19,7 @@ from .serializers import (
     serialize_npc_global_bag,
 )
 from .components import BATCH_COPY_FIELDS, copy_batch_attributes, same_batch_attributes
+from .storage import add_inventory_items, attributes_from_slot
 from items.models import Item, ItemType
 from account.env_auth import EnvServerJWTAuthentication
 from account.authentication import GameJWTAuthentication
@@ -117,58 +118,12 @@ def inventory_add(request, character_id):
     if item_id is None:
         return Response(error_response("缺少 itemId"), status=400)
 
-    # Check if item is food or usable
-    is_food = False
-    is_usable = False
-    item_name = ""
-    max_use = 1
-    try:
-        item = Item.objects.get(item_id=item_id)
-        is_food = (item.item_type == "食物")
-        is_usable = (item.item_type == ItemType.USABLE)
-        item_name = item.item_name
-        max_use = item.max_use_count
-    except Item.DoesNotExist:
-        pass
-
-    # NPC背包中的物品默认不在商店显示（NPC商店只卖预设物品）
-    is_npc_bag = (character_id != "player")
-
-    if is_food and instance_id:
-        # Food: always create a new slot (each dish is unique)
-        slot = find_empty_slot(bag)
-        slot.item_id = item_id
-        slot.item_amount = amount
-        slot.ingredient = ingredient
-        slot.cook_time = cook_time
-        slot.dish_quality = dish_quality
-        slot.item_bag_name = f"{item_name}_{slot.slot_index}"
-        if is_npc_bag:
-            slot.hide_in_shop = True
-        slot.save()
-    else:
-        # Non-food: stack on existing slot
-        existing = bag.slots.filter(item_id=item_id, item_amount__gt=0).first()
-        if existing:
-            existing.item_amount += amount
-            if ingredient:
-                existing.ingredient = ingredient
-            if is_npc_bag:
-                existing.hide_in_shop = True
-            existing.save()
-        else:
-            slot = find_empty_slot(bag)
-            slot.item_id = item_id
-            slot.item_amount = amount
-            slot.ingredient = ingredient
-            slot.cook_time = cook_time
-            slot.dish_quality = dish_quality
-            slot.item_bag_name = f"{item_name}_{slot.slot_index}"
-            if is_npc_bag:
-                slot.hide_in_shop = True
-            if is_usable:
-                slot.remaining_uses = max_use
-            slot.save()
+    item = Item.objects.filter(pk=item_id).first()
+    if item is None or type(amount) is not int or amount <= 0:
+        return Response(error_response("物品或数量无效"), status=400)
+    add_inventory_items(bag, item_id, amount, attributes=dict(ingredient=ingredient,
+        cook_time=cook_time, dish_quality=dish_quality, item_bag_name=item.item_name,
+        remaining_uses=item.max_use_count if item.item_type == ItemType.USABLE else None))
 
     return Response(success_response(bag))
 
@@ -208,7 +163,7 @@ def inventory_rate(request, character_id):
         new_slot.rating_price = rating_price
         new_slot.overall_score = overall_score
         new_slot.ingredient = slot.ingredient
-        new_slot.item_bag_name = slot.item_bag_name
+        new_slot.item_bag_name = f"{slot.item_bag_name[:66]}_{new_slot.instance_id.hex}"
         new_slot.cook_time = slot.cook_time
         new_slot.dish_quality = slot.dish_quality
         new_slot.hide_in_shop = slot.hide_in_shop
@@ -310,28 +265,9 @@ def inventory_transfer(request, character_id):
         return Response(error_response("不能向同一个背包转移物品"), status=400)
     is_npc_target = (target_id != "player")
 
-    # Find or create target slot
-    target_slot = next((row for row in target_bag.slots.filter(item_id=source_slot.item_id, item_amount__gt=0)
-                        if same_batch_attributes(row, source_slot)), None)
-    if target_slot:
-        target_slot.item_amount += amount
-        # 不改变已有槽位的 hide_in_shop，避免覆盖NPC预设物品的可见性
-        target_slot.save()
-    else:
-        empty = find_empty_slot(target_bag)
-        empty.item_id = source_slot.item_id
-        empty.item_amount = amount
-        copy_batch_attributes(source_slot, empty)
-        empty.rated = source_slot.rated
-        empty.rating_price = source_slot.rating_price
-        empty.ingredient = source_slot.ingredient
-        empty.item_bag_name = source_slot.item_bag_name
-        empty.cook_time = source_slot.cook_time
-        empty.dish_quality = source_slot.dish_quality
-        empty.hide_in_shop = source_slot.hide_in_shop or is_npc_target
-        empty.remaining_uses = source_slot.remaining_uses
-        empty.review_comment = source_slot.review_comment
-        empty.save()
+    attrs = attributes_from_slot(source_slot)
+    attrs["hide_in_shop"] = source_slot.hide_in_shop or is_npc_target
+    add_inventory_items(target_bag, source_slot.item_id, amount, attributes=attrs)
 
     source_slot.item_amount -= amount
     source_slot.save(update_fields=["item_amount"])
@@ -343,20 +279,21 @@ def inventory_transfer(request, character_id):
 @extend_schema(responses={200: DualBagResponseSerializer, 400: ErrorResponseSerializer})
 @api_view(["POST"])
 def inventory_compact(request, character_id):
-    """整理背包：删除空槽位，有物品的槽位重新从 0 开始连续编号。"""
+    """Reindex live items first while retaining referenced historical empty rows."""
     bag = get_or_create_bag(request.user, character_id)
 
     with transaction.atomic():
         bag = InventoryBag.objects.select_for_update().get(pk=bag.pk)
         filled_slots = list(bag.slots.select_for_update().filter(item_amount__gt=0).order_by("slot_index"))
-        bag.slots.filter(item_amount__lte=0).delete()
+        empty_slots = list(bag.slots.select_for_update().filter(item_amount__lte=0).order_by("slot_index"))
+        rows = filled_slots + empty_slots
         # Reindex in place: preserve parent PKs, batch IDs and component ownership.
         # A disjoint temporary range avoids the unique (bag, slot_index) constraint.
-        temporary_start = min([0, *(row.slot_index for row in filled_slots)]) - len(filled_slots) - 1
-        for offset, row in enumerate(filled_slots):
+        temporary_start = min([0, *(row.slot_index for row in rows)]) - len(rows) - 1
+        for offset, row in enumerate(rows):
             row.slot_index = temporary_start + offset
             row.save(update_fields=["slot_index"])
-        for index, row in enumerate(filled_slots):
+        for index, row in enumerate(rows):
             row.slot_index = index
             row.save(update_fields=["slot_index"])
 
@@ -502,20 +439,8 @@ def inventory_use(request, character_id):
         recipe_item = Item.objects.filter(item_id=item_id).first()
         recipe_max_use = recipe_item.max_use_count if recipe_item else 1
 
-        existing = bag.slots.filter(item_id=item_id, item_amount__gt=0).first()
-        if existing:
-            existing.item_amount += 1
-            if existing.remaining_uses is None:
-                existing.remaining_uses = recipe_max_use
-            existing.save()
-        else:
-            target_slot = find_empty_slot(bag)
-            target_slot.item_id = item_id
-            target_slot.item_amount = 1
-            target_slot.remaining_uses = recipe_max_use
-            recipe_name_for_bag = recipe_item.item_name if recipe_item else f"菜谱#{item_id}"
-            target_slot.item_bag_name = f"{recipe_name_for_bag}_{target_slot.slot_index}"
-            target_slot.save()
+        add_inventory_items(bag, item_id, 1, attributes=dict(remaining_uses=recipe_max_use,
+            item_bag_name=recipe_item.item_name if recipe_item else str(item_id)))
         recipe_name = recipe_item.item_name if recipe_item else f"菜谱#{item_id}"
 
         _consume_item_use(slot, item)
@@ -534,20 +459,8 @@ def inventory_use(request, character_id):
         recipe_item = Item.objects.filter(item_id=item_id).first()
         recipe_max_use = recipe_item.max_use_count if recipe_item else 1
 
-        existing = bag.slots.filter(item_id=item_id, item_amount__gt=0).first()
-        if existing:
-            existing.item_amount += 1
-            if existing.remaining_uses is None:
-                existing.remaining_uses = recipe_max_use
-            existing.save()
-        else:
-            target_slot = find_empty_slot(bag)
-            target_slot.item_id = item_id
-            target_slot.item_amount = 1
-            target_slot.remaining_uses = recipe_max_use
-            recipe_name_for_bag = recipe_item.item_name if recipe_item else f"菜谱#{item_id}"
-            target_slot.item_bag_name = f"{recipe_name_for_bag}_{target_slot.slot_index}"
-            target_slot.save()
+        add_inventory_items(bag, item_id, 1, attributes=dict(remaining_uses=recipe_max_use,
+            item_bag_name=recipe_item.item_name if recipe_item else str(item_id)))
 
         recipe_name = recipe_item.item_name if recipe_item else f"菜谱#{item_id}"
 
@@ -763,16 +676,7 @@ def inventory_collect(request, character_id):
         player.save(update_fields=["action_points", "action_points_recovered_at"])
 
         for ci in collected_items:
-            existing = bag.slots.filter(item_id=ci["itemId"], item_amount__gt=0).first()
-            if existing:
-                existing.item_amount += ci["amount"]
-                existing.save()
-            else:
-                slot = find_empty_slot(bag)
-                slot.item_id = ci["itemId"]
-                slot.item_amount = ci["amount"]
-                slot.item_bag_name = f"{ci['itemName']}_{slot.slot_index}"
-                slot.save()
+            add_inventory_items(bag, ci["itemId"], ci["amount"], attributes=dict(item_bag_name=ci["itemName"]))
 
     return Response({
         "code": 0,
@@ -1270,7 +1174,7 @@ def inventory_judge(request, character_id):
             new_slot.rating_price = rating_price
             new_slot.overall_score = overall_score
             new_slot.ingredient = slot.ingredient
-            new_slot.item_bag_name = slot.item_bag_name
+            new_slot.item_bag_name = f"{slot.item_bag_name[:66]}_{new_slot.instance_id.hex}"
             new_slot.cook_time = slot.cook_time
             new_slot.dish_quality = slot.dish_quality
             new_slot.hide_in_shop = slot.hide_in_shop
@@ -1409,7 +1313,7 @@ def inventory_judge_by_agent(request, character_id):
             new_slot.rating_price = rating_price
             new_slot.overall_score = overall_score
             new_slot.ingredient = slot.ingredient
-            new_slot.item_bag_name = slot.item_bag_name
+            new_slot.item_bag_name = f"{slot.item_bag_name[:66]}_{new_slot.instance_id.hex}"
             new_slot.cook_time = slot.cook_time
             new_slot.dish_quality = slot.dish_quality
             new_slot.hide_in_shop = slot.hide_in_shop
@@ -1568,44 +1472,11 @@ def _character_trade_copy_slot(source_slot, target_owner, amount):
             hide_in_shop=False,
         ).exists()
 
-    candidates = target_bag.slots.select_for_update().filter(
-        item_id=source_slot.item_id,
-        item_amount__gt=0,
-        quality=source_slot.quality,
-    ).order_by("hide_in_shop", "slot_index", "id")
-    existing = next((row for row in candidates if same_batch_attributes(row, source_slot)), None)
-    if existing:
-        existing.item_amount += amount
-        # 同步模板白名单结果，同时修正历史上写错的可见性。
-        existing.hide_in_shop = target_hide_in_shop
-        existing.save(update_fields=["item_amount", "hide_in_shop"])
-        return
-
-    if target_is_npc:
-        target = target_bag.slots.filter(item_amount=0).first()
-        if target is None:
-            max_idx = target_bag.slots.aggregate(Max("slot_index"))["slot_index__max"]
-            target = NpcGlobalInventorySlot.objects.create(
-                bag=target_bag,
-                slot_index=(max_idx + 1) if max_idx is not None else 0,
-            )
-    else:
-        target = find_empty_slot(target_bag)
-
-    target.item_id = source_slot.item_id
-    target.item_amount = amount
-    copy_batch_attributes(source_slot, target)
-    target.rated = source_slot.rated
-    target.rating_price = source_slot.rating_price
-    target.overall_score = source_slot.overall_score
-    target.ingredient = source_slot.ingredient
-    target.item_bag_name = source_slot.item_bag_name
-    target.cook_time = source_slot.cook_time
-    target.dish_quality = source_slot.dish_quality
-    target.hide_in_shop = target_hide_in_shop
-    target.remaining_uses = source_slot.remaining_uses
-    target.review_comment = source_slot.review_comment
-    target.save()
+    attrs = attributes_from_slot(source_slot)
+    attrs["hide_in_shop"] = target_hide_in_shop
+    for target, _ in add_inventory_items(target_bag, source_slot.item_id, amount, attributes=attrs):
+        target.hide_in_shop = target_hide_in_shop
+        target.save(update_fields=["hide_in_shop"])
 
 
 def _character_trade_remove_slot(slot, amount):
@@ -2031,11 +1902,9 @@ def npc_global_inventory_update(request, character_id):
         # 清除旧slots，全量写入
         bag.slots.all().delete()
         for item_data in items:
-            NpcGlobalInventorySlot.objects.create(
-                bag=bag,
-                slot_index=item_data.get("slotIndex", 0),
-                item_id=item_data.get("itemId", 0),
-                item_amount=item_data.get("itemAmount", 0),
+            if not item_data.get("itemId") or item_data.get("itemAmount", 0) <= 0:
+                continue
+            add_inventory_items(bag, item_data["itemId"], item_data["itemAmount"], attributes=dict(
                 rated=item_data.get("rated", False),
                 rating_price=item_data.get("ratingPrice", -1),
                 overall_score=item_data.get("overallScore", 0),
@@ -2046,7 +1915,7 @@ def npc_global_inventory_update(request, character_id):
                 hide_in_shop=item_data.get("hideInShop", False),
                 remaining_uses=item_data.get("remainingUses"),
                 review_comment=item_data.get("reviewComment", ""),
-            )
+            ))
 
     return Response({
         "success": True,
@@ -2102,29 +1971,12 @@ def npc_global_inventory_restock(request):
         for tmpl_slot in tmpl.slots.select_related("item").all():
             if not tmpl_slot.item:
                 continue
-            existing = bag.slots.filter(item_id=tmpl_slot.item_id, item_amount__gt=0).first()
-            if existing:
-                deficit = tmpl_slot.item_amount - existing.item_amount
-                if deficit > 0:
-                    existing.item_amount = tmpl_slot.item_amount
-                    existing.save()
-            else:
-                max_idx = bag.slots.aggregate(Max("slot_index"))["slot_index__max"]
-                next_idx = (max_idx + 1) if max_idx is not None else 0
-                NpcGlobalInventorySlot.objects.create(
-                    bag=bag,
-                    slot_index=next_idx,
-                    item_id=tmpl_slot.item_id,
-                    item_amount=tmpl_slot.item_amount,
-                    rated=tmpl_slot.rated,
-                    rating_price=tmpl_slot.rating_price,
-                    overall_score=tmpl_slot.overall_score,
-                    ingredient=tmpl_slot.ingredient,
-                    item_bag_name=f"{tmpl_slot.item.item_name}_{next_idx}",
-                    cook_time=tmpl_slot.cook_time,
-                    dish_quality=tmpl_slot.dish_quality,
-                    hide_in_shop=tmpl_slot.hide_in_shop,
-                )
+            from inventory.services import add_template_items
+            from django.db.models import Sum
+            owned = bag.slots.filter(item_id=tmpl_slot.item_id, item_amount__gt=0).aggregate(total=Sum("item_amount"))["total"] or 0
+            deficit = tmpl_slot.item_amount - owned
+            if deficit > 0:
+                add_template_items(bag, tmpl_slot, deficit)
         restocked += 1
 
     return Response({"success": True, "restocked": restocked})
@@ -2143,22 +1995,6 @@ def _init_npc_global_from_template(character_id):
         for tmpl_slot in tmpl.slots.select_related("item").all():
             if not tmpl_slot.item:
                 continue
-            remaining_uses = None
-            if tmpl_slot.item.item_type == "Usable":
-                remaining_uses = tmpl_slot.item.max_use_count
-            NpcGlobalInventorySlot.objects.create(
-                bag=bag,
-                slot_index=tmpl_slot.slot_index,
-                item_id=tmpl_slot.item_id,
-                item_amount=tmpl_slot.item_amount,
-                rated=tmpl_slot.rated,
-                rating_price=tmpl_slot.rating_price,
-                overall_score=tmpl_slot.overall_score,
-                ingredient=tmpl_slot.ingredient,
-                item_bag_name=f"{tmpl_slot.item.item_name}_{tmpl_slot.slot_index}",
-                cook_time=tmpl_slot.cook_time,
-                dish_quality=tmpl_slot.dish_quality,
-                hide_in_shop=tmpl_slot.hide_in_shop,
-                remaining_uses=remaining_uses,
-            )
+            from inventory.services import add_template_items
+            add_template_items(bag, tmpl_slot)
     return bag

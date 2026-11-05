@@ -1,7 +1,7 @@
-"""Versioned, read-only batch contract over normalized instance storage.
+"""Versioned, read-only item attributes over normalized inventory storage.
 
 Legacy Python properties read the optional typed detail tables. Consumers use
-usage/dish/freshness objects, not dish fields to infer generic item behavior.
+usage/dish objects, not dish fields to infer generic item behavior.
 This adapter also accepts store/market attributes via a slot-shaped object.
 """
 from items.models import ItemType
@@ -19,9 +19,9 @@ def item_rules(item):
                 "hasUsage": False, "isDish": False}
     dish = item.item_type == ItemType.FOOD
     usage = item.item_type in TOOL_TYPES or item.item_type == ItemType.USABLE
-    single_use = item.item_type == ItemType.USABLE and item.max_use_count == 1
+    from .storage import can_stack_item
     return {
-        "stackable": item.stackable and not dish and (not usage or single_use),
+        "stackable": can_stack_item(item),
         "maxPerSlot": item.max_stack_size,
         "hasQuality": has_quality(item),
         "hasUsage": usage,
@@ -29,8 +29,8 @@ def item_rules(item):
     }
 
 
-def project_batch(slot, item, world_minute):
-    """Do not write, merge, rename, or replace any source batch IDs."""
+def project_item_attributes(slot, item, world_minute):
+    """Describe one authoritative stack or individual item without mutating it."""
     rules = item_rules(item)
     metadata = getattr(slot, "dish_metadata", None) or {}
     # Preserve special historical instances even if their catalog type changed.
@@ -58,8 +58,6 @@ def project_batch(slot, item, world_minute):
         if stats:
             equipment = {"level": level, "attackMin": stats["attack_min"], "attackMax": stats["attack_max"]}
             usage["maximum"] = stats["max_durability"]
-    produced = getattr(slot, "produced_world_minute", None)
-    freshness = None
     dish = None
     if is_dish:
         dish = {"cookTime": slot.cook_time, "ingredients": slot.ingredient,
@@ -72,25 +70,55 @@ def project_batch(slot, item, world_minute):
         "quality": slot.dish_quality if rules["hasQuality"] or is_dish else None,
         "stacking": {"stackable": rules["stackable"] and not is_dish and (not has_usage or single_use),
                      "maxPerSlot": rules["maxPerSlot"], **({"singleUse": True} if single_use else {})},
-        "usage": usage, "equipment": equipment, "dish": dish, "freshness": freshness,
-        "origin": {"producedWorldMinute": produced,
-                   "requestId": str(slot.source_request_id) if getattr(slot, "source_request_id", None) else None},
+        "usage": usage, "equipment": equipment, "dish": dish,
         "snapshotWorldMinute": world_minute,
     }
 
 
-def project_public_batch(slot, item, world_minute, quantity, *, expires_world_minute=None,
-                         freshness_unknown=False):
+def project_public_attributes(slot, item, world_minute, quantity):
     """Public tooltip snapshot: no private identity, provenance or arbitrary metadata."""
     view = SimpleNamespace(
         instance_id="", item_id=slot.item_id, item_amount=quantity,
         **{name: getattr(slot, name) for name in (
             "dish_quality", "remaining_uses", "equipment_level", "ingredient", "cook_time", "dish_metadata",
             "rated", "rating_price", "overall_score", "review_comment")},
-        expires_world_minute=expires_world_minute, freshness_unknown=freshness_unknown,
     )
-    result = project_batch(view, item, world_minute)
-    result["origin"] = None
+    result = project_item_attributes(view, item, world_minute)
+    result.pop("id", None)
     if result["dish"] is not None:
-        result["dish"]["metadata"] = {}
+        result["dish"].pop("metadata", None)
     return result
+
+
+def normalize_legacy_attributes(value):
+    """Read old typed inventory snapshots without touching other business metadata."""
+    def typed(snapshot):
+        return (isinstance(snapshot, dict) and snapshot.get("schemaVersion") == 1
+                and "itemId" in snapshot and "quantity" in snapshot and "stacking" in snapshot)
+
+    if isinstance(value, list):
+        for child in value:
+            normalize_legacy_attributes(child)
+    elif isinstance(value, dict):
+        old_items = value.get("batches")
+        if ("item_id" in value and ("listing_id" in value or "total_amount" in value)
+                and isinstance(old_items, list) and old_items
+                and all(isinstance(row, dict) and typed(row.get("batch")) for row in old_items)):
+            value["items"] = value.pop("batches")
+        old = value.get("batch")
+        if typed(old):
+            value.pop("batch")
+            value.setdefault("attributes", old)
+        attributes = value.get("attributes")
+        if typed(attributes):
+            attributes.pop("origin", None)
+            attributes.pop("freshness", None)
+            if not attributes.get("id"):
+                attributes.pop("id", None)
+                if isinstance(attributes.get("dish"), dict):
+                    attributes["dish"].pop("metadata", None)
+        for key, child in value.items():
+            # Dish metadata is arbitrary user/business data, never an inventory envelope.
+            if key != "metadata":
+                normalize_legacy_attributes(child)
+    return value

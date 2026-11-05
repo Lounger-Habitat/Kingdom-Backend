@@ -4,11 +4,9 @@ from .models import MarketListing, MarketTransaction
 
 def serialize_listing(listing, viewer=None, *, context=None):
     """Serialize a MarketListing to a camelCase dict."""
-    from .services import _listing_batch
-    batch = _listing_batch(listing)
     if context is None:
         context = _tooltip_context([listing])
-    from inventory.batches import project_public_batch
+    from inventory.batches import project_public_attributes
     seller_name = ""
     if listing.source_type == "system":
         seller_name = "系统"
@@ -45,17 +43,11 @@ def serialize_listing(listing, viewer=None, *, context=None):
         "dishQuality": listing.dish_quality,
         "cookTime": listing.cook_time,
         "remainingUses": listing.remaining_uses,
-        "producedWorldMinute": batch.get("producedWorldMinute"),
-        "expiresWorldMinute": None,
-        "freshnessUnknown": False,
         "reviewComment": listing.review_comment,
-        "itemBagName": listing.item_bag_name,
         "createdAt": listing.created_at.isoformat() if listing.created_at else None,
         "expiresAt": listing.expires_at.isoformat() if listing.expires_at else None,
-        "batch": project_public_batch(
+        "attributes": project_public_attributes(
             listing, context[0].get(listing.item_id), context[1], listing.remaining_amount,
-            expires_world_minute=batch.get("expiresWorldMinute"),
-            freshness_unknown=bool(batch.get("freshnessUnknown")),
         ),
     }
     return data

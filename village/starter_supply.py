@@ -11,9 +11,9 @@ import uuid
 from django.db import models, transaction
 
 from game_time.models import GlobalGameTimeState
-from inventory.components import copy_batch_attributes, same_batch_attributes
+from inventory.storage import add_inventory_items, attributes_from_slot
 from inventory.models import (CollectionPointLevelItem, InventoryBag, InventorySlot,
-                              NpcGlobalInventory, NpcGlobalInventorySlot)
+                              NpcGlobalInventory)
 from items.models import Item
 from player.progression_rules import BUSINESS_ORDER_XP
 from marketplace.services import get_player_main_bag
@@ -64,14 +64,10 @@ def _next_index(bag):
 
 
 def _copy_quantity(source, target, quantity):
-    cls = NpcGlobalInventorySlot if isinstance(target, NpcGlobalInventory) else InventorySlot
-    row = cls(bag=target, slot_index=_next_index(target), item_id=source.item_id,
-              item_amount=quantity, item_bag_name=source.item_bag_name)
-    copy_batch_attributes(source, row)
-    row.save()
+    received = add_inventory_items(target, source.item_id, quantity, attributes=attributes_from_slot(source))
     source.item_amount -= quantity
     source.save(update_fields=["item_amount"])
-    return row
+    return received
 
 
 def _batch_line(slot, quantity):
@@ -120,21 +116,7 @@ def _return_deliveries(order):
     returned = []
     for delivery in order.deliveries.select_for_update().filter(status="HELD").select_related("slot").order_by("pk"):
         source = InventorySlot.objects.select_for_update().get(pk=delivery.slot_id)
-        original = InventorySlot.objects.select_for_update().filter(bag=bag, instance_id=delivery.source_instance_id).first()
-        if original and original.item_id == source.item_id and same_batch_attributes(original, source):
-            original.item_amount += delivery.quantity
-            original.save(update_fields=["item_amount"])
-            source.item_amount -= delivery.quantity
-            source.save(update_fields=["item_amount"])
-            target = original
-        else:
-            target = _copy_quantity(source, bag, delivery.quantity)
-            # If the original row was removed, restore its identity as well as
-            # its attributes. A changed original batch remains independent.
-            if original is None:
-                target.instance_id = delivery.source_instance_id
-                target.save(update_fields=["instance_id"])
-        returned.append(_batch_line(target, delivery.quantity))
+        returned.extend(_batch_line(target, delta) for target, delta in _copy_quantity(source, bag, delivery.quantity))
         delivery.status = "RETURNED"
         delivery.save(update_fields=["status"])
     return returned
@@ -289,18 +271,18 @@ def execute_supply(player, bag, action, params, rid, minute):
             error = _eligibility(source, order, minute)
             if error:
                 _fail(error, "该批次不满足物品、品质、来源或剩余鲜期要求。")
-            target = _copy_quantity(source, order.escrow_bag, quantity)
-            StarterSupplyDelivery.objects.create(order=order, source_instance_id=source.instance_id,
-                                                 slot=target, quantity=quantity)
+            received = _copy_quantity(source, order.escrow_bag, quantity)
+            for target, delta in received:
+                StarterSupplyDelivery.objects.create(order=order, source_instance_id=source.instance_id,
+                                                     slot=target, quantity=delta)
             order.delivered_quantity += quantity
             complete = order.delivered_quantity == order.required_quantity
             if complete:
                 for delivery in order.deliveries.select_for_update().filter(status="HELD").select_related("slot"):
-                    slot = delivery.slot
+                    slot = InventorySlot.objects.select_for_update().get(pk=delivery.slot_id)
                     if _eligibility(slot, order, minute):
                         _fail("HELD_BATCH_NO_LONGER_ELIGIBLE", "较早交付的批次已不满足鲜期或目录要求，请弃单取回。")
-                    slot.bag, slot.slot_index = batch.reserve_bag, _next_index(batch.reserve_bag)
-                    slot.save(update_fields=["bag", "slot_index"])
+                    _copy_quantity(slot, batch.reserve_bag, delivery.quantity)
                     delivery.status = "RESERVED"
                     delivery.save(update_fields=["status"])
                 if batch.escrow_gold < order.reward_gold:
@@ -317,7 +299,7 @@ def execute_supply(player, bag, action, params, rid, minute):
             _ledger(f"action:{player.pk}:{rid}", "STARTER_DELIVERY", {
                 f"PLAYER:{player.pk}": {"money": result["earned_gold"], str(source.item_id): -quantity},
                 "STARTER_ESCROW": {"money": -result["earned_gold"]},
-                "delivered_batch": _batch_line(target, quantity), "order_id": str(order.pk),
+                "delivered_batches": [_batch_line(target, delta) for target, delta in received], "order_id": str(order.pk),
                 "destination": "PUBLIC_RESERVE" if complete else "ORDER_ESCROW"}, minute)
     batch.revision += 1
     batch.save(update_fields=["revision", "escrow_gold", "paid_gold"])
@@ -365,7 +347,7 @@ def spend_reserve(batch_id, beneficiary_bag, allocations, request_id, minute, pu
                                                                   instance_id=row["instance_id"]).first()
         if not source or source.item_amount < row["quantity"]:
             _fail("INSUFFICIENT_RESERVE", "公共储备的该批次物资不足。")
-        moved.append(_batch_line(_copy_quantity(source, target, row["quantity"]), row["quantity"]))
+        moved.extend(_batch_line(slot, delta) for slot, delta in _copy_quantity(source, target, row["quantity"]))
     if isinstance(target, NpcGlobalInventory):
         target.asset_version += 1
         target.save(update_fields=["asset_version"])

@@ -169,19 +169,25 @@ def _tool_shop(minute):
     return data
 
 
-def gathering_overview(player, bag, minute):
+def gathering_overview(player, bag, minute, *, tool_state=None, levels=None, slots=None, include_shop=True, context=None):
     """Private read-only snapshot, also safe before first participation."""
-    level = _level(player)
+    levels = context.get("levels") if levels is None and context is not None else levels
+    level = levels.get("gathering", 1) if levels is not None else _level(player)
     ids = _pool_item_ids(player)
     categories = [dict(code=code, title=title, item_ids=sorted(ids.intersection(items)),
                        available=bool(ids.intersection(items))) for code, title, items in CATEGORIES]
     from .production_tools import tools_overview
-    tools = tools_overview(player, bag, minute, capability="targeted_gathering")["tools"]
+    tool_state = tool_state if tool_state is not None else tools_overview(player, bag, minute,
+        capability="targeted_gathering", levels=levels, slots=slots, context=context)
+    tools = [{key: value for key, value in row.items() if key not in {"repair", "upgrade"}}
+             for row in tool_state["tools"] if row["capability"] == "targeted_gathering"]
     usable = any(tool["usable"] for tool in tools)
     reason = ("SKILL_LEVEL_REQUIRED" if level < REQUIRED_LEVEL else "GATHERING_TOOL_REQUIRED" if not usable
               else "COLLECTION_CATEGORY_EMPTY" if not any(c["available"] for c in categories) else None)
-    return dict(level=level, targeted_available=reason is None, reason=reason, categories=categories,
-                tools=tools, tool_shop=_tool_shop(minute))
+    result = dict(level=level, targeted_available=reason is None, reason=reason, categories=categories, tools=tools)
+    if include_shop:
+        result["tool_shop"] = _tool_shop(minute)
+    return result
 
 
 def prepare_targeted_collection(player, bag, params, pool, weights, *, minute=None):
@@ -236,12 +242,8 @@ def wear_tool(tool):
     if tool.item_amount > 1:
         tool.item_amount -= 1
         tool.save(update_fields=["item_amount"])
-        index = tool.bag.slots.aggregate(n=models.Max("slot_index"))["n"]
-        used = InventorySlot(bag=tool.bag, slot_index=0 if index is None else index + 1,
-                             item_id=tool.item_id, item_amount=1, item_bag_name=tool.item_bag_name)
-        copy_batch_attributes(tool, used)
-        used.save()
-        tool = used
+        from inventory.storage import add_inventory_items, attributes_from_slot
+        tool = add_inventory_items(tool.bag, tool.item_id, 1, attributes=attributes_from_slot(tool))[0][0]
     tool.remaining_uses -= 1
     tool.save(update_fields=["remaining_uses"])
     return dict(item_id=tool.item_id, instance_id=str(tool.instance_id), uses=1, remaining_uses=tool.remaining_uses)

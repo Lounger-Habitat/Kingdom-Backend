@@ -104,22 +104,18 @@ def _reward_terms(cfg, period, item_ids):
 
 
 def _procurement_plan(cfg, period, minute, deadline):
-    from .caravan import item_pool
     from .phase3_public_economy import _get_published_price
     from .career_catalog import NEW_CONTENT_ITEM_IDS
     from .career_development import procurement_candidates, recommendation_context
-    from .career_trade import THEMES, item_theme, local_stock, forecast_supply
+    from .career_trade import THEMES, item_theme, forecast_supply
     theme, label = THEMES[period % len(THEMES)]
-    imports = set(item_pool(cfg))
     eligible = set(cfg.caravan_export_item_ids) & EXPORT_WHITELIST
     career = {row["item_id"]: row for row in procurement_candidates(minute)}
     rows = []
-    strict = set()
     for item in Item.objects.filter(pk__in=eligible, is_deleted=False).order_by("item_id"):
-        local_only = item.pk in NEW_CONTENT_ITEM_IDS or item.pk in imports
         if item.pk in NEW_CONTENT_ITEM_IDS and item.pk not in career:
             continue
-        stock = local_stock(item.pk, minute) if local_only else _village_stock(item.pk, minute)
+        stock = _village_stock(item.pk, minute)
         surplus = max(0, stock - SAFE_STOCKS.get(item.pk, 0))
         trial = bool(career.get(item.pk, {}).get("trial"))
         if item.pk in career:
@@ -132,8 +128,6 @@ def _procurement_plan(cfg, period, minute, deadline):
         base = max(1, (_get_published_price(item.pk) * 115 + 50) // 100)
         rows.append(dict(item=item, target=target, trial=trial,
             prices={str(q): item_price(item, q, base) for q in range(1, 7)}))
-        if local_only:
-            strict.add(item.pk)
     # Rotate peers within a theme; a new product cannot monopolize every order.
     rows.sort(key=lambda row: (item_theme(row["item"].pk) != theme, row["item"].pk))
     same = [row for row in rows if item_theme(row["item"].pk) == theme]
@@ -160,10 +154,9 @@ def _procurement_plan(cfg, period, minute, deadline):
             break
         if row not in selected and not row["trial"]:
             selected.append(row)
-    ids = {row["item"].pk for row in selected}
     snapshot = dict(version=1, theme=theme, theme_label=label,
         trial_item_ids=[row["item"].pk for row in selected if row["trial"]],
-        local_source_item_ids=sorted(ids & strict),
+        local_source_item_ids=[],
         recommendation_item_id=recommendation["item"].pk if recommendation else None,
         review_track_code=review.get("track_code", "") if recommendation else "")
     return [(row["item"], row["target"], row["prices"]) for row in selected], snapshot
@@ -400,22 +393,18 @@ def _window_reason(order, minute):
 
 def _order_data(order, actor_type, bag, minute, actor_error=""):
     from .caravan import ARRIVAL, DEPARTURE
-    from .career_trade import is_local_production, local_stock
     reason = _window_reason(order, minute) or actor_error
     procurement = order.procurement_snapshot or {}
-    local_ids = set(procurement.get("local_source_item_ids", []))
     lines = []
     names = dict(Item.objects.filter(pk__in=[line.item_id for line in order.lines.all()]).values_list("pk", "item_name"))
     for line in order.lines.all():
         remaining = line.target_quantity - line.delivered_quantity
-        stock = local_stock(line.item_id, minute) if line.item_id in local_ids else _village_stock(line.item_id, minute)
+        stock = _village_stock(line.item_id, minute)
         village_surplus = max(0, stock - SAFE_STOCKS.get(line.item_id, 0)) if bag else 0
         batches = []
         if bag:
             for slot in bag.slots.filter(item_id=line.item_id, item_amount__gt=0).order_by("quality", "slot_index"):
                 available = _available(slot, minute) if slot.quality >= line.min_quality else 0
-                if line.item_id in local_ids and not is_local_production(slot):
-                    available = 0
                 price = line.quality_prices.get(str(slot.quality), 0)
                 if available and price:
                     deliverable = min(remaining, available, village_surplus)
@@ -424,7 +413,7 @@ def _order_data(order, actor_type, bag, minute, actor_error=""):
                         unit_price=price, preview_income=price * deliverable))
         lines.append(dict(line_id=line.pk, item_id=line.item_id, item_name=names.get(line.item_id, str(line.item_id)),
             target_quantity=line.target_quantity, delivered_quantity=line.delivered_quantity,
-            local_production_required=line.item_id in local_ids,
+            local_production_required=False,
             trial_item=line.item_id in procurement.get("trial_item_ids", []),
             remaining_quantity=remaining, min_quality=line.min_quality, quality_prices=deepcopy(line.quality_prices),
             available_quantity=min(remaining, village_surplus, sum(row["available_quantity"] for row in batches)), deliverable_batches=batches))
@@ -517,10 +506,6 @@ def deliver_order(actor_type, actor_id, params, world_minute, request_id, curren
     if quantity > remaining:
         return reject("CARAVAN_ORDER_REMAINING_CHANGED", {"remaining_quantity": remaining, "item_id": line.item_id})
     slot = bag.slots.select_for_update().filter(instance_id=instance_id, item_id=line.item_id).first()
-    from .career_trade import is_local_production, local_stock
-    local_only = line.item_id in (order.procurement_snapshot or {}).get("local_source_item_ids", [])
-    if slot is not None and local_only and not is_local_production(slot):
-        return reject("CARAVAN_ORDER_LOCAL_PRODUCTION_REQUIRED")
     if slot is None:
         return reject("CARAVAN_ORDER_ITEM_NOT_OWNED")
     available = _available(slot, minute) if slot.quality >= line.min_quality else 0
@@ -531,7 +516,7 @@ def deliver_order(actor_type, actor_id, params, world_minute, request_id, curren
         return reject("PRICE_CHANGED", {"unit_price": price})
     if actor_type == "NPC" and params.get("expected_asset_version", bag.asset_version) != bag.asset_version:
         return reject("P3_ASSET_VERSION_CONFLICT")
-    stock = local_stock(line.item_id, minute) if local_only else _village_stock(line.item_id, minute)
+    stock = _village_stock(line.item_id, minute)
     surplus = max(0, stock - SAFE_STOCKS.get(line.item_id, 0))
     if quantity > surplus:
         return reject("EXPORT_SAFETY_STOCK_REQUIRED", {"maximum_amount": surplus})

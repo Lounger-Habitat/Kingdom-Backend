@@ -2,8 +2,6 @@
 import uuid
 from collections import Counter
 
-from django.db.models import Count
-
 from inventory.models import NpcGlobalInventory, NpcGlobalInventorySlot
 from items.quality import production_quality, quality_rng
 from .phase3_asset_service import deterministic_rng
@@ -51,14 +49,7 @@ def reserved_amounts(slots, exclude_command_id=None):
             for key in ("tool_instance_id", "prey_instance_id"):
                 if isinstance(state.get(key), str):
                     reserved[(npc_id, state[key])] += 1
-    from .models import VillagePlayerProcessingJob
-    tools = [slot.instance_id for slot in slots if str(slot.bag.npc.agent_id) == "10012"]
-    player_reserved = dict(VillagePlayerProcessingJob.objects.filter(
-        status="RUNNING", tool_instance_id__in=tools).values("tool_instance_id")
-        .annotate(total=Count("pk")).values_list("tool_instance_id", "total"))
-    return {slot.pk: reserved[(slot.bag.npc_id, str(slot.instance_id))]
-        + (player_reserved.get(slot.instance_id, 0) if str(slot.bag.npc.agent_id) == "10012" else 0)
-        for slot in slots}
+    return {slot.pk: reserved[(slot.bag.npc_id, str(slot.instance_id))] for slot in slots}
 
 
 def is_jack_work(command):
@@ -102,8 +93,7 @@ def start_work(runtime, command, minute):
     error = work_unavailable(runtime, command, minute, resources=False)
     if error:
         return error
-    from .player_processing import jack_processing_busy
-    if runtime.active_command_id is not None or jack_processing_busy(runtime.npc.agent_id):
+    if runtime.active_command_id is not None:
         return "NPC_BUSY"
     inventory = NpcGlobalInventory.objects.select_for_update().get(npc=runtime.npc)
     expected = command.sanitized_parameters.get("expected_asset_version")
@@ -182,7 +172,8 @@ def settle_work_needs(runtime, command, minute):
 
 
 def finish_work(npc_id, params, minute, request_id):
-    from .phase3_asset_service import add_batch, consume_tool_use, _fail, _ok
+    from .phase3_asset_service import consume_tool_use, _fail, _ok
+    from inventory.storage import add_inventory_items
     command = NpcCommandState.objects.select_for_update().filter(request_id=request_id).first()
     if command is None or not is_jack_work(command) or command.status != "RUNNING":
         return _fail("PRODUCTION_COMMAND_REQUIRED")
@@ -230,10 +221,9 @@ def finish_work(npc_id, params, minute, request_id):
     for item_id, amount in outputs.items():
         expiry = None if item_id in BYPRODUCT_ITEM_IDS else expires
         item_produced = minute if command.kind == "PROCESS_GAME" and item_id in NEW_CONTENT_ITEM_IDS else produced
-        slot = add_batch(inventory, item_id, amount, item_produced, expiry, request_id, item_attributes={"quality": quality})
-        added.append({"item_id": item_id, "item_name": item_names.get(item_id, str(item_id)),
-                      "amount": amount, "instance_id": str(slot.instance_id), "quality": slot.quality,
-                      "produced_world_minute": item_produced, "expires_world_minute": expiry})
+        for slot, delta in add_inventory_items(inventory, item_id, amount, attributes={"quality": quality}):
+            added.append({"item_id": item_id, "item_name": item_names.get(item_id, str(item_id)),
+                          "amount": delta, "instance_id": str(slot.instance_id), "quality": slot.quality})
     inventory.asset_version += 1
     inventory.save(update_fields=["asset_version", "updated_at"])
     if command.kind == "PROCESS_GAME":

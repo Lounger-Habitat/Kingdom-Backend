@@ -9,6 +9,7 @@ from django.db import transaction
 from django.db.models import Q
 
 from game_time.models import GlobalGameTimeState
+from inventory.storage import add_inventory_items, attributes_from_slot
 from inventory.models import NpcGlobalInventory, NpcGlobalInventorySlot
 from items.models import Item
 from .models import (
@@ -341,7 +342,7 @@ def handle_deposit(npc_id, params, minute, request_id):
 
 
 def handle_withdraw_item(npc_id, params, minute, request_id):
-    from .phase3_asset_service import _fail, _ok, add_batch, get_available_slot_amount
+    from .phase3_asset_service import _fail, _ok, get_available_slot_amount
     item, amount = params.get("item_id"), params.get("amount")
     if type(item) is not int or type(amount) is not int or amount <= 0 or not Item.objects.filter(item_id=item, is_deleted=False).exists():
         return _fail("P3_INVALID_PARAMS")
@@ -358,16 +359,14 @@ def handle_withdraw_item(npc_id, params, minute, request_id):
                      "required_amount": amount, "available_amount": available})
     batches = []
     for slot, taken in consumed:
-        from .career_trade import source_request_id
-        received = add_batch(inventory, item, taken, slot.produced_world_minute,
-            slot.expires_world_minute, source_request_id(slot, request_id), remaining_uses=slot.remaining_uses,
-            item_attributes=slot.item_attributes)
-        batches.append({"source_store_instance_id": str(slot.instance_id),
-            "source_slot_instance_id": str(slot.source_slot_instance_id) if slot.source_slot_instance_id else None,
-            "source_npc_id": str(slot.source_npc.agent_id) if slot.source_npc_id else None,
-            "personal_instance_id": str(received.instance_id), "amount": taken,
-            "produced_world_minute": slot.produced_world_minute, "expires_world_minute": slot.expires_world_minute,
-            "remaining_uses": slot.remaining_uses})
+        received = add_inventory_items(inventory, item, taken, attributes=attributes_from_slot(slot))
+        for target, delta in received:
+            batches.append({"source_store_instance_id": str(slot.instance_id),
+                "source_slot_instance_id": str(slot.source_slot_instance_id) if slot.source_slot_instance_id else None,
+                "source_npc_id": str(slot.source_npc.agent_id) if slot.source_npc_id else None,
+                "personal_instance_id": str(target.instance_id), "amount": delta,
+                "produced_world_minute": slot.produced_world_minute, "expires_world_minute": slot.expires_world_minute,
+                "remaining_uses": slot.remaining_uses})
     store.inventory_version += 1
     store.save(update_fields=["inventory_version", "updated_at"])
     inventory.asset_version += 1
@@ -441,7 +440,7 @@ def available_village_stock(item_id, minute):
 
 
 def handle_import(npc_id, params, minute, request_id):
-    from .phase3_asset_service import _fail, _ok, add_batch
+    from .phase3_asset_service import _fail, _ok
     from .phase3_direct_trade import _get_buyer_available_money
     # Reject stale store-funded requests instead of silently charging the NPC.
     if "store_code" in params:
@@ -475,7 +474,8 @@ def handle_import(npc_id, params, minute, request_id):
     for key, n in requested.items():
         item = items[key]
         uses = item.max_use_count if item.item_id in TOOL_ITEM_IDS else None
-        add_batch(inventory, item.item_id, n, minute, None, request_id, remaining_uses=uses)
+        add_inventory_items(inventory, item.item_id, n, attributes=dict(produced_world_minute=minute,
+            source_request_id=request_id, remaining_uses=uses))
         visit.stock[key] -= n
     visit.save(update_fields=["stock"])
     inventory.money -= total

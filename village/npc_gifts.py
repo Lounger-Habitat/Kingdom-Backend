@@ -1,11 +1,10 @@
 """One-way NPC gifts, settled by the existing atomic economy command service."""
 import uuid
 
-from django.db.models import Max
 
 from account.models import GameAccount
-from inventory.components import copy_batch_attributes
-from inventory.models import InventoryBag, InventorySlot, NpcDefinition, NpcGlobalInventory, NpcGlobalInventorySlot
+from inventory.storage import add_inventory_items, attributes_from_slot
+from inventory.models import InventoryBag, NpcDefinition, NpcGlobalInventory
 from items.models import Item
 from .phase3_asset_service import _fail, _ok, get_available_money, get_available_slot_amount
 
@@ -117,21 +116,16 @@ def give_items(npc_id, params, world_minute, request_id):
                 "item_id": slot.item_id, "required_amount": row["amount"], "available_amount": available})
         selected.append((slot, item, row["amount"]))
 
-    slot_model = NpcGlobalInventorySlot if target_type == "NPC" else InventorySlot
-    last_index = target_bag.slots.aggregate(value=Max("slot_index"))["value"]
-    next_index = 0 if last_index is None else last_index + 1
     delivered = []
     deltas = {}
     for source, item, amount in selected:
-        target = slot_model(bag=target_bag, slot_index=next_index, item_id=source.item_id,
-            item_amount=amount, item_bag_name=source.item_bag_name, hide_in_shop=target_type == "NPC")
-        copy_batch_attributes(source, target)
-        target.save()
+        received = add_inventory_items(target_bag, source.item_id, amount,
+            attributes=dict(attributes_from_slot(source), hide_in_shop=target_type == "NPC"))
         source.item_amount -= amount
         source.save(update_fields=["item_amount"])
-        next_index += 1
-        delivered.append({"item_id": source.item_id, "item_name": item.item_name, "amount": amount,
-            "source_instance_id": str(source.instance_id), "received_instance_id": str(target.instance_id)})
+        for target, delta in received:
+            delivered.append({"item_id": source.item_id, "item_name": item.item_name, "amount": delta,
+                "source_instance_id": str(source.instance_id), "received_instance_id": str(target.instance_id)})
         key = str(source.item_id)
         deltas[key] = deltas.get(key, 0) + amount
 

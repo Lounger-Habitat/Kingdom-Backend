@@ -96,20 +96,8 @@ def _reset_inventory(account):
         if not bag:
             continue
         for slot in tmpl.slots.select_related("item").all():
-            InventorySlot.objects.create(
-                bag=bag,
-                slot_index=slot.slot_index,
-                instance_id=uuid.uuid4(),
-                item_id=slot.item.item_id if slot.item else 0,
-                item_amount=slot.item_amount,
-                rated=slot.rated,
-                rating_price=slot.rating_price,
-                overall_score=slot.overall_score,
-                ingredient=slot.ingredient,
-                item_bag_name=f"{slot.item.item_name}_{slot.slot_index}" if slot.item else "",
-                cook_time=slot.cook_time,
-                dish_quality=slot.dish_quality,
-            )
+            from inventory.services import add_template_items
+            add_template_items(bag, slot)
         reset_count += 1
 
     return reset_count

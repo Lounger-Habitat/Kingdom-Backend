@@ -16,6 +16,7 @@ from typing import Any, Mapping
 from django.db import models, transaction
 
 from game_time.models import GlobalGameTimeState
+from inventory.storage import add_inventory_items, attributes_from_slot
 from inventory.models import NpcDefinition, NpcGlobalInventory
 
 from .models import (
@@ -393,7 +394,6 @@ def _transfer_commitment_assets(
     request_id: uuid.UUID,
 ) -> tuple[bool, str, dict[str, Any]]:
     """Move NPC assets using phase-three's existing FEFO and reservation checks."""
-    from .phase3_asset_service import add_batch, BATCH_ITEM_ATTRIBUTES
     from .phase3_direct_trade import _consume_personal_fefo_available, _get_buyer_available_money
 
     promisor_id = str(commitment.promisor_npc.agent_id)
@@ -428,16 +428,7 @@ def _transfer_commitment_assets(
                 "available_amount": sum(get_available_slot_amount(s, world_minute)
                     for s in promisor_inv.slots.filter(item_id=item_id, item_amount__gt=0))}
         for slot, taken in consumed:
-            add_batch(
-                beneficiary_inv,
-                item_id,
-                taken,
-                slot.produced_world_minute or world_minute,
-                slot.expires_world_minute,
-                request_id,
-                remaining_uses=slot.remaining_uses,
-                item_attributes={key: getattr(slot, key) for key in BATCH_ITEM_ATTRIBUTES},
-            )
+            add_inventory_items(beneficiary_inv, item_id, taken, attributes=attributes_from_slot(slot))
         promisor_inv.asset_version += 1
         beneficiary_inv.asset_version += 1
         promisor_inv.save(update_fields=["asset_version", "updated_at"])

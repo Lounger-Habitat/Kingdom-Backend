@@ -50,7 +50,11 @@ class StarterLoopTests(TestCase):
         shop = accepted["data"]["overview"]["starter"]["gathering"]["tool_shop"]
         bought, purchase = self.act("buy_store", dict(listing_id=shop["listing_id"],
             quantity=1, expected_unit_price=shop["unit_price"]), "GENERAL_STORE")
-        self.assertEqual(bought, execute_player_action(copy.deepcopy(purchase)))
+        replayed_purchase = execute_player_action(copy.deepcopy(purchase))
+        # Scoped store receipts retain their replay marker so clients refresh
+        # historical shop projections. Every other field must remain identical.
+        self.assertTrue(replayed_purchase.pop("replayed", False))
+        self.assertEqual(bought, replayed_purchase)
         tool_id = bought["data"]["result"]["purchased_batches"][0]["instance_id"]
         self.bag.refresh_from_db()
         self.assertEqual(self.bag.money, 239)  # Tool costs 50; its one-time goal returns 10.

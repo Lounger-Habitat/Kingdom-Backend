@@ -349,25 +349,8 @@ def _reset_player_inventory(account):
         if not bag:
             continue
         for slot in tmpl.slots.select_related("item").all():
-            remaining_uses = None
-            if slot.item and slot.item.item_type == "Usable":
-                remaining_uses = slot.item.max_use_count
-            InventorySlot.objects.create(
-                bag=bag,
-                slot_index=slot.slot_index,
-                instance_id=uuid.uuid4(),
-                item_id=slot.item.item_id if slot.item else 0,
-                item_amount=slot.item_amount,
-                rated=slot.rated,
-                rating_price=slot.rating_price,
-                overall_score=slot.overall_score,
-                ingredient=slot.ingredient,
-                item_bag_name=f"{slot.item.item_name}_{slot.slot_index}" if slot.item else "",
-                cook_time=slot.cook_time,
-                dish_quality=slot.dish_quality,
-                hide_in_shop=slot.hide_in_shop,
-                remaining_uses=remaining_uses,
-            )
+            from inventory.services import add_template_items
+            created = add_template_items(bag, slot)
 
 
 def _reset_player_money(account):
@@ -452,26 +435,9 @@ def full_reset_to_season_1():
                 stats["inventory_bags_reset"] += 1
 
                 for slot in tmpl.slots.select_related("item").all():
-                    remaining_uses = None
-                    if slot.item and slot.item.item_type == "Usable":
-                        remaining_uses = slot.item.max_use_count
-                    InventorySlot.objects.create(
-                        bag=bag,
-                        slot_index=slot.slot_index,
-                        instance_id=uuid.uuid4(),
-                        item_id=slot.item.item_id if slot.item else 0,
-                        item_amount=slot.item_amount,
-                        rated=slot.rated,
-                        rating_price=slot.rating_price,
-                        overall_score=slot.overall_score,
-                        ingredient=slot.ingredient,
-                        item_bag_name=f"{slot.item.item_name}_{slot.slot_index}" if slot.item else "",
-                        cook_time=slot.cook_time,
-                        dish_quality=slot.dish_quality,
-                        hide_in_shop=slot.hide_in_shop,
-                        remaining_uses=remaining_uses,
-                    )
-                    stats["inventory_slots_created"] += 1
+                    from inventory.services import add_template_items
+                    created = add_template_items(bag, slot)
+                    stats["inventory_slots_created"] += len(created)
 
         # ── 5. 重置所有玩家食谱 ──
         stats["recipes_deleted"] = PlayerRecipe.objects.all().delete()[0]

@@ -286,7 +286,7 @@ class HarvestSuccessTest(ProductionTestBase):
         resp = self._harvest()
         self.assertEqual(resp["result_code"], ResultCode.OK)
 
-        # Corn added (new slot created by add_batch)
+        # Corn added to its inventory stack
         corn_slots = NpcGlobalInventorySlot.objects.filter(
             bag=self.bill_inv, item_id=1030,
         )
@@ -294,7 +294,7 @@ class HarvestSuccessTest(ProductionTestBase):
         self.assertGreaterEqual(total_corn, 4)
         self.assertLessEqual(total_corn, 6)
 
-        # Seeds added (new slot created by add_batch, total should increase)
+        # Seed total increases in the inventory stack
         seeds_after = sum(
             s.item_amount for s in
             NpcGlobalInventorySlot.objects.filter(bag=self.bill_inv, item_id=1051)

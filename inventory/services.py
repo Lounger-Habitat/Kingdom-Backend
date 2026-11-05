@@ -1,6 +1,18 @@
 import uuid
 from django.db import transaction
 from .models import InventoryBag, InventorySlot, BagTemplate, BagTemplateSlot
+from .storage import add_inventory_items, TOOL_TYPES
+
+
+def add_template_items(bag, slot, amount=None):
+    if not slot.item_id or (slot.item_amount if amount is None else amount) <= 0:
+        return []
+    return add_inventory_items(bag, slot.item_id, slot.item_amount if amount is None else amount,
+        attributes=dict(rated=slot.rated, rating_price=slot.rating_price,
+            overall_score=slot.overall_score, ingredient=slot.ingredient,
+            item_bag_name=slot.item.item_name, cook_time=slot.cook_time,
+            dish_quality=slot.dish_quality, hide_in_shop=slot.hide_in_shop,
+            remaining_uses=slot.item.max_use_count if slot.item.item_type == "Usable" or slot.item.item_type in TOOL_TYPES else None))
 
 
 @transaction.atomic
@@ -23,9 +35,8 @@ def ensure_initial_equipment(player, bag):
         owned = bag.slots.filter(item_id__in=family, item_amount__gt=0).exists()
         claimed = PlayerMilestoneProgress.objects.filter(player=player, code=legacy).exists()
         if not owned and not claimed:
-            index = max(bag.slots.values_list("slot_index", flat=True), default=-1) + 1
-            InventorySlot.objects.create(bag=bag, slot_index=index, item_id=item_id, item_bag_name=item.item_name,
-                item_amount=1, quality=3, remaining_uses=item.max_use_count, produced_world_minute=minute)
+            add_inventory_items(bag, item_id, 1, attributes=dict(item_bag_name=item.item_name,
+                quality=3, remaining_uses=item.max_use_count, produced_world_minute=minute))
         PlayerMilestoneProgress.objects.create(player=player, code=marker, title="初始装备",
             source_type="initial_equipment", source_id=str(player.pk))
 
@@ -53,25 +64,7 @@ def init_player_bags(player):
             money=template.money,
         )
         for slot in template.slots.all():
-            remaining_uses = None
-            if slot.item and slot.item.item_type == "Usable":
-                remaining_uses = slot.item.max_use_count
-            InventorySlot.objects.create(
-                bag=bag,
-                slot_index=slot.slot_index,
-                instance_id=uuid.uuid4(),
-                item_id=slot.item_id,
-                item_amount=slot.item_amount,
-                rated=slot.rated,
-                rating_price=slot.rating_price,
-                overall_score=slot.overall_score,
-                ingredient=slot.ingredient,
-                item_bag_name=f"{slot.item.item_name}_{slot.slot_index}" if slot.item else "",
-                cook_time=slot.cook_time,
-                dish_quality=slot.dish_quality,
-                hide_in_shop=slot.hide_in_shop,
-                remaining_uses=remaining_uses,
-            )
+            add_template_items(bag, slot)
         ensure_initial_equipment(player, bag)
 
     # 设置富豪榜日榜第一天基准金币和总榜快照
@@ -196,32 +189,8 @@ def restock_npc_bags_global():
         for tmpl_slot in tmpl.slots.select_related("item").all():
             if not tmpl_slot.item:
                 continue
-            existing = bag.slots.filter(item_id=tmpl_slot.item_id, item_amount__gt=0).first()
-            if existing:
-                deficit = tmpl_slot.item_amount - existing.item_amount
-                if deficit > 0:
-                    existing.item_amount = tmpl_slot.item_amount
-                    existing.hide_in_shop = tmpl_slot.hide_in_shop
-                    existing.save()
-            else:
-                from django.db.models import Max
-                max_idx = bag.slots.aggregate(Max("slot_index"))["slot_index__max"]
-                next_idx = (max_idx + 1) if max_idx is not None else 0
-                remaining_uses = None
-                if tmpl_slot.item.item_type == "Usable":
-                    remaining_uses = tmpl_slot.item.max_use_count
-                NpcGlobalInventorySlot.objects.create(
-                    bag=bag,
-                    slot_index=next_idx,
-                    item_id=tmpl_slot.item_id,
-                    item_amount=tmpl_slot.item_amount,
-                    rated=tmpl_slot.rated,
-                    rating_price=tmpl_slot.rating_price,
-                    overall_score=tmpl_slot.overall_score,
-                    ingredient=tmpl_slot.ingredient,
-                    item_bag_name=f"{tmpl_slot.item.item_name}_{next_idx}",
-                    cook_time=tmpl_slot.cook_time,
-                    dish_quality=tmpl_slot.dish_quality,
-                    hide_in_shop=tmpl_slot.hide_in_shop,
-                    remaining_uses=remaining_uses,
-                )
+            from django.db.models import Sum
+            owned = bag.slots.filter(item_id=tmpl_slot.item_id, item_amount__gt=0).aggregate(total=Sum("item_amount"))["total"] or 0
+            deficit = tmpl_slot.item_amount - owned
+            if deficit > 0:
+                add_template_items(bag, tmpl_slot, deficit)

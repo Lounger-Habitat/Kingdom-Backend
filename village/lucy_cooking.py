@@ -13,7 +13,7 @@ from items.quality import ingredient_average, cooking_quality, quality_rng
 from cooking.dish_rules import calculate_quality, default_value, overall_score, review_value
 from .lucy_catalog import RELIEF_PACK
 from .models import NpcCookingCounter, VillageDishReview, VillageAccount
-from .phase3_asset_service import (_ok, _fail, add_batch, consume_fefo, get_available_slot_amount,
+from .phase3_asset_service import (_ok, _fail, consume_fefo, get_available_slot_amount,
                                   deterministic_rng, BATCH_ITEM_ATTRIBUTES)
 from .phase3_catalog import RECIPE_WHITELIST
 from .public_finance import mark_unavailable
@@ -133,20 +133,22 @@ def cook(npc_id, params, minute, request_id):
             recipe_name=recipe.recipe_name, recipe=recipe_info, ingredients=inputs, base_quality=3,
             cook_time_source="NO_HEAT" if cold else "RECIPE_RANDOM_SECONDS", production_request_id=str(request_id))
         expires = None
-        slot = add_batch(inventory, recipe.item_id, recipe.output_quantity, minute,
-            expires, request_id, item_attributes=dict(dish_metadata=metadata,
+        from inventory.storage import add_inventory_items
+        output_slots = add_inventory_items(inventory, recipe.item_id, recipe.output_quantity, attributes=dict(
+            produced_world_minute=minute, expires_world_minute=expires, source_request_id=request_id, dish_metadata=metadata,
             dish_quality=quality, cook_time=seconds, ingredient="、".join(f"{i.item_name}×{i.count}" for i in ingredients),
             item_bag_name=recipe.recipe_name, rated=False, rating_price=-1))
         inventory.asset_version += 1
         inventory.save(update_fields=["asset_version", "updated_at"])
-        output = dict(instance_id=str(slot.instance_id), item_id=slot.item_id, amount=slot.item_amount,
+        outputs = [dict(instance_id=str(slot.instance_id), item_id=slot.item_id, amount=delta,
             name=item.item_name,
             dish_quality=quality, cook_time_seconds=seconds, dish_metadata=metadata,
-            default_value=None if cold else default_value(item, quality), expires_world_minute=slot.expires_world_minute)
+            default_value=None if cold else default_value(item, quality), expires_world_minute=slot.expires_world_minute) for slot, delta in output_slots]
+        output = outputs[0]
         record_production("NPC", npc_id, request_id, {recipe.item_id: recipe.output_quantity}, minute,
-            source_kind="COOK", recipe_id=recipe.pk, output_instance_ids=[str(slot.instance_id)])
+            source_kind="COOK", recipe_id=recipe.pk, output_instance_ids=[str(slot.instance_id) for slot, _ in output_slots])
     return _ok(asset_versions={str(npc_id): inventory.asset_version},
-        effects={"items_consumed": inputs, "items_added": [output]}, data={"dish": output}, external_delta=0)
+        effects={"items_consumed": inputs, "items_added": outputs}, data={"dish": output, "dishes": outputs}, external_delta=0)
 
 
 def reservations(slots, minute):
@@ -196,8 +198,8 @@ def request_review(npc_id, params, minute, request_id):
     if slot.item_amount > 1:
         slot.item_amount -= 1
         slot.save(update_fields=["item_amount"])
-        slot = add_batch(inventory, slot.item_id, 1, slot.produced_world_minute, slot.expires_world_minute,
-            request_id, item_attributes={k: copy.deepcopy(getattr(slot, k)) for k in BATCH_ITEM_ATTRIBUTES})
+        from inventory.storage import add_inventory_items, attributes_from_slot
+        slot = add_inventory_items(inventory, slot.item_id, 1, attributes=attributes_from_slot(slot))[0][0]
     snapshot = dict(instance_id=str(slot.instance_id), item_id=slot.item_id,
         name=Item.objects.get(item_id=slot.item_id).item_name, quality=slot.dish_quality,
         cook_time_seconds=slot.cook_time, ingredient=slot.ingredient, metadata=copy.deepcopy(slot.dish_metadata),

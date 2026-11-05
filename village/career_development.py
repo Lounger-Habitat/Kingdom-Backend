@@ -439,15 +439,14 @@ def record_business_evidence(kind, request_id, actor_type, actor_id, items, worl
                 progress.update(reviewed_items=sorted(reviewed), review_scores=scores)
                 changed = True
         elif track.code == "NORA_1":
-            if kind == "SALE" and metadata.get("external") is True and metadata.get("provenance_valid") is not False:
+            if kind == "SALE" and metadata.get("external") is True:
                 counts = progress.setdefault("external_sales", {})
                 for item, amount in normalized.items():
                     if int(item) in NEW_ITEM_IDS:
                         counts[item] = counts.get(item, 0) + amount
                         changed = True
         elif kind in {"PRODUCTION", "SALE"}:
-            paid = not (kind == "SALE" and (metadata.get("income") == 0 or metadata.get("unit_price") == 0
-                or metadata.get("provenance_valid") is False))
+            paid = not (kind == "SALE" and (metadata.get("income") == 0 or metadata.get("unit_price") == 0))
             if paid:
                 key = "production" if kind == "PRODUCTION" else "sales"
                 counts = progress.setdefault(key, {})

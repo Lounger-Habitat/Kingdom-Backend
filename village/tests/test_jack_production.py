@@ -209,11 +209,11 @@ class JackProductionTests(ProductionTestBase):
 
     def test_atomic_failure_after_first_output_rolls_back_every_asset(self):
         prey=self.prey();cmd=self.start('PROCESS_GAME',{'prey_instance_id':str(prey.instance_id)})
-        from village.phase3_asset_service import add_batch
+        from inventory.storage import add_inventory_items
         def fail_second(*args,**kwargs):
             if args[1] in BYPRODUCT_ITEM_IDS:raise ValueError('injected failure')
-            return add_batch(*args,**kwargs)
-        with patch('village.phase3_asset_service.add_batch',side_effect=fail_second):
+            return add_inventory_items(*args,**kwargs)
+        with patch('inventory.storage.add_inventory_items',side_effect=fail_second):
             with self.assertRaises(ValueError):self.finish(cmd)
         prey.refresh_from_db();self.jack_hunt_tool.refresh_from_db()
         self.assertEqual((prey.item_amount,self.jack_hunt_tool.remaining_uses),(1,20))

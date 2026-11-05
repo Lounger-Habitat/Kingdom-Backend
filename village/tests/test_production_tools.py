@@ -194,7 +194,18 @@ class ProductionToolTests(TestCase):
         self.assertIsNone(quote["location_code"])
         answer, payload = self.remote("repair_tool", tool, quote)
         self.assertTrue(answer["success"], answer)
-        self.assertEqual(execute_player_action(payload), answer)
+        self.assertEqual(execute_player_action(payload), dict(answer, replayed=True))
+        self.assertEqual(answer["data"]["settlement_section"], "equipment")
+        self.assertTrue(answer["data"]["maintenance_settlement"])
+        self.assertTrue(answer["data"]["overview_partial"])
+        self.assertNotIn("inventory_partial", answer["data"])
+        self.assertNotIn("tutorial", answer["data"]["overview"])
+        self.assertNotIn("starter", answer["data"]["overview"])
+        self.assertTrue(answer["data"]["overview"]["plants"]["nodes_partial"])
+        for row in answer["data"]["overview"]["inventory"]:
+            self.assertTrue({"slot_index", "item_bag_name", "hide_in_shop"}.issubset(row))
+        self.assertCountEqual([row["instance_id"] for row in answer["data"]["overview"]["inventory"]],
+            [str(value) for value in self.bag.slots.filter(item_amount__gt=0).values_list("instance_id", flat=True)])
         tool.refresh_from_db(); wood.refresh_from_db(); self.bag.refresh_from_db(); self.account.refresh_from_db()
         self.assertEqual((tool.remaining_uses, wood.item_amount, self.bag.money, self.account.balance), (20, 1, 495, 505))
 
@@ -210,6 +221,8 @@ class ProductionToolTests(TestCase):
         foreign = InventorySlot.objects.create(bag=bag, slot_index=0, item_id=4101, item_amount=1, remaining_uses=3)
         answer, _ = self.remote("upgrade_tool", foreign, quote)
         self.assertFalse(answer["success"])
+        self.assertTrue(answer["data"]["maintenance_settlement"])
+        self.assertNotIn(str(foreign.instance_id), [row["instance_id"] for row in answer["data"]["overview"]["inventory"]])
         self.bag.refresh_from_db()
         self.assertEqual(self.bag.money, 500)
         original_id = tool.instance_id
@@ -219,6 +232,8 @@ class ProductionToolTests(TestCase):
         self.assertEqual((tool.instance_id, tool.item_id, tool.remaining_uses), (original_id, 4101, 3))
         self.account.refresh_from_db()
         self.assertEqual((answer["data"]["result"]["spent_gold"], self.account.balance), (20, 520))
+        self.assertEqual(answer["data"]["settlement_section"], "equipment")
+        self.assertNotIn("inventory_partial", answer["data"])
 
     def test_free_basic_weapon_repair_does_not_require_jack_or_a_workshop(self):
         NpcDefinition.objects.filter(agent_id="10012").update(is_test_only=True)
@@ -229,5 +244,6 @@ class ProductionToolTests(TestCase):
         self.assertIsNone(quote["location_code"])
         answer, _ = self.remote("repair_hunting_weapon", tool, quote)
         self.assertTrue(answer["success"], answer)
+        self.assertTrue(answer["data"]["maintenance_settlement"])
         tool.refresh_from_db(); self.bag.refresh_from_db()
         self.assertEqual((tool.remaining_uses, self.bag.money), (60, 500))

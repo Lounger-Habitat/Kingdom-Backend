@@ -353,11 +353,12 @@ def execute_player_cooking(player, bag, params, rid, clock):
         group_metadata.update(quality=group_quality, standard_batches=group_count,
             output_quantity=recipe.output_quantity * group_count if plan["exact"] else plan["quantity"],
             production_batch_id=str(uuid.uuid5(uuid.UUID(batch_id), str(group_quality))))
-        output_slots.append(InventorySlot.objects.create(bag=bag, slot_index=_index(bag), item_id=item_id,
-            item_amount=group_metadata["output_quantity"], quality=group_quality, produced_world_minute=clock.world_minute,
+        from inventory.storage import add_inventory_items
+        output_slots.extend(slot for slot, _ in add_inventory_items(bag, item_id, group_metadata["output_quantity"], attributes=dict(
+            quality=group_quality, produced_world_minute=clock.world_minute,
             expires_world_minute=plan["expires"], freshness_unknown=plan["legacy"], source_request_id=rid,
             ingredient="、".join(f"{v['item_name']}×{v['quantity']}" for v in consumed), cook_time=seconds,
-            dish_metadata=group_metadata, rated=False, rating_price=-1))
+            dish_metadata=group_metadata, rated=False, rating_price=-1)))
     slot = output_slots[0]
     metadata, quality = slot.dish_metadata, slot.quality
     learned = False

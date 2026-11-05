@@ -50,7 +50,7 @@ def public_market(params, *, viewer=None):
             "item_name": item["itemName"], "seller_name": item["sellerName"],
             "is_own_listing": item["isOwnListing"], "source_type": item["sourceType"],
             "available_amount": item["remainingAmount"], "unit_price": item["price"],
-            "listed_at": item["createdAt"], "batch": item["batch"],
+            "listed_at": item["createdAt"], "attributes": item["attributes"],
         })
     return {"listings": rows, "total_count": paginator.count, "item_count": item_count,
             "page": current.number, "page_count": paginator.num_pages, "world_minute": minute}

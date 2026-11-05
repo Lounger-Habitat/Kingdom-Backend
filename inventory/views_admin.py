@@ -4,6 +4,7 @@ from django.contrib import messages
 from django.contrib.admin.views.decorators import staff_member_required
 from django.shortcuts import render, get_object_or_404, redirect
 from django.db.models import Count, Max
+from django.db import transaction
 from account.models import GameAccount
 from items.models import Item
 from .models import InventoryBag, InventorySlot, BagTemplate, BagTemplateSlot
@@ -94,7 +95,10 @@ def bag_detail(request, player_id, bag_id):
                 pass
 
         elif action == "save_slots":
-            _save_slots(request, bag)
+            try:
+                _save_slots(request, bag)
+            except (ValueError, TypeError) as exc:
+                messages.error(request, str(exc))
 
         elif action == "add_slot":
             _add_slot(request, bag)
@@ -176,7 +180,9 @@ def _init_missing_npc_bags(player):
     return created
 
 
+@transaction.atomic
 def _save_slots(request, bag):
+    InventoryBag.objects.select_for_update().get(pk=bag.pk)
     slot_ids = request.POST.getlist("slot_id")
     for slot_id in slot_ids:
         try:
@@ -201,6 +207,8 @@ def _save_slots(request, bag):
             slot.save()
         except (ValueError, TypeError):
             continue
+    from .normalization import normalize_owner
+    normalize_owner(bag)
 
 
 def _add_slot(request, bag):

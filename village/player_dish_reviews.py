@@ -91,17 +91,22 @@ def _entry(row, minute):
         can_claim=status in ("COMPLETED", "CANCELLED", "EXPIRED") and row.claimed_world_minute is None)
 
 
-def review_overview(player, bag, minute, read_only=False):
+def review_overview(player, bag, minute, read_only=False, *, slots=None, items=None, revision=None):
     """Observation never creates growth, closes expiry, or returns held items."""
     rows = list(VillagePlayerDishReview.objects.filter(player=player)
-                .select_related("sample_slot").order_by("-created_world_minute", "review_id"))
+                .select_related("sample_slot__usage", "sample_slot__dish", "sample_slot__review")
+                .order_by("-created_world_minute", "review_id"))
     reason = _mark_reason(minute)
     pending = any(_status(row, minute) == "PENDING" for row in rows)
     samples = []
     if bag.pk and bag.player_id == player.pk and bag.character_id == player.username:
-        slots = list(bag.slots.filter(item_amount__gt=0).order_by("slot_index"))
-        items = Item.objects.in_bulk({slot.item_id for slot in slots})
-        for slot in slots:
+        if slots is None:
+            slots = list(bag.slots.filter(item_amount__gt=0).select_related("usage", "dish", "review"))
+        items = dict(items) if items is not None else {}
+        missing = {slot.item_id for slot in slots} - items.keys()
+        if missing:
+            items.update(Item.objects.in_bulk(missing))
+        for slot in sorted(slots, key=lambda row: row.slot_index):
             item = items.get(slot.item_id)
             if not item or item.item_type != ItemType.FOOD:
                 continue
@@ -110,7 +115,9 @@ def review_overview(player, bag, minute, read_only=False):
             sample = _dish(slot, item)
             sample.update(eligible=not blocked and not read_only, reason="MODE_READ_ONLY" if read_only and not blocked else blocked)
             samples.append(sample)
-    return dict(revision=PlayerGrowthState.objects.filter(player=player).values_list("revision", flat=True).first() or 0,
+    if revision is None:
+        revision = PlayerGrowthState.objects.filter(player=player).values_list("revision", flat=True).first() or 0
+    return dict(revision=revision,
         observed_world_minute=minute,
         mark_available=not reason, unavailable_reason=reason,
         entries=[_entry(row, minute) for row in rows], samples=samples)
@@ -136,7 +143,7 @@ def _snapshot(slot, item):
 
 
 def _held_slot(row):
-    slot = InventorySlot.objects.select_for_update().select_related("bag").get(pk=row.sample_slot_id)
+    slot = InventorySlot.objects.select_for_update().select_related("bag", "usage", "dish", "review").get(pk=row.sample_slot_id)
     if (slot.bag.player_id != row.player_id or slot.bag.character_id != f"dish-review:{row.pk}"
             or slot.item_amount != 1 or slot.item_id != row.snapshot.get("item_id")):
         _fail("DISH_REVIEW_SAMPLE_UNAVAILABLE", "托管样品不完整，请刷新状态。")
@@ -155,9 +162,9 @@ def _notify_mark(row, clock, request_id):
 
 
 @transaction.atomic
-def execute_review_action(player, bag, action, params, rid, clock):
+def execute_review_action(player, bag, action, params, rid, clock, *, update_growth=True):
     minute = clock.world_minute
-    GameAccount.objects.select_for_update().get(pk=player.pk)
+    GameAccount.objects.select_for_update().only("pk").get(pk=player.pk)
     if not bag.pk or bag.player_id != player.pk or bag.character_id != player.username:
         _fail("PLAYER_BAG_REQUIRED", "请使用本人的主背包。")
     rid = _uuid(rid)
@@ -165,7 +172,7 @@ def execute_review_action(player, bag, action, params, rid, clock):
         if set(params) != {"instance_id"}:
             _fail("INVALID_PARAMS", "请选择一份真实菜品。")
         source_id = _uuid(params.get("instance_id"))
-        old = VillagePlayerDishReview.objects.select_related("sample_slot").filter(player=player, request_id=rid).first()
+        old = VillagePlayerDishReview.objects.select_related("sample_slot__usage", "sample_slot__dish", "sample_slot__review").filter(player=player, request_id=rid).first()
         if old:
             if old.source_instance_id != source_id:
                 _fail("REQUEST_CONFLICT", "同一请求不能更换样品。")
@@ -174,7 +181,7 @@ def execute_review_action(player, bag, action, params, rid, clock):
         pending.filter(expires_world_minute__lte=minute).update(status="EXPIRED")
         if pending.exists():
             _fail("DISH_REVIEW_PENDING", "已有一份待评样品，请先等待或取消。")
-        slot = bag.slots.select_for_update().filter(instance_id=source_id, item_amount__gt=0).first()
+        slot = bag.slots.select_for_update().select_related("usage", "dish", "review").filter(instance_id=source_id, item_amount__gt=0).first()
         if not slot:
             _fail("DISH_REVIEW_SAMPLE_UNAVAILABLE", "本人主背包中没有这份样品。")
         item = Item.objects.filter(pk=slot.item_id).first()
@@ -183,10 +190,8 @@ def execute_review_action(player, bag, action, params, rid, clock):
             _fail(reason, "此样品当前无法送评，请检查鲜期和点评状态。")
         review_id = uuid.uuid4()
         escrow = InventoryBag.objects.create(player=player, character_id=f"dish-review:{review_id}")
-        held = InventorySlot(bag=escrow, slot_index=0, item_id=slot.item_id,
-                             item_amount=1, item_bag_name=slot.item_bag_name, hide_in_shop=slot.hide_in_shop)
-        copy_batch_attributes(slot, held)
-        held.save()
+        from inventory.storage import add_inventory_items, attributes_from_slot
+        held = add_inventory_items(escrow, slot.item_id, 1, attributes=attributes_from_slot(slot))[0][0]
         # Leave a full review window after a known absence, so queued samples survive his return.
         return_minute = NpcRuntimeState.objects.filter(npc__agent_id="10013").values_list(
             "away_until_world_minute", flat=True).first() or minute
@@ -196,12 +201,14 @@ def execute_review_action(player, bag, action, params, rid, clock):
             expires_world_minute=max(minute, return_minute) + 180)
         slot.item_amount -= 1
         slot.save(update_fields=["item_amount"])
-        _bump(player)
+        if update_growth:
+            _bump(player)
         _notify_mark(row, clock, rid)
         return dict(review=_entry(row, minute))
     if action not in ("cancel_dish_review", "claim_dish_review") or set(params) != {"review_id"}:
         _fail("INVALID_PARAMS", "点评动作参数无效。")
-    row = VillagePlayerDishReview.objects.select_for_update().select_related("sample_slot").filter(
+    row = VillagePlayerDishReview.objects.select_for_update(of=("self",)).select_related(
+        "sample_slot__usage", "sample_slot__dish", "sample_slot__review").filter(
         pk=_uuid(params.get("review_id")), player=player).first()
     if row is None:
         _fail("DISH_REVIEW_NOT_FOUND", "没有这份本人的点评记录。")
@@ -218,16 +225,15 @@ def execute_review_action(player, bag, action, params, rid, clock):
         if status == "PENDING":
             _fail("DISH_REVIEW_NOT_READY", "样品正在等待Mark点评，可先取消再领取。")
         held = _held_slot(row)
-        returned = InventorySlot(bag=bag, slot_index=_next_index(bag), item_id=held.item_id,
-            item_amount=1, item_bag_name=held.item_bag_name, hide_in_shop=held.hide_in_shop)
-        copy_batch_attributes(held, returned)
-        returned.save()
+        from inventory.storage import add_inventory_items, attributes_from_slot
+        returned = add_inventory_items(bag, held.item_id, 1, attributes=attributes_from_slot(held))[0][0]
         held.item_amount = 0
         held.save(update_fields=["item_amount"])
         row.status, row.claimed_world_minute, row.claim_request_id = status, minute, rid
         row.claimed_instance_id = returned.instance_id
         row.save(update_fields=["status", "claimed_world_minute", "claim_request_id", "claimed_instance_id"])
-    _bump(player)
+    if update_growth:
+        _bump(player)
     return dict(review=_entry(row, minute), returned_instance_id=str(row.claimed_instance_id) if row.claimed_instance_id else None)
 
 

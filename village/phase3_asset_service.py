@@ -287,37 +287,6 @@ BATCH_ITEM_ATTRIBUTES = ("quality", "equipment_level", "rated", "rating_price", 
                          "cook_time", "dish_quality", "hide_in_shop", "review_comment", "freshness_unknown", "dish_metadata")
 
 
-def add_batch(
-    inventory: NpcGlobalInventory,
-    item_id: int,
-    amount: int,
-    produced_world_minute: int,
-    expires_world_minute: Optional[int],
-    source_request_id: uuid.UUID,
-    remaining_uses: Optional[int] = None,
-    item_attributes: Optional[Dict[str, Any]] = None,
-) -> NpcGlobalInventorySlot:
-    """Add a new inventory batch. Never merges with existing slots."""
-    max_idx = (
-        NpcGlobalInventorySlot.objects.filter(bag=inventory)
-        .order_by("-slot_index")
-        .values_list("slot_index", flat=True)
-        .first()
-    )
-    next_index = (max_idx + 1) if max_idx is not None else 0
-    return NpcGlobalInventorySlot.objects.create(
-        bag=inventory,
-        slot_index=next_index,
-        item_id=item_id,
-        item_amount=amount,
-        remaining_uses=remaining_uses,
-        produced_world_minute=produced_world_minute,
-        expires_world_minute=expires_world_minute,
-        source_request_id=source_request_id,
-        **{key: value for key, value in (item_attributes or {}).items() if key in BATCH_ITEM_ATTRIBUTES},
-    )
-
-
 def get_usable_tool_slot(inventory, tool_item_id, world_minute, *, exclude_command_id=None, slot_instance_id=None):
     """Select a usable physical tool without changing its quantity or wear."""
     from player.models import EquipmentDefinition
@@ -354,12 +323,8 @@ def consume_tool_use(npc_id: int, tool_item_id: int, world_minute=None, *, exclu
     if slot.item_amount > 1:
         slot.item_amount -= 1
         slot.save(update_fields=["item_amount"])
-        slot = add_batch(
-            inventory, slot.item_id, 1, slot.produced_world_minute,
-            slot.expires_world_minute, slot.source_request_id,
-            remaining_uses=slot.remaining_uses,
-            item_attributes={key: getattr(slot, key) for key in BATCH_ITEM_ATTRIBUTES},
-        )
+        from inventory.storage import add_inventory_items, attributes_from_slot
+        slot = add_inventory_items(inventory, slot.item_id, 1, attributes=attributes_from_slot(slot))[0][0]
     slot.remaining_uses -= 1
     slot.save(update_fields=["remaining_uses"])
     return slot

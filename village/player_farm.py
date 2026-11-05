@@ -11,6 +11,7 @@ from django.utils import timezone
 
 from items.quality import production_quality, quality_rng
 from inventory.components import copy_batch_attributes
+from inventory.storage import add_inventory_items
 from inventory.models import InventorySlot, NpcGlobalInventory
 from .models import EconomicLedgerEntry, VillageFarmPlot, VillageSimulationConfig, VillageWorldEvent
 from .phase3_catalog import FARM_CROP_RULES, FARM_TOOL_ITEM_ID, farm_crop_catalog
@@ -400,14 +401,12 @@ def execute_farm_action(player, bag, action, p, rid, clock):
                 output=dict(item_id=rule["output_item_id"], amount=output),
                 seed_return=dict(item_id=rule["seed_item_id"], amount=seeds))
             reservation_request_id = trial_request_id(player.pk, plot.source_request_id) if plot.source_request_id else None
-            next_index = (bag.slots.aggregate(n=Max("slot_index"))["n"] or 0) + 1
             for item_id, amount in ((rule["output_item_id"], output), (rule["seed_item_id"], seeds)):
-                slot = InventorySlot.objects.create(bag=bag, slot_index=next_index, item_id=item_id,
-                    item_amount=amount, quality=quality if item_id == rule["output_item_id"] else 3,
-                    produced_world_minute=minute, source_request_id=rid,
-                    expires_world_minute=None)
-                next_index += 1
-                result["items_added"].append(dict(batch_evidence(slot), amount=amount))
+                if not amount:
+                    continue
+                for slot, delta in add_inventory_items(bag, item_id, amount,
+                        attributes=dict(quality=quality if item_id == rule["output_item_id"] else 3)):
+                    result["items_added"].append(dict(batch_evidence(slot), amount=delta, quantity=delta))
             from player.progression import award_skill
             result["growth_rewards"] = [award_skill(player, source_type="farm_harvest", source_id=batch_id,
                 skill_code="farming", xp=rule.get("harvest_xp", 20),
@@ -424,8 +423,14 @@ def execute_farm_action(player, bag, action, p, rid, clock):
             if state == "HARVEST_ONLY":
                 clear_lease(plot)
             effect = dict(action="HARVEST", harvested=harvested)
-        changes[f"PLAYER:{player.pk}"] = {str(i["item_id"]): i["amount"] for i in result["items_added"]}
-        changes[f"PLAYER:{player.pk}"].update({str(i["item_id"]): -i["amount"] for i in result["items_consumed"]})
+        player_changes = {}
+        for row in result["items_added"]:
+            key = str(row["item_id"])
+            player_changes[key] = player_changes.get(key, 0) + row["amount"]
+        for row in result["items_consumed"]:
+            key = str(row["item_id"])
+            player_changes[key] = player_changes.get(key, 0) - row["amount"]
+        changes[f"PLAYER:{player.pk}"] = player_changes
         changes["tool_used"] = result["tool_used"]
     plot.plot_version += 1
     plot.save()

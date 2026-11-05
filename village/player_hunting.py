@@ -18,8 +18,8 @@ from player.progression import ensure_growth, growth_snapshot
 from .models import EconomicLedgerEntry, VillageHuntAttempt, VillageSimulationConfig, VillageWildlife
 from .phase3_catalog import HUNTING_WEAPONS, HUNTING_KILL_XP
 from .production_tools import ToolError, resolve_tool, wear_tool, _index, _single_in_place
-from player.models import EquipmentDefinition
-from player.equipment import stats_for, weapon_moves, WEAPONS
+from player.models import EquipmentDefinition, WeaponMove
+from player.equipment import stats_for, weapon_moves, WEAPONS, equipment_catalog
 
 KIT_MILESTONE = "starter_hunting_kit_claimed"
 SAFE_LOCATION, REST_MINUTES = "VILLAGE_SQUARE", 30
@@ -80,10 +80,10 @@ def _combat_ready(state):
         reject("PLAYER_RESTING", "休整期间不能进行战斗。")
 
 
-def _weapon_data(slot, weapon, level):
-    stats = stats_for(slot)
-    item = Item.objects.filter(pk=slot.item_id).first()
+def _weapon_data(slot, weapon, level, *, context=None):
+    stats = stats_for(slot, catalog=context["catalog"] if context is not None else None)
     if not stats:
+        item = Item.objects.filter(pk=slot.item_id).first()
         return dict(weapon=weapon, instance_id=str(slot.instance_id), item_id=slot.item_id,
             name=item.item_name if item else str(slot.item_id), equipment_level=slot.equipment_level,
             remaining_uses=slot.remaining_uses, max_uses=0, usable=False)
@@ -91,34 +91,34 @@ def _weapon_data(slot, weapon, level):
         name=stats["item_name"], category=stats["category"], equipment_level=stats["level"], tier=stats["tier"],
         remaining_uses=slot.remaining_uses, max_uses=stats["max_durability"],
         base_attack_min=stats["attack_min"], base_attack_max=stats["attack_max"],
-        moves=weapon_moves(stats["category"]), draw_duration=1.2 * (.95 if level >= 2 else 1))
+        moves=weapon_moves(stats["category"], moves=context["moves"] if context is not None else None), draw_duration=1.2 * (.95 if level >= 2 else 1))
 
 
-def resolve_player_weapon(player, bag, weapon, instance_id, minute):
+def resolve_player_weapon(player, bag, weapon, instance_id, minute, *, levels=None, context=None):
     if type(weapon) is not int or weapon not in CAPABILITIES:
         reject("INVALID_WEAPON", "武器类型无效。")
     if not bag.pk:
         reject("TOOL_MISSING", "请先持有真实武器。")
     try:
-        slot = resolve_tool(player, bag, CAPABILITIES[weapon], instance_id=instance_id, minute=minute)
+        slot = resolve_tool(player, bag, CAPABILITIES[weapon], instance_id=instance_id, minute=minute, levels=levels, context=context)
     except ToolError as exc:
         reject(exc.code, exc.message)
-    stats = stats_for(slot)
+    stats = stats_for(slot, catalog=context["catalog"] if context is not None else None)
     if not stats or WEAPONS.get(stats["category"]) != weapon:
         reject("TOOL_UNAVAILABLE", "该物品不是指定类型的武器。")
     if stats["attack_min"] < 1 or stats["attack_max"] < stats["attack_min"]:
         reject("WEAPON_CONFIGURATION_UNAVAILABLE", "武器基础攻击配置无效。")
-    moves = weapon_moves(stats["category"])
+    moves = weapon_moves(stats["category"], moves=context["moves"] if context is not None else None)
     expected = {0: {"spear_thrust"}, 1: {"sword_light_0", "sword_light_1", "sword_light_2", "sword_heavy"},
                 2: {"bow_shot"}, 3: {"axe_chop"}}[weapon]
     if not expected.issubset(moves):
         reject("WEAPON_MOVE_UNAVAILABLE", "武器招式配置不完整。")
-    return slot, _weapon_data(slot, weapon, _level(player))
+    return slot, _weapon_data(slot, weapon, levels.get("hunting", 1) if levels is not None else _level(player), context=context)
 
 
-def weapon_repair_quote(player, bag, slot, minute):
-    stats = stats_for(slot)
-    item = Item.objects.filter(pk=slot.item_id, is_deleted=False).first()
+def weapon_repair_quote(player, bag, slot, minute, *, context=None):
+    stats = context["catalog"].get((slot.item_id, slot.equipment_level)) if context is not None else stats_for(slot)
+    item = context["items"].get(slot.item_id) if context is not None else Item.objects.filter(pk=slot.item_id, is_deleted=False).first()
     reason = ("TOOL_NOT_OWNED" if not bag.pk or slot.bag_id != bag.pk or bag.player_id != player.pk or bag.character_id != player.username else
         "PAID_REPAIR_REQUIRED" if not stats or stats["repair_gold"] or stats["repair_materials"] else
         "TOOL_UNAVAILABLE" if not item else
@@ -133,21 +133,39 @@ def weapon_repair_quote(player, bag, slot, minute):
         location_code=None, action="repair_hunting_weapon")
 
 
-def hunting_overview(player, bag, minute, read_only=False):
+def hunting_overview(player, bag, minute, read_only=False, *, tool_state=None, levels=None, slots=None, context=None):
     state = PlayerHuntingState.objects.filter(player=player).first()
-    level, weapons = _level(player), []
-    for slot in bag.slots.filter(item_amount__gt=0, item_id__in=[*HUNTING_WEAPONS, 4104, 4105, *EquipmentDefinition.objects.filter(category__in=WEAPONS).values_list("item_id", flat=True)]).order_by("slot_index") if bag.pk else []:
-        profile = EquipmentDefinition.objects.filter(item_id=slot.item_id).first()
+    context = {} if context is None else context
+    levels = context.get("levels") if levels is None else levels
+    if levels is None:
+        levels = {row["code"]: row["level"] for row in growth_snapshot(player, read_only=True, compact=True)["skills"]}
+    level, weapons = levels.get("hunting", 1), []
+    if "profiles" not in context:
+        context["profiles"] = {row.item_id: row for row in EquipmentDefinition.objects.select_related("item")}
+    profiles = context["profiles"]
+    weapon_ids = {*HUNTING_WEAPONS, 4104, 4105, *(item_id for item_id, row in profiles.items() if row.category in WEAPONS)}
+    repairs = {row["instance_id"]: row["repair"] for row in (tool_state or {}).get("tools", []) if "repair" in row}
+    slots = context.get("slots") if slots is None else slots
+    slots = list(bag.slots.filter(item_amount__gt=0, item_id__in=weapon_ids).select_related("usage").order_by("slot_index")) if slots is None and bag.pk else sorted(slots or [], key=lambda s: s.slot_index)
+    context.update(levels=levels, slots=slots)
+    if "catalog" not in context:
+        context["catalog"] = equipment_catalog()
+    if "moves" not in context:
+        context["moves"] = list(WeaponMove.objects.all())
+    for slot in slots:
+        if slot.item_amount <= 0 or slot.item_id not in weapon_ids:
+            continue
+        profile = profiles.get(slot.item_id)
         weapon = WEAPONS[profile.category] if profile else HUNTING_WEAPONS.get(slot.item_id, {}).get("weapon", 3)
-        data = _weapon_data(slot, weapon, level)
         try:
             _combat_ready(state)
-            resolve_player_weapon(player, bag, weapon, slot.instance_id, minute)
+            _, data = resolve_player_weapon(player, bag, weapon, slot.instance_id, minute, levels=levels, context=context)
             reason = ""
         except HuntingError as exc:
+            data = _weapon_data(slot, weapon, level, context=context)
             reason = exc.code
         from .production_tools import _quote
-        repair = _quote(player, bag, slot, "repair", minute)
+        repair = deepcopy(repairs[str(slot.instance_id)]) if str(slot.instance_id) in repairs else _quote(player, bag, slot, "repair", minute)
         if read_only:
             repair.update(available=False, reason="MODE_READ_ONLY")
         data.update(usable=not reason, reason=reason, repair=repair)

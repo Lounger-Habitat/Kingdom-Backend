@@ -233,14 +233,14 @@ class Phase7PresentationTests(TestCase):
             "today_transaction_count": 1,
             "today_gross": 65,
         })
-        self.assertEqual(data["listings"][0]["batches"][0]["remaining_uses"], 18)
-        tooltip = data["listings"][0]["batches"][0]["batch"]
+        self.assertEqual(data["listings"][0]["items"][0]["remaining_uses"], 18)
+        tooltip = data["listings"][0]["items"][0]["attributes"]
         self.assertEqual(tooltip["usage"], {"mode": "FINITE", "remaining": 18, "maximum": 20})
         self.assertEqual(tooltip["quality"], 4)
         self.assertEqual(tooltip["dish"]["ingredients"], "木材、铁")
-        self.assertEqual(tooltip["dish"]["metadata"], {})
-        self.assertEqual(tooltip["id"], "")
-        self.assertIsNone(tooltip["origin"])
+        self.assertNotIn("metadata", tooltip["dish"])
+        self.assertNotIn("id", tooltip)
+        self.assertNotIn("origin", tooltip)
         self.assertEqual(tooltip["quantity"], 2)
         self.assertEqual(data["listing_history"][0]["action"], "LIST")
         self.assertEqual(data["transactions"][0]["amount"], 1)
@@ -293,8 +293,8 @@ class Phase7PresentationTests(TestCase):
             "unlisted_amount", "reserved_amount", "unavailable_amount")}, {
             "total_amount": 15, "available_amount": 10, "listed_amount": 2,
             "unlisted_amount": 8, "reserved_amount": 2, "unavailable_amount": 3})
-        self.assertEqual(len(row["batches"]), 5)
-        self.assertEqual(row["batches"][0]["batch"]["usage"]["remaining"], 12)
+        self.assertEqual(len(row["items"]), 5)
+        self.assertEqual(row["items"][0]["attributes"]["usage"]["remaining"], 12)
         self.assertEqual(inventory[45002]["item_name"], "仅在库商品")
         self.assertEqual(inventory[45002]["total_amount"], 7)
         warehouse = {row["item_id"]: row for row in data["warehouse"]}
@@ -302,8 +302,8 @@ class Phase7PresentationTests(TestCase):
             "unlisted_amount", "reserved_amount", "unavailable_amount")}, {
             "total_amount": 12, "available_amount": 8, "listed_amount": 0,
             "unlisted_amount": 8, "reserved_amount": 1, "unavailable_amount": 3})
-        self.assertEqual(len(warehouse[45001]["batches"]), 4)
-        self.assertTrue(all(not batch["is_listed"] for row in warehouse.values() for batch in row["batches"]))
+        self.assertEqual(len(warehouse[45001]["items"]), 4)
+        self.assertTrue(all(not batch["is_listed"] for row in warehouse.values() for batch in row["items"]))
         self.assertEqual(warehouse[45002]["total_amount"], 7)
         self.assertNotIn(45003, warehouse)
         self.assertEqual(next(row for row in data["listings"] if row["item_id"] == 45001)["available_amount"], 2)
