@@ -2,6 +2,7 @@
 import uuid
 
 from django.db import transaction
+from django.db.models import F
 
 from .models import PlayerGrowthState, PlayerMilestoneProgress, PlayerSkillProgress
 from .progression import award_skill, ensure_growth
@@ -149,8 +150,7 @@ def record_order_completion(player, source_type, order_id):
     return reward
 
 
-@transaction.atomic
-def post_action_progress(player, bag, action, params, result, rid, minute):
+def post_action_progress(player, bag, action, params, result, rid, minute, *, growth_state=None):
     """Called once inside the original successful action savepoint, before receipt.
 
     Result flags are produced by trusted services. For repeatable paid orders,
@@ -158,7 +158,7 @@ def post_action_progress(player, bag, action, params, result, rid, minute):
     """
     if action == "overview":
         return {}
-    ensure_growth(player)
+    state = growth_state if growth_state is not None else ensure_growth(player)
     milestones, rewards = [], []
     code = None
     if action == "collect" and result.get("collected_items"):
@@ -194,10 +194,13 @@ def post_action_progress(player, bag, action, params, result, rid, minute):
     task_rewards = [row for reward in rewards for row in reward.get("starter_rewards", [])]
     codes = list(GOAL_GOLD) if action == "claim_goal_rewards" else [row["code"] for row in milestones]
     codes += [row["code"] for reward in result.get("growth_rewards", []) for row in reward.get("milestones", [])]
-    task_rewards.extend(_award_goal_rewards(player, codes, minute))
+    if codes:
+        task_rewards.extend(_award_goal_rewards(player, codes, minute))
     # Even a sale or tool purchase with no new milestone changes the starter
     # inventory view. Its snapshot must supersede an older saved action receipt.
-    state = PlayerGrowthState.objects.select_for_update().get(player=player)
-    state.revision += 1
-    state.save(update_fields=["revision"])
+    PlayerGrowthState.objects.filter(pk=state.pk).update(revision=F("revision") + 1)
+    if source:
+        state.refresh_from_db(fields=["revision"])
+    else:
+        state.revision += 1
     return dict(growth_rewards=rewards, starter_milestones=milestones, starter_rewards=task_rewards)

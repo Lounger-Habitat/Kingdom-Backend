@@ -30,7 +30,7 @@ def _legacy_floor(points):
 
 @transaction.atomic
 def ensure_growth(player):
-    GameAccount.objects.select_for_update().get(pk=player.pk)
+    GameAccount.objects.select_for_update().only("pk").get(pk=player.pk)
     state, _ = PlayerGrowthState.objects.select_for_update().get_or_create(player=player)
     if state.legacy_migration_version >= 1:
         return state
@@ -52,8 +52,9 @@ def _milestone_data(row):
                 completed_at=row.completed_at.isoformat(), rules_version=row.rules_version)
 
 
-def growth_snapshot(player, *, read_only=False, compact=False):
-    state = PlayerGrowthState.objects.filter(player=player).first() if read_only else ensure_growth(player)
+def growth_snapshot(player, *, read_only=False, compact=False, state=None):
+    if state is None:
+        state = PlayerGrowthState.objects.filter(player=player).first() if read_only else ensure_growth(player)
     points = _legacy_points(player) if state is None or state.legacy_migration_version < 1 else None
     totals = dict(PlayerSkillProgress.objects.filter(player=player).values_list("skill_code", "total_xp"))
     if points is not None:

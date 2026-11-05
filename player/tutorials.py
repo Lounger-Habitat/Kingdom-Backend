@@ -246,15 +246,16 @@ def control(player, action, params, bag):
     return dict(tutorial_updated=True, tutorial_backfilled=False, tutorial_acknowledged=acknowledged)
 
 
-@transaction.atomic
 def observe_action(player, bag, action, result, request_id):
+    """The player action caller owns the savepoint for evidence and asset changes."""
     state = PlayerTutorialState.objects.select_for_update().filter(player=player, started=True).first()
     if state is None:
-        return
+        return False
     before = _before(state)
     _normalize(state)
     _action_evidence(state, action, result, str(request_id))
     _save_changed(state, before, _context(player, bag))
+    return before != _before(state)
 
 
 @transaction.atomic
